@@ -7341,8 +7341,19 @@ def encode_o7_parse(Seq: int, Sql: str, Binds: list | None = None) -> bytes:
         + _O7_PARSE_TAIL
     )
     if Binds:
-        Out += b''.join(_o7_bind_oac(V) for V in Binds)
-        Out += encode_tokens_rxd(Binds, b'')
+        Oacs = [_o7_bind_oac(V) for V in Binds]
+        Out += b''.join(Oacs)
+        # 9i applies the LONG-class rule too (docs/PROTOCOL.md 5.4, #723): a
+        # bind declared wider than 4000 bytes has its value read after the
+        # row's others. The declared size is the descriptor's sb4 at +4; a
+        # plain string is declared 4000 there and stays in place. A PL/SQL
+        # block (encode_o7_block) keeps every value in place.
+        Long = [decode_ub4(Oac[4:])[0] > 4000 for Oac in Oacs]
+        Out += encode_tokens_rxd(
+            [V for V, L in zip(Binds, Long) if not L]
+            + [V for V, L in zip(Binds, Long) if L],
+            b'',
+        )
     return Out
 
 
@@ -8376,12 +8387,18 @@ def decode_fv2_dml_response(Data: bytes) -> tuple[int, int]:
     Rest = Data
     if Rest[0] == TTI_RPA:
         # Skip the RPA piggyback (same shape as decode_token_rpa_piggyback):
-        # read the field count, consume that many ub4s, skip alignment zeros,
-        # leaving the stream on the trailing OER token.
+        # read the field count, consume exactly that many ub4s, skip alignment
+        # zeros, leaving the stream on the trailing OER token. The count is the
+        # only guide: a ub4's length byte can be any value up to 4, and the
+        # first parameter is a counter that passes 2**24 as the instance ages,
+        # at which point its length byte reads 0x04, the OER token. A loop that
+        # stopped at a token-looking byte then took the counter for the status
+        # and every successful DDL and DML on 9i raised a garbled negative
+        # ORA code (#711).
         Rest = Rest[1:]
         (Num, Rest) = decode_ub4(Rest)
         for _ in range(max(Num, 0)):
-            if not Rest or Rest[0] in (TTI_OER, TTI_RXH, TTI_RXD, TTI_STA):
+            if not Rest:
                 break
             (_, Rest) = decode_ub4(Rest)
         while Rest and Rest[0] == 0:

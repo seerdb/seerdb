@@ -110,6 +110,38 @@ class TestTheClientWritesLongClassValuesLast(unittest.TestCase):
         )
 
 
+class TestThe9iBuilderWritesLongClassValuesLast(unittest.TestCase):
+    """9i has its own request builder and the same rule (#723)."""
+
+    SQL = 'insert into t values (:1, :2, :3)'
+
+    def test_a_wide_bind_is_written_after_the_row(self):
+        from seerdb.common.tns import encode_o7_parse
+
+        encoded = encode_o7_parse(3, self.SQL, [1, _wide('WIDE'), 'PLAIN'])
+        self.assertLess(encoded.index(b'PLAIN'), encoded.index(b'WIDE'))
+
+    def test_a_bind_within_4000_bytes_stays_in_place(self):
+        from seerdb.common.tns import encode_o7_parse
+
+        small = Var(str, 4000)
+        small.setvalue(0, 'SMALL')
+        encoded = encode_o7_parse(3, self.SQL, [1, small, 'PLAIN'])
+        self.assertLess(encoded.index(b'SMALL'), encoded.index(b'PLAIN'))
+
+    def test_a_plsql_block_keeps_every_value_in_place(self):
+        # A 9i block's parse carries only the descriptors; the dialect sends the
+        # values afterwards as one RXD built straight from the bind list, which
+        # is the in-place order the server wants for a block.
+        from seerdb.common.tns import encode_o7_block, encode_tokens_rxd
+
+        bind = [1, _wide('WIDE'), 'PLAIN']
+        parse = encode_o7_block(3, 'begin p(:1, :2, :3); end;', bind)
+        self.assertNotIn(b'PLAIN', parse)
+        values = encode_tokens_rxd(bind, b'')
+        self.assertLess(values.index(b'WIDE'), values.index(b'PLAIN'))
+
+
 class TestThe8iBuilderWritesLongClassValuesLast(unittest.TestCase):
     """8i has its own request builder and the same rule (#714)."""
 
