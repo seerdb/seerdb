@@ -3059,6 +3059,14 @@ the short OER whose **first field is the affected-row count** (ORA code 0 =
 success). 9i's parse carries no autocommit bit, so the client issues an explicit
 `TTI_COMMIT` when autocommit is on (verified to persist on 9.2.0.4).
 
+The RPA piggyback is `08`, a `ub4` parameter count, then exactly that many
+`ub4` parameters; the first is a counter that grows with the instance. Its
+length byte reads `0x04` once the counter passes 2**24, which is also the OER
+token, so the parameters must be consumed by count and never by sniffing for a
+token: a decoder that stopped at the `0x04` took the counter for the status and
+turned every successful DDL and DML on an aged 9i into a garbled negative ORA
+code (#711). Captured with the counter at `0x0129c868`.
+
 ### 19.4 Errors, ROWID, and unsupported types (#102)
 
 A parse/execute that fails returns the **short OER** as the response (in place

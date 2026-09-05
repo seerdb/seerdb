@@ -8376,12 +8376,18 @@ def decode_fv2_dml_response(Data: bytes) -> tuple[int, int]:
     Rest = Data
     if Rest[0] == TTI_RPA:
         # Skip the RPA piggyback (same shape as decode_token_rpa_piggyback):
-        # read the field count, consume that many ub4s, skip alignment zeros,
-        # leaving the stream on the trailing OER token.
+        # read the field count, consume exactly that many ub4s, skip alignment
+        # zeros, leaving the stream on the trailing OER token. The count is the
+        # only guide: a ub4's length byte can be any value up to 4, and the
+        # first parameter is a counter that passes 2**24 as the instance ages,
+        # at which point its length byte reads 0x04, the OER token. A loop that
+        # stopped at a token-looking byte then took the counter for the status
+        # and every successful DDL and DML on 9i raised a garbled negative
+        # ORA code (#711).
         Rest = Rest[1:]
         (Num, Rest) = decode_ub4(Rest)
         for _ in range(max(Num, 0)):
-            if not Rest or Rest[0] in (TTI_OER, TTI_RXH, TTI_RXD, TTI_STA):
+            if not Rest:
                 break
             (_, Rest) = decode_ub4(Rest)
         while Rest and Rest[0] == 0:
