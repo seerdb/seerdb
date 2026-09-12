@@ -352,6 +352,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         await self._open_transport()
         try:
             result = await self.handle_login()
+        except ConnectionError as Exc:
+            # See the sync twin (#805).
+            raise OperationalError(
+                f'the server closed the connection during login ({Exc})'
+            ) from Exc
         except OperationalError:
             # Stale negotiation cache (#438): invalidate and retry with a full
             # negotiation. Mirror of OracleConnect.connect.
@@ -515,8 +520,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         while True:
             Received = await self.recv(b'', b'')
             if Received is False:
+                # See the sync twin: a dead socket used to leave connect() as a
+                # live connection (#805).
                 logger.debug('handle_login (async): peer closed')
-                return 1
+                raise OperationalError(
+                    'the server closed the connection during login (no reply to the last handshake packet)'
+                )
             (Type, Packet) = Received
             if Type != TNS_MARKER:
                 self._in_break = False
@@ -661,11 +670,11 @@ class AsyncOracleConnect(_ConnectionLogic):
 
                     (NewHost, NewPort) = parse_redirect_address(Packet)
                     if NewHost is None or NewPort is None:
-                        return 1
+                        raise OperationalError(
+                            'the server sent a redirect this client could not parse'
+                        )
                     self._redirects = getattr(self, '_redirects', 0) + 1
                     if self._redirects > _MAX_REDIRECTS:
-                        from seerdb.common.exceptions import OperationalError
-
                         raise OperationalError(
                             f'too many TNS redirects (> {_MAX_REDIRECTS})'
                         )
@@ -698,7 +707,9 @@ class AsyncOracleConnect(_ConnectionLogic):
                     continue
                 case _:
                     logger.debug('handle_login (async): unexpected %s', Type)
-                    return 1
+                    raise OperationalError(
+                        f'the server sent an unexpected packet type {Type} during login'
+                    )
 
     async def _negotiate_ano(self) -> None:
         # Async port of OracleConnect._negotiate_ano (#437): run the plaintext ANO

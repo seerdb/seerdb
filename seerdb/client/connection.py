@@ -892,6 +892,14 @@ class OracleConnect(_ConnectionLogic):
         self._open_transport()
         try:
             result = self.handle_login()
+        except ConnectionError as Exc:
+            # A reset or broken pipe mid-handshake is the same failure as a
+            # clean close, only reported differently by the OS depending on
+            # timing. Surface it the same way instead of letting a raw socket
+            # error out of connect() (#805).
+            raise OperationalError(
+                f'the server closed the connection during login ({Exc})'
+            ) from Exc
         except OperationalError:
             # A connection-level failure on the cached (bare-PRO-skipping) path
             # most likely means the cached field version is stale (the server
@@ -977,9 +985,14 @@ class OracleConnect(_ConnectionLogic):
         while True:
             Received = self.recv(b'', b'')
             if Received is False:
-                # Peer closed during handshake.
+                # Peer closed mid-handshake. Raise: returning a code here let a
+                # dead socket out of connect() as a live connection, and the
+                # failure only surfaced on the first statement, pointing at that
+                # statement rather than at the login that actually failed (#805).
                 logger.debug('handle_login: connection closed by peer')
-                return 1
+                raise OperationalError(
+                    'the server closed the connection during login (no reply to the last handshake packet)'
+                )
             (Type, Packet) = Received
             if Type != TNS_MARKER:
                 # A real packet ends any in-flight break/reset episode (#45).
@@ -1167,7 +1180,9 @@ class OracleConnect(_ConnectionLogic):
                     (NewHost, NewPort) = parse_redirect_address(Packet)
                     if NewHost is None or NewPort is None:
                         logger.debug('handle_login: unparseable redirect %r', Packet)
-                        return 1
+                        raise OperationalError(
+                            'the server sent a redirect this client could not parse'
+                        )
                     self._redirects = getattr(self, '_redirects', 0) + 1
                     if self._redirects > _MAX_REDIRECTS:
                         raise OperationalError(
@@ -1206,7 +1221,9 @@ class OracleConnect(_ConnectionLogic):
                     continue
                 case _:
                     logger.debug('handle_login: unexpected %s', Type)
-                    return 1
+                    raise OperationalError(
+                        f'the server sent an unexpected packet type {Type} during login'
+                    )
 
     def _fast_auth_login(self) -> int | None:
         # 23ai fast-auth (#89): send PRO, DTY and OSESSKEY bundled in one
