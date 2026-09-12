@@ -895,7 +895,7 @@ _ADMIN_NOOP = re.compile(
 def _translate_admin(sql: str) -> str:
     m = _ALTER_SESSION_SCHEMA.match(sql)
     if m:
-        return f'SET search_path TO {m.group(1).lower()}, public, oracle, sys'
+        return f'SET search_path TO {m.group(1).lower()}, public, sys, oracle'
     m = _CREATE_USER.match(sql)
     if m:
         return f'CREATE SCHEMA IF NOT EXISTS {m.group(1).lower()}'
@@ -1660,7 +1660,15 @@ class PostgresBackend:
             self._conn.execute('CREATE SCHEMA IF NOT EXISTS sys')
         except psycopg.Error:
             self._conn.rollback()
-        self._conn.execute('SET search_path TO public, oracle, sys')
+        # `sys` ahead of `oracle`: orafce ships its own `user_tables` and
+        # `user_tab_columns` in the `oracle` schema, and they select from
+        # information_schema with no owner filter at all -- every base table in
+        # the database, PostgreSQL's own catalogs included, reported as though
+        # the connected user owned them. Those are the only two names the two
+        # schemas share, so this ordering changes nothing else: user objects
+        # still resolve first through the schema ahead of both, and the rest of
+        # orafce is still reached through `oracle` (#818).
+        self._conn.execute('SET search_path TO public, sys, oracle')
         # Create + register the composite that backs TIMESTAMP WITH TIME ZONE, so
         # its columns come back as a typed tuple the read path can re-tag with the
         # entered offset (#519). Best-effort: a backend that can't create the type

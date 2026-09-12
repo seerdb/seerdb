@@ -383,9 +383,12 @@ def test_translate_admin_maps_session_user_and_index() -> None:
     # Oracle session/user admin → PostgreSQL: schema resolution is search_path, a
     # user is a schema, and grants/tablespace admin no-op; a schema-qualified index
     # name loses the qualifier (#759).
+    # `sys` precedes `oracle` because both define `user_tables`-style views and the
+    # dictionary's has to win; orafce's answers with raw lower-case names, so a
+    # session could not find the table it had just created (#818).
     assert (
         _translate_admin('ALTER SESSION SET CURRENT_SCHEMA = TEST_SCHEMA')
-        == 'SET search_path TO test_schema, public, oracle, sys'
+        == 'SET search_path TO test_schema, public, sys, oracle'
     )
     assert (
         _translate_admin('CREATE USER test_schema IDENTIFIED BY secret')
