@@ -967,9 +967,18 @@ _REF_SELECT = re.compile(
 _IDIOM_REWRITES = [
     # (HEXTORAW, RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as
     # real PostgreSQL functions — see _HELPER_FUNCTIONS_DDL / __init__ — so their
-    # call sites resolve directly and need no rewrite here. NVL, DECODE, TO_CHAR,
+    # call sites resolve directly and need no rewrite here. DECODE, TO_CHAR,
     # TO_DATE, ADD_MONTHS, INSTR, … come from the orafce extension the same way.
     # Only bare pseudo-constants and literal / clause shapes remain below.)
+    # NVL is the exception: orafce offers four overloads — nvl(anyelement,
+    # anyelement), nvl(bigint, integer), nvl(integer, integer) and nvl(numeric,
+    # integer) — and a PostgreSQL literal starts out as `unknown`, so a call with
+    # bare literals (NVL(NULL, 'ok'), the most ordinary Oracle there is) matches
+    # several candidates and the resolver refuses to pick. COALESCE is native,
+    # accepts untyped literals, and for the two arguments NVL takes means exactly
+    # the same thing — so sidestep overload resolution rather than adding a fifth
+    # candidate to it (#819).
+    (re.compile(r'\bNVL\s*\(', re.IGNORECASE), 'COALESCE('),
     # BINARY_DOUBLE/FLOAT special values → IEEE-754 float literals.
     (
         re.compile(r'\bbinary_(?:double|float)_infinity\b', re.IGNORECASE),

@@ -1061,8 +1061,14 @@ def test_translate_idioms_functions_and_literals() -> None:
     # HEXTORAW / RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as
     # real PostgreSQL functions (_HELPER_FUNCTIONS_DDL), so their call sites
     # resolve directly and pass through the idiom translation unchanged — just
-    # like the orafce-provided NVL / DECODE / TO_CHAR do.
-    assert _translate_idioms("SELECT NVL(:v, 'x')") == "SELECT NVL(:v, 'x')"
+    # like the orafce-provided DECODE / TO_CHAR do.
+    # NVL is the exception: orafce's four overloads are ambiguous for the untyped
+    # literals an application actually writes, so it becomes the native COALESCE,
+    # which means the same for two arguments (#819). NVL2 keeps its own name --
+    # the pattern needs `(` right after NVL, so it does not catch NVL2.
+    assert _translate_idioms("SELECT NVL(:v, 'x')") == "SELECT COALESCE(:v, 'x')"
+    assert _translate_idioms("SELECT nvl (NULL, 'ok')") == "SELECT COALESCE(NULL, 'ok')"
+    assert _translate_idioms("SELECT NVL2(:v, 'y', 'n')") == "SELECT NVL2(:v, 'y', 'n')"
     assert _translate_idioms("SELECT HEXTORAW('DEADBEEF')") == (
         "SELECT HEXTORAW('DEADBEEF')"
     )
@@ -1607,6 +1613,36 @@ def test_dbms_utility_functions() -> None:
             ],
         )
         assert result.out_binds == ['12.1.0.2.0', '12.1.0.0.0']
+    finally:
+        backend.close()
+
+
+def test_nvl_with_literal_arguments_runs() -> None:
+    # NVL with bare literals is ordinary Oracle, and it did not run here at all:
+    # orafce's four overloads left `nvl(unknown, unknown)` ambiguous and the
+    # resolver refused to choose (#819). Assert against the real backend rather
+    # than only the rewrite, because the rewrite is not the claim -- the claim is
+    # that the statement an application writes now returns the right value.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        assert backend.execute("SELECT nvl(NULL, 'ok') FROM dual").rows == [('ok',)]
+        assert backend.execute("SELECT nvl('a', 'b') FROM dual").rows == [('a',)]
+        assert backend.execute('SELECT nvl(NULL, 1) FROM dual').rows == [(1,)]
+        # The typed calls that already worked through orafce still do.
+        assert backend.execute('SELECT nvl(1, 2) FROM dual').rows == [(1,)]
+        # NVL2 is a different function and keeps its orafce implementation.
+        assert backend.execute("SELECT nvl2(NULL, 'y', 'n') FROM dual").rows == [('n',)]
+        assert backend.execute("SELECT nvl2('x', 'y', 'n') FROM dual").rows == [('y',)]
+        # A column reference, not just a literal, and inside a WHERE clause.
+        backend.execute('CREATE TABLE nvl819 (a VARCHAR(8), b VARCHAR(8))')
+        backend.execute("INSERT INTO nvl819 VALUES ('x', NULL)")
+        backend.commit()
+        assert backend.execute('SELECT nvl(b, a) FROM nvl819').rows == [('x',)]
+        assert backend.execute(
+            "SELECT a FROM nvl819 WHERE nvl(b, 'none') = 'none'"
+        ).rows == [('x',)]
+        backend.execute('DROP TABLE nvl819')
+        backend.commit()
     finally:
         backend.close()
 
