@@ -478,3 +478,35 @@ def encode_type_reply_sqlplus(*, sdu: int = DEFAULT_SDU) -> bytes:
     """
     packet, _ = encode_packet(TNS_DATA, build_type_reply_sqlplus(), sdu)
     return packet
+
+
+def client_field_version(dty_body: bytes) -> int | None:
+    """The TTC field version a client settled on, read from its DTY.
+
+    A client picks ``min(its own, the version the server advertised in the PRO
+    reply)`` and then sends its capability block in the DTY, so this byte is the
+    version the session actually agreed on -- the server does not have to infer
+    it. The Mirror used to discard the DTY and keep encoding at whatever it was
+    configured with, which is why a client below that version failed (#816).
+
+    Layout, mirroring ``encode_dictionary_dty``: the TTI_DTY token, the charset
+    and ncharset as little-endian ub2s, an encoding flag, then the compile
+    capabilities as a length byte followed by the array. The field version is
+    ``CCAP_FIELD_VERSION`` within it.
+
+    Returns ``None`` when the block cannot be read -- a truncated packet, or the
+    23ai fast-auth bundle, whose DTY does not arrive on its own. Callers fall
+    back to their configured version, so an unreadable block costs nothing that
+    worked before.
+    """
+    try:
+        if not dty_body or dty_body[0] != TTI_DTY:
+            return None
+        caps_len = dty_body[6]
+        caps = dty_body[7 : 7 + caps_len]
+        if len(caps) <= CCAP_FIELD_VERSION:
+            return None
+        version = caps[CCAP_FIELD_VERSION]
+        return version or None
+    except IndexError:
+        return None
