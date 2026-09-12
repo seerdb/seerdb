@@ -148,6 +148,7 @@ from seerdb.server.backend import (
 )
 from seerdb.server.framing import PacketStream
 from seerdb.server.handshake import (
+    client_field_version,
     encode_accept,
     encode_ano_null_reply,
     encode_dty_reply,
@@ -279,9 +280,10 @@ def handle_login(
     encryption: str = 'accepted',
     token_public_key: bytes | None = None,
     field_version: int = FIELD_VERSION_11_2,
+    min_field_version: int = FIELD_VERSION_11_2,
     tns_version: int | None = None,
     identity: 'ServerIdentity | None' = None,
-) -> tuple[str, bool, bytes | None]:
+) -> tuple[str, bool, bytes | None, int | None]:
     """Run the server side of the handshake + O5LOGON.
 
     Returns ``(username, is_sqlplus, conn_key)`` — the second flag says whether
@@ -341,6 +343,24 @@ def handle_login(
     sqlplus = pro_is_sqlplus(first)
     stream.send_raw(encode_pro_reply(sqlplus=sqlplus, field_version=field_version))
     after_pro = _expect(stream, TNS_DATA, 'DTY')
+    # The client has already picked min(its own, what the PRO reply advertised)
+    # and put the result in this packet's capability block, so the session's real
+    # version is readable here rather than assumed (#816). None for the fast-auth
+    # bundle, whose DTY does not arrive on its own, and for anything unparseable;
+    # the caller then keeps its configured version, as before.
+    negotiated = client_field_version(after_pro)
+    if negotiated is not None and negotiated != field_version:
+        if negotiated < min_field_version:
+            raise InterfaceError(
+                f'client negotiated TTC field version {negotiated}, below the '
+                f'{min_field_version} this Mirror serves (it presents '
+                f'{field_version})'
+            )
+        # Adopt it here rather than after the handshake: the DTY reply and the
+        # O5LOGON exchange that follow are themselves version-shaped, so a
+        # client below the advertised version failed to authenticate at all
+        # (ORA-01017) before it could reach a statement (#816).
+        field_version = negotiated
     # 23ai fast-auth (§20): a client at field version >= 18 cannot use the legacy
     # three-message handshake (the server rejects it with ORA-03146), so after the
     # bare PRO it sends one FAST_AUTH packet bundling DTY + OSESSKEY. The DTY and
@@ -372,7 +392,12 @@ def handle_login(
     # tokens, verify the OCI IAM signature (offline-checkable) and grant the
     # session — there is no O5LOGON challenge, proof, or ConnKey.
     if token_public_key is not None and is_token_auth(osesskey):
-        return _handle_token_login(stream, osesskey, token_public_key), sqlplus, None
+        return (
+            _handle_token_login(stream, osesskey, token_public_key),
+            sqlplus,
+            None,
+            negotiated,
+        )
     user = (
         parse_osesskey_oci(osesskey)
         if sqlplus
@@ -423,7 +448,7 @@ def handle_login(
         )
 
     logger.info('login OK: %s', user)
-    return user, sqlplus, conn_key
+    return user, sqlplus, conn_key, negotiated
 
 
 def _deny_login(stream: PacketStream, reason: str) -> NoReturn:
@@ -499,6 +524,7 @@ def serve_session(
     encryption: str = 'accepted',
     token_public_key: bytes | None = None,
     field_version: int = FIELD_VERSION_11_2,
+    min_field_version: int = FIELD_VERSION_11_2,
     tns_version: int | None = None,
 ) -> str:
     """Log a client in, then answer its queries until it disconnects.
@@ -529,15 +555,26 @@ def serve_session(
     declared_identity = getattr(backend, 'server_identity', None)
     identity = declared_identity or server_identity(field_version)
     backend = _IsolatedBackend(backend)
-    user, sqlplus, conn_key = handle_login(
+    user, sqlplus, conn_key, negotiated = handle_login(
         stream,
         backend,
         encryption=encryption,
         token_public_key=token_public_key,
         field_version=field_version,
+        min_field_version=min_field_version,
         tns_version=tns_version,
         identity=identity,
     )
+    # Serve the session at the version the client actually negotiated, not the
+    # one this Mirror advertises. A client above the advertised version comes
+    # down to it and was already served; one below it used to be answered in the
+    # advertised layout and failed on the first row, with an error naming
+    # neither version (#816).
+    if negotiated is not None and negotiated != field_version:
+        logger.info(
+            'serving field version %s (advertised %s)', negotiated, field_version
+        )
+        field_version = negotiated
     if sqlplus:
         return _serve_oci_session(stream, backend, user, conn_key, identity)
     cursors = _Cursors()
