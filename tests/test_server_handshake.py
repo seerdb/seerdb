@@ -27,7 +27,9 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
+    FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
+    FIELD_VERSION_23_4,
     TNS_DATA,
     TNS_VERSION_MIN_LARGE_SDU,
     TTI_DTY,
@@ -36,6 +38,8 @@ from seerdb.common.tns_consts import (
 from seerdb.server.handshake import (
     TNS_VERSION_11_2,
     TNS_VERSION_12_2,
+    TNS_VERSION_21_1,
+    TNS_VERSION_23_1,
     encode_accept,
     encode_dty_reply,
     encode_pro_reply,
@@ -256,8 +260,12 @@ def test_protocol_version_follows_the_field_version() -> None:
     assert server_tns_version(FIELD_VERSION_11_2) == TNS_VERSION_11_2
     assert server_tns_version(FIELD_VERSION_12_1) == TNS_VERSION_11_2
     assert server_tns_version(FIELD_VERSION_12_2) == TNS_VERSION_12_2
-    # Above 12.2 stays on 12.2's framing — the newest release the Mirror models.
-    assert server_tns_version(FIELD_VERSION_23_1) == TNS_VERSION_12_2
+    # The same argument one tier up: a Mirror presenting 21c or 23ai must frame
+    # like one, not fall back to 12.2's 316 (#823). 318 and 319 are captured off
+    # the live testbeds -- a real 23ai answers 319, not 320.
+    assert server_tns_version(FIELD_VERSION_21_1) == TNS_VERSION_21_1
+    assert server_tns_version(FIELD_VERSION_23_1) == TNS_VERSION_23_1
+    assert server_tns_version(FIELD_VERSION_23_4) == TNS_VERSION_23_1
 
 
 def test_a_12_2_mirror_is_large_sdu_without_being_asked() -> None:
@@ -266,3 +274,31 @@ def test_a_12_2_mirror_is_large_sdu_without_being_asked() -> None:
     accept = encode_accept(req, tns_version=server_tns_version(FIELD_VERSION_12_2))
     assert struct.unpack('>H', accept[8:10])[0] >= TNS_VERSION_MIN_LARGE_SDU
     assert len(accept[8:]) == 37
+
+
+def test_a_23ai_accept_matches_the_captured_shape() -> None:
+    # A live 26ai ACCEPT (version 319) is 53 bytes, not the 21c 37: flags 0x003D
+    # instead of 0x002D, and sixteen trailing bytes of per-connection id. A client
+    # that reads by offset needs the whole shape, so pin it (#823).
+    req = replace(parse_connect(fx.CONNECT[8:]), protocol_version=319)
+    body = encode_accept(req, tns_version=server_tns_version(FIELD_VERSION_23_4))[8:]
+    assert struct.unpack('>H', body[0:2])[0] == TNS_VERSION_23_1
+    assert len(body) == 53
+    assert struct.unpack('>H', body[12:14])[0] == 0x003D
+    # flags2 stays clear: a real 23ai sets FAST_AUTH | HAS_END_OF_RESPONSE there,
+    # and a client turns each on only when the version AND the flag agree. The
+    # Mirror sends no end-of-response markers, so claiming the bit would hang it.
+    assert struct.unpack('>I', body[33:37])[0] == 0
+    # The trailing id is random per connection, not a constant to copy.
+    other = encode_accept(req, tns_version=server_tns_version(FIELD_VERSION_23_4))[8:]
+    assert body[37:] != other[37:]
+    assert body[:37] == other[:37]
+
+
+def test_a_21c_accept_keeps_the_37_byte_shape() -> None:
+    # The tier below 23ai is unchanged by #823 -- still the captured 21c form.
+    req = replace(parse_connect(fx.CONNECT[8:]), protocol_version=319)
+    body = encode_accept(req, tns_version=server_tns_version(FIELD_VERSION_21_1))[8:]
+    assert struct.unpack('>H', body[0:2])[0] == TNS_VERSION_21_1
+    assert len(body) == 37
+    assert struct.unpack('>H', body[12:14])[0] == 0x002D
