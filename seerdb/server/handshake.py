@@ -28,6 +28,7 @@ capability block advertises is the one parameter that follows the session.
 from __future__ import annotations
 
 import re
+import secrets
 import struct
 from dataclasses import dataclass
 
@@ -47,6 +48,8 @@ from seerdb.common.tns_consts import (
     CCAP_FIELD_VERSION,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_2,
+    FIELD_VERSION_21_1,
+    FIELD_VERSION_23_1,
     TNS_ACCEPT,
     TNS_DATA,
     TNS_VERSION_MIN_LARGE_SDU,
@@ -79,16 +82,22 @@ _MIN_HEADER = 20  # bytes we must have to read every field above
 # packet framing. A client that speaks a newer version negotiates down to
 # whatever is set here, exactly as it would against a real listener of that age.
 #
-# The version scale, anchored on what the testbeds actually answer: 11.2 -> 314,
-# 21c -> 318, 23ai/26ai -> 320. 12.1 and 12.2 sit in the gap, so 12.2 is taken as
-# 316 — inferred from those anchors rather than captured, since there is no 12.2
-# testbed here. What is *behavioural* about the number (and is captured) is which
-# side of two thresholds it falls on: >= 315 switches the post-ACCEPT DATA stream
-# to the 4-byte packet length, and >= 318 (``TNS_VERSION_MIN_OOB_CHECK``) adds the
-# extended ``flags2`` word a client reads for end-of-response support. 316 is
-# large-SDU but not end-of-response, which is what a 12.2 server is.
+# The version scale, anchored on what the testbeds actually answer: 10g -> 313,
+# 11g -> 314, 21c -> 318, 23ai/26ai -> 319. 12.1 and 12.2 sit in the gap, so 12.2
+# is taken as 316 — inferred from those anchors rather than captured, since there
+# is no 12.2 testbed here; every other number is a live capture. What is
+# *behavioural* about 316 is which side of two thresholds it falls on: >= 315
+# switches the post-ACCEPT DATA stream to the 4-byte packet length, and >= 318
+# (``TNS_VERSION_MIN_OOB_CHECK``) adds the extended ``flags2`` word a client reads
+# for end-of-response support. 316 is large-SDU but not end-of-response, which is
+# what a 12.2 server is.
+#
+# Note 319, not 320: a real 23ai answers exactly the value a client knows as
+# ``TNS_VERSION_MIN_END_OF_RESPONSE``.
 TNS_VERSION_11_2 = 314
 TNS_VERSION_12_2 = 316
+TNS_VERSION_21_1 = 318
+TNS_VERSION_23_1 = 319
 
 _SERVER_TNS_VERSION = TNS_VERSION_11_2
 
@@ -102,11 +111,15 @@ def server_tns_version(field_version: int) -> int:
     way. Deriving one from the other means asking for a 12.2 Mirror gets a 12.2
     Mirror end to end.
 
-    Tiered like :func:`seerdb.server.identity.server_identity`, and on the same
-    threshold. A field version above 12.2 also lands here — 12.2 is the newest
-    release the Mirror models, and answering 316 is nearer the truth than
-    dropping back to 11.2's framing.
+    Tiered exactly like :func:`seerdb.server.identity.server_identity`, on the
+    same thresholds, so the release a session reports and the way it frames the
+    connection can never disagree — the argument above applies at every tier, not
+    just the first (#823).
     """
+    if field_version >= FIELD_VERSION_23_1:
+        return TNS_VERSION_23_1
+    if field_version >= FIELD_VERSION_21_1:
+        return TNS_VERSION_21_1
     if field_version >= FIELD_VERSION_12_2:
         return TNS_VERSION_12_2
     return TNS_VERSION_11_2
@@ -134,6 +147,21 @@ _OFF_ACCEPT_TDU32 = 28
 _ACCEPT_LARGE_FLAGS = 0x002D
 _ACCEPT_LARGE_RESERVED = 0x4101
 _LARGE_DEFAULT_TDU = 0x2000
+
+# A 319 (23ai) ACCEPT grows again, read off a live 26ai (body 53 bytes): the
+# flags word is 0x003D rather than 21c's 0x002D, and sixteen bytes follow the
+# flags2 word — a per-connection identifier, random in every capture.
+#
+# flags2 stays ZERO here even though a real 23ai sends 0x1A000000. Those bits
+# advertise FAST_AUTH (0x10000000) and end-of-response (0x02000000), and a
+# client enables each only when the version threshold *and* the flag agree, so
+# leaving them clear is how a server says "I speak 319 but not those two". The
+# Mirror emits no end-of-response markers, so claiming the bit would hang any
+# client that believed it.
+_ACCEPT_23_BODY_LEN = 53
+_ACCEPT_23_FLAGS = 0x003D
+_OFF_ACCEPT_CONN_ID = 37
+_ACCEPT_CONN_ID_LEN = 16
 
 # The classic sqlplus / thick-OCI PRO request leads its TTC payload with the ANO
 # container magic (0xDEADBEEF) instead of TTI_PRO (0x01); the Mirror must answer
@@ -233,7 +261,9 @@ def encode_accept(
     if version >= TNS_VERSION_MIN_LARGE_SDU:
         # The 16-bit SDU/TDU pair is zeroed and the real values move to the ub4
         # fields the client reads at offsets 24 / 28.
-        large_body = bytearray(_ACCEPT_LARGE_BODY_LEN)
+        is_23 = version >= TNS_VERSION_23_1
+        body_len = _ACCEPT_23_BODY_LEN if is_23 else _ACCEPT_LARGE_BODY_LEN
+        large_body = bytearray(body_len)
         struct.pack_into(
             '>HHHHHHHH',
             large_body,
@@ -244,13 +274,17 @@ def encode_accept(
             0,
             _ACCEPT_PROTO_CHARS,
             _ACCEPT_DATA_LEN,
-            _ACCEPT_LARGE_FLAGS,
+            _ACCEPT_23_FLAGS if is_23 else _ACCEPT_LARGE_FLAGS,
             _ACCEPT_LARGE_RESERVED,
         )
         struct.pack_into('>I', large_body, _OFF_ACCEPT_SDU32, negotiated_sdu)
         struct.pack_into(
             '>I', large_body, _OFF_ACCEPT_TDU32, min(request.tdu, _LARGE_DEFAULT_TDU)
         )
+        if is_23:
+            # Random per connection, as it is on the real server. It identifies
+            # the session in the server's own logs; nothing reads it back here.
+            large_body[_OFF_ACCEPT_CONN_ID:] = secrets.token_bytes(_ACCEPT_CONN_ID_LEN)
         packet, _ = encode_packet(TNS_ACCEPT, bytes(large_body), sdu)
         return packet
     negotiated_tdu = min(request.tdu, _DEFAULT_TDU)
