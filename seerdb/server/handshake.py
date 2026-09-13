@@ -41,12 +41,14 @@ from seerdb.common.tns import (
     _SERVER_COMPILE_CAPS,
     _SERVER_DTY_TABLE,
     _SERVER_RUNTIME_CAPS,
+    _datatype_table_12c,
     encode_packet,
 )
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     CCAP_FIELD_VERSION,
     FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
@@ -376,10 +378,29 @@ def build_caps_block_reply(field_version: int = FIELD_VERSION_11_2) -> bytes:
     )
 
 
-def build_dty_type_reply() -> bytes:
+def build_dty_type_reply(field_version: int = FIELD_VERSION_11_2) -> bytes:
     """The thin DTY reply as a TTC payload: TTI_DTY then the server's
-    type-conversion table."""
-    return bytes([TTI_DTY]) + _SERVER_DTY_TABLE
+    type-conversion table.
+
+    The table has two encodings and the field version picks between them. Up to
+    11g each entry is single bytes (``<type> <conv> <rep> 00``); from 12.1 every
+    field widens to a UB2 and the table ends in a UB2 zero. A client reads the
+    table by walking entries until that terminator, so handing a 12.1+ client the
+    narrow table does not merely mis-describe a few types — the client reads two
+    of our bytes as one field, never lands on the terminator, runs off the end
+    and blocks waiting for a continuation that never comes (#824).
+
+    seerdb's own client has always chosen on the same threshold when it *sends*
+    its table (``FieldVersion >= FIELD_VERSION_12_1``); this is the server half of
+    the same decision. It tolerated the narrow table only because it stops
+    reading once it has what it needs.
+    """
+    table = (
+        _datatype_table_12c()
+        if field_version >= FIELD_VERSION_12_1
+        else _SERVER_DTY_TABLE
+    )
+    return bytes([TTI_DTY]) + table
 
 
 def build_pro_sqlplus_reply() -> bytes:
@@ -460,7 +481,11 @@ def encode_fast_auth_reply(challenge: bytes, *, field_version: int) -> bytes:
     three-message handshake does. ``challenge`` is :func:`encode_challenge`\'s RPA
     payload; the caller frames the whole thing with ``write_packet``.
     """
-    return build_caps_block_reply(field_version) + build_dty_type_reply() + challenge
+    return (
+        build_caps_block_reply(field_version)
+        + build_dty_type_reply(field_version)
+        + challenge
+    )
 
 
 def encode_pro_reply(
@@ -499,7 +524,9 @@ def encode_dty_reply(
     of the handshake speak one dialect.
     """
     payload = (
-        build_caps_block_reply(field_version) if sqlplus else build_dty_type_reply()
+        build_caps_block_reply(field_version)
+        if sqlplus
+        else build_dty_type_reply(field_version)
     )
     packet, _ = encode_packet(TNS_DATA, payload, sdu)
     return packet
