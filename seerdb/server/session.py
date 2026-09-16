@@ -26,6 +26,7 @@ from secrets import token_bytes
 from typing import NoReturn, TypeVar
 
 from seerdb.common.crypto import decrypt_password
+from seerdb.common.dbobject import ObjectImage
 from seerdb.common.exceptions import InterfaceError, NotSupportedError, Truncated
 from seerdb.common.oci import (
     OCI_CMD_COMMIT,
@@ -39,12 +40,14 @@ from seerdb.common.tns import (
     _ENCODE_OCI_CALL_SEQ,
     _ENCODE_OER_SEQ,
     _ENCODE_TXN_IN_PROGRESS,
+    _LOB_EMIT_LOG,
     _SERVER_RUNTIME_CAPS,
     _THIN_OBJ_LOB_LOCATOR,
     ArrayOutBind,
     ColumnMeta,
     ExecRequest,
     FetchRequest,
+    LobEmitLog,
     ReexecuteRequest,
     RefCursorOutBind,
     ScalarOutBind,
@@ -727,6 +730,12 @@ def serve_session(
     object_lobs: list[tuple[bytes, bool]] = []
     current_object_lob: tuple[bytes, bool] | None = None
     temp_lobs = _TempLobs()
+    # Every column LOB the Mirror emits is minted a unique locator and its content
+    # remembered here, so a later object bind carrying that locator can be resolved
+    # back to content (there is no live upstream LOB behind a Mirror locator). Set
+    # on the ContextVar `_thin_column_value` reads while encoding rows (#888).
+    lob_emit_log = LobEmitLog()
+    _LOB_EMIT_LOG.set(lob_emit_log)
     # The thin reply path's OER sequence, advanced per message below (#842).
     oer_seq = 0
     while True:
@@ -789,6 +798,7 @@ def serve_session(
                 parse_exec(body, bind_types=cached_types, max_string_size=max_size),
                 temp_lobs,
             )
+            _attach_object_bind_lobs(request, lob_emit_log, temp_lobs)
             if request.scrollable:
                 lobs = _answer_scroll(stream, backend, request, cursors)
             else:
@@ -1700,6 +1710,7 @@ class _TempLobs:
     # bind, so the value arrived NULL (#857).
     def __init__(self) -> None:
         self._buffers: dict[bytes, bytearray] = {}
+        self._is_blob: dict[bytes, bool] = {}
         self._next = 0
 
     def mint(self, is_blob: bool) -> bytes:
@@ -1707,6 +1718,7 @@ class _TempLobs:
         locator = mint_temp_lob_locator(self._next, is_blob)
         self._next += 1
         self._buffers[bytes(locator)] = bytearray()
+        self._is_blob[bytes(locator)] = is_blob
         return locator
 
     def append(self, locator: bytes, payload: bytes) -> None:
@@ -1716,9 +1728,24 @@ class _TempLobs:
         # A client may free a locator the Mirror never saw written; that is fine,
         # and the index is still never reused.
         self._buffers.pop(bytes(locator), None)
+        self._is_blob.pop(bytes(locator), None)
 
     def content(self, locator: bytes) -> bytes:
         return bytes(self._buffers.get(bytes(locator), b''))
+
+    def contents_map(self) -> dict[bytes, tuple[object, bool]]:
+        # Each live temp LOB's content as (value, is_clob) for an object bind to
+        # resolve a LOB attribute set to a createlob temp LOB (#888). A CLOB rode
+        # in over the wire as UTF-16BE (the minted locator says so), so decode it
+        # back to str; a BLOB is raw bytes.
+        out: dict[bytes, tuple[object, bool]] = {}
+        for locator, buf in self._buffers.items():
+            is_blob = self._is_blob.get(locator, False)
+            if is_blob:
+                out[locator] = (bytes(buf), False)
+            else:
+                out[locator] = (bytes(buf).decode('utf-16-be'), True)
+        return out
 
 
 def _answer_lobops(
@@ -1862,6 +1889,25 @@ def _run_returning(backend: Backend, sql: str, request: ExecRequest) -> Result:
 def _is_plsql_block(sql: str) -> bool:
     head = sql.lstrip().upper()
     return head.startswith('BEGIN') or head.startswith('DECLARE')
+
+
+def _attach_object_bind_lobs(
+    request: ExecRequest, lob_emit_log: LobEmitLog, temp_lobs: _TempLobs
+) -> None:
+    # Give every object-image bind the content the Mirror served under each LOB
+    # locator, so the backend can turn a LOB attribute the client set to a fetched
+    # or a createlob temp LOB back into an upstream LOB (its locator points at the
+    # Mirror, not a live upstream LOB) (#888). A no-op when nothing has been
+    # served or bound. The map is attached by reference; the backend only reads.
+    combined = dict(lob_emit_log.contents)
+    combined.update(temp_lobs.contents_map())
+    if not combined:
+        return
+    rows = list(request.bind_rows) if request.bind_rows else []
+    for values in [request.binds, *rows]:
+        for value in values or []:
+            if isinstance(value, ObjectImage):
+                value.lob_contents = combined
 
 
 def _bind_vars(request: ExecRequest) -> list:

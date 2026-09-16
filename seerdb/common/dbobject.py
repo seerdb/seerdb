@@ -137,7 +137,14 @@ class ObjectImage:
     into a DbObject once the layout has been fetched.
     """
 
-    __slots__ = ('type_oid', 'type_schema', 'type_name', 'charset', 'image')
+    __slots__ = (
+        'type_oid',
+        'type_schema',
+        'type_name',
+        'charset',
+        'image',
+        'lob_contents',
+    )
 
     def __init__(self, type_oid, type_schema, type_name, charset, image):
         self.type_oid = type_oid
@@ -145,6 +152,11 @@ class ObjectImage:
         self.type_name = type_name
         self.charset = charset
         self.image = image
+        # For an inbound object bind, the content the Mirror served under each LOB
+        # locator the image may carry, so the backend can turn a LOB attribute
+        # back into an upstream LOB (#888). {locator: (value, is_clob)}; the
+        # session fills it, the decoder leaves it empty.
+        self.lob_contents: dict[bytes, tuple[object, bool]] = {}
 
 
 class DbRef:

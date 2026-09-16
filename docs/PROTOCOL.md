@@ -4456,10 +4456,38 @@ Two pieces make this work:
 Verified through the Mirror against a live 23ai: python-oracledb's
 `test_1900_dbobject` test 1904 (fetch an object holding `CLOB` / `NCLOB` / `BLOB`
 attributes, plus a nested object and a collection) reads every attribute back.
-Binding an object that *carries* LOB attributes (test 1907) is the inbound
-direction and is not yet covered — the client sends its own LOB locators inside
-the image, which the Mirror would have to resolve to content and re-materialise
-as upstream LOBs before binding.
+
+### 21.13 Binding an object that carries LOB attributes — the inbound path (#888)
+
+The reverse of §21.12: the client sets an object's LOB attribute to a LOB it
+holds — one it fetched (`obj.CLOBVALUE = clob`) or a temp LOB it created
+(`obj.CLOBVALUE = conn.createlob(...)`) — and binds the object. It writes that
+LOB's **locator** into the image, `write_bytes_with_length` of a **ub2-prefixed**
+locator (`_obj_write_length(2 + n) | ub2 n | <n-byte locator>`). But the locator
+is one the *Mirror* invented, with no live upstream LOB behind it; binding it
+straight through fails `ORA-22275 invalid LOB locator`.
+
+The Mirror turns each such locator back into a real upstream LOB before binding:
+
+1. **Remember what a fetch served.** Every column LOB the Mirror emits gets a
+   **unique** locator (byte-identical to the fixed one but for a per-LOB counter,
+   so the row reader — which is order-based — is unaffected) and its content is
+   kept in a session **emit log** keyed by that locator. A temp LOB's content is
+   already kept, keyed by the locator `CREATE_TEMP` minted. So both kinds of LOB
+   a client can bind are recoverable from a locator.
+
+2. **Resolve, materialise, rebind.** The session hands every object-image bind the
+   content map (emit log + temp LOBs). The backend decodes the image, and for each
+   LOB attribute looks its locator up in the map (as-is for a bare fetched locator,
+   or with a leading ub2 length stripped for a temp locator, which rides
+   ub2-prefixed), streams the content into a fresh **upstream** temp LOB, and binds
+   the attribute to that. A locator with no known content binds NULL rather than
+   desyncing. The object encoder writes an upstream LOB attribute as its real
+   locator behind the ub2 prefix, the form the receiving server dereferences.
+
+Verified end to end against a live 23ai: `test_1900_dbobject` test 1907 (insert an
+object holding both a fetched and a `createlob` `CLOB` / `NCLOB` / `BLOB`, then read
+it back) passes through the Mirror. Object dbobject count 40 → 41.
 
 ## 22. DML RETURNING ... INTO (#120)
 

@@ -1344,6 +1344,18 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
         # A SQL object (ADT) column carries its own image framing, NULL included
         # (#116) — the bare-0x00 NULL path below would desync the row stream.
         return encode_object_column_value(value, col.type_oid)
+    if col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and value is not None:
+        # Mint a unique locator and remember the content, so an object bind that
+        # later carries this locator can recover it (#888). The read path is
+        # order-based and ignores the locator, so this changes no reader; the log
+        # is unset outside a Mirror session, keeping the fixed-locator behaviour.
+        log = _LOB_EMIT_LOG.get()
+        if log is not None:
+            is_clob = col.data_type == TNS_TYPE_CLOB
+            locator = log.record(value, is_clob)
+            return encode_lob_locator_thin(
+                _lob_value_size(value), with_metadata=True, locator=locator
+            )
     if (
         describe_wire_length(col) == 0
         and col.data_type not in _ZERO_DESCRIBE_CARRIES_DATA
@@ -10269,6 +10281,56 @@ def _thin_obj_lob_locator() -> bytes:
 
 
 _THIN_OBJ_LOB_LOCATOR = _thin_obj_lob_locator()
+
+# The counter slot of `_THIN_LOB_LOCATOR` (its trailing "0000000000"): a per-LOB
+# index printed here makes each fetched column LOB's locator unique while keeping
+# the byte layout the client accepts. Index 0 reproduces `_THIN_LOB_LOCATOR`.
+_COLUMN_LOB_LOCATOR_PREFIX = b'\x00seerdb-mirror-lob-locator-'
+
+
+def mint_column_lob_locator(index: int) -> bytes:
+    """A fetched column LOB's locator, unique per session LOB (#888).
+
+    The read path is row-major and ignores the locator, so uniqueness costs the
+    reader nothing; it lets :class:`LobEmitLog` remember the content the Mirror
+    served under each locator, so an object bind that later carries one can be
+    resolved. Byte-for-byte `_THIN_LOB_LOCATOR` with the trailing counter set."""
+    raw = bytearray(_COLUMN_LOB_LOCATOR_PREFIX + b'%010d' % (index % 10**10) + b'\x00')
+    raw[_THIN_LOB_LOC_OFFSET_FLAG_3] |= _THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET
+    return bytes(raw)
+
+
+class LobEmitLog:
+    """The content of each column LOB the Mirror emits in a session, keyed by the
+    unique locator it minted for it (#888).
+
+    A LOB fetched from the Mirror rides a locator the Mirror invented; when the
+    client later binds that LOB into an object attribute it sends the locator
+    back inside the image, and the Mirror has to turn it back into content (there
+    is no live upstream LOB behind it). The read path stays order-based; this log
+    exists only so a bind can recover what a fetch served. Content is the original
+    value (``str`` for CLOB / NCLOB, ``bytes`` for BLOB), not the wire form."""
+
+    def __init__(self) -> None:
+        self._next = 0
+        self.contents: dict[bytes, tuple[object, bool]] = {}
+
+    def record(self, value: object, is_clob: bool) -> bytes:
+        locator = mint_column_lob_locator(self._next)
+        self._next += 1
+        self.contents[locator] = (value, is_clob)
+        return locator
+
+    def content(self, locator: bytes) -> tuple[object, bool] | None:
+        return self.contents.get(bytes(locator))
+
+
+# The session's LOB emit log, set per session so `_thin_column_value` can mint a
+# unique locator + remember the content of every column LOB it emits (#888).
+_LOB_EMIT_LOG: contextvars.ContextVar[LobEmitLog | None] = contextvars.ContextVar(
+    'lob_emit_log', default=None
+)
+
 # The chunk size a live 23ai reports alongside a LOB column locator. The client
 # keeps it for its own chunking (`lob.getchunksize()`); any sane value works.
 _THIN_LOB_CHUNK_SIZE = 8060
@@ -10314,9 +10376,15 @@ def encode_vector_value_thin(image: bytes) -> bytes:
     )
 
 
-def encode_lob_locator_thin(size: int = 0, *, with_metadata: bool = False) -> bytes:
+def encode_lob_locator_thin(
+    size: int = 0, *, with_metadata: bool = False, locator: bytes = _THIN_LOB_LOCATOR
+) -> bytes:
     """The RXD value for a thin LOB column (#413): a minted opaque locator the
     client echoes back over TTI_LOBOPS. The content follows in the read reply.
+
+    ``locator`` overrides the fixed session locator with a unique one so a bind
+    that later carries it can be resolved to the content the Mirror served
+    (:class:`LobEmitLog`, #888); the read path is order-based and ignores it.
 
     A CLOB / BLOB column carries the locator's **metadata** in front of it --
     ``ub4 locator length | ub8 size | ub4 chunk size | length-prefixed
@@ -10339,10 +10407,10 @@ def encode_lob_locator_thin(size: int = 0, *, with_metadata: bool = False) -> by
     which is what the stricter reader demands, and :func:`_read_lob_column`
     accepts either so seerdb's own client reads the Mirror and a real server
     alike."""
-    head = encode_sb4(len(_THIN_LOB_LOCATOR))
+    head = encode_sb4(len(locator))
     if with_metadata:
         head += encode_sb4(size) + encode_sb4(_THIN_LOB_CHUNK_SIZE)
-    return head + _bytes_with_length(_THIN_LOB_LOCATOR)
+    return head + _bytes_with_length(locator)
 
 
 def _encode_temporal(Value: datetime.date, DataType: int) -> bytes:
@@ -11199,12 +11267,21 @@ def _encode_object_attr_field(DataType: int, Charset: int, Value: Any) -> bytes:
     if Value is None:
         return bytes([TNS_NULL_LENGTH_INDICATOR])
     if DataType in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
-        # A LOB attribute rides in the image as a minted locator the client reads
-        # back over TTI_LOBOPS; the content is queued separately, in the same
-        # attribute order, by object_lob_contents. The value here is the content
-        # (the Mirror resolves each LOB attribute upstream before re-encoding), so
-        # it is not written inline -- only the locator is. The object-LOB locator
-        # is distinct from a column LOB's so the session routes its reads to the
+        from seerdb.common.lob import LOB
+
+        if isinstance(Value, LOB):
+            # An upstream LOB bound into an object attribute (the inbound bind
+            # direction, #888): the image field is the locator behind a ub2 length
+            # prefix (python-oracledb writes `write_bytes_with_length` of the
+            # ub2-prefixed locator), which the receiving server dereferences
+            # directly. Distinct from the fetch path below, whose value is content.
+            field = struct.pack('>H', len(Value.raw)) + Value.raw
+            return _obj_write_length(len(field)) + field
+        # A LOB attribute the Mirror emits to an external client: it rides as a
+        # minted locator the client reads back over TTI_LOBOPS, with the content
+        # queued separately (in attribute order) by object_lob_contents. The value
+        # here is the content, so it is not written inline -- only the locator is,
+        # distinct from a column LOB's so the session routes its reads to the
         # persistent object-LOB queue (#888).
         return _obj_write_length(len(_THIN_OBJ_LOB_LOCATOR)) + _THIN_OBJ_LOB_LOCATOR
     Raw = _encode_object_attr(DataType, Charset or AL32UTF8_CHARSET, Value)
@@ -11342,6 +11419,12 @@ def _member_lob_contents(Value: object, Attr: dict) -> list[tuple[bytes, bool]]:
     if Value is None:
         return []
     DataType = Attr.get('data_type')
+    from seerdb.common.lob import LOB
+
+    if isinstance(Value, LOB):
+        # An upstream LOB bound into an object attribute carries a real locator
+        # (its content is not the Mirror's to serve), so it queues nothing (#888).
+        return []
     if DataType == TNS_TYPE_CLOB:
         return [(str(Value).encode('utf-16-be'), True)]
     if DataType == TNS_TYPE_BLOB:

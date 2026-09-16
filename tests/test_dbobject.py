@@ -10,6 +10,7 @@
 # packed image are identical across 10g/11g/21c/23ai (fv 4/6/16/24), verified
 # live, so a single fixture exercises every tier.
 
+import struct
 import unittest
 
 from seerdb.common.dbobject import (
@@ -25,10 +26,13 @@ from seerdb.common.dbobject import (
     type_name_to_tns,
 )
 from seerdb.common.exceptions import NotSupportedError
+from seerdb.common.lob import LOB
 from seerdb.common.tns import (
     _ENCODE_FIELD_VERSION,
+    _THIN_LOB_LOCATOR,
     _THIN_OBJ_LOB_LOCATOR,
     ColumnMeta,
+    LobEmitLog,
     _encode_object_bind_value,
     _encode_ref_bind_value,
     _encode_ref_oac,
@@ -36,6 +40,7 @@ from seerdb.common.tns import (
     _read_object_column,
     encode_object_column_value,
     encode_object_image,
+    mint_column_lob_locator,
     object_lob_contents,
 )
 from seerdb.common.tns_consts import (
@@ -767,3 +772,45 @@ class TestObjectLobAttributes(unittest.TestCase):
             name=b'N', data_type=TNS_TYPE_NUMBER, data_length=0, max_size=0
         )
         self.assertEqual(object_lob_contents([scalar_col], [(5,)]), [])
+
+
+class TestLobEmitLog(unittest.TestCase):
+    # Each column LOB the Mirror emits gets a unique locator whose content the
+    # session remembers, so a later object bind carrying it can be resolved (#888).
+
+    def test_unique_locators_and_content_recall(self):
+        log = LobEmitLog()
+        loc_a = log.record('first', True)
+        loc_b = log.record(b'second', False)
+        self.assertNotEqual(loc_a, loc_b)
+        self.assertEqual(log.content(loc_a), ('first', True))
+        self.assertEqual(log.content(loc_b), (b'second', False))
+        self.assertIsNone(log.content(b'unknown'))
+
+    def test_index_zero_reproduces_the_fixed_locator(self):
+        # Index 0 is byte-identical to the fixed session locator, so a Mirror that
+        # emits exactly one LOB is unchanged on the wire.
+        self.assertEqual(mint_column_lob_locator(0), _THIN_LOB_LOCATOR)
+        self.assertEqual(len(mint_column_lob_locator(7)), len(_THIN_LOB_LOCATOR))
+        self.assertNotEqual(mint_column_lob_locator(7), _THIN_LOB_LOCATOR)
+
+
+class TestObjectLobAttributeBind(unittest.TestCase):
+    # The inbound direction: an object whose LOB attribute is set to a resolved
+    # upstream LOB rides its real locator behind a ub2 length prefix (#888).
+
+    def _lob_obj(self):
+        lob = LOB(TNS_TYPE_CLOB, b'UPSTREAM-LOCATOR-BYTES', connection=None)
+        return _DOC_TYPE.newobject({'NAME': 'file', 'DOC': lob, 'PIC': None})
+
+    def test_lob_object_attribute_is_ub2_prefixed_locator(self):
+        image = encode_object_image(self._lob_obj())
+        # The image carries the raw locator behind its ub2 length, not the fetch
+        # placeholder locator.
+        self.assertIn(struct.pack('>H', len(b'UPSTREAM-LOCATOR-BYTES')), image)
+        self.assertIn(b'UPSTREAM-LOCATOR-BYTES', image)
+        self.assertNotIn(_THIN_OBJ_LOB_LOCATOR, image)
+
+    def test_lob_object_attribute_queues_no_content(self):
+        # A bound upstream LOB is not the Mirror's to serve, so it queues nothing.
+        self.assertEqual(object_lob_contents([_ADT_COLUMN], [(self._lob_obj(),)]), [])

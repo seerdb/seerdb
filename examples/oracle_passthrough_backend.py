@@ -17,6 +17,7 @@ client, and the same credentials open the upstream connection.
 from __future__ import annotations
 
 import re
+import struct
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -168,11 +169,69 @@ class OraclePassthroughBackend:
         typ = self._gettype_by_oid(image.type_oid or b'')
         if typ is None:
             return None
+        lob_contents = getattr(image, 'lob_contents', None) or {}
         if getattr(typ, 'is_collection', False):
             elements = decode_collection_image(image.image, typ.element)
-            return typ.newobject(list(elements))
-        attrs = decode_object_image(image.image, typ.attrs)
-        return typ.newobject(dict(attrs))
+            obj = typ.newobject(list(elements))
+        else:
+            attrs = decode_object_image(image.image, typ.attrs)
+            obj = typ.newobject(dict(attrs))
+        self._materialize_bind_object_lobs(obj, lob_contents)
+        return obj
+
+    def _materialize_bind_object_lobs(self, value: object, lob_contents: dict) -> None:
+        # Replace each LOB attribute's locator (a Mirror locator the client echoed
+        # from a fetch or a createlob) with an upstream LOB carrying the content
+        # the Mirror served, so the upstream bind sees a real LOB rather than a
+        # dangling locator (#888). A locator with no known content binds NULL --
+        # far better than an ORA-22275 desync. Nested objects / collections recurse.
+        if not isinstance(value, DbObject):
+            return
+        typ = value._dbtype
+        if typ is not None and typ.is_collection:
+            element = typ.element or {}
+            for idx, elem in enumerate(value._elements):
+                value._elements[idx] = self._materialize_member_lob(
+                    elem, element, lob_contents
+                )
+            return
+        if typ is None:
+            return
+        for attr in typ.attrs:
+            name = attr['name']
+            value._attrs[name] = self._materialize_member_lob(
+                value._attrs.get(name), attr, lob_contents
+            )
+
+    def _materialize_member_lob(
+        self, value: object, attr: dict, lob_contents: dict
+    ) -> object:
+        from seerdb.common.lob import LOB
+
+        if attr.get('object_type') is not None:
+            if value is not None:
+                self._materialize_bind_object_lobs(value, lob_contents)
+            return value
+        if value is None:
+            return value
+        data_type = attr.get('data_type')
+        if data_type not in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) or not isinstance(
+            value, (bytes, bytearray)
+        ):
+            return value
+        # `value` is the LOB locator the client sent inside the image. Resolve it
+        # to the content the Mirror served, then stream that into an upstream temp
+        # LOB and bind the object attribute to it.
+        entry = _lookup_bind_lob(lob_contents, bytes(value))
+        if entry is None:
+            return None
+        content, _is_clob = entry
+        is_blob = data_type == TNS_TYPE_BLOB
+        assert self._conn is not None
+        locator = self._conn.create_temp_lob(is_blob=is_blob)
+        if content and isinstance(content, (str, bytes)):
+            self._conn.write_temp_lob(locator, content, is_blob=is_blob)
+        return LOB(data_type, locator, self._conn)
 
     def _resolve_fetched_object_lobs(self, columns: list, rows: list) -> list:
         # An object (ADT) column's LOB attributes decode upstream to bare locator
@@ -550,6 +609,20 @@ def _enrich_ref_columns(columns: list, rows: list) -> list:
                 )
                 break
     return out
+
+
+def _lookup_bind_lob(lob_contents: dict, locator: bytes) -> tuple[object, bool] | None:
+    # The content the Mirror served under an object-bind LOB attribute's locator.
+    # A temp LOB's locator rides in the image behind a ub2 length prefix (the
+    # server hands temp locators out ub2-prefixed, and the client echoes that
+    # into the image), while a fetched column LOB's is bare -- so try the locator
+    # as-is, then with a leading ub2 length prefix stripped (#888).
+    entry = lob_contents.get(locator)
+    if entry is not None:
+        return entry
+    if len(locator) >= 2 and struct.unpack('>H', locator[:2])[0] == len(locator) - 2:
+        return lob_contents.get(locator[2:])
+    return None
 
 
 def _out_value(value: object) -> object:
