@@ -5859,6 +5859,12 @@ class ObjectOutBindIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('an object bind needs the 12.1+ OAC')
+        # The object OUT binds are filled by procedures in a PL/SQL PACKAGE this
+        # setUp builds and every test calls into, so a backend with no PL/SQL
+        # cannot run the class. It was hidden twice over on the PostgreSQL leg:
+        # first by the 12.1 version gate above, then by the VARRAY it declares,
+        # which PostgreSQL could not parse until that was translated (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         self._drop_objects()
         self.cur.execute(f'CREATE TYPE {self.TYPE} AS VARRAY(10) OF NUMBER')
         self.cur.execute(
