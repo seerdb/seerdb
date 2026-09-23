@@ -516,6 +516,19 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'ip_address' THEN NULL "
     "WHEN 'lang' THEN 'US' "
     "WHEN 'language' THEN 'AMERICAN_AMERICA.AL32UTF8' "
+    # End-to-end application tracing (#183): the client sets these over the 12c
+    # tracing piggyback and reads them straight back out of SYS_CONTEXT, so they
+    # have to survive in the session. They live in PostgreSQL customised options
+    # under `seerdb.`, which are exactly session-scoped GUCs; `true` is
+    # missing_ok, so an attribute never set reads as NULL rather than raising,
+    # and an attribute CLEARED is stored as '' and mapped back to NULL -- Oracle
+    # reports a cleared attribute as NULL, not as an empty string.
+    "WHEN 'module' THEN nullif(current_setting('seerdb.module', true), '') "
+    "WHEN 'action' THEN nullif(current_setting('seerdb.action', true), '') "
+    "WHEN 'client_identifier' THEN "
+    "nullif(current_setting('seerdb.client_identifier', true), '') "
+    "WHEN 'client_info' THEN "
+    "nullif(current_setting('seerdb.client_info', true), '') "
     'ELSE NULL END $$;'
     # ora_owner(schema): the Oracle owner for a PostgreSQL schema — the current
     # schema for a session-local (pg_temp) object, so GLOBAL TEMPORARY tables and
@@ -3385,6 +3398,35 @@ class PostgresBackend:
                 self._credentials[name] = new_password
                 return
         self._credentials[username.upper()] = new_password
+
+    # The end-to-end tracing attributes a client sets over the 12c piggyback
+    # (#183). Oracle keeps them on the session and reports them through
+    # SYS_CONTEXT('USERENV', ...); PostgreSQL's equivalent of session-scoped
+    # state is a customised option, so each lands in `seerdb.<name>` and
+    # sys_context (above) reads it back.
+    _END_TO_END_SETTINGS = ('client_identifier', 'module', 'action', 'client_info')
+
+    def set_end_to_end(self, attrs: dict) -> None:
+        """Record the session's tracing attributes (#183).
+
+        Called by the Mirror when the client sends the tracing piggyback. Only
+        the attributes the client actually sent are touched: the piggyback marks
+        each one modified or not, and an unmodified attribute keeps its value
+        rather than being cleared.
+
+        A cleared attribute is stored as the empty string rather than removed --
+        there is no "unset" for a customised option within a session, and
+        sys_context maps '' back to NULL, which is what Oracle reports.
+        """
+        with self._conn.cursor() as cur:
+            for name in self._END_TO_END_SETTINGS:
+                if name not in attrs:
+                    continue
+                value = attrs[name]
+                cur.execute(
+                    'SELECT set_config(%s, %s, false)',
+                    (f'seerdb.{name}', '' if value is None else value),
+                )
 
     def commit(self) -> None:
         self._conn.commit()
