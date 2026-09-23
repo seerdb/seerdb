@@ -5595,6 +5595,12 @@ class PlsqlTypeIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('a package-level type needs the 12.1+ bind support')
+        # A package-level type lives in a PL/SQL PACKAGE, so this class cannot
+        # run against a backend with no PL/SQL at all. It skipped on the
+        # PostgreSQL leg only by accident until that Mirror reached 12.1: the
+        # version gate above was doing the work. The capability is what actually
+        # decides it (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         self._drop_objects()
         # A schema-level type of the SAME shape, so the two-part name
         # `PKG.TYPE` cannot be confused with `SCHEMA.TYPE` by accident.
@@ -5752,6 +5758,11 @@ class RefCursorInBindIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('a REF CURSOR IN bind needs the 12c+ bind OAC')
+        # The cursor is drained by a PL/SQL procedure in a PACKAGE, and the whole
+        # class is built on one, so a backend with no PL/SQL cannot run it. It
+        # skipped on the PostgreSQL leg only because that Mirror was below 12.1;
+        # the capability is what actually decides it (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         try:
             self.cur.execute(f'DROP PACKAGE {self.PKG}')
         except seerdb.DatabaseError:
