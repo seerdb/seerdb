@@ -1425,9 +1425,11 @@ def _translate_time_zone(zone: str) -> str:
         posix = f'<{zone}>{flipped}{hh:02d}:{mm}'
     else:
         posix = zone  # a region name, e.g. Europe/Moscow, means the same in both
+    # A DO block, not a SELECT: ALTER SESSION is not a query, and answering it
+    # with a row failed the reference thin client (#1153).
     return (
-        f"SELECT set_config('TimeZone', '{posix}', false), "
-        f"set_config('seerdb.time_zone', '{zone}', false)"
+        f"DO $$ BEGIN PERFORM set_config('TimeZone', '{posix}', false); "
+        f"PERFORM set_config('seerdb.time_zone', '{zone}', false); END $$"
     )
 
 

@@ -685,22 +685,22 @@ def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> No
     # -05:30), so the offset goes in as an explicit POSIX spec -- and is also
     # kept in Oracle's spelling, which SESSIONTIMEZONE reports back.
     assert _translate_admin("ALTER SESSION SET TIME_ZONE='+05:30'") == (
-        "SELECT set_config('TimeZone', '<+05:30>-05:30', false), "
-        "set_config('seerdb.time_zone', '+05:30', false)"
+        "DO $$ BEGIN PERFORM set_config('TimeZone', '<+05:30>-05:30', false); "
+        "PERFORM set_config('seerdb.time_zone', '+05:30', false); END $$"
     )
     # A single-digit hour is Oracle's to normalise; a negative sub-hour offset
     # keeps its sign.
     assert _translate_admin("alter session set time_zone = '-0:30'") == (
-        "SELECT set_config('TimeZone', '<-00:30>+00:30', false), "
-        "set_config('seerdb.time_zone', '-00:30', false)"
+        "DO $$ BEGIN PERFORM set_config('TimeZone', '<-00:30>+00:30', false); "
+        "PERFORM set_config('seerdb.time_zone', '-00:30', false); END $$"
     )
     # A region name means the same thing to both, and is echoed as given.
     assert _translate_admin("ALTER SESSION SET TIME_ZONE='Europe/Moscow'") == (
-        "SELECT set_config('TimeZone', 'Europe/Moscow', false), "
-        "set_config('seerdb.time_zone', 'Europe/Moscow', false)"
+        "DO $$ BEGIN PERFORM set_config('TimeZone', 'Europe/Moscow', false); "
+        "PERFORM set_config('seerdb.time_zone', 'Europe/Moscow', false); END $$"
     )
     # Any other ALTER SESSION is still the harmless no-op it was.
-    assert _translate_admin("ALTER SESSION SET NLS_DATE_FORMAT='YYYY'") == 'SELECT 1'
+    assert _translate_admin("ALTER SESSION SET NLS_DATE_FORMAT='YYYY'") == _NO_OP
 
 
 def test_sessiontimezone_reads_the_zone_the_session_was_given() -> None:
