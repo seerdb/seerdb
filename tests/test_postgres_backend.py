@@ -186,22 +186,96 @@ def test_translate_ddl_maps_object_type_to_composite() -> None:
     assert 'PYORACLE_REF_PERSON' in sent  # the type name is untouched
 
 
-def test_translate_ddl_maps_ref_column_to_bytea() -> None:
-    # A `REF <object type>` column has no PostgreSQL equal; since the REF bind that
-    # uses it is 12c+ and skips on the 11g Mirror, the column becomes a bytea
-    # placeholder so the CREATE succeeds (#139). A REF() call is left alone.
-    sent = _translate_ddl('CREATE TABLE t (id NUMBER, r REF PYORACLE_REF_PERSON)')
-    assert 'r bytea' in sent
-    assert 'REF' not in sent
-    # CREATE TABLE ... OF type (a typed table) passes through unchanged.
-    assert _translate_ddl('CREATE TABLE people OF PYORACLE_REF_PERSON') == (
-        'CREATE TABLE people OF PYORACLE_REF_PERSON'
+def test_translate_ddl_maps_a_ref_column_to_its_companion_type() -> None:
+    # A `REF <type>` column holds the type's `<type>$ref` companion -- the object
+    # table's oid and the row's stable id -- which sys.deref() resolves (#1127).
+    # A column merely NAMED `ref` is left alone.
+    assert _translate_ddl('CREATE TABLE t (id NUMBER, r REF person_t)') == (
+        'CREATE TABLE t (id numeric, r person_t$ref)'
     )
-    # A column merely NAMED `ref` (with an ordinary type) is not a REF type, so
-    # it is left alone — the match is anchored to a column name before REF, which
-    # a leading `ref INTEGER` has none of (BizarroCharacterTest, #10275).
-    named = _translate_ddl('CREATE TABLE other (id INTEGER, ref INTEGER)')
-    assert 'ref integer' in named.lower() and 'bytea' not in named
+    assert (
+        _translate_ddl('CREATE TABLE t (ref NUMBER)') == 'CREATE TABLE t (ref numeric)'
+    )
+
+
+def test_an_object_type_brings_its_ref_companions() -> None:
+    out = _translate_ddl('CREATE TYPE person_t AS OBJECT (id NUMBER)')
+    assert out.startswith('CREATE TYPE person_t AS (id numeric); ')
+    assert 'CREATE TYPE person_t$ref AS (tab oid, id uuid)' in out
+    assert 'CREATE FUNCTION sys.deref(r person_t$ref) RETURNS person_t' in out
+    # Dropped first, without CASCADE: a REF column still holding the type keeps
+    # the drop refused, as Oracle's ORA-02303 does.
+    drop = _translate_ddl('DROP TYPE person_t')
+    assert drop.endswith('; DROP TYPE person_t')
+    assert 'CASCADE' not in drop
+
+
+def test_an_object_table_is_an_ordinary_table_with_a_hidden_object_id() -> None:
+    # A typed table cannot take the stable row id a REF needs, so an object
+    # table is the type's columns plus `sys_nc_oid$`, recorded with its type.
+    out = _translate_ddl('CREATE TABLE people OF person_t')
+    assert out.startswith(
+        'CREATE TABLE people (LIKE person_t, "sys_nc_oid$" uuid NOT NULL '
+        'DEFAULT gen_random_uuid() UNIQUE); '
+    )
+    assert "INSERT INTO sys.ora_object_tables VALUES ('people'::regclass" in out
+
+
+def test_deref_becomes_a_parenthesised_sys_deref() -> None:
+    assert _translate_idioms('SELECT id, DEREF(r).name FROM t') == (
+        'SELECT id, (sys.deref(r)).name FROM t'
+    )
+    assert _translate_idioms('SELECT DEREF(:1).name FROM dual') == (
+        'SELECT (sys.deref(:1)).name FROM dual'
+    )
+
+
+def test_a_ref_survives_update_and_vacuum_full() -> None:
+    # The point of the hidden object id: an UPDATE and a VACUUM FULL both move
+    # the row physically (its ctid), and a stored REF still reaches it.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for stmt in (
+            'DROP TABLE t_refkeep',
+            'DROP TABLE t_refpeople',
+            'DROP TYPE t_refperson',
+        ):
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_refperson AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        backend.execute('CREATE TABLE t_refpeople OF t_refperson')
+        backend.execute("INSERT INTO t_refpeople VALUES (1, 'Alice')")
+        backend.execute('CREATE TABLE t_refkeep (id NUMBER, r REF t_refperson)')
+        (ref,) = backend.execute(
+            'SELECT REF(p) FROM t_refpeople p WHERE p.id = 1'
+        ).rows[0]
+        assert ref.type_name == 'T_REFPERSON'
+        backend.execute('INSERT INTO t_refkeep (id, r) VALUES (:1, :2)', [100, ref])
+        backend.execute("UPDATE t_refpeople SET name = 'Alicia' WHERE id = 1")
+        backend.commit()
+        backend._conn.autocommit = True
+        backend._conn.execute('VACUUM FULL t_refpeople')
+        backend._conn.autocommit = False
+        rows = backend.execute(
+            'SELECT id, DEREF(r).name FROM t_refkeep WHERE id = 100'
+        ).rows
+        assert rows == [(100, 'Alicia')]
+        assert backend.execute('SELECT DEREF(:1).name FROM dual', [ref]).rows == [
+            ('Alicia',)
+        ]
+        for stmt in (
+            'DROP TABLE t_refkeep',
+            'DROP TABLE t_refpeople',
+            'DROP TYPE t_refperson',
+        ):
+            backend.execute(stmt)
+        backend.commit()
+    finally:
+        backend.close()
 
 
 def test_ref_select_matches_the_object_ref_fetch() -> None:
@@ -487,20 +561,29 @@ def test_table_compression_is_dropped() -> None:
 
 def test_a_replaced_type_is_dropped_and_created() -> None:
     # PostgreSQL has no CREATE OR REPLACE TYPE; the old type goes, without
-    # CASCADE, and the new one is translated as a plain CREATE TYPE (#1197).
-    assert _translate_ddl('CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)') == (
-        'DROP TYPE IF EXISTS s.o; CREATE TYPE s.o AS (a numeric)'
+    # CASCADE, and the new one is translated as a plain CREATE TYPE (#1197). The
+    # REF companions of an object type depend on it, so they go first when they
+    # exist, and a replaced object type gets new ones (#1127).
+    companions_first = (
+        "DO $$ BEGIN IF to_regtype('s.o$ref') IS NOT NULL THEN "
+        'DROP FUNCTION sys.deref(s.o$ref); DROP TYPE s.o$ref; END IF; END $$'
+        '; DROP TYPE IF EXISTS s.o; CREATE TYPE s.o AS (a numeric)'
     )
-    assert _translate_ddl('create or replace type s.v as varray(4) of number;') == (
-        'DROP TYPE IF EXISTS s.v; CREATE DOMAIN s.v AS numeric[] '
+    replaced_object = _translate_ddl('CREATE OR REPLACE TYPE s.o AS OBJECT (a NUMBER)')
+    assert replaced_object.startswith(companions_first)
+    assert '; CREATE TYPE s.o$ref AS (tab oid, id uuid)' in replaced_object
+    assert _translate_ddl(
+        'create or replace type s.v as varray(4) of number;'
+    ).endswith(
+        '; DROP TYPE IF EXISTS s.v; CREATE DOMAIN s.v AS numeric[] '
         'CHECK (VALUE IS NULL OR array_length(VALUE, 1) <= 4)'
     )
-    assert _translate_ddl('create or replace type s.t\n    as table of s.o;') == (
-        'DROP TYPE IF EXISTS s.t; CREATE DOMAIN s.t AS s.o[]'
+    assert _translate_ddl('create or replace type s.t\n    as table of s.o;').endswith(
+        '; DROP TYPE IF EXISTS s.t; CREATE DOMAIN s.t AS s.o[]'
     )
     # FORCE is not translated.
     forced = 'CREATE OR REPLACE TYPE s.o FORCE AS OBJECT (a NUMBER)'
-    assert not _translate_ddl(forced).startswith('DROP TYPE')
+    assert not _translate_ddl(forced).startswith(('DROP TYPE', 'DO $$'))
     # A type something depends on is refused as Oracle refuses it; the same
     # SQLSTATE on another statement keeps the generic code.
     held = _FakePgError('2BP01', 'cannot drop type s.o because other objects depend')

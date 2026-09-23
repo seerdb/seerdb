@@ -59,13 +59,17 @@ edge of this adapter:
   binds, returns (``RETURNING o INTO :b``) and fetches. Not yet: an attribute that
   is itself an object or a collection (refused, not guessed), collection types in
   ``all_coll_types`` (the VARRAY domains are not described), and type methods.
-- **Real ``REF`` / ``DEREF``** — ``SELECT REF(p)`` from a typed table (``CREATE
-  TABLE t OF type``) is emulated with the row's ctid as the locator plus the object
-  type recovered from ``pg_class.reloftype`` — enough for the client to decode a REF
-  with the right ``type_name``. But a PostgreSQL composite has no REF *pointer*: a
-  REF **bind** and the ``DEREF`` round-trip are not served — the ctid locator is
-  opaque and never dereferenced, and it moves on ``UPDATE`` / ``VACUUM FULL``, so a
-  stored one would silently point elsewhere. The suite's REF-bind tests fail here.
+- **``REF`` / ``DEREF``, with a visible object id** — an Oracle object table
+  (``CREATE TABLE t OF type``) gives every row a hidden object id that a REF names.
+  PostgreSQL's typed tables cannot take a column beyond their type's, and a row's
+  physical address (``ctid``) moves on ``UPDATE`` / ``VACUUM FULL``, so an object
+  table becomes an ordinary table of the type's columns plus ``sys_nc_oid$`` (a
+  uuid; Oracle's own name for the column), recorded in ``sys.ora_object_tables``.
+  A REF is the table's oid and that id, carried in each type's ``<type>$ref``
+  companion composite; ``DEREF`` is an overloaded ``sys.deref()``, and a REF whose
+  row is gone dereferences to NULL, as a dangling Oracle REF does. PostgreSQL has
+  no hidden columns, though: ``SELECT *`` from an object table, and the dictionary
+  views, show ``sys_nc_oid$`` too.
 - **Integer division semantics** — Oracle's ``/`` is always NUMBER (float)
   division, so ``15 / 10`` is ``1.5``; PostgreSQL's integer ``/`` truncates to
   ``1``. Matching Oracle would mean coercing every division to numeric, a broad
@@ -89,6 +93,7 @@ import datetime
 import hashlib
 import re
 import struct
+import uuid
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -842,7 +847,7 @@ _ORACLE_DICTIONARY_DDL = (
     'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
     'JOIN pg_class c ON c.oid = t.typrelid '
     "WHERE t.typtype = 'c' AND c.relkind = 'c' "
-    f"AND t.typname <> '{_TSTZ_TYPE}' "
+    f"AND t.typname <> '{_TSTZ_TYPE}' AND t.typname !~ '[$]ref$' "
     "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_types AS SELECT * FROM all_types '
     'WHERE owner=upper(current_schema());'
@@ -856,10 +861,25 @@ _ORACLE_DICTIONARY_DDL = (
     'a.character_maximum_length AS length, a.numeric_precision AS precision, '
     'a.numeric_scale AS scale, a.ordinal_position AS attr_no '
     'FROM information_schema.attributes a '
-    f"WHERE a.udt_name <> '{_TSTZ_TYPE}' "
+    f"WHERE a.udt_name <> '{_TSTZ_TYPE}' AND a.udt_name !~ '[$]ref$' "
     "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_type_attrs AS SELECT * FROM all_type_attrs '
     'WHERE owner=upper(current_schema());'
+    # REFs (#1127): which tables are Oracle object tables, and of what type --
+    # what PostgreSQL's reloftype said while they were typed tables -- and the
+    # one lookup every per-type sys.deref() makes: the object's attributes, as
+    # the type's text form, from the row whose hidden id the REF carries. A REF
+    # to a row that is gone yields NULL, as Oracle's dangling REF does.
+    'CREATE TABLE IF NOT EXISTS sys.ora_object_tables '
+    '(relid oid PRIMARY KEY, typ oid NOT NULL);'
+    'CREATE OR REPLACE FUNCTION sys.ora_deref_row(tab oid, id uuid, typ regtype) '
+    'RETURNS text LANGUAGE plpgsql STABLE AS $$ DECLARE cols text; res text; BEGIN '
+    'IF tab IS NULL OR id IS NULL THEN RETURN NULL; END IF; '
+    "SELECT string_agg(quote_ident(attname), ',' ORDER BY attnum) INTO cols "
+    'FROM pg_attribute WHERE attrelid = (SELECT typrelid FROM pg_type '
+    'WHERE oid = typ) AND attnum > 0 AND NOT attisdropped; '
+    'EXECUTE format(\'SELECT ROW(%s)::%s::text FROM %s WHERE "sys_nc_oid$" = $1\', '
+    'cols, typ, tab::regclass) INTO res USING id; RETURN res; END $$;'
 )
 
 # What the installed dictionary is stamped with, as the `sys` schema's comment:
@@ -1149,13 +1169,13 @@ _DDL_TYPE_REWRITES = [
     (re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE), r'(\1)'),
     # SYS_REFCURSOR (a REF CURSOR OUT param) → PostgreSQL's refcursor (#518).
     (re.compile(r'\bSYS_REFCURSOR\b', re.IGNORECASE), 'refcursor'),
-    # A `REF <object type>` column (#139). PostgreSQL has no REF, but the REF-bind
-    # column is only exercised by the 12c+ path the suite skips on the 11g Mirror —
-    # the CREATE just has to succeed — so the column becomes a bytea placeholder.
-    # The column name before REF is kept: it anchors the match to a REF *type*, so
-    # a column merely *named* `ref` (ref INTEGER) is left alone. `REF(` (a REF()
-    # call) has no space and is not matched.
-    (re.compile(r'\b(\w+)\s+REF\s+\w+', re.IGNORECASE), r'\1 bytea'),
+    # A `REF <object type>` column (#139): the type's companion `<type>$ref`
+    # composite -- the object table's oid and the row's stable id -- which the
+    # overloaded sys.deref() resolves (#1127). The column name before REF is
+    # kept: it anchors the match to a REF *type*, so a column merely *named* `ref`
+    # (ref INTEGER) is left alone. `REF(` (a REF() call) has no space and is not
+    # matched.
+    (re.compile(r'\b(\w+)\s+REF\s+(\w+)', re.IGNORECASE), r'\1 \2$ref'),
     # ROWID / UROWID column types hold a rowid's text form. Without this the
     # ROWID pseudo-column rewrite reached the column's TYPE and the CREATE
     # failed. A UROWID can hold an index-organized table's logical rowid, which
@@ -1506,6 +1526,74 @@ def _translate_replace_view(sql: str) -> str | None:
 _CREATE_OR_REPLACE_TYPE = re.compile(
     r'(\s*CREATE)\s+OR\s+REPLACE\s+(TYPE\s+([\w."$#]+)\s+AS\b)', re.IGNORECASE
 )
+# Oracle REFs (#1127). An Oracle object table gives every row a hidden object
+# id, and a REF names the table and that id. PostgreSQL's typed tables cannot
+# take a column beyond their type's, and a row's physical address (ctid) moves on
+# UPDATE / VACUUM FULL, so an object table becomes an ordinary table of the
+# type's columns plus a hidden `sys_nc_oid$` uuid -- Oracle's own name for the
+# column -- and is recorded in sys.ora_object_tables with its type. Each object
+# type gets a companion `<type>$ref` composite (table oid, row id) and an
+# overloaded sys.deref() returning the object, so `DEREF(r).attr` resolves by
+# the stable id wherever the REF came from.
+_CREATE_OBJECT_TABLE = re.compile(
+    r'\s*CREATE\s+TABLE\s+([\w."$#]+)\s+OF\s+([\w."$#]+)\s*$', re.IGNORECASE
+)
+_DROP_TYPE = re.compile(r'\s*DROP\s+TYPE\s+([\w."$#]+)(\s+FORCE)?\s*$', re.IGNORECASE)
+_TYPE_NAME_OF_CREATE = re.compile(
+    r'\s*CREATE\s+(?:OR\s+REPLACE\s+)?TYPE\s+([\w."$#]+)', re.IGNORECASE
+)
+_OBJECT_ID_COLUMN = '"sys_nc_oid$"'
+
+
+def _ref_type_name(type_name: str) -> str:
+    # `<type>$ref`, inside the quotes of a quoted name so the case survives.
+    if type_name.endswith('"'):
+        return type_name[:-1] + '$ref"'
+    return f'{type_name}$ref'
+
+
+def _object_type_companions(type_name: str) -> str:
+    ref = _ref_type_name(type_name)
+    return (
+        f'; CREATE TYPE {ref} AS (tab oid, id uuid)'
+        f'; CREATE FUNCTION sys.deref(r {ref}) RETURNS {type_name} LANGUAGE sql '
+        f"STABLE AS $$ SELECT sys.ora_deref_row(r.tab, r.id, '{type_name}'::regtype)"
+        f'::{type_name} $$'
+    )
+
+
+def _drop_type(type_name: str, *, if_exists: bool = False) -> str:
+    # A type's drop, its REF companions first. They depend on the type (the
+    # deref() function returns it), so the type alone could never be dropped or
+    # replaced. No CASCADE: a REF column of the type still holds it, and Oracle
+    # refuses that drop too (ORA-02303).
+    ref = _ref_type_name(type_name)
+    exists = ' IF EXISTS' if if_exists else ''
+    return (
+        f"DO $$ BEGIN IF to_regtype('{ref}') IS NOT NULL THEN "
+        f'DROP FUNCTION sys.deref({ref}); DROP TYPE {ref}; END IF; END $$'
+        f'; DROP TYPE{exists} {type_name}'
+    )
+
+
+def _translate_object_ddl(sql: str) -> str | None:
+    """CREATE TABLE ... OF and DROP TYPE, for REFs (#1127); None for other SQL."""
+    table = _CREATE_OBJECT_TABLE.match(sql)
+    if table:
+        name, type_name = table.groups()
+        return (
+            f'CREATE TABLE {name} (LIKE {type_name}, '
+            f'{_OBJECT_ID_COLUMN} uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE)'
+            '; DELETE FROM sys.ora_object_tables o WHERE NOT EXISTS '
+            '(SELECT 1 FROM pg_class c WHERE c.oid = o.relid)'
+            f"; INSERT INTO sys.ora_object_tables VALUES ('{name}'::regclass, "
+            f"'{type_name}'::regtype) ON CONFLICT (relid) DO UPDATE "
+            'SET typ = excluded.typ'
+        )
+    drop = _DROP_TYPE.match(sql)
+    if drop:
+        return _drop_type(drop.group(1))
+    return None
 
 
 def _translate_ddl(sql: str) -> str:
@@ -1524,7 +1612,7 @@ def _translate_ddl(sql: str) -> str:
         plain = _translate_ddl(
             f'{replaced.group(1)} {replaced.group(2)}{sql[replaced.end() :]}'
         )
-        return f'DROP TYPE IF EXISTS {replaced.group(3)}; {plain}'
+        return f'{_drop_type(replaced.group(3), if_exists=True)}; {plain}'
     varray = _CREATE_TYPE_VARRAY.match(sql)
     if varray:
         name, bound, element = varray.groups()
@@ -1540,12 +1628,18 @@ def _translate_ddl(sql: str) -> str:
         for pattern, replacement in _DDL_TYPE_REWRITES:
             element = pattern.sub(replacement, element)
         return f'CREATE DOMAIN {name} AS {element}[]'
+    object_ddl = _translate_object_ddl(sql)
+    if object_ddl is not None:
+        return object_ddl
     if _CREATE_TYPE_OBJECT.match(sql):
         # `... AS OBJECT (attrs)` → `... AS (attrs)`, then map the attribute types
         # (NUMBER → numeric, VARCHAR2(n) → varchar(n), …) the same way as a table.
         out = _CREATE_TYPE_OBJECT.sub(r'\1', sql, count=1)
         for pattern, replacement in _DDL_TYPE_REWRITES:
             out = pattern.sub(replacement, out)
+        named = _TYPE_NAME_OF_CREATE.match(sql)
+        if named is not None:
+            out += _object_type_companions(named.group(1))
         return out
     view = _translate_replace_view(sql)
     if view is not None:
@@ -1981,9 +2075,43 @@ def _translate_decode(sql: str) -> str:
     return ''.join(out)
 
 
+# Not after a `.`: the generated `sys.deref(` is already the translation.
+_DEREF_CALL = re.compile(r'(?<![.\w])DEREF\s*\(', re.IGNORECASE)
+
+
+def _translate_deref(sql: str) -> str:
+    # DEREF(x) → (sys.deref(x)) (#1127). The parentheses round the call are what
+    # PostgreSQL needs before a field selection: Oracle's `DEREF(r).name` is
+    # `(sys.deref(r)).name`. The argument is copied to its matching parenthesis,
+    # a string literal inside it taken whole.
+    out: list[str] = []
+    pos = 0
+    for match in _DEREF_CALL.finditer(sql):
+        if match.start() < pos:
+            continue  # inside an argument already copied
+        depth, i, n = 1, match.end(), len(sql)
+        while i < n and depth:
+            if sql[i] == "'":
+                i = sql.find("'", i + 1)
+                if i < 0:
+                    return sql  # unbalanced: leave the statement to fail as is
+            elif sql[i] == '(':
+                depth += 1
+            elif sql[i] == ')':
+                depth -= 1
+            i += 1
+        if depth:
+            return sql
+        inner = _translate_deref(sql[match.end() : i - 1])
+        out.append(sql[pos : match.start()] + f'(sys.deref({inner}))')
+        pos = i
+    return ''.join(out) + sql[pos:]
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
+    sql = _translate_deref(sql)
     sql = _translate_connect_by(sql)
     sql = _translate_signed_year(sql)
     sql = _translate_decode(sql)
@@ -2494,6 +2622,27 @@ def _object_type_oid(pg_oid: int) -> bytes:
     return pg_oid.to_bytes(16, 'big')
 
 
+# A REF locator this backend issues (#1127): a tag, the target type's and the
+# object table's pg oids, and the row's hidden object id. It is opaque to the
+# client, which only hands it back.
+_REF_LOCATOR_TAG = b'PGREF1'
+
+
+def _ref_locator(type_pg_oid: int, table_oid: int, row_id: object) -> bytes:
+    raw_id = (
+        row_id.bytes if isinstance(row_id, uuid.UUID) else uuid.UUID(str(row_id)).bytes
+    )
+    return _REF_LOCATOR_TAG + struct.pack('>II', type_pg_oid, table_oid) + raw_id
+
+
+def _parse_ref_locator(locator: bytes) -> tuple[int, int, uuid.UUID] | None:
+    tag = len(_REF_LOCATOR_TAG)
+    if len(locator) != tag + 8 + 16 or not locator.startswith(_REF_LOCATOR_TAG):
+        return None
+    type_pg_oid, table_oid = struct.unpack('>II', locator[tag : tag + 8])
+    return type_pg_oid, table_oid, uuid.UUID(bytes=locator[tag + 8 :])
+
+
 def _pg_oid_of(oid: bytes) -> int | None:
     # The inverse of _object_type_oid; None for an OID that cannot be one of
     # ours (a real Oracle OID a client carried over, or a malformed one).
@@ -2578,6 +2727,10 @@ class PostgresBackend:
         # its registered psycopg CompositeInfo -- or None for an oid that is not
         # an object type, so a column of it is looked up once (#1127).
         self._object_types: dict[int, tuple[DbObjectType, CompositeInfo] | None] = {}
+        # REFs (#1127): each `<type>$ref` composite's target type (None for any
+        # other composite), and the registered companion per target type.
+        self._ref_targets: dict[int, int | None] = {}
+        self._ref_composites: dict[int, CompositeInfo] = {}
         # Pipeline mode ships a statement's SAVEPOINT / statement / RELEASE in one
         # network round-trip instead of three (a 3x per-statement latency cut
         # against a remote database). It needs libpq >= 14; older builds fall back
@@ -3155,6 +3308,13 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = _to_interval_ym(row[i])
                 columns.append(_intervalym_column_meta(desc.name))
+            elif (
+                desc.type_code not in _BUILTIN_OIDS
+                and (target := self._ref_target(desc.type_code)) is not None
+            ):
+                for row in rows:
+                    row[i] = self._ref_cell(target, row[i])
+                columns.append(self._ref_column_meta(desc.name, target))
             elif (entry := self._column_object_type(desc.type_code)) is not None:
                 typ, info = entry
                 for row in rows:
@@ -3204,7 +3364,8 @@ class PostgresBackend:
             'n.nspname, t.typname '
             'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
             'JOIN pg_class c ON c.oid = t.typrelid '
-            "WHERE t.oid = %s AND t.typtype = 'c' AND c.relkind = 'c'",
+            "WHERE t.oid = %s AND t.typtype = 'c' AND c.relkind = 'c' "
+            "AND t.typname !~ '[$]ref$'",
             (pg_oid,),
         ).fetchone()
         entry = None
@@ -3266,6 +3427,18 @@ class PostgresBackend:
             raise UnsupportedFeature(f'object type {typ.name}: not a composite value')
         return typ.newobject({a['name']: v for a, v in zip(typ.attrs, value)})
 
+    def _ref_cell(self, type_pg_oid: int, value: object) -> DbRef | None:
+        # A `<type>$ref` cell: a tuple once the composite is registered, its text
+        # form `(16842,1c4e...)` before -- both carry the table oid and row id.
+        if value is None:
+            return None
+        if isinstance(value, str):
+            tab, _, rid = value.strip('()').partition(',')
+            value = (int(tab) if tab else None, rid or None)
+        if not isinstance(value, tuple):
+            raise UnsupportedFeature('REF column: not a composite value')
+        return self._db_ref(type_pg_oid, value[0], value[1])
+
     def _resolve_object_binds(self, binds: Sequence) -> list:
         # An object (ADT) bind arrives as the image the client packed, bare or
         # in a BindVar. Decode it against the type the OID names and bind the
@@ -3273,9 +3446,12 @@ class PostgresBackend:
         out: list = []
         for b in binds:
             value = b.value if isinstance(b, BindVar) else b
-            out.append(
-                self._object_bind_value(value) if isinstance(value, ObjectImage) else b
-            )
+            if isinstance(value, ObjectImage):
+                out.append(self._object_bind_value(value))
+            elif isinstance(value, DbRef):
+                out.append(self._ref_bind_value(value))
+            else:
+                out.append(b)
         return out
 
     def _object_bind_value(self, image: ObjectImage) -> object:
@@ -3461,67 +3637,125 @@ class PostgresBackend:
             total += affected
         return total, counts
 
-    def _object_type_name(self, table: str) -> str | None:
-        # The Oracle object-type name of a typed table (CREATE TABLE t OF type), or
-        # None if `table` is not one. pg_class.reloftype names the row type; Oracle
-        # folds identifiers to upper case, so the name is compared uppercased.
-        relname = table.split('.')[-1].strip('"').lower()
+    def _object_table_type(self, table: str) -> int | None:
+        # The pg_type oid of an Oracle object table's type (CREATE TABLE t OF
+        # type), from the registry the CREATE filled; None for any other table.
         row = self._conn.execute(
-            'SELECT reloftype::regtype::text FROM pg_class '
-            'WHERE relname = %s AND reloftype <> 0',
-            (relname,),
+            'SELECT o.typ FROM sys.ora_object_tables o WHERE o.relid = to_regclass(%s)',
+            (table,),
         ).fetchone()
-        if row is None or row[0] is None:
+        return None if row is None else int(row[0])
+
+    def _ref_identity(self, type_pg_oid: int) -> tuple[str, str]:
+        # (schema, name) of the object type a REF points at, as all_types has it.
+        row = self._conn.execute(
+            'SELECT sys.ora_owner(n.nspname), sys.ora_name(t.typname) '
+            'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+            'WHERE t.oid = %s',
+            (type_pg_oid,),
+        ).fetchone()
+        if row is None:
+            raise UnsupportedFeature(f'REF: no object type has pg oid {type_pg_oid}')
+        return row[0], row[1]
+
+    def _db_ref(
+        self, type_pg_oid: int, table_oid: int | None, row_id: object
+    ) -> DbRef | None:
+        # A REF value for the client: the private locator plus the identity of
+        # the type it points at, which the describe and the value both carry.
+        if table_oid is None or row_id is None:
             return None
-        return row[0].split('.')[-1].strip('"').upper()
+        schema, name = self._ref_identity(type_pg_oid)
+        return DbRef(
+            _ref_locator(type_pg_oid, table_oid, row_id),
+            type_name=name,
+            type_schema=schema,
+            type_oid=_object_type_oid(type_pg_oid),
+        )
 
     def _execute_ref_select(self, match: 're.Match[str]') -> Result:
-        # Serve `SELECT REF(alias) FROM table alias [rest]` (#139). The referenced
-        # object type comes from the typed table's catalog entry; the REF locator is
-        # stood in by the row's ctid (opaque, and never dereferenced — the DEREF /
-        # bind the test does next is 12c+ and skips on the 11g Mirror). The result is
-        # one REF column of DbRef values carrying the type identity the describe
-        # reports, so the client reads ref.type_name correctly.
+        # Serve `SELECT REF(alias) FROM table alias [rest]` (#139/#1127). The
+        # table must be an Oracle object table; each row's REF is its table oid
+        # and hidden object id, which stay put across UPDATE and VACUUM FULL.
         ref_alias, table, table_alias, rest = match.groups()
-        type_name = self._object_type_name(table)
-        if type_name is None:
+        type_pg_oid = self._object_table_type(table)
+        if type_pg_oid is None:
             raise UnsupportedFeature(
                 f'REF({ref_alias}): {table} is not an object table'
             )
-        query = f'SELECT {table_alias}.ctid::text FROM {table} {table_alias}{rest}'
+        query = (
+            f'SELECT {table_alias}.tableoid, {table_alias}.{_OBJECT_ID_COLUMN} '
+            f'FROM {table} {table_alias}{rest}'
+        )
         cursor = self._conn.cursor()
         cursor.execute('SAVEPOINT _mirror_stmt')
         try:
             cursor.execute(query)
-            ctids = [r[0] for r in cursor.fetchall()]
+            found = cursor.fetchall()
         except psycopg.Error as exc:
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
             raise _backend_error(exc) from exc
         self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
-        schema = 'PUBLIC'
-        oid = b'\x00' * 16  # Oracle carries a 16-byte type OID; unused pre-12c bind
-        column = ColumnMeta(
-            name=f'REF({ref_alias})'.upper().encode('utf-8'),
+        rows = [(self._db_ref(type_pg_oid, tab, rid),) for tab, rid in found]
+        column = self._ref_column_meta(f'REF({ref_alias})', type_pg_oid)
+        return Result(columns=[column], rows=rows)
+
+    def _ref_column_meta(self, name: str, type_pg_oid: int) -> ColumnMeta:
+        schema, type_name = self._ref_identity(type_pg_oid)
+        return ColumnMeta(
+            name=name.upper().encode('utf-8'),
             data_type=TNS_TYPE_REF,
             data_length=4000,
             max_size=0,
             type_name=type_name.encode('ascii'),
             type_schema=schema.encode('ascii'),
-            type_oid=oid,
+            type_oid=_object_type_oid(type_pg_oid),
         )
-        rows = [
-            (
-                DbRef(
-                    ctid.encode('utf-8'),
-                    type_name=type_name,
-                    type_schema=schema,
-                    type_oid=oid,
-                ),
-            )
-            for ctid in ctids
-        ]
-        return Result(columns=[column], rows=rows)
+
+    def _ref_target(self, pg_oid: int) -> int | None:
+        # For a `<type>$ref` companion composite, the pg_type oid of <type>;
+        # None for any other type. Cached per session.
+        if pg_oid in self._ref_targets:
+            return self._ref_targets[pg_oid]
+        row = self._conn.execute(
+            'SELECT target.oid FROM pg_type ref '
+            'JOIN pg_type target ON target.typnamespace = ref.typnamespace '
+            "AND target.typname || '$ref' = ref.typname "
+            "WHERE ref.oid = %s AND ref.typname ~ '[$]ref$'",
+            (pg_oid,),
+        ).fetchone()
+        target = None if row is None else int(row[0])
+        self._ref_targets[pg_oid] = target
+        return target
+
+    def _ref_bind_value(self, ref: DbRef) -> object:
+        # A REF the client binds is the locator this backend handed it; it
+        # becomes the `<type>$ref` composite the column / sys.deref() take.
+        parsed = _parse_ref_locator(ref.bytes)
+        if parsed is None:
+            raise UnsupportedFeature('REF bind: not a locator this backend issued')
+        type_pg_oid, table_oid, row_id = parsed
+        info = self._ref_composites.get(type_pg_oid)
+        if info is None:
+            named = self._conn.execute(
+                "SELECT format('%%I.%%I', n.nspname, t.typname || '$ref') "
+                'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+                'WHERE t.oid = %s',
+                (type_pg_oid,),
+            ).fetchone()
+            if named is None:
+                raise UnsupportedFeature(f'REF bind: no type with pg oid {type_pg_oid}')
+            ref_name = named[0]
+            info = CompositeInfo.fetch(self._conn, ref_name)
+            if info is None:
+                raise UnsupportedFeature(f'REF bind: no {ref_name} type')
+            register_composite(info, self._conn)
+            self._ref_composites[type_pg_oid] = info
+        factory = info.python_type
+        if factory is None:
+            raise UnsupportedFeature('REF bind: companion type not registered')
+        return factory(table_oid, row_id)
 
     def _domain_type(self, pgresult, index: int) -> int | None:
         # The Oracle wire type if result column `index` comes from one of the typed
