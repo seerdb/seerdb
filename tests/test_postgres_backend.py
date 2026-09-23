@@ -591,6 +591,39 @@ def test_translate_admin_maps_session_user_and_index() -> None:
         _translate_admin('CREATE INDEX test_schema.ix1 ON test_schema.t (c)')
         == 'CREATE INDEX ix1 ON test_schema.t (c)'
     )
+
+
+def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> None:
+    # A 12.1+ client sends ALTER SESSION SET TIME_ZONE at login. PostgreSQL reads
+    # a bare offset as POSIX and INVERTS it (`SET TIME ZONE '+05:30'` runs at
+    # -05:30), so the offset goes in as an explicit POSIX spec -- and is also
+    # kept in Oracle's spelling, which SESSIONTIMEZONE reports back.
+    assert _translate_admin("ALTER SESSION SET TIME_ZONE='+05:30'") == (
+        "SELECT set_config('TimeZone', '<+05:30>-05:30', false), "
+        "set_config('seerdb.time_zone', '+05:30', false)"
+    )
+    # A single-digit hour is Oracle's to normalise; a negative sub-hour offset
+    # keeps its sign.
+    assert _translate_admin("alter session set time_zone = '-0:30'") == (
+        "SELECT set_config('TimeZone', '<-00:30>+00:30', false), "
+        "set_config('seerdb.time_zone', '-00:30', false)"
+    )
+    # A region name means the same thing to both, and is echoed as given.
+    assert _translate_admin("ALTER SESSION SET TIME_ZONE='Europe/Moscow'") == (
+        "SELECT set_config('TimeZone', 'Europe/Moscow', false), "
+        "set_config('seerdb.time_zone', 'Europe/Moscow', false)"
+    )
+    # Any other ALTER SESSION is still the harmless no-op it was.
+    assert _translate_admin("ALTER SESSION SET NLS_DATE_FORMAT='YYYY'") == 'SELECT 1'
+
+
+def test_sessiontimezone_reads_the_zone_the_session_was_given() -> None:
+    # The Oracle spelling ALTER SESSION stored, or before any was set the
+    # session's own offset in Oracle's `+hh:mm` form.
+    assert _translate_idioms('SELECT sessiontimezone FROM dual') == (
+        "SELECT coalesce(nullif(current_setting('seerdb.time_zone', true), ''), "
+        "to_char(now(), 'TZH:TZM')) FROM dual"
+    )
     # An ordinary statement is passed through untouched.
     assert _translate_admin('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
 

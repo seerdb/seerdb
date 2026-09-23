@@ -1332,6 +1332,34 @@ _CREATE_TYPE_TABLE_OF = re.compile(
 _ALTER_SESSION_SCHEMA = re.compile(
     r'\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*"?(\w+)"?\s*$', re.IGNORECASE
 )
+# ALTER SESSION SET TIME_ZONE -- which a 12.1+ client also sends at login, pinned
+# to its own UTC offset. PostgreSQL's own spelling of an offset is POSIX and
+# INVERTS the sign (`SET TIME ZONE '+05:30'` runs the session at -05:30), so an
+# offset is set as an explicit POSIX spec instead. The zone is also kept as
+# Oracle spelled it, which is what SESSIONTIMEZONE reports back. The pattern
+# admits no quote, so the zone is safe to inline as a literal.
+_ALTER_SESSION_TIME_ZONE = re.compile(
+    r"\s*ALTER\s+SESSION\s+SET\s+TIME_ZONE\s*=\s*'([^']+)'\s*;?\s*$", re.IGNORECASE
+)
+_TZ_OFFSET = re.compile(r'([+-])(\d{1,2}):(\d{2})$')
+
+
+def _translate_time_zone(zone: str) -> str:
+    zone = zone.strip()
+    m = _TZ_OFFSET.match(zone)
+    if m:
+        sign, hh, mm = m.group(1), int(m.group(2)), m.group(3)
+        zone = f'{sign}{hh:02d}:{mm}'
+        flipped = '-' if sign == '+' else '+'
+        posix = f'<{zone}>{flipped}{hh:02d}:{mm}'
+    else:
+        posix = zone  # a region name, e.g. Europe/Moscow, means the same in both
+    return (
+        f"SELECT set_config('TimeZone', '{posix}', false), "
+        f"set_config('seerdb.time_zone', '{zone}', false)"
+    )
+
+
 _CREATE_USER = re.compile(r'\s*CREATE\s+USER\s+"?(\w+)"?\b', re.IGNORECASE)
 _CREATE_INDEX_QUALIFIED = re.compile(
     r'(\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+)"?\w+"?\.("?\w+"?\s+ON\s+.*)$',
@@ -1347,6 +1375,9 @@ def _translate_admin(sql: str) -> str:
     m = _ALTER_SESSION_SCHEMA.match(sql)
     if m:
         return f'SET search_path TO {m.group(1).lower()}, public, sys, oracle'
+    m = _ALTER_SESSION_TIME_ZONE.match(sql)
+    if m:
+        return _translate_time_zone(m.group(1))
     m = _CREATE_USER.match(sql)
     if m:
         return f'CREATE SCHEMA IF NOT EXISTS {m.group(1).lower()}'
@@ -1538,9 +1569,6 @@ _IDIOM_REWRITES = [
         'ora_current_timestamp()',
     ),
     (re.compile(r'\bdbtimezone\b', re.IGNORECASE), f"'{_DB_TIME_ZONE_NAME}'::text"),
-    # SESSIONTIMEZONE: the zone a TIMESTAMP is read in on its way into an LTZ
-    # value, the PostgreSQL session's, as an offset (#1208).
-    (re.compile(r'\bsessiontimezone\b', re.IGNORECASE), "to_char(now(), 'TZH:TZM')"),
     # CAST(x AS TIMESTAMP [(p)] WITH LOCAL TIME ZONE): the DDL type rewrite only
     # runs on DDL, so a query's cast is translated here (#1208).
     (
@@ -1551,6 +1579,14 @@ _IDIOM_REWRITES = [
         r'AS timestamptz\1',
     ),
     (re.compile(r'\bsysdate\b', re.IGNORECASE), 'localtimestamp(0)'),
+    # SESSIONTIMEZONE → the zone as ALTER SESSION spelled it, or, before any was
+    # set, the session's current offset in Oracle's `+hh:mm` form: the zone a
+    # TIMESTAMP is read in on its way into an LTZ value (#1208).
+    (
+        re.compile(r'\bsessiontimezone\b', re.IGNORECASE),
+        "coalesce(nullif(current_setting('seerdb.time_zone', true), ''), "
+        "to_char(now(), 'TZH:TZM'))",
+    ),
     # The ROWID pseudo-column → the row's ctid, in Oracle's extended form
     # (sys.ora_rowid). This one rewrite serves a SELECT (returns the str), a
     # `WHERE ROWID = :bind` (compares the bound text) and `SET col = ROWID`, and
@@ -3538,6 +3574,17 @@ class PostgresBackend:
                     'SELECT set_config(%s, %s, false)',
                     (f'seerdb.{name}', '' if value is None else value),
                 )
+
+    def alter_session(self, statement: str) -> None:
+        """Run the ALTER SESSION a client sent with its login.
+
+        A 12.1+ client pins the session time zone to its own UTC offset this
+        way. It is committed at once: a PostgreSQL SET made inside a transaction
+        is undone if that transaction rolls back, and Oracle's is not.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(_translate_admin(statement))
+        self._conn.commit()
 
     def commit(self) -> None:
         self._conn.commit()
