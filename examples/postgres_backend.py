@@ -3092,6 +3092,60 @@ class PostgresBackend:
             )
         return max(affected, 0)
 
+    def execute_many_rowcounts(
+        self, sql: str, rows: Sequence[Sequence]
+    ) -> tuple[int, list[int]]:
+        """Array DML reporting the per-iteration affected-row counts (#18).
+
+        The Mirror calls this only when the client asked for
+        ``arraydmlrowcounts`` and did not ask for batcherrors, so the cost here
+        is opt-in.
+
+        Row by row, rather than through ``executemany`` -- and deliberately,
+        because Oracle's semantics for a batch that ABORTS are what decide it.
+        The rows before the failing one really applied and their counts are owed
+        to the client in the error reply, so the batch cannot sit inside one
+        savepoint: rolling that back would undo them. Each iteration gets its own
+        savepoint instead, which is the same per-statement model the rest of this
+        backend uses, and leaves the earlier rows exactly where Oracle leaves
+        them.
+
+        (``executemany(..., returning=True)`` does report per-statement counts
+        through ``nextset()`` and keeps the pipeline, which would be faster. It
+        cannot serve the abort case: once the batch raises, the counts for the
+        rows that did apply are no longer reachable.)
+        """
+        rows = list(rows)
+        if not rows:
+            return 0, []
+        translated = _translate_idioms(
+            _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
+        )
+        bound_sql, _ = _translate_binds(translated, rows[0])
+        cursor = self._conn.cursor()
+        counts: list[int] = []
+        total = 0
+        for row in rows:
+            _, params = _translate_binds(translated, row)
+            cursor.execute('SAVEPOINT _mirror_stmt')
+            try:
+                cursor.execute(bound_sql, params)
+            except psycopg.Error as exc:
+                self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
+                self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
+                error = _backend_error(exc, original=sql, translated=bound_sql)
+                # What applied before the failure, and how much of it per
+                # iteration: a client that asked for the counts is owed them in
+                # the ERROR reply as much as in a successful one (#1031).
+                error.rowcount = total
+                error.row_counts = counts
+                raise error from exc
+            self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
+            affected = max(cursor.rowcount, 0)
+            counts.append(affected)
+            total += affected
+        return total, counts
+
     def _object_type_name(self, table: str) -> str | None:
         # The Oracle object-type name of a typed table (CREATE TABLE t OF type), or
         # None if `table` is not one. pg_class.reloftype names the row type; Oracle
