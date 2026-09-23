@@ -102,7 +102,7 @@ from seerdb.common.sqltext import (
     strip_returning_into,
 )
 from seerdb.common.tns_consts import (
-    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
@@ -2354,14 +2354,19 @@ class PostgresBackend:
     """
 
     capabilities = frozenset({Capability.TRANSACTIONS})
-    # This demo speaks the 11.2 WIRE protocol (field version): it cannot back the
-    # 12c+/23ai wire formats a higher field version would invite, so it pins the
-    # floor the whole conformance suite is baselined at. But it REPORTS release
-    # 12.1 (server_identity, read only from the login banner, never the wire), so
-    # the SQLAlchemy dialect uses native OFFSET/FETCH pagination and identity
-    # columns -- both of which PostgreSQL runs directly -- instead of Oracle's
-    # nested-ROWNUM pagination, which has no faithful PostgreSQL rewrite (#33).
-    field_version = FIELD_VERSION_11_2
+    # This demo speaks the 12.1 WIRE protocol (field version), which is also the
+    # release it reports (server_identity). Those were deliberately apart while
+    # the wire was 11.2: the dialect reads the RELEASE to pick native
+    # OFFSET/FETCH pagination and identity columns -- both of which PostgreSQL
+    # runs directly -- instead of Oracle's nested-ROWNUM pagination, which has no
+    # faithful PostgreSQL rewrite (#33). They now agree.
+    #
+    # 12.1 rather than 12.2, and deliberately: a modern thin client refuses any
+    # server below protocol version 315, which is 12.1's, so this is the LOWEST
+    # version at which one will talk to the Mirror at all (#1127). Going to 12.2
+    # was measured too and costs far more -- and a client can negotiate DOWN to
+    # 12.1 whichever we advertise, so 12.1 has to work regardless.
+    field_version = FIELD_VERSION_12_1
     server_identity = IDENTITY_12_1
 
     def __init__(
