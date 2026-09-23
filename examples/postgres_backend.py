@@ -530,6 +530,16 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'client_info' THEN "
     "nullif(current_setting('seerdb.client_info', true), '') "
     'ELSE NULL END $$;'
+    # TO_CLOB(x): Oracle promotes a value to a CLOB; a CLOB IS text here, so the
+    # conversion is a cast and the function exists only so the name resolves
+    # (#1127). Declared for text and for the untyped literal a bare
+    # `TO_CLOB('x')` produces -- PostgreSQL resolves `unknown` to no function at
+    # all otherwise, which is what `ORA-00904: function to_clob(unknown) does
+    # not exist` was. orafce does not provide it.
+    'CREATE OR REPLACE FUNCTION sys.to_clob(text) RETURNS text LANGUAGE sql '
+    'IMMUTABLE AS $$ SELECT $1 $$;'
+    'CREATE OR REPLACE FUNCTION sys.to_clob(anyelement) RETURNS text LANGUAGE sql '
+    'IMMUTABLE AS $$ SELECT $1::text $$;'
     # ora_owner(schema): the Oracle owner for a PostgreSQL schema — the current
     # schema for a session-local (pg_temp) object, so GLOBAL TEMPORARY tables and
     # their indexes/constraints report under the user's schema like Oracle (#759).
