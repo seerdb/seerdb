@@ -2138,10 +2138,31 @@ _ORA_MESSAGE = {
 }
 
 
+# `22003 numeric_value_out_of_range` covers two different Oracle errors, so the
+# SQLSTATE alone cannot pick the code (#1127). A value too wide for a NUMBER(p,s)
+# column is ORA-01438, "value larger than specified precision allowed for this
+# column"; an arithmetic result that overflows is ORA-01426, "numeric overflow".
+# PostgreSQL tells them apart only in the primary message -- measured:
+#     numeric(3,0) given 123456  -> 22003 "numeric field overflow"
+#     int 2147483647 + 1         -> 22003 "integer out of range"
+# so the column case is matched on its message and everything else under 22003
+# is the arithmetic one. A client that branches on the code -- batcherrors
+# reports it per row -- would otherwise be told ORA-00900, a syntax error, about
+# a statement whose syntax was fine.
+_ORA_COLUMN_PRECISION = 1438
+_ORA_NUMERIC_OVERFLOW = 1426
+
+
 def _ora_code_for(exc) -> int:
     sqlstate = getattr(exc, 'sqlstate', None)
     if not isinstance(sqlstate, str):
         return _ORA_INVALID_SQL
+    if sqlstate == '22003':
+        diag = getattr(exc, 'diag', None)
+        primary = getattr(diag, 'message_primary', None) or str(exc)
+        if 'numeric field overflow' in primary:
+            return _ORA_COLUMN_PRECISION
+        return _ORA_NUMERIC_OVERFLOW
     return _SQLSTATE_TO_ORA.get(sqlstate, _ORA_INVALID_SQL)
 
 
