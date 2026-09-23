@@ -1819,6 +1819,23 @@ def test_change_password_rejects_a_wrong_old_password() -> None:
     assert exc.value.ora_code == 1017
 
 
+def test_change_password_rejects_one_oracle_would_not_store() -> None:
+    # Oracle up to 12.1 -- the release this backend presents -- keeps passwords
+    # of at most 30 bytes, and the protocol route refuses a longer one with
+    # ORA-01017. Accepting it left the account with a password no client could
+    # log in with (#1127).
+    from seerdb.server import BackendError
+
+    creds = {'PYO': 'pyo123'}
+    backend = _NoConnPostgresBackend(creds)
+    with pytest.raises(BackendError) as exc:
+        backend.change_password('PYO', 'pyo123', '1' * 31)
+    assert exc.value.ora_code == 1017
+    assert creds['PYO'] == 'pyo123'
+    backend.change_password('PYO', 'pyo123', '1' * 30)
+    assert creds['PYO'] == '1' * 30
+
+
 # --- Bind translation (#516) — a pure function, no live PG needed --------------
 
 

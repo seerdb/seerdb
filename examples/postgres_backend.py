@@ -3527,6 +3527,9 @@ class PostgresBackend:
             return None, []
         return list(row[0]), list(row[1] or ())
 
+    # Oracle's longest password up to 12.1, the release this backend presents.
+    _MAX_PASSWORD_BYTES = 30
+
     def change_password(
         self, username: str, old_password: str, new_password: str
     ) -> None:
@@ -3539,6 +3542,13 @@ class PostgresBackend:
         # the stored secret (#515). The map is shared across sessions.
         current = credential_lookup(self._credentials, username)
         if current is not None and old_password != current:
+            raise BackendError('invalid username/password; logon denied', ora_code=1017)
+        # A password Oracle would not store is refused the way the protocol route
+        # refuses it, ORA-01017. Up to 12.1 -- the release this backend presents --
+        # the limit is 30 bytes; 12.2 raised it to 1024. Accepting one PostgreSQL
+        # would take left the account with a password no client could log in
+        # with, and every later session failed ORA-01017 instead (#1127).
+        if len(new_password.encode('utf-8')) > self._MAX_PASSWORD_BYTES:
             raise BackendError('invalid username/password; logon denied', ora_code=1017)
         for name in list(self._credentials):
             if name.upper() == username.upper():
