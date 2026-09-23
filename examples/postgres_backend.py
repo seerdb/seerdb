@@ -530,6 +530,23 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'client_info' THEN "
     "nullif(current_setting('seerdb.client_info', true), '') "
     'ELSE NULL END $$;'
+    # DBMS_LOB.GETLENGTH(lob): the one DBMS_LOB entry point the suite calls from
+    # ordinary SQL rather than from inside a PL/SQL block (#1127). A CLOB is
+    # `text` here and a BLOB is `bytea`, so the length is `length` or
+    # `octet_length` -- Oracle counts CHARACTERS for a CLOB and BYTES for a BLOB,
+    # which is what those two do respectively. NULL in, NULL out, as Oracle does
+    # for a NULL locator.
+    #
+    # The schema is created rather than the function put on the search_path:
+    # every call site writes it qualified, `DBMS_LOB.GETLENGTH(c)`, and
+    # PostgreSQL folds the unquoted name to `dbms_lob.getlength`. orafce ships
+    # dbms_alert / assert / output / pipe / random / sql / utility but no
+    # dbms_lob at all, so there is nothing to lean on.
+    'CREATE SCHEMA IF NOT EXISTS dbms_lob;'
+    'CREATE OR REPLACE FUNCTION dbms_lob.getlength(text) RETURNS integer '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT length($1) $$;'
+    'CREATE OR REPLACE FUNCTION dbms_lob.getlength(bytea) RETURNS integer '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT octet_length($1) $$;'
     # TO_CLOB(x): Oracle promotes a value to a CLOB; a CLOB IS text here, so the
     # conversion is a cast and the function exists only so the name resolves
     # (#1127). Declared for text and for the untyped literal a bare
