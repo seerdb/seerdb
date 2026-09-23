@@ -39,7 +39,10 @@ from postgres_backend import (  # noqa: E402
     _bc_date_loader,
     _distinct_bind_refs,
     _iot_primary_key,
+    _object_column_meta,
+    _object_type_oid,
     _parse_out_assignments,
+    _pg_oid_of,
     _reject_unsupported_ddl_types,
     _strip_leading_comments,
     _to_interval_ym,
@@ -2026,6 +2029,82 @@ def test_a_held_read_delays_a_reinstall_but_does_not_hang_it() -> None:
             "SELECT obj_description(to_regnamespace('sys'), 'pg_namespace')"
         ).fetchone()
     assert stamp == _DICTIONARY_STAMP
+
+
+def test_an_object_type_oid_is_its_pg_oid_padded_and_back() -> None:
+    # all_types reports a composite's PostgreSQL oid zero-padded to Oracle's 16
+    # bytes, so the OID a bind carries turns straight back into the type. A real
+    # Oracle OID a client carried over is not one of ours (#1127).
+    oid = _object_type_oid(0x16F248)
+    assert oid == bytes(13) + b'\x16\xf2\x48'
+    assert _pg_oid_of(oid) == 0x16F248
+    assert _pg_oid_of(bytes.fromhex('5c284ab405f7def0e0639600a8c0b006')) is None
+    assert _pg_oid_of(b'short') is None
+
+
+def test_an_object_column_describes_as_a_real_server_does() -> None:
+    # Measured on 23ai: ADT, data length 2000, max size 0, no charset / form, and
+    # the type's identity -- a zero length would claim the column sends nothing.
+    from seerdb.common.dbobject import DbObjectType
+
+    typ = DbObjectType('PUBLIC', 'T_OBJ', _object_type_oid(42), 1, [])
+    col = _object_column_meta('o', typ)
+    assert (col.name, col.data_type, col.data_length, col.max_size) == (
+        b'O',
+        109,
+        2000,
+        0,
+    )
+    assert (col.charset, col.csfrm) == (0, 0)
+    assert (col.type_schema, col.type_name, col.type_oid) == (
+        b'PUBLIC',
+        b'T_OBJ',
+        _object_type_oid(42),
+    )
+
+
+def test_an_object_type_is_in_the_dictionary_and_round_trips() -> None:
+    # CREATE TYPE ... AS OBJECT is a composite; all_types / all_type_attrs are
+    # what a client's gettype reads, a bound image is decoded into the
+    # composite, and a selected composite comes back as a DbObject (#1127).
+    from seerdb.common.dbobject import ObjectImage
+    from seerdb.common.tns import encode_object_image
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for stmt in ('DROP TABLE t_objround', 'DROP TYPE t_objround_t'):
+            try:
+                backend.execute(stmt)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+        backend.execute(
+            'CREATE TYPE t_objround_t AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        backend.execute('CREATE TABLE t_objround (n NUMBER, o t_objround_t)')
+        (row,) = backend.execute(
+            'SELECT owner, type_oid, typecode FROM all_types '
+            "WHERE type_name = 'T_OBJROUND_T'"
+        ).rows
+        owner, oid, typecode = row
+        assert typecode == 'OBJECT'
+        attrs = backend.execute(
+            'SELECT attr_name, attr_type_name, attr_type_owner, length '
+            "FROM all_type_attrs WHERE type_name = 'T_OBJROUND_T' ORDER BY attr_no"
+        ).rows
+        assert attrs == [('ID', 'NUMBER', None, None), ('NAME', 'VARCHAR2', None, 40)]
+
+        typ, _info = backend._object_type(_pg_oid_of(bytes(oid)))
+        obj = typ.newobject({'ID': 7, 'NAME': 'Alice'})
+        image = ObjectImage(bytes(oid), owner, typ.name, None, encode_object_image(obj))
+        backend.execute('INSERT INTO t_objround VALUES (1, :o)', [image])
+        (got,) = backend.execute('SELECT o FROM t_objround').rows[0]
+        assert got.NAME == 'Alice'
+        assert int(got.ID) == 7
+        backend.execute('DROP TABLE t_objround')
+        backend.execute('DROP TYPE t_objround_t')
+        backend.commit()
+    finally:
+        backend.close()
 
 
 def test_dictionary_views_preserve_quoted_identifier_case() -> None:
