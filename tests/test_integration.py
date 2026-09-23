@@ -3313,6 +3313,31 @@ class ErrorAndRowcountIntegration(_IntegrationBase):
         self.assertEqual(ctx.exception.code, 1722)
         self.assertIn('ORA-01722', str(ctx.exception))
 
+    def test_a_string_too_long_for_its_column_is_ora_12899(self):
+        # "value too large for column". A real server raises it natively, so this
+        # holds every leg to the same answer -- over PostgreSQL it arrives as
+        # SQLSTATE 22001 and has to be mapped, or a client branching on the code
+        # is told ORA-00900, a syntax error (#1127).
+        # Before 10g the same error is ORA-01401, "inserted value too large for
+        # column" (measured on 8i and 9i).
+        expected = 1401 if self.conn.field_version < FIELD_VERSION_10_2 else 12899
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v VARCHAR2(3))')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(f"INSERT INTO {self.TABLE} VALUES ('abcd')")
+        self.assertEqual(ctx.exception.code, expected)
+        self.assertIn(f'ORA-{expected:05d}', str(ctx.exception))
+
+    def test_a_number_too_wide_for_its_column_is_ora_01438(self):
+        # "value larger than specified precision allowed for this column". Over
+        # PostgreSQL it shares SQLSTATE 22003 with arithmetic overflow, which is
+        # Oracle's ORA-01426 instead, so the mapping has to tell them apart
+        # (#1127). This is the column case.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v NUMBER(3))')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1000)')
+        self.assertEqual(ctx.exception.code, 1438)
+        self.assertIn('ORA-01438', str(ctx.exception))
+
     def test_error_message_for_unique_constraint(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY)')
         self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')

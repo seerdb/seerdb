@@ -2122,6 +2122,10 @@ _SQLSTATE_TO_ORA = {
     '22P02': 1722,  # invalid_text_representation -> invalid number (TO_NUMBER)
     '3B001': 1086,  # invalid_savepoint_specification -> savepoint never established
     '55P03': 54,  # lock_not_available -> resource busy (a DDL's lock wait, #1191)
+    # A string too long for its VARCHAR2(n) column: Oracle's ORA-12899, "value
+    # too large for column". Unlike 22003 below, this SQLSTATE means exactly one
+    # Oracle error, so the table can carry it (#1127).
+    '22001': 12899,  # string_data_right_truncation -> value too large for column
 }
 
 
