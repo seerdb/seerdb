@@ -2373,6 +2373,8 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(Var.getvalue(), 'nat ünî 中')
 
     def test_national_array_bind_round_trip(self):
+        # PL/SQL-bound: an associative array lives in a PL/SQL PACKAGE (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # An associative array of NVARCHAR2 in both directions (#991). The
         # element is encoded as a bare value, so it never saw the bind's charset
         # form: going out it went as UTF-8 and the server read those bytes as
@@ -4300,6 +4302,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertIsNone(Var.getvalue())
 
     def test_inout_clob_var_small(self):
+        # PL/SQL-bound: DBMS_LOB.WRITEAPPEND is a PL/SQL procedure with an IN OUT LOB (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # Under the 32767-byte promotion threshold, so the bind stays a Var.
         Var = self.cur.var(seerdb.DB_TYPE_CLOB)
         Var.setvalue(0, 'small')
@@ -4307,6 +4311,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(Var.getvalue().read(), 'smallEND')
 
     def test_inout_clob_var_over_the_promotion_threshold(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # Over it, so the Var is promoted to a temp-LOB marker on the way out
         # (#902). The marker has to carry the Var, or the returned value has
         # neither a type to decode against nor anywhere to land.
@@ -4327,6 +4333,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
 
     def test_inout_blob_var_over_the_promotion_threshold(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         Var = self.cur.var(seerdb.DB_TYPE_BLOB)
         Var.setvalue(0, b'L' * 52345)
         self.cur.execute(
@@ -6909,6 +6917,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Conn.close()
 
     async def test_gettype_resolves_a_package_level_type(self):
+        # PL/SQL-bound: a package-level type lives in a PL/SQL PACKAGE (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # Async twin of PlsqlTypeIntegration (#1030).
         Pkg = 'PYO_ASYNC_PLSQLTYPE_PKG'
         Conn = await seerdb.connect_async(**self._kwargs())
@@ -6949,6 +6960,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Conn.close()
 
     async def test_a_bare_object_out_bind_takes_its_value(self):
+        # PL/SQL-bound: the object OUT bind is filled by a PL/SQL PACKAGE (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # Async twin of ObjectOutBindIntegration (#1029): an object handed to
         # callproc with no Var around it takes the OUT value in place.
         Typ = 'PYO_ASYNC_OUTBIND_T'
@@ -7053,6 +7067,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Conn.close()
 
     async def test_inout_clob_var(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # The async twin of LOBOutBindIntegration (#978): a LOB OUT bind's value
         # arrives in the LOB framing, and the read that materialises it is
         # awaited. 12.1+ only, like the sync class.
