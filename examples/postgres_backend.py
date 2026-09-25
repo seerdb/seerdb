@@ -861,9 +861,13 @@ _ORACLE_DICTIONARY_DDL = (
     'CREATE OR REPLACE VIEW sys.all_type_attrs AS SELECT '
     'ora_owner(a.udt_schema) AS owner, ora_name(a.udt_name) AS type_name, '
     'ora_name(a.attribute_name) AS attr_name, '
-    "CASE WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
+    # The ora_tstz composite is this backend's TIMESTAMP WITH TIME ZONE, not an
+    # object type an attribute holds.
+    f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' THEN 'TIMESTAMP WITH TIME ZONE' "
+    "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
     'ELSE ora_type_name(a.data_type) END AS attr_type_name, '
-    "CASE WHEN a.data_type = 'USER-DEFINED' THEN ora_owner(a.attribute_udt_schema) "
+    "CASE WHEN a.data_type = 'USER-DEFINED' "
+    f"AND a.attribute_udt_name <> '{_TSTZ_TYPE}' THEN ora_owner(a.attribute_udt_schema) "
     'END AS attr_type_owner, '
     'a.character_maximum_length AS length, a.numeric_precision AS precision, '
     'a.numeric_scale AS scale, a.ordinal_position AS attr_no '
@@ -3054,12 +3058,14 @@ class PostgresBackend:
         # entered offset (#519). Best-effort: a backend that can't create the type
         # just leaves WITH TIME ZONE unsupported, like the orafce idioms above.
         self._tstz_oid: int | None = None
+        self._tstz_info: CompositeInfo | None = None
         try:
             self._conn.execute(_TSTZ_TYPE_DDL)
             info = CompositeInfo.fetch(self._conn, _TSTZ_TYPE)
             if info is not None:
                 register_composite(info, self._conn)
                 self._tstz_oid = info.oid
+                self._tstz_info = info
         except psycopg.Error:
             self._conn.rollback()
         # Create the typed domains and map each domain's oid to the Oracle wire type
@@ -3797,10 +3803,13 @@ class PostgresBackend:
             # the one all_type_attrs applies.
             for attr_name, type_name, type_owner in self._conn.execute(
                 'SELECT sys.ora_name(a.attribute_name), '
-                "CASE WHEN a.data_type = 'USER-DEFINED' "
+                f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' "
+                "THEN 'TIMESTAMP WITH TIME ZONE' "
+                "WHEN a.data_type = 'USER-DEFINED' "
                 'THEN sys.ora_name(a.attribute_udt_name) '
                 'ELSE sys.ora_type_name(a.data_type) END, '
                 "CASE WHEN a.data_type = 'USER-DEFINED' "
+                f"AND a.attribute_udt_name <> '{_TSTZ_TYPE}' "
                 'THEN sys.ora_owner(a.attribute_udt_schema) END '
                 'FROM information_schema.attributes a '
                 'WHERE a.udt_schema = %s AND a.udt_name = %s '
@@ -3845,7 +3854,14 @@ class PostgresBackend:
             value = loader(info.oid, self._conn).load(value.encode('utf-8'))
         if not isinstance(value, tuple):
             raise UnsupportedFeature(f'object type {typ.name}: not a composite value')
-        return typ.newobject({a['name']: v for a, v in zip(typ.attrs, value)})
+        return typ.newobject(
+            {
+                a['name']: _reconstruct_tstz(v)
+                if a['data_type'] == TNS_TYPE_TIMESTAMPTZ and hasattr(v, 'utc')
+                else v
+                for a, v in zip(typ.attrs, value)
+            }
+        )
 
     def _ref_cell(self, type_pg_oid: int, value: object) -> DbRef | None:
         # A `<type>$ref` cell: a tuple once the composite is registered, its text
@@ -3891,7 +3907,33 @@ class PostgresBackend:
         if factory is None:
             raise UnsupportedFeature(f'object type {typ.name}: not registered')
         attrs = dict(decode_object_image(image.image, typ.attrs))
-        return factory(*(attrs.get(a['name']) for a in typ.attrs))
+        return factory(
+            *(
+                self._tstz_composite(attrs.get(a['name']))
+                if a['data_type'] == TNS_TYPE_TIMESTAMPTZ
+                else attrs.get(a['name'])
+                for a in typ.attrs
+            )
+        )
+
+    def _tstz_composite(self, value: object) -> object:
+        # An aware datetime as the ora_tstz composite a TIMESTAMP WITH TIME ZONE
+        # attribute is stored as: the instant and the offset it was entered at
+        # (#519). A naive one is taken as UTC.
+        if not isinstance(value, datetime.datetime) or self._tstz_info is None:
+            return value
+        factory = self._tstz_info.python_type
+        if factory is None:
+            return value
+        offset = value.utcoffset() or datetime.timedelta(0)
+        instant = (
+            value
+            if value.tzinfo is not None
+            else value.replace(tzinfo=datetime.timezone.utc)
+        )
+        return factory(
+            instant.astimezone(datetime.timezone.utc), int(offset.total_seconds())
+        )
 
     def _execute_sequential(
         self,

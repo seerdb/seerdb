@@ -6071,6 +6071,65 @@ class ObjectReturningIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
+    # An object whose attribute is TIMESTAMP WITH TIME ZONE binds and returns
+    # with the offset it was entered at. The Mirror-over-PG stores that type as
+    # a composite of its own, which its object support once took for a nested
+    # object type and refused (#1134).
+    TYPE = 'PYO_TSTZ_ATTR_T'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+        self.cur.execute(
+            f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, ts TIMESTAMP WITH TIME ZONE)'
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, o {self.TYPE})')
+
+    def tearDown(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass
+        super().tearDown()
+
+    def test_the_attribute_keeps_its_offset(self):
+        import datetime
+
+        entered = datetime.datetime(
+            2026, 9, 25, 1, 2, 3, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+        )
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        obj.ID = 1
+        obj.TS = entered
+        out = self.cur.var(typ)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (n, o) VALUES (1, :obj) '
+            'RETURNING o INTO :outObj',
+            [obj, out],
+        )
+        (returned,) = out.getvalue()
+        self.assertEqual(returned.TS, entered)
+        self.assertEqual(returned.TS.utcoffset(), datetime.timedelta(hours=2))
+        self.cur.execute(f'SELECT o FROM {self.TABLE}')
+        (fetched,) = self.cur.fetchone()
+        self.assertEqual(fetched.TS, entered)
+        self.assertEqual(fetched.TS.utcoffset(), datetime.timedelta(hours=2))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class RefBindIntegration(_IntegrationBase):
     # REF bind (#139): fetch a REF for a row object, bind it back into an INSERT
     # and into DEREF(?), and confirm it round-trips to the original object. REF
