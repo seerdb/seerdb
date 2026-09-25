@@ -1664,6 +1664,200 @@ def test_kill_session_ends_only_the_session_named() -> None:
         victim.close()
 
 
+# --- DBMS_PICKLER.GET_TYPE_SHAPE (#1134) -----------------------------------------
+
+# The TDS real 23ai returned for each type (type_shape capture, 2026-09-25), the
+# ground truth the encoder has to reproduce. The DDL of each is in the shapes
+# below; the OIDs inside are not in a TDS, so these bytes are the server's own.
+_CAPTURED_TDS = {
+    'PYO_TS_SUB': '0000001426010001000100290000000000090600812a0007',
+    'PYO_TS_ALL': '0000007926020001001600290000000000440600810605020609000600000500050a07003c01000001000a01000007003c820000010008820000130010252d0215061503170621061d1d1e27060081282a0007000a000d0010001300150017001d00230029002f003200330034003500370039003b003d003e003f0041',
+    'PYO_TS_VARRAY': '0000001e260100010001ff290000000000131c0000001d0000000a032a0600810007',
+    'PYO_TS_TABLE_V': '00000021260100010001ff290000000000161c0000001d00000000022a0700140100000007',
+    'PYO_TS_TABLE_O': '00000057260100010001ff2900000000004c1c0000001d00000000022a1b00000023fafd000000310000001426010001000100290000000000090600812a00070000001526010001000200290000000000081a1a2a000700080007',
+    'PYO_TS_VARRAY_O': '00000057260100010001ff2900000000004c1c0000001d00000003032a1b00000023fafd000000310000001426010001000100290000000000090600812a00070000001526010001000200290000000000081a1a2a000700080007',
+    'PYO_T2_NUM2': '00000019260100010002002900000000000c0600810600812a0007000a',
+    'PYO_T2_VC': '0000001c260100010002002900000000000f0700140100000604002a0007000d',
+    'PYO_T2_TS': '00000013260200010001002900000000000815062a0007',
+    'PYO_T2_BF': '000000122602000100010029000000000007252a0007',
+    'PYO_T2_CL': '0000001226010001000100290000000000071d2a0007',
+    'PYO_T2_DT': '000000122601000100010029000000000007022a0007',
+    'PYO_T2_EMB': '00000020260100010003002900000000001106008127060081060081282a0007000b000e',
+    'PYO_T2_TAB_VC': '00000062260100010001ff290000000000571c0000001d00000000022a1b00000023fafd0000003c0000001c260100010002002900000000000f0700140100000604002a0007000d0000001826010001000300290000000000091a1a1a2a0007000800090007',
+    'PYO_T2_VA_NUM2': '0000005f260100010001ff290000000000541c0000001d00000005032a1b00000023fafd0000003900000019260100010002002900000000000c0600810600812a0007000a0000001826010001000300290000000000091a1a1a2a0007000800090007',
+    'PYO_T2_TN': '0000001e260100010001ff290000000000131c0000001d00000000022a0600810007',
+    'PYO_T2_TTN': '00000044260100010001ff290000000000391c0000001d00000000022a1b00000023fbfd0000001e260100010001ff290000000000131c0000001d00000000022a06008100070007',
+    'PYO_T2_VTN': '00000044260100010001ff290000000000391c0000001d00000004032a1b00000023fbfd0000001e260100010001ff290000000000131c0000001d00000000022a06008100070007',
+    'PYO_T2_TAB_EMB': '0000006e260100010001ff290000000000631c0000001d00000000022a1b00000023fafd0000004800000020260100010003002900000000001106008127060081060081282a0007000b000e00000020260100010005002900000000000d1a1a271a1a1a282a00070008000a000b000c0007',
+    'PYO_T3_ARR': '00000057260100010001ff2900000000004c1c0000001d0000000a032a1b00000023fafd000000310000001426010001000100290000000000090600812a00070000001526010001000200290000000000081a1a2a000700080007',
+    'PYO_T3_OBJ': '000000ab260100010004002900000000009a0600811b00000028fb1b00000084fb0700050100002afd00000057260100010001ff2900000000004c1c0000001d0000000a032a1b00000023fafd000000310000001426010001000100290000000000090600812a00070000001526010001000200290000000000081a1a2a000700080007fd0000001e260100010001ff290000000000131c0000001d00000000022a06008100070007000a00100016',
+}
+
+
+def _captured_shapes() -> dict:
+    from postgres_backend import _tds_chars, _tds_number, _tds_timestamp
+    from postgres_backend import _TdsCollection as C
+    from postgres_backend import _TdsLeaf as L
+    from postgres_backend import _TdsObject as _O
+
+    def O(*attrs):  # noqa: N802 -- a constructor, as the encoder's types read
+        return _O(tuple(attrs))
+
+    N = _tds_number()
+    V20 = _tds_chars(0x07, 20, False)
+    SUB = O(N)
+    NUM2 = O(N, N)
+    VC = O(V20, _tds_number(4, 0))
+    EMB = O(N, NUM2)
+    TN = C(False, 0, N)
+    ARR3 = C(True, 10, SUB)
+    return {
+        'PYO_TS_SUB': SUB,
+        'PYO_TS_ALL': O(
+            N,
+            _tds_number(5, 2),
+            _tds_number(9, 0),
+            _tds_number(0, 0),
+            L(b'\x05\x00'),
+            L(b'\x05\x0a'),
+            _tds_chars(0x07, 60, False),
+            _tds_chars(0x01, 10, False),
+            _tds_chars(0x07, 60, True),
+            _tds_chars(0x01, 8, True),
+            L(b'\x13\x00\x10'),
+            L(b'\x25', newer=True),
+            L(b'\x2d', newer=True),
+            L(b'\x02'),
+            _tds_timestamp(0x15, 6),
+            _tds_timestamp(0x15, 3),
+            _tds_timestamp(0x17, 6),
+            _tds_timestamp(0x21, 6),
+            L(b'\x1d'),
+            L(b'\x1d'),
+            L(b'\x1e'),
+            SUB,
+        ),
+        'PYO_TS_VARRAY': C(True, 10, N),
+        'PYO_TS_TABLE_V': C(False, 0, V20),
+        'PYO_TS_TABLE_O': C(False, 0, SUB),
+        'PYO_TS_VARRAY_O': C(True, 3, SUB),
+        'PYO_T2_NUM2': NUM2,
+        'PYO_T2_VC': VC,
+        'PYO_T2_TS': O(_tds_timestamp(0x15, 6)),
+        'PYO_T2_BF': O(L(b'\x25', newer=True)),
+        'PYO_T2_CL': O(L(b'\x1d')),
+        'PYO_T2_DT': O(L(b'\x02')),
+        'PYO_T2_EMB': EMB,
+        'PYO_T2_TAB_VC': C(False, 0, VC),
+        'PYO_T2_VA_NUM2': C(True, 5, NUM2),
+        'PYO_T2_TN': TN,
+        'PYO_T2_TTN': C(False, 0, TN),
+        'PYO_T2_VTN': C(True, 4, TN),
+        'PYO_T2_TAB_EMB': C(False, 0, EMB),
+        'PYO_T3_ARR': ARR3,
+        'PYO_T3_OBJ': O(N, ARR3, C(False, 0, N), _tds_chars(0x07, 5, False)),
+    }
+
+
+def test_the_tds_encoder_reproduces_what_23ai_sends() -> None:
+    # Byte for byte, header, embedded objects, references, null images and the
+    # index table included, for every captured object and collection type.
+    from postgres_backend import _tds
+
+    shapes = _captured_shapes()
+    assert set(shapes) == set(_CAPTURED_TDS)
+    for name, shape in shapes.items():
+        assert _tds(shape).hex() == _CAPTURED_TDS[name], name
+
+
+_TYPE_SHAPE_SQL = """
+        declare
+            t_Instantiable              varchar2(3);
+            t_SuperTypeOwner            varchar2(128);
+            t_SuperTypeName             varchar2(128);
+            t_SubTypeRefCursor          sys_refcursor;
+            t_Pos                       pls_integer;
+        begin
+            :ret_val := dbms_pickler.get_type_shape(:full_name, :oid,
+                :version, :tds, t_Instantiable, t_SuperTypeOwner,
+                t_SuperTypeName, :attrs_rc, t_SubTypeRefCursor);
+            :package_name := null;
+        end;"""
+
+
+def test_get_type_shape_is_answered_from_the_catalog() -> None:
+    # python-oracledb's type-metadata block, answered whole: the OID, the TDS,
+    # the attribute cursor, the type's own schema and name -- and 1001 for a
+    # type that does not exist, as GET_TYPE_SHAPE returns it.
+    from postgres_backend import _tds
+
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_RAW,
+        TNS_TYPE_REFCURSOR,
+        TNS_TYPE_VARCHAR,
+    )
+    from seerdb.server.backend import BindVar
+
+    admin = psycopg.connect(_CONNINFO, autocommit=True)
+    admin.execute('DROP SCHEMA IF EXISTS pyo_shape CASCADE')
+    admin.execute('CREATE SCHEMA pyo_shape')
+    backend = PostgresBackend(_CONNINFO, credentials={'PYO_SHAPE': 'x'})
+    try:
+        backend.authenticate('PYO_SHAPE')
+        backend.execute('CREATE TYPE pyo_shape_sub AS OBJECT (a NUMBER)')
+        backend.execute('CREATE TYPE pyo_shape_arr AS VARRAY(10) OF pyo_shape_sub')
+        backend.execute(
+            'CREATE TYPE pyo_shape_obj AS OBJECT '
+            '(n NUMBER(5,2), v VARCHAR2(20), arr pyo_shape_arr)'
+        )
+
+        def shape(full_name: str) -> list:
+            binds = [
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+                BindVar(value=full_name, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+                BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=16),
+                BindVar(value=None, tns_type=TNS_TYPE_NUMBER, max_size=4),
+                BindVar(value=None, tns_type=TNS_TYPE_RAW, max_size=32767),
+                BindVar(value=None, tns_type=TNS_TYPE_REFCURSOR, max_size=1),
+                BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=128),
+            ]
+            return backend.execute(_TYPE_SHAPE_SQL, binds).out_binds
+
+        (ret_val, _full, oid, version, tds, attrs, package) = shape(
+            'PYO_SHAPE.PYO_SHAPE_OBJ'
+        )
+        assert (ret_val, version, package) == (0, 1, None)
+        assert len(oid) == 16
+        from postgres_backend import _tds_chars, _tds_number, _TdsCollection, _TdsObject
+
+        sub = _TdsObject((_tds_number(),))
+        assert tds == _tds(
+            _TdsObject(
+                (
+                    _tds_number(5, 2),
+                    _tds_chars(0x07, 20, False),
+                    _TdsCollection(True, 10, sub),
+                )
+            )
+        )
+        assert [r[1:5] for r in attrs.rows] == [
+            ('N', 1, 'NUMBER', None),
+            ('V', 2, 'VARCHAR2', None),
+            ('ARR', 3, 'PYO_SHAPE_ARR', 'PYO_SHAPE'),
+        ]
+        # A collection has no attributes; unqualified resolves in the schema.
+        (ret_val, _f, _o, _v, tds, attrs, _p) = shape('PYO_SHAPE_ARR')
+        assert ret_val == 0 and attrs.rows == []
+        assert tds == _tds(_TdsCollection(True, 10, sub))
+        (ret_val, _f, oid, _v, tds, _a, _p) = shape('PYO_SHAPE.NO_SUCH_TYPE')
+        assert (ret_val, oid, tds) == (1001, None, None)
+    finally:
+        backend.close()
+        admin.execute('DROP SCHEMA pyo_shape CASCADE')
+        admin.close()
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the

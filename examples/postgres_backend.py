@@ -56,9 +56,16 @@ edge of this adapter:
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
-  binds, returns (``RETURNING o INTO :b``) and fetches. Not yet: an attribute that
-  is itself an object or a collection (refused, not guessed), collection types in
-  ``all_coll_types`` (the VARRAY domains are not described), and type methods.
+  binds, returns (``RETURNING o INTO :b``) and fetches. Not yet: binding an
+  attribute that is itself an object or a collection (refused, not guessed), and
+  type methods. A VARRAY or nested table is a domain over an array, listed in
+  ``all_coll_types``. The block python-oracledb runs to learn a type,
+  ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
+  attribute cursor 23ai sends; an attribute is reported as the DDL translation
+  stored it, so ``RAW`` reads as ``BLOB``, ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB``
+  as their non-national forms, ``FLOAT`` as ``BINARY_DOUBLE`` and ``DATE`` as
+  ``TIMESTAMP(0)``, as the rest of the dictionary reports them. PL/SQL package
+  types (``all_plsql_types``) are not described.
 - **``REF`` / ``DEREF``, with a visible object id** — an Oracle object table
   (``CREATE TABLE t OF type``) gives every row a hidden object id that a REF names.
   PostgreSQL's typed tables cannot take a column beyond their type's, and a row's
@@ -95,7 +102,7 @@ import re
 import struct
 import uuid
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import psycopg
 from psycopg import sql
@@ -865,6 +872,32 @@ _ORACLE_DICTIONARY_DDL = (
     "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
     'CREATE OR REPLACE VIEW sys.user_type_attrs AS SELECT * FROM all_type_attrs '
     'WHERE owner=upper(current_schema());'
+    # Collection types (#1134): a VARRAY or nested table is a domain over an
+    # array, its bound the CHECK a VARRAY carries. A client reads the element's
+    # type here once the type shape has told it the element is an object.
+    'CREATE OR REPLACE VIEW sys.all_coll_types AS SELECT ora_owner(n.nspname) AS owner, '
+    'ora_name(d.typname) AS type_name, '
+    "CASE WHEN k.bound IS NULL THEN 'TABLE' ELSE 'VARYING ARRAY' END AS coll_type, "
+    'k.bound AS upper_bound, '
+    "CASE WHEN e.typtype = 'c' OR (e.typtype = 'd' AND eb.typcategory = 'A') "
+    'THEN ora_owner(en.nspname) END AS elem_type_owner, '
+    "CASE WHEN e.typtype = 'c' OR (e.typtype = 'd' AND eb.typcategory = 'A') "
+    'THEN ora_name(e.typname) '
+    f"WHEN e.typname = '{_CLOB_TYPE}' THEN 'CLOB' WHEN e.typname = '{_BLOB_TYPE}' THEN 'BLOB' "
+    'ELSE ora_type_name(format_type(e.oid, NULL)) END AS elem_type_name, '
+    'NULL::text AS elem_type_package '
+    'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
+    "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
+    'JOIN pg_type e ON e.oid = b.typelem '
+    'JOIN pg_namespace en ON en.oid = e.typnamespace '
+    'LEFT JOIN pg_type eb ON eb.oid = e.typbasetype '
+    'LEFT JOIN LATERAL (SELECT substring(pg_get_constraintdef(c.oid) '
+    "FROM '<=\\s*([0-9]+)')::int AS bound FROM pg_constraint c "
+    'WHERE c.contypid = d.oid LIMIT 1) k ON true '
+    "WHERE d.typtype = 'd' "
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    'CREATE OR REPLACE VIEW sys.user_coll_types AS SELECT * FROM all_coll_types '
+    'WHERE owner=upper(current_schema());'
     # REFs (#1127): which tables are Oracle object tables, and of what type --
     # what PostgreSQL's reloftype said while they were typed tables -- and the
     # one lookup every per-type sys.deref() makes: the object's attributes, as
@@ -1392,6 +1425,223 @@ _CREATE_TYPE_TABLE_OF = re.compile(
     r'\s*CREATE\s+TYPE\s+(\S+)\s+AS\s+TABLE\s+OF\s+(.+?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
+
+
+# The type descriptor (TDS) DBMS_PICKLER.GET_TYPE_SHAPE returns: a client reads
+# from it whether a type is a collection -- then its bound, its kind and its
+# element -- and each attribute's precision, scale and maximum length. Layout
+# measured against 23ai, which the offline tests reproduce byte for byte:
+#
+#   0   ub4  length of what follows          10  flags: 00 object, ff collection
+#   4   26 <version>, 1 or 2                 11  29, start of the ADT
+#   6   00 01                                12  00 00
+#   8   ub2  number of leaf attributes       14  ub4  index table position - 13
+#   18  the attributes, 2a, then the blocks a reference points at, then the
+#       index table: a ub2 per leaf, its position less 11.
+#
+# An object's object-typed attribute is embedded, 27 ... 28; a collection-typed
+# one, and a collection's named element, is a reference: 1b, the ub4 absolute
+# position of an fd block, then fa for an object or fb for a collection. A
+# collection's block is fd and its TDS; an object's is fd, a ub4 length, its TDS
+# and its null-image TDS, whose leaves are all 1a (one for the object itself).
+# The version is 2 when a leaf is of a type newer than Oracle 8.0 (the
+# timestamps, BINARY_FLOAT / BINARY_DOUBLE).
+@dataclass(frozen=True)
+class _TdsLeaf:
+    code: bytes
+    newer: bool = False
+
+
+@dataclass(frozen=True)
+class _TdsObject:
+    attrs: tuple
+
+
+@dataclass(frozen=True)
+class _TdsCollection:
+    varray: bool
+    bound: int
+    element: object
+
+
+_TDS_NULL_LEAF = _TdsLeaf(b'\x1a')
+
+
+def _tds_header(
+    body: bytes, leaves: list[int], *, collection: bool, version: int
+) -> bytes:
+    # `body` starts at absolute offset 18; `leaves` are absolute positions.
+    index_at = 18 + len(body)
+    index = b''.join((pos - 11).to_bytes(2, 'big') for pos in leaves)
+    head = (
+        bytes([0x26, version, 0x00, 0x01])
+        + len(leaves).to_bytes(2, 'big')
+        + bytes([0xFF if collection else 0x00, 0x29, 0x00, 0x00])
+        + (index_at - 13).to_bytes(4, 'big')
+    )
+    rest = head + body + index
+    return len(rest).to_bytes(4, 'big') + rest
+
+
+def _tds_is_newer(shape) -> bool:
+    if isinstance(shape, _TdsLeaf):
+        return shape.newer
+    if isinstance(shape, _TdsObject):
+        return any(
+            _tds_is_newer(a) for a in shape.attrs if not isinstance(a, _TdsCollection)
+        )
+    return False
+
+
+def _tds_reference(shape, block_at: int) -> tuple[bytes, bytes]:
+    # A reference to a named object or collection, and the fd block it names.
+    if isinstance(shape, _TdsCollection):
+        return (b'\x1b' + block_at.to_bytes(4, 'big') + b'\xfb', b'\xfd' + _tds(shape))
+    image = _tds(shape) + _tds_null(shape)
+    return (
+        b'\x1b' + block_at.to_bytes(4, 'big') + b'\xfa',
+        b'\xfd' + len(image).to_bytes(4, 'big') + image,
+    )
+
+
+def _tds(shape) -> bytes:
+    """The TDS of an object (_TdsObject) or a collection (_TdsCollection)."""
+    if isinstance(shape, _TdsCollection):
+        body = bytearray(b'\x1c' + (29).to_bytes(4, 'big'))
+        body += shape.bound.to_bytes(4, 'big') + bytes([3 if shape.varray else 2])
+        body += b'\x2a'
+        element = shape.element
+        if isinstance(element, _TdsLeaf):
+            body += element.code
+        else:
+            # The reference's block follows it directly, at 35.
+            (ref, block) = _tds_reference(element, 18 + len(body) + 6)
+            body += ref + block
+        return _tds_header(bytes(body), [18], collection=True, version=1)
+    body = bytearray()
+    leaves: list[int] = []
+    pending: list[tuple[int, object]] = []
+
+    def walk(attrs) -> None:
+        for attr in attrs:
+            if isinstance(attr, _TdsLeaf):
+                leaves.append(18 + len(body))
+                body.extend(attr.code)
+            elif isinstance(attr, _TdsObject):
+                body.append(0x27)
+                walk(attr.attrs)
+                body.append(0x28)
+            else:
+                leaves.append(18 + len(body))
+                pending.append((len(body) + 1, attr))
+                body.extend(b'\x1b\x00\x00\x00\x00\xfb')
+
+    walk(shape.attrs)
+    body.append(0x2A)
+    for slot, attr in pending:
+        block_at = 18 + len(body)
+        (_ref, block) = _tds_reference(attr, block_at)
+        body[slot : slot + 4] = block_at.to_bytes(4, 'big')
+        body.extend(block)
+    version = 2 if _tds_is_newer(shape) else 1
+    return _tds_header(bytes(body), leaves, collection=False, version=version)
+
+
+def _tds_null(shape: _TdsObject) -> bytes:
+    # The null-image TDS of an object: a 1a for the object and for each
+    # attribute, an embedded object's own set between 27 and 28.
+    def nulls(obj: _TdsObject) -> tuple:
+        out: list = [_TDS_NULL_LEAF]
+        for attr in obj.attrs:
+            out.append(
+                _TdsObject(nulls(attr))
+                if isinstance(attr, _TdsObject)
+                else _TDS_NULL_LEAF
+            )
+        return tuple(out)
+
+    return _tds(_TdsObject(nulls(shape)))
+
+
+# The metadata block a python-oracledb client runs before it binds or reads an
+# object: it calls DBMS_PICKLER.GET_TYPE_SHAPE for the type's OID, version, TDS
+# and a cursor of its attributes, then looks the type's own name up. Answered
+# here from the catalog, as a whole; the block's text is the client's, fixed.
+_TYPE_SHAPE_BLOCK = re.compile(
+    r'\bdbms_pickler\s*\.\s*get_type_shape\s*\(', re.IGNORECASE
+)
+# What GET_TYPE_SHAPE returns for a type that does not exist, as measured.
+_TYPE_SHAPE_NOT_FOUND = 1001
+# The built-in types' OIDs, as the attribute cursor reports them: 16 bytes,
+# zero but for the last.
+_BUILTIN_TYPE_OID_BYTE = {
+    'NUMBER': 0x0F,
+    'INTEGER': 0x16,
+    'VARCHAR2': 0x19,
+    'CHAR': 0x1A,
+    'BINARY_FLOAT': 0x44,
+    'BINARY_DOUBLE': 0x45,
+    'TIMESTAMP': 0x3D,
+    'TIMESTAMP WITH TZ': 0x3E,
+    'TIMESTAMP WITH LOCAL TZ': 0x41,
+    'CLOB': 0x22,
+    'BLOB': 0x23,
+}
+
+
+def _tds_number(precision: int = 0, scale: int = -127) -> _TdsLeaf:
+    return _TdsLeaf(bytes([0x06, precision & 0xFF, scale & 0xFF]))
+
+
+def _tds_chars(code: int, byte_length: int, national: bool) -> _TdsLeaf:
+    return _TdsLeaf(
+        bytes([code])
+        + byte_length.to_bytes(2, 'big')
+        + (b'\x82' if national else b'\x01')
+        + b'\x00\x00'
+    )
+
+
+def _tds_timestamp(code: int, scale: int) -> _TdsLeaf:
+    return _TdsLeaf(bytes([code, scale]), newer=True)
+
+
+def _tds_scalar(pg_name: str, typmod: int) -> tuple[_TdsLeaf, str]:
+    """A scalar PostgreSQL type's TDS leaf and the Oracle name the dictionary
+    reports it by (all_type_attrs), or raise for one with no Oracle equal."""
+    if pg_name == 'numeric':
+        if typmod < 0:
+            return (_tds_number(), 'NUMBER')
+        precision = ((typmod - 4) >> 16) & 0xFFFF
+        scale = (typmod - 4) & 0xFFFF
+        return (
+            _tds_number(precision, scale - 0x10000 if scale > 0x7FFF else scale),
+            'NUMBER',
+        )
+    if pg_name in ('int2', 'int4', 'int8'):
+        return (_tds_number(0, 0), 'INTEGER')
+    if pg_name == 'float4':
+        return (_TdsLeaf(b'\x25', newer=True), 'BINARY_FLOAT')
+    if pg_name == 'float8':
+        return (_TdsLeaf(b'\x2d', newer=True), 'BINARY_DOUBLE')
+    if pg_name == 'varchar':
+        return (_tds_chars(0x07, typmod - 4 if typmod > 4 else 4000, False), 'VARCHAR2')
+    if pg_name == 'bpchar':
+        return (_tds_chars(0x01, typmod - 4 if typmod > 4 else 1, False), 'CHAR')
+    if pg_name in ('text', _CLOB_TYPE):
+        return (_TdsLeaf(b'\x1d'), 'CLOB')
+    if pg_name in ('bytea', _BLOB_TYPE):
+        return (_TdsLeaf(b'\x1e'), 'BLOB')
+    if pg_name == 'timestamp':
+        return (_tds_timestamp(0x15, typmod if typmod >= 0 else 6), 'TIMESTAMP')
+    if pg_name == 'timestamptz':
+        return (
+            _tds_timestamp(0x21, typmod if typmod >= 0 else 6),
+            'TIMESTAMP WITH LOCAL TZ',
+        )
+    if pg_name == _TSTZ_TYPE:
+        return (_tds_timestamp(0x17, 6), 'TIMESTAMP WITH TZ')
+    raise UnsupportedFeature(f'type shape: {pg_name} has no Oracle attribute type')
 
 
 # Oracle session / user admin statements the provisioning issues, mapped to their
@@ -2618,6 +2868,31 @@ _BUILTIN_OIDS = frozenset(
 )
 
 
+def _varchar_column(name: bytes, size: int = 128) -> ColumnMeta:
+    return ColumnMeta(
+        name=name, data_type=TNS_TYPE_VARCHAR, data_length=size, max_size=size
+    )
+
+
+def _number_column(name: bytes) -> ColumnMeta:
+    return ColumnMeta(name=name, data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22)
+
+
+# The attribute cursor GET_TYPE_SHAPE returns, one column per field (#1134).
+_ATTRIBUTE_CURSOR_COLUMNS = (
+    _number_column(b'VERSION'),
+    _varchar_column(b'NAME'),
+    _number_column(b'ATTRIBUTE#'),
+    _varchar_column(b'TYPE_NAME'),
+    _varchar_column(b'TYPE_OWNER'),
+    _varchar_column(b'TYPE_PACKAGE'),
+    ColumnMeta(name=b'ATTR_TOID', data_type=TNS_TYPE_RAW, data_length=16, max_size=16),
+    _varchar_column(b'INSTANTIABLE', 3),
+    _varchar_column(b'SUPERTYPE_OWNER'),
+    _varchar_column(b'SUPERTYPE_NAME'),
+)
+
+
 def _object_type_oid(pg_oid: int) -> bytes:
     # The 16-byte OID all_types reports for a composite: its PostgreSQL oid,
     # zero-padded, the same bytes the view's `decode(lpad(to_hex(...)))` builds.
@@ -3344,6 +3619,149 @@ class PostgresBackend:
             return None
         return self._object_type(pg_oid)
 
+    def _type_kind(self, pg_oid: int) -> tuple[str, str, str, int, int] | None:
+        # (kind, owner, name, element oid, element typmod) of a named type: kind
+        # 'object' for a standalone or table row composite, 'collection' for an
+        # array domain (its element and bound), else None.
+        row = self._conn.execute(
+            'SELECT t.typtype, sys.ora_owner(n.nspname), sys.ora_name(t.typname), '
+            'b.typcategory, b.typelem, t.typtypmod, c.relkind '
+            'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+            'LEFT JOIN pg_type b ON b.oid = t.typbasetype '
+            'LEFT JOIN pg_class c ON c.oid = t.typrelid WHERE t.oid = %s',
+            (pg_oid,),
+        ).fetchone()
+        if row is None:
+            return None
+        (typtype, owner, name, base_category, element, typmod, relkind) = row
+        if typtype == 'c' and relkind in ('c', 'r') and pg_oid != self._tstz_oid:
+            return ('object', owner, name, 0, -1)
+        if typtype == 'd' and base_category == 'A':
+            return ('collection', owner, name, element, typmod)
+        return None
+
+    def _pg_type_name(self, pg_oid: int) -> str:
+        row = self._conn.execute(
+            'SELECT typname FROM pg_type WHERE oid = %s', (pg_oid,)
+        ).fetchone()
+        if row is None:
+            raise UnsupportedFeature(f'type shape: no type has the oid {pg_oid}')
+        return row[0]
+
+    def _type_shape(self, pg_oid: int, typmod: int = -1):
+        """The TDS shape of a type (#1134): a _TdsObject of its attributes, a
+        _TdsCollection of its element, or a scalar's leaf."""
+        kind = self._type_kind(pg_oid)
+        if kind is None:
+            return _tds_scalar(self._pg_type_name(pg_oid), typmod)[0]
+        if kind[0] == 'object':
+            return _TdsObject(
+                tuple(self._type_shape(t, m) for (_n, t, m) in self._attributes(pg_oid))
+            )
+        (_kind, _owner, _name, element, element_typmod) = kind
+        bound = self._conn.execute(
+            "SELECT substring(pg_get_constraintdef(oid) FROM '<=\\s*([0-9]+)')::int "
+            'FROM pg_constraint WHERE contypid = %s',
+            (pg_oid,),
+        ).fetchone()
+        return _TdsCollection(
+            varray=bound is not None and bound[0] is not None,
+            bound=bound[0] if bound and bound[0] is not None else 0,
+            element=self._type_shape(element, element_typmod),
+        )
+
+    def _attributes(self, pg_oid: int) -> list[tuple[str, int, int]]:
+        # (name, type oid, typmod) of a composite's attributes, in order.
+        return self._conn.execute(
+            'SELECT a.attname, a.atttypid, a.atttypmod FROM pg_type t '
+            'JOIN pg_attribute a ON a.attrelid = t.typrelid '
+            'WHERE t.oid = %s AND a.attnum > 0 AND NOT a.attisdropped '
+            "AND a.attname <> 'sys_nc_oid$' ORDER BY a.attnum",
+            (pg_oid,),
+        ).fetchall()
+
+    def _attribute_rows(self, pg_oid: int) -> list[tuple]:
+        # The attribute cursor GET_TYPE_SHAPE returns for an object: one row per
+        # attribute, as 23ai sends it -- a version, the name, the position, the
+        # type name, its owner (a named type's only), its package, its OID, and
+        # whether it is instantiable -- in the order the client reads them.
+        rows = []
+        for position, (attname, atttypid, atttypmod) in enumerate(
+            self._attributes(pg_oid), 1
+        ):
+            kind = self._type_kind(atttypid)
+            if kind is None:
+                type_name = _tds_scalar(self._pg_type_name(atttypid), atttypmod)[1]
+                (owner, toid) = (
+                    None,
+                    bytes(15) + bytes([_BUILTIN_TYPE_OID_BYTE[type_name]]),
+                )
+            else:
+                (_kind, owner, type_name, _e, _m) = kind
+                toid = _object_type_oid(atttypid)
+            rows.append(
+                (
+                    1,
+                    _oracle_column_name(attname),
+                    position,
+                    type_name,
+                    owner,
+                    None,
+                    toid,
+                    'YES',
+                    None,
+                    None,
+                )
+            )
+        return rows
+
+    def _execute_type_shape(self, sql: str, binds: Sequence) -> Result:
+        """python-oracledb's type-metadata block (#1134), answered whole: the
+        type's return code, OID, version, TDS, attribute cursor, and its own
+        schema and name."""
+        names = [name.lower() for (name, _q) in bind_placeholders(sql, dedupe=True)]
+        values: dict[str, object] = {n: b.value for (n, b) in zip(names, binds)}
+        full_name = str(values.get('full_name') or '')
+        attrs_rc = CursorResult(columns=list(_ATTRIBUTE_CURSOR_COLUMNS), rows=[])
+        answer: dict[str, object] = {
+            'ret_val': _TYPE_SHAPE_NOT_FOUND,
+            'oid': None,
+            'version': None,
+            'tds': None,
+            'attrs_rc': attrs_rc,
+            'package_name': None,
+            'schema': None,
+            'name': None,
+        }
+        row_type = full_name.upper().endswith('%ROWTYPE')
+        (schema, _dot, name) = full_name.rpartition('.')
+        if row_type:
+            name = name[: -len('%ROWTYPE')]
+        found = self._conn.execute(
+            'SELECT t.oid FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+            'LEFT JOIN pg_class c ON c.oid = t.typrelid '
+            'WHERE sys.ora_owner(n.nspname) = coalesce(%s, sys.ora_owner(current_schema())) '
+            'AND sys.ora_name(coalesce(c.relname, t.typname)) = %s '
+            "AND coalesce(c.relkind = 'r', false) = %s LIMIT 1",
+            (schema.strip('"') or None, name.strip('"'), row_type),
+        ).fetchone()
+        pg_oid = found[0] if found is not None else None
+        kind = self._type_kind(pg_oid) if pg_oid is not None else None
+        if pg_oid is not None and kind is not None:
+            (_kind, owner, type_name, _e, _m) = kind
+            shape = self._type_shape(pg_oid)
+            answer.update(
+                ret_val=0,
+                oid=_object_type_oid(pg_oid),
+                version=1,
+                tds=_tds(shape),
+                schema=owner,
+                name=f'{name.strip(chr(34))}%ROWTYPE' if row_type else type_name,
+            )
+            if isinstance(shape, _TdsObject):
+                attrs_rc.rows.extend(self._attribute_rows(pg_oid))
+        return Result(out_binds=[answer.get(n, values.get(n)) for n in names])
+
     def _object_type(self, pg_oid: int) -> tuple[DbObjectType, CompositeInfo] | None:
         """The Oracle object type a PostgreSQL composite oid stands for (#1127).
 
@@ -3791,6 +4209,8 @@ class PostgresBackend:
         # return every bind's value in order (input for IN, the routine's result
         # for OUT / IN OUT / the function return) — the Mirror marks them all OUT
         # and the client keeps only the positions it bound as a Var (#483/#503).
+        if _TYPE_SHAPE_BLOCK.search(sql):
+            return self._execute_type_shape(sql, binds)
         values = [b.value for b in binds]
         inner = _CALL_BLOCK.match(sql)
         statement = inner.group(1) if inner else ''
