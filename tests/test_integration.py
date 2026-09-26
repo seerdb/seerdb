@@ -1398,7 +1398,7 @@ class CursorIntegration(_IntegrationBase):
             ),
         )
         if self.conn.field_version < FIELD_VERSION_10_2:
-            self.skipTest('9i reads an LTZ var() bind in the session zone (#1241)')
+            self.skipTest('9i PL/SQL does LTZ + n on the database clock (#1241)')
         var = self.cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
         var.setvalue(0, value.replace(microsecond=0))
         self.cur.execute('begin :value := :value + 5.25; end;', {'value': var})
@@ -6729,7 +6729,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 )
                 if Conn.field_version < FIELD_VERSION_10_2:
                     self.skipTest(
-                        '9i reads an LTZ var() bind in the session zone (#1241)'
+                        '9i PL/SQL does LTZ + n on the database clock (#1241)'
                     )
                 var = Cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
                 var.setvalue(0, value.replace(microsecond=0))
