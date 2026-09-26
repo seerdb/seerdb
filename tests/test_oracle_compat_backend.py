@@ -103,6 +103,30 @@ def test_plsql_without_assignments_stays_a_noop() -> None:
     assert result.out_binds == []
 
 
+def test_end_to_end_tracing_reaches_the_inner_backend() -> None:
+    # The Mirror finds this hook with `getattr` on the backend it was HANDED,
+    # which is the wrapper -- so a hook the wrapper does not name is invisible
+    # however well the backend beneath implements it. Tracing over PostgreSQL
+    # failed exactly that way: the piggyback was parsed, PostgresBackend grew a
+    # set_end_to_end, and nothing ever called it, so SYS_CONTEXT kept answering
+    # NULL (#183).
+    class _Tracing(_FakeInner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attrs: dict | None = None
+
+        def set_end_to_end(self, attrs: dict) -> None:
+            self.attrs = attrs
+
+    inner = _Tracing()
+    backend = OracleCompatBackend(inner)
+    # The wrapper has to ADVERTISE it, not merely be able to call it: the Mirror
+    # tests with getattr before calling.
+    assert getattr(backend, 'set_end_to_end', None) is not None
+    backend.set_end_to_end({'module': 'M', 'action': 'A'})
+    assert inner.attrs == {'module': 'M', 'action': 'A'}
+
+
 def test_a_hook_the_backend_lacks_stays_absent_through_the_wrapper() -> None:
     # The absence has to survive the wrapper too. The Mirror decides whether a
     # capability exists with `getattr(backend, hook, None)`, so a wrapper that

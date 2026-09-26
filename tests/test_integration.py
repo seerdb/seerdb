@@ -2373,6 +2373,8 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(Var.getvalue(), 'nat ünî 中')
 
     def test_national_array_bind_round_trip(self):
+        # PL/SQL-bound: an associative array lives in a PL/SQL PACKAGE (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # An associative array of NVARCHAR2 in both directions (#991). The
         # element is encoded as a bare value, so it never saw the bind's charset
         # form: going out it went as UTF-8 and the server read those bytes as
@@ -3310,6 +3312,31 @@ class ErrorAndRowcountIntegration(_IntegrationBase):
         # value … to a number"), so assert on the code + prefix, not the phrase.
         self.assertEqual(ctx.exception.code, 1722)
         self.assertIn('ORA-01722', str(ctx.exception))
+
+    def test_a_string_too_long_for_its_column_is_ora_12899(self):
+        # "value too large for column". A real server raises it natively, so this
+        # holds every leg to the same answer -- over PostgreSQL it arrives as
+        # SQLSTATE 22001 and has to be mapped, or a client branching on the code
+        # is told ORA-00900, a syntax error (#1127).
+        # Before 10g the same error is ORA-01401, "inserted value too large for
+        # column" (measured on 8i and 9i).
+        expected = 1401 if self.conn.field_version < FIELD_VERSION_10_2 else 12899
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v VARCHAR2(3))')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(f"INSERT INTO {self.TABLE} VALUES ('abcd')")
+        self.assertEqual(ctx.exception.code, expected)
+        self.assertIn(f'ORA-{expected:05d}', str(ctx.exception))
+
+    def test_a_number_too_wide_for_its_column_is_ora_01438(self):
+        # "value larger than specified precision allowed for this column". Over
+        # PostgreSQL it shares SQLSTATE 22003 with arithmetic overflow, which is
+        # Oracle's ORA-01426 instead, so the mapping has to tell them apart
+        # (#1127). This is the column case.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (v NUMBER(3))')
+        with self.assertRaises(seerdb.DatabaseError) as ctx:
+            self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1000)')
+        self.assertEqual(ctx.exception.code, 1438)
+        self.assertIn('ORA-01438', str(ctx.exception))
 
     def test_error_message_for_unique_constraint(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY)')
@@ -4300,6 +4327,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertIsNone(Var.getvalue())
 
     def test_inout_clob_var_small(self):
+        # PL/SQL-bound: DBMS_LOB.WRITEAPPEND is a PL/SQL procedure with an IN OUT LOB (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # Under the 32767-byte promotion threshold, so the bind stays a Var.
         Var = self.cur.var(seerdb.DB_TYPE_CLOB)
         Var.setvalue(0, 'small')
@@ -4307,6 +4336,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(Var.getvalue().read(), 'smallEND')
 
     def test_inout_clob_var_over_the_promotion_threshold(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         # Over it, so the Var is promoted to a temp-LOB marker on the way out
         # (#902). The marker has to carry the Var, or the returned value has
         # neither a type to decode against nor anywhere to land.
@@ -4327,6 +4358,8 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
 
     def test_inout_blob_var_over_the_promotion_threshold(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        self._skip_if_mirror_backend('postgres', 'run PL/SQL')
         Var = self.cur.var(seerdb.DB_TYPE_BLOB)
         Var.setvalue(0, b'L' * 52345)
         self.cur.execute(
@@ -5542,7 +5575,6 @@ class GettypeCurrentSchemaIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        self._skip_if_mirror_backend('postgres', 'describe an object type')
         self._drop_type()
         self.cur.execute(f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER)')
         self.owner = self.conn.gettype(self.TYPE).schema
@@ -5595,6 +5627,12 @@ class PlsqlTypeIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('a package-level type needs the 12.1+ bind support')
+        # A package-level type lives in a PL/SQL PACKAGE, so this class cannot
+        # run against a backend with no PL/SQL at all. It skipped on the
+        # PostgreSQL leg only by accident until that Mirror reached 12.1: the
+        # version gate above was doing the work. The capability is what actually
+        # decides it (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         self._drop_objects()
         # A schema-level type of the SAME shape, so the two-part name
         # `PKG.TYPE` cannot be confused with `SCHEMA.TYPE` by accident.
@@ -5752,6 +5790,11 @@ class RefCursorInBindIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('a REF CURSOR IN bind needs the 12c+ bind OAC')
+        # The cursor is drained by a PL/SQL procedure in a PACKAGE, and the whole
+        # class is built on one, so a backend with no PL/SQL cannot run it. It
+        # skipped on the PostgreSQL leg only because that Mirror was below 12.1;
+        # the capability is what actually decides it (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         try:
             self.cur.execute(f'DROP PACKAGE {self.PKG}')
         except seerdb.DatabaseError:
@@ -5848,6 +5891,12 @@ class ObjectOutBindIntegration(_IntegrationBase):
         super().setUp()
         if self.conn.field_version < FIELD_VERSION_12_1:
             self.skipTest('an object bind needs the 12.1+ OAC')
+        # The object OUT binds are filled by procedures in a PL/SQL PACKAGE this
+        # setUp builds and every test calls into, so a backend with no PL/SQL
+        # cannot run the class. It was hidden twice over on the PostgreSQL leg:
+        # first by the 12.1 version gate above, then by the VARRAY it declares,
+        # which PostgreSQL could not parse until that was translated (#1127).
+        self._skip_if_mirror_backend('postgres', 'create a PL/SQL package')
         self._drop_objects()
         self.cur.execute(f'CREATE TYPE {self.TYPE} AS VARRAY(10) OF NUMBER')
         self.cur.execute(
@@ -6019,6 +6068,65 @@ class ObjectReturningIntegration(_IntegrationBase):
         (returned,) = out_obj.getvalue()
         self.assertEqual(returned.NAME, 'Bob')
         self.assertEqual(int(out_num.getvalue()[0]), 42)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
+    # An object whose attribute is TIMESTAMP WITH TIME ZONE binds and returns
+    # with the offset it was entered at. The Mirror-over-PG stores that type as
+    # a composite of its own, which its object support once took for a nested
+    # object type and refused (#1134).
+    TYPE = 'PYO_TSTZ_ATTR_T'
+
+    def setUp(self):
+        super().setUp()
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            self.skipTest('an object bind needs the 12.1+ OAC')
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass  # best-effort teardown of leftovers
+        self.cur.execute(
+            f'CREATE TYPE {self.TYPE} AS OBJECT (id NUMBER, ts TIMESTAMP WITH TIME ZONE)'
+        )
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, o {self.TYPE})')
+
+    def tearDown(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for stmt in (f'DROP TABLE {self.TABLE}', f'DROP TYPE {self.TYPE}'):
+            try:
+                self.cur.execute(stmt)
+            except DatabaseError:
+                pass
+        super().tearDown()
+
+    def test_the_attribute_keeps_its_offset(self):
+        import datetime
+
+        entered = datetime.datetime(
+            2026, 9, 25, 1, 2, 3, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+        )
+        typ = self.conn.gettype(self.TYPE)
+        obj = typ.newobject()
+        obj.ID = 1
+        obj.TS = entered
+        out = self.cur.var(typ)
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} (n, o) VALUES (1, :obj) '
+            'RETURNING o INTO :outObj',
+            [obj, out],
+        )
+        (returned,) = out.getvalue()
+        self.assertEqual(returned.TS, entered)
+        self.assertEqual(returned.TS.utcoffset(), datetime.timedelta(hours=2))
+        self.cur.execute(f'SELECT o FROM {self.TABLE}')
+        (fetched,) = self.cur.fetchone()
+        self.assertEqual(fetched.TS, entered)
+        self.assertEqual(fetched.TS.utcoffset(), datetime.timedelta(hours=2))
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
@@ -6864,10 +6972,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
 
     async def test_gettype_follows_the_current_schema(self):
         # Async twin of GettypeCurrentSchemaIntegration.
-        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
-            self.skipTest(
-                "the Mirror's postgres backend cannot describe an object type"
-            )
         Typ = 'PYO_ASYNC_CURSCHEMA_T'
         Conn = await seerdb.connect_async(**self._kwargs())
         try:
@@ -6892,6 +6996,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Conn.close()
 
     async def test_gettype_resolves_a_package_level_type(self):
+        # PL/SQL-bound: a package-level type lives in a PL/SQL PACKAGE (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # Async twin of PlsqlTypeIntegration (#1030).
         Pkg = 'PYO_ASYNC_PLSQLTYPE_PKG'
         Conn = await seerdb.connect_async(**self._kwargs())
@@ -6932,6 +7039,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Conn.close()
 
     async def test_a_bare_object_out_bind_takes_its_value(self):
+        # PL/SQL-bound: the object OUT bind is filled by a PL/SQL PACKAGE (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # Async twin of ObjectOutBindIntegration (#1029): an object handed to
         # callproc with no Var around it takes the OUT value in place.
         Typ = 'PYO_ASYNC_OUTBIND_T'
@@ -7036,6 +7146,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Conn.close()
 
     async def test_inout_clob_var(self):
+        # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
+        if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+            self.skipTest("the Mirror's postgres backend cannot run PL/SQL")
         # The async twin of LOBOutBindIntegration (#978): a LOB OUT bind's value
         # arrives in the LOB framing, and the read that materialises it is
         # awaited. 12.1+ only, like the sync class.

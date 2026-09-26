@@ -53,15 +53,30 @@ edge of this adapter:
   only a block and a slot, not the data-object# and
   relative-file# that the package's accessors (``ROWID_OBJECT``,
   ``ROWID_RELATIVE_FNO``, …) decompose a physical rowid into.
-- **Real ``REF`` / ``DEREF``** — an Oracle object type maps to a PostgreSQL
-  composite type and a typed table (``CREATE TABLE t OF type``), and ``SELECT
-  REF(p)`` is emulated with the row's ctid as the locator plus the object type
-  recovered from ``pg_class.reloftype`` — enough for the client to decode a REF with
-  the right ``type_name`` (which is all the 11g REF tests check before they skip the
-  bind). But a PostgreSQL composite has no REF *pointer*: the actual REF **bind** and
-  ``DEREF`` round-trip is a 12c+ feature the suite already skips on the 11g Mirror,
-  and could not be served if it did not — the ctid locator is opaque and never
-  dereferenced.
+- **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
+  composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
+  composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
+  binds, returns (``RETURNING o INTO :b``) and fetches. Not yet: binding an
+  attribute that is itself an object or a collection (refused, not guessed), and
+  type methods. A VARRAY or nested table is a domain over an array, listed in
+  ``all_coll_types``. The block python-oracledb runs to learn a type,
+  ``DBMS_PICKLER.GET_TYPE_SHAPE``, is answered from the catalog with the TDS and
+  attribute cursor 23ai sends; an attribute is reported as the DDL translation
+  stored it, so ``RAW`` reads as ``BLOB``, ``NVARCHAR2`` / ``NCHAR`` / ``NCLOB``
+  as their non-national forms, ``FLOAT`` as ``BINARY_DOUBLE`` and ``DATE`` as
+  ``TIMESTAMP(0)``, as the rest of the dictionary reports them. PL/SQL package
+  types (``all_plsql_types``) are not described.
+- **``REF`` / ``DEREF``, with a visible object id** — an Oracle object table
+  (``CREATE TABLE t OF type``) gives every row a hidden object id that a REF names.
+  PostgreSQL's typed tables cannot take a column beyond their type's, and a row's
+  physical address (``ctid``) moves on ``UPDATE`` / ``VACUUM FULL``, so an object
+  table becomes an ordinary table of the type's columns plus ``sys_nc_oid$`` (a
+  uuid; Oracle's own name for the column), recorded in ``sys.ora_object_tables``.
+  A REF is the table's oid and that id, carried in each type's ``<type>$ref``
+  companion composite; ``DEREF`` is an overloaded ``sys.deref()``, and a REF whose
+  row is gone dereferences to NULL, as a dangling Oracle REF does. PostgreSQL has
+  no hidden columns, though: ``SELECT *`` from an object table, and the dictionary
+  views, show ``sys_nc_oid$`` too.
 - **Integer division semantics** — Oracle's ``/`` is always NUMBER (float)
   division, so ``15 / 10`` is ``1.5``; PostgreSQL's integer ``/`` truncates to
   ``1``. Matching Oracle would mean coercing every division to numeric, a broad
@@ -85,8 +100,9 @@ import datetime
 import hashlib
 import re
 import struct
+import uuid
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import psycopg
 from psycopg import sql
@@ -94,7 +110,13 @@ from psycopg.adapt import Loader
 from psycopg.types.composite import CompositeInfo, register_composite
 
 from seerdb.common.datatypes import BcDate, IntervalYM
-from seerdb.common.dbobject import DbRef
+from seerdb.common.dbobject import (
+    DbObjectType,
+    DbRef,
+    ObjectImage,
+    decode_object_image,
+    type_name_to_tns,
+)
 from seerdb.common.sqltext import (
     bind_placeholders,
     is_plsql,
@@ -102,7 +124,8 @@ from seerdb.common.sqltext import (
     strip_returning_into,
 )
 from seerdb.common.tns_consts import (
-    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
+    TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
@@ -516,7 +539,47 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN 'ip_address' THEN NULL "
     "WHEN 'lang' THEN 'US' "
     "WHEN 'language' THEN 'AMERICAN_AMERICA.AL32UTF8' "
+    # End-to-end application tracing (#183): the client sets these over the 12c
+    # tracing piggyback and reads them straight back out of SYS_CONTEXT, so they
+    # have to survive in the session. They live in PostgreSQL customised options
+    # under `seerdb.`, which are exactly session-scoped GUCs; `true` is
+    # missing_ok, so an attribute never set reads as NULL rather than raising,
+    # and an attribute CLEARED is stored as '' and mapped back to NULL -- Oracle
+    # reports a cleared attribute as NULL, not as an empty string.
+    "WHEN 'module' THEN nullif(current_setting('seerdb.module', true), '') "
+    "WHEN 'action' THEN nullif(current_setting('seerdb.action', true), '') "
+    "WHEN 'client_identifier' THEN "
+    "nullif(current_setting('seerdb.client_identifier', true), '') "
+    "WHEN 'client_info' THEN "
+    "nullif(current_setting('seerdb.client_info', true), '') "
     'ELSE NULL END $$;'
+    # DBMS_LOB.GETLENGTH(lob): the one DBMS_LOB entry point the suite calls from
+    # ordinary SQL rather than from inside a PL/SQL block (#1127). A CLOB is
+    # `text` here and a BLOB is `bytea`, so the length is `length` or
+    # `octet_length` -- Oracle counts CHARACTERS for a CLOB and BYTES for a BLOB,
+    # which is what those two do respectively. NULL in, NULL out, as Oracle does
+    # for a NULL locator.
+    #
+    # The schema is created rather than the function put on the search_path:
+    # every call site writes it qualified, `DBMS_LOB.GETLENGTH(c)`, and
+    # PostgreSQL folds the unquoted name to `dbms_lob.getlength`. orafce ships
+    # dbms_alert / assert / output / pipe / random / sql / utility but no
+    # dbms_lob at all, so there is nothing to lean on.
+    'CREATE SCHEMA IF NOT EXISTS dbms_lob;'
+    'CREATE OR REPLACE FUNCTION dbms_lob.getlength(text) RETURNS integer '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT length($1) $$;'
+    'CREATE OR REPLACE FUNCTION dbms_lob.getlength(bytea) RETURNS integer '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT octet_length($1) $$;'
+    # TO_CLOB(x): Oracle promotes a value to a CLOB; a CLOB IS text here, so the
+    # conversion is a cast and the function exists only so the name resolves
+    # (#1127). Declared for text and for the untyped literal a bare
+    # `TO_CLOB('x')` produces -- PostgreSQL resolves `unknown` to no function at
+    # all otherwise, which is what `ORA-00904: function to_clob(unknown) does
+    # not exist` was. orafce does not provide it.
+    'CREATE OR REPLACE FUNCTION sys.to_clob(text) RETURNS text LANGUAGE sql '
+    'IMMUTABLE AS $$ SELECT $1 $$;'
+    'CREATE OR REPLACE FUNCTION sys.to_clob(anyelement) RETURNS text LANGUAGE sql '
+    'IMMUTABLE AS $$ SELECT $1::text $$;'
     # ora_owner(schema): the Oracle owner for a PostgreSQL schema — the current
     # schema for a session-local (pg_temp) object, so GLOBAL TEMPORARY tables and
     # their indexes/constraints report under the user's schema like Oracle (#759).
@@ -537,6 +600,20 @@ _ORACLE_DICTIONARY_DDL = (
     "IMMUTABLE AS $$ SELECT CASE WHEN $1 ~ '^[a-z][a-z0-9_$#]*$' "
     "AND upper($1) <> ALL (ARRAY['ALL','ALTER','AND','ANY','AS','ASC','BETWEEN','BY','CHAR','CHECK','CLUSTER','COMMENT','COMPRESS','CONNECT','CREATE','CURRENT','DATE','DECIMAL','DEFAULT','DELETE','DESC','DISTINCT','DROP','ELSE','EXCLUSIVE','EXISTS','FLOAT','FOR','FROM','GRANT','GROUP','HAVING','IDENTIFIED','IN','INDEX','INSERT','INTEGER','INTERSECT','INTO','IS','LEVEL','LIKE','LOCK','LONG','MINUS','MODE','NOCOMPRESS','NOT','NOWAIT','NULL','NUMBER','OF','ON','OPTION','OR','ORDER','PCTFREE','PRIOR','PUBLIC','RAW','RENAME','RESOURCE','REVOKE','SELECT','SET','SHARE','SIZE','SMALLINT','START','SYNONYM','TABLE','THEN','TO','TRIGGER','UID','UNION','UNIQUE','UPDATE','USER','VALUES','VARCHAR','VARCHAR2','VIEW','WHERE','WITH']) THEN upper($1) "
     'ELSE $1 END $$;'
+    # ora_type_name(data_type): the Oracle type name for an information_schema
+    # data_type, shared by the table-column and the object-attribute views so
+    # the two report one type the same way.
+    'CREATE OR REPLACE FUNCTION sys.ora_type_name(text) RETURNS text LANGUAGE sql '
+    "IMMUTABLE AS $$ SELECT CASE $1 WHEN 'numeric' THEN 'NUMBER' "
+    "WHEN 'integer' THEN 'NUMBER' "
+    "WHEN 'bigint' THEN 'NUMBER' WHEN 'smallint' THEN 'NUMBER' "
+    "WHEN 'double precision' THEN 'BINARY_DOUBLE' WHEN 'real' THEN 'BINARY_FLOAT' "
+    "WHEN 'character varying' THEN 'VARCHAR2' WHEN 'character' THEN 'CHAR' "
+    "WHEN 'text' THEN 'CLOB' WHEN 'date' THEN 'DATE' "
+    "WHEN 'timestamp without time zone' THEN 'TIMESTAMP' "
+    "WHEN 'timestamp with time zone' THEN 'TIMESTAMP WITH TIME ZONE' "
+    "WHEN 'bytea' THEN 'BLOB' WHEN 'boolean' THEN 'NUMBER' "
+    'ELSE upper($1) END $$;'
     # Oracle-shaped catalog views over information_schema / pg_catalog. Oracle
     # treats the user as the schema and folds names upper-case, so `owner` and the
     # object names are UPPER(pg schema/relation), and a client that filters
@@ -582,15 +659,7 @@ _ORACLE_DICTIONARY_DDL = (
     'ELSE upper(c.table_schema) END AS owner, '
     'ora_name(c.table_name) AS table_name, ora_name(c.column_name) AS column_name, '
     'c.ordinal_position AS column_id, '
-    "CASE c.data_type WHEN 'numeric' THEN 'NUMBER' WHEN 'integer' THEN 'NUMBER' "
-    "WHEN 'bigint' THEN 'NUMBER' WHEN 'smallint' THEN 'NUMBER' "
-    "WHEN 'double precision' THEN 'BINARY_DOUBLE' WHEN 'real' THEN 'BINARY_FLOAT' "
-    "WHEN 'character varying' THEN 'VARCHAR2' WHEN 'character' THEN 'CHAR' "
-    "WHEN 'text' THEN 'CLOB' WHEN 'date' THEN 'DATE' "
-    "WHEN 'timestamp without time zone' THEN 'TIMESTAMP' "
-    "WHEN 'timestamp with time zone' THEN 'TIMESTAMP WITH TIME ZONE' "
-    "WHEN 'bytea' THEN 'BLOB' WHEN 'boolean' THEN 'NUMBER' "
-    'ELSE upper(c.data_type) END AS data_type, '
+    'ora_type_name(c.data_type) AS data_type, '
     'coalesce(c.character_maximum_length, c.numeric_precision, 22) AS data_length, '
     'c.numeric_precision AS data_precision, c.numeric_scale AS data_scale, '
     'c.character_maximum_length AS char_length, '
@@ -769,6 +838,85 @@ _ORACLE_DICTIONARY_DDL = (
     'sys.ora_serial(a.pid) AS "serial#", s.driver AS client_driver '
     'FROM pg_stat_activity a LEFT JOIN sys.ora_sessions s ON s.pid = a.pid '
     "WHERE a.datname = current_database() AND a.backend_type = 'client backend';"
+    # Object types (#1127): `CREATE TYPE ... AS OBJECT` is a standalone composite
+    # (relkind 'c' -- a table's own row type is not one). A client resolves a
+    # type through these two views before it binds or reads a value of it, so a
+    # type missing here is `object type ... not found`. Oracle identifies a type
+    # by a 16-byte OID; here it is PostgreSQL's own type oid, zero-padded, so the
+    # backend can turn an OID a bind carries straight back into the type. A
+    # built-in attribute type has no owner, as in Oracle.
+    'CREATE OR REPLACE VIEW sys.all_types AS SELECT ora_owner(n.nspname) AS owner, '
+    'ora_name(t.typname) AS type_name, '
+    "decode(lpad(to_hex(t.oid::bigint), 32, '0'), 'hex') AS type_oid, "
+    "'OBJECT'::text AS typecode, "
+    '(SELECT count(*) FROM pg_attribute a WHERE a.attrelid = t.typrelid '
+    'AND a.attnum > 0 AND NOT a.attisdropped) AS attributes '
+    'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+    'JOIN pg_class c ON c.oid = t.typrelid '
+    "WHERE t.typtype = 'c' AND c.relkind = 'c' "
+    f"AND t.typname <> '{_TSTZ_TYPE}' AND t.typname !~ '[$]ref$' "
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    'CREATE OR REPLACE VIEW sys.user_types AS SELECT * FROM all_types '
+    'WHERE owner=upper(current_schema());'
+    'CREATE OR REPLACE VIEW sys.all_type_attrs AS SELECT '
+    'ora_owner(a.udt_schema) AS owner, ora_name(a.udt_name) AS type_name, '
+    'ora_name(a.attribute_name) AS attr_name, '
+    # The ora_tstz composite is this backend's TIMESTAMP WITH TIME ZONE, not an
+    # object type an attribute holds.
+    f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' THEN 'TIMESTAMP WITH TIME ZONE' "
+    "WHEN a.data_type = 'USER-DEFINED' THEN ora_name(a.attribute_udt_name) "
+    'ELSE ora_type_name(a.data_type) END AS attr_type_name, '
+    "CASE WHEN a.data_type = 'USER-DEFINED' "
+    f"AND a.attribute_udt_name <> '{_TSTZ_TYPE}' THEN ora_owner(a.attribute_udt_schema) "
+    'END AS attr_type_owner, '
+    'a.character_maximum_length AS length, a.numeric_precision AS precision, '
+    'a.numeric_scale AS scale, a.ordinal_position AS attr_no '
+    'FROM information_schema.attributes a '
+    f"WHERE a.udt_name <> '{_TSTZ_TYPE}' AND a.udt_name !~ '[$]ref$' "
+    "AND a.udt_schema NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    'CREATE OR REPLACE VIEW sys.user_type_attrs AS SELECT * FROM all_type_attrs '
+    'WHERE owner=upper(current_schema());'
+    # Collection types (#1134): a VARRAY or nested table is a domain over an
+    # array, its bound the CHECK a VARRAY carries. A client reads the element's
+    # type here once the type shape has told it the element is an object.
+    'CREATE OR REPLACE VIEW sys.all_coll_types AS SELECT ora_owner(n.nspname) AS owner, '
+    'ora_name(d.typname) AS type_name, '
+    "CASE WHEN k.bound IS NULL THEN 'TABLE' ELSE 'VARYING ARRAY' END AS coll_type, "
+    'k.bound AS upper_bound, '
+    "CASE WHEN e.typtype = 'c' OR (e.typtype = 'd' AND eb.typcategory = 'A') "
+    'THEN ora_owner(en.nspname) END AS elem_type_owner, '
+    "CASE WHEN e.typtype = 'c' OR (e.typtype = 'd' AND eb.typcategory = 'A') "
+    'THEN ora_name(e.typname) '
+    f"WHEN e.typname = '{_CLOB_TYPE}' THEN 'CLOB' WHEN e.typname = '{_BLOB_TYPE}' THEN 'BLOB' "
+    'ELSE ora_type_name(format_type(e.oid, NULL)) END AS elem_type_name, '
+    'NULL::text AS elem_type_package '
+    'FROM pg_type d JOIN pg_namespace n ON n.oid = d.typnamespace '
+    "JOIN pg_type b ON b.oid = d.typbasetype AND b.typcategory = 'A' "
+    'JOIN pg_type e ON e.oid = b.typelem '
+    'JOIN pg_namespace en ON en.oid = e.typnamespace '
+    'LEFT JOIN pg_type eb ON eb.oid = e.typbasetype '
+    'LEFT JOIN LATERAL (SELECT substring(pg_get_constraintdef(c.oid) '
+    "FROM '<=\\s*([0-9]+)')::int AS bound FROM pg_constraint c "
+    'WHERE c.contypid = d.oid LIMIT 1) k ON true '
+    "WHERE d.typtype = 'd' "
+    "AND n.nspname NOT IN ('pg_catalog','information_schema','oracle','sys');"
+    'CREATE OR REPLACE VIEW sys.user_coll_types AS SELECT * FROM all_coll_types '
+    'WHERE owner=upper(current_schema());'
+    # REFs (#1127): which tables are Oracle object tables, and of what type --
+    # what PostgreSQL's reloftype said while they were typed tables -- and the
+    # one lookup every per-type sys.deref() makes: the object's attributes, as
+    # the type's text form, from the row whose hidden id the REF carries. A REF
+    # to a row that is gone yields NULL, as Oracle's dangling REF does.
+    'CREATE TABLE IF NOT EXISTS sys.ora_object_tables '
+    '(relid oid PRIMARY KEY, typ oid NOT NULL);'
+    'CREATE OR REPLACE FUNCTION sys.ora_deref_row(tab oid, id uuid, typ regtype) '
+    'RETURNS text LANGUAGE plpgsql STABLE AS $$ DECLARE cols text; res text; BEGIN '
+    'IF tab IS NULL OR id IS NULL THEN RETURN NULL; END IF; '
+    "SELECT string_agg(quote_ident(attname), ',' ORDER BY attnum) INTO cols "
+    'FROM pg_attribute WHERE attrelid = (SELECT typrelid FROM pg_type '
+    'WHERE oid = typ) AND attnum > 0 AND NOT attisdropped; '
+    'EXECUTE format(\'SELECT ROW(%s)::%s::text FROM %s WHERE "sys_nc_oid$" = $1\', '
+    'cols, typ, tab::regclass) INTO res USING id; RETURN res; END $$;'
 )
 
 # What the installed dictionary is stamped with, as the `sys` schema's comment:
@@ -1058,13 +1206,13 @@ _DDL_TYPE_REWRITES = [
     (re.compile(r'\(\s*(\d+)\s+(?:CHAR|BYTE)\s*\)', re.IGNORECASE), r'(\1)'),
     # SYS_REFCURSOR (a REF CURSOR OUT param) → PostgreSQL's refcursor (#518).
     (re.compile(r'\bSYS_REFCURSOR\b', re.IGNORECASE), 'refcursor'),
-    # A `REF <object type>` column (#139). PostgreSQL has no REF, but the REF-bind
-    # column is only exercised by the 12c+ path the suite skips on the 11g Mirror —
-    # the CREATE just has to succeed — so the column becomes a bytea placeholder.
-    # The column name before REF is kept: it anchors the match to a REF *type*, so
-    # a column merely *named* `ref` (ref INTEGER) is left alone. `REF(` (a REF()
-    # call) has no space and is not matched.
-    (re.compile(r'\b(\w+)\s+REF\s+\w+', re.IGNORECASE), r'\1 bytea'),
+    # A `REF <object type>` column (#139): the type's companion `<type>$ref`
+    # composite -- the object table's oid and the row's stable id -- which the
+    # overloaded sys.deref() resolves (#1127). The column name before REF is
+    # kept: it anchors the match to a REF *type*, so a column merely *named* `ref`
+    # (ref INTEGER) is left alone. `REF(` (a REF() call) has no space and is not
+    # matched.
+    (re.compile(r'\b(\w+)\s+REF\s+(\w+)', re.IGNORECASE), r'\1 \2$ref'),
     # ROWID / UROWID column types hold a rowid's text form. Without this the
     # ROWID pseudo-column rewrite reached the column's TYPE and the CREATE
     # failed. A UROWID can hold an index-organized table's logical rowid, which
@@ -1283,6 +1431,223 @@ _CREATE_TYPE_TABLE_OF = re.compile(
 )
 
 
+# The type descriptor (TDS) DBMS_PICKLER.GET_TYPE_SHAPE returns: a client reads
+# from it whether a type is a collection -- then its bound, its kind and its
+# element -- and each attribute's precision, scale and maximum length. Layout
+# measured against 23ai, which the offline tests reproduce byte for byte:
+#
+#   0   ub4  length of what follows          10  flags: 00 object, ff collection
+#   4   26 <version>, 1 or 2                 11  29, start of the ADT
+#   6   00 01                                12  00 00
+#   8   ub2  number of leaf attributes       14  ub4  index table position - 13
+#   18  the attributes, 2a, then the blocks a reference points at, then the
+#       index table: a ub2 per leaf, its position less 11.
+#
+# An object's object-typed attribute is embedded, 27 ... 28; a collection-typed
+# one, and a collection's named element, is a reference: 1b, the ub4 absolute
+# position of an fd block, then fa for an object or fb for a collection. A
+# collection's block is fd and its TDS; an object's is fd, a ub4 length, its TDS
+# and its null-image TDS, whose leaves are all 1a (one for the object itself).
+# The version is 2 when a leaf is of a type newer than Oracle 8.0 (the
+# timestamps, BINARY_FLOAT / BINARY_DOUBLE).
+@dataclass(frozen=True)
+class _TdsLeaf:
+    code: bytes
+    newer: bool = False
+
+
+@dataclass(frozen=True)
+class _TdsObject:
+    attrs: tuple
+
+
+@dataclass(frozen=True)
+class _TdsCollection:
+    varray: bool
+    bound: int
+    element: object
+
+
+_TDS_NULL_LEAF = _TdsLeaf(b'\x1a')
+
+
+def _tds_header(
+    body: bytes, leaves: list[int], *, collection: bool, version: int
+) -> bytes:
+    # `body` starts at absolute offset 18; `leaves` are absolute positions.
+    index_at = 18 + len(body)
+    index = b''.join((pos - 11).to_bytes(2, 'big') for pos in leaves)
+    head = (
+        bytes([0x26, version, 0x00, 0x01])
+        + len(leaves).to_bytes(2, 'big')
+        + bytes([0xFF if collection else 0x00, 0x29, 0x00, 0x00])
+        + (index_at - 13).to_bytes(4, 'big')
+    )
+    rest = head + body + index
+    return len(rest).to_bytes(4, 'big') + rest
+
+
+def _tds_is_newer(shape) -> bool:
+    if isinstance(shape, _TdsLeaf):
+        return shape.newer
+    if isinstance(shape, _TdsObject):
+        return any(
+            _tds_is_newer(a) for a in shape.attrs if not isinstance(a, _TdsCollection)
+        )
+    return False
+
+
+def _tds_reference(shape, block_at: int) -> tuple[bytes, bytes]:
+    # A reference to a named object or collection, and the fd block it names.
+    if isinstance(shape, _TdsCollection):
+        return (b'\x1b' + block_at.to_bytes(4, 'big') + b'\xfb', b'\xfd' + _tds(shape))
+    image = _tds(shape) + _tds_null(shape)
+    return (
+        b'\x1b' + block_at.to_bytes(4, 'big') + b'\xfa',
+        b'\xfd' + len(image).to_bytes(4, 'big') + image,
+    )
+
+
+def _tds(shape) -> bytes:
+    """The TDS of an object (_TdsObject) or a collection (_TdsCollection)."""
+    if isinstance(shape, _TdsCollection):
+        body = bytearray(b'\x1c' + (29).to_bytes(4, 'big'))
+        body += shape.bound.to_bytes(4, 'big') + bytes([3 if shape.varray else 2])
+        body += b'\x2a'
+        element = shape.element
+        if isinstance(element, _TdsLeaf):
+            body += element.code
+        else:
+            # The reference's block follows it directly, at 35.
+            (ref, block) = _tds_reference(element, 18 + len(body) + 6)
+            body += ref + block
+        return _tds_header(bytes(body), [18], collection=True, version=1)
+    body = bytearray()
+    leaves: list[int] = []
+    pending: list[tuple[int, object]] = []
+
+    def walk(attrs) -> None:
+        for attr in attrs:
+            if isinstance(attr, _TdsLeaf):
+                leaves.append(18 + len(body))
+                body.extend(attr.code)
+            elif isinstance(attr, _TdsObject):
+                body.append(0x27)
+                walk(attr.attrs)
+                body.append(0x28)
+            else:
+                leaves.append(18 + len(body))
+                pending.append((len(body) + 1, attr))
+                body.extend(b'\x1b\x00\x00\x00\x00\xfb')
+
+    walk(shape.attrs)
+    body.append(0x2A)
+    for slot, attr in pending:
+        block_at = 18 + len(body)
+        (_ref, block) = _tds_reference(attr, block_at)
+        body[slot : slot + 4] = block_at.to_bytes(4, 'big')
+        body.extend(block)
+    version = 2 if _tds_is_newer(shape) else 1
+    return _tds_header(bytes(body), leaves, collection=False, version=version)
+
+
+def _tds_null(shape: _TdsObject) -> bytes:
+    # The null-image TDS of an object: a 1a for the object and for each
+    # attribute, an embedded object's own set between 27 and 28.
+    def nulls(obj: _TdsObject) -> tuple:
+        out: list = [_TDS_NULL_LEAF]
+        for attr in obj.attrs:
+            out.append(
+                _TdsObject(nulls(attr))
+                if isinstance(attr, _TdsObject)
+                else _TDS_NULL_LEAF
+            )
+        return tuple(out)
+
+    return _tds(_TdsObject(nulls(shape)))
+
+
+# The metadata block a python-oracledb client runs before it binds or reads an
+# object: it calls DBMS_PICKLER.GET_TYPE_SHAPE for the type's OID, version, TDS
+# and a cursor of its attributes, then looks the type's own name up. Answered
+# here from the catalog, as a whole; the block's text is the client's, fixed.
+_TYPE_SHAPE_BLOCK = re.compile(
+    r'\bdbms_pickler\s*\.\s*get_type_shape\s*\(', re.IGNORECASE
+)
+# What GET_TYPE_SHAPE returns for a type that does not exist, as measured.
+_TYPE_SHAPE_NOT_FOUND = 1001
+# The built-in types' OIDs, as the attribute cursor reports them: 16 bytes,
+# zero but for the last.
+_BUILTIN_TYPE_OID_BYTE = {
+    'NUMBER': 0x0F,
+    'INTEGER': 0x16,
+    'VARCHAR2': 0x19,
+    'CHAR': 0x1A,
+    'BINARY_FLOAT': 0x44,
+    'BINARY_DOUBLE': 0x45,
+    'TIMESTAMP': 0x3D,
+    'TIMESTAMP WITH TZ': 0x3E,
+    'TIMESTAMP WITH LOCAL TZ': 0x41,
+    'CLOB': 0x22,
+    'BLOB': 0x23,
+}
+
+
+def _tds_number(precision: int = 0, scale: int = -127) -> _TdsLeaf:
+    return _TdsLeaf(bytes([0x06, precision & 0xFF, scale & 0xFF]))
+
+
+def _tds_chars(code: int, byte_length: int, national: bool) -> _TdsLeaf:
+    return _TdsLeaf(
+        bytes([code])
+        + byte_length.to_bytes(2, 'big')
+        + (b'\x82' if national else b'\x01')
+        + b'\x00\x00'
+    )
+
+
+def _tds_timestamp(code: int, scale: int) -> _TdsLeaf:
+    return _TdsLeaf(bytes([code, scale]), newer=True)
+
+
+def _tds_scalar(pg_name: str, typmod: int) -> tuple[_TdsLeaf, str]:
+    """A scalar PostgreSQL type's TDS leaf and the Oracle name the dictionary
+    reports it by (all_type_attrs), or raise for one with no Oracle equal."""
+    if pg_name == 'numeric':
+        if typmod < 0:
+            return (_tds_number(), 'NUMBER')
+        precision = ((typmod - 4) >> 16) & 0xFFFF
+        scale = (typmod - 4) & 0xFFFF
+        return (
+            _tds_number(precision, scale - 0x10000 if scale > 0x7FFF else scale),
+            'NUMBER',
+        )
+    if pg_name in ('int2', 'int4', 'int8'):
+        return (_tds_number(0, 0), 'INTEGER')
+    if pg_name == 'float4':
+        return (_TdsLeaf(b'\x25', newer=True), 'BINARY_FLOAT')
+    if pg_name == 'float8':
+        return (_TdsLeaf(b'\x2d', newer=True), 'BINARY_DOUBLE')
+    if pg_name == 'varchar':
+        return (_tds_chars(0x07, typmod - 4 if typmod > 4 else 4000, False), 'VARCHAR2')
+    if pg_name == 'bpchar':
+        return (_tds_chars(0x01, typmod - 4 if typmod > 4 else 1, False), 'CHAR')
+    if pg_name in ('text', _CLOB_TYPE):
+        return (_TdsLeaf(b'\x1d'), 'CLOB')
+    if pg_name in ('bytea', _BLOB_TYPE):
+        return (_TdsLeaf(b'\x1e'), 'BLOB')
+    if pg_name == 'timestamp':
+        return (_tds_timestamp(0x15, typmod if typmod >= 0 else 6), 'TIMESTAMP')
+    if pg_name == 'timestamptz':
+        return (
+            _tds_timestamp(0x21, typmod if typmod >= 0 else 6),
+            'TIMESTAMP WITH LOCAL TZ',
+        )
+    if pg_name == _TSTZ_TYPE:
+        return (_tds_timestamp(0x17, 6), 'TIMESTAMP WITH TZ')
+    raise UnsupportedFeature(f'type shape: {pg_name} has no Oracle attribute type')
+
+
 # Oracle session / user admin statements the provisioning issues, mapped to their
 # PostgreSQL equivalent or a no-op (#759). Oracle treats a user as a schema, so a
 # CREATE USER becomes a CREATE SCHEMA; ALTER SESSION SET CURRENT_SCHEMA points
@@ -1292,6 +1657,36 @@ _CREATE_TYPE_TABLE_OF = re.compile(
 _ALTER_SESSION_SCHEMA = re.compile(
     r'\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*"?(\w+)"?\s*$', re.IGNORECASE
 )
+# ALTER SESSION SET TIME_ZONE -- which a 12.1+ client also sends at login, pinned
+# to its own UTC offset. PostgreSQL's own spelling of an offset is POSIX and
+# INVERTS the sign (`SET TIME ZONE '+05:30'` runs the session at -05:30), so an
+# offset is set as an explicit POSIX spec instead. The zone is also kept as
+# Oracle spelled it, which is what SESSIONTIMEZONE reports back. The pattern
+# admits no quote, so the zone is safe to inline as a literal.
+_ALTER_SESSION_TIME_ZONE = re.compile(
+    r"\s*ALTER\s+SESSION\s+SET\s+TIME_ZONE\s*=\s*'([^']+)'\s*;?\s*$", re.IGNORECASE
+)
+_TZ_OFFSET = re.compile(r'([+-])(\d{1,2}):(\d{2})$')
+
+
+def _translate_time_zone(zone: str) -> str:
+    zone = zone.strip()
+    m = _TZ_OFFSET.match(zone)
+    if m:
+        sign, hh, mm = m.group(1), int(m.group(2)), m.group(3)
+        zone = f'{sign}{hh:02d}:{mm}'
+        flipped = '-' if sign == '+' else '+'
+        posix = f'<{zone}>{flipped}{hh:02d}:{mm}'
+    else:
+        posix = zone  # a region name, e.g. Europe/Moscow, means the same in both
+    # A DO block, not a SELECT: ALTER SESSION is not a query, and answering it
+    # with a row failed the reference thin client (#1153).
+    return (
+        f"DO $$ BEGIN PERFORM set_config('TimeZone', '{posix}', false); "
+        f"PERFORM set_config('seerdb.time_zone', '{zone}', false); END $$"
+    )
+
+
 _CREATE_USER = re.compile(r'\s*CREATE\s+USER\s+"?(\w+)"?\b', re.IGNORECASE)
 _CREATE_INDEX_QUALIFIED = re.compile(
     r'(\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+)"?\w+"?\.("?\w+"?\s+ON\s+.*)$',
@@ -1307,6 +1702,9 @@ def _translate_admin(sql: str) -> str:
     m = _ALTER_SESSION_SCHEMA.match(sql)
     if m:
         return f'SET search_path TO {m.group(1).lower()}, public, sys, oracle'
+    m = _ALTER_SESSION_TIME_ZONE.match(sql)
+    if m:
+        return _translate_time_zone(m.group(1))
     m = _CREATE_USER.match(sql)
     if m:
         return f'CREATE SCHEMA IF NOT EXISTS {m.group(1).lower()}'
@@ -1384,6 +1782,74 @@ def _translate_replace_view(sql: str) -> str | None:
 _CREATE_OR_REPLACE_TYPE = re.compile(
     r'(\s*CREATE)\s+OR\s+REPLACE\s+(TYPE\s+([\w."$#]+)\s+AS\b)', re.IGNORECASE
 )
+# Oracle REFs (#1127). An Oracle object table gives every row a hidden object
+# id, and a REF names the table and that id. PostgreSQL's typed tables cannot
+# take a column beyond their type's, and a row's physical address (ctid) moves on
+# UPDATE / VACUUM FULL, so an object table becomes an ordinary table of the
+# type's columns plus a hidden `sys_nc_oid$` uuid -- Oracle's own name for the
+# column -- and is recorded in sys.ora_object_tables with its type. Each object
+# type gets a companion `<type>$ref` composite (table oid, row id) and an
+# overloaded sys.deref() returning the object, so `DEREF(r).attr` resolves by
+# the stable id wherever the REF came from.
+_CREATE_OBJECT_TABLE = re.compile(
+    r'\s*CREATE\s+TABLE\s+([\w."$#]+)\s+OF\s+([\w."$#]+)\s*$', re.IGNORECASE
+)
+_DROP_TYPE = re.compile(r'\s*DROP\s+TYPE\s+([\w."$#]+)(\s+FORCE)?\s*$', re.IGNORECASE)
+_TYPE_NAME_OF_CREATE = re.compile(
+    r'\s*CREATE\s+(?:OR\s+REPLACE\s+)?TYPE\s+([\w."$#]+)', re.IGNORECASE
+)
+_OBJECT_ID_COLUMN = '"sys_nc_oid$"'
+
+
+def _ref_type_name(type_name: str) -> str:
+    # `<type>$ref`, inside the quotes of a quoted name so the case survives.
+    if type_name.endswith('"'):
+        return type_name[:-1] + '$ref"'
+    return f'{type_name}$ref'
+
+
+def _object_type_companions(type_name: str) -> str:
+    ref = _ref_type_name(type_name)
+    return (
+        f'; CREATE TYPE {ref} AS (tab oid, id uuid)'
+        f'; CREATE FUNCTION sys.deref(r {ref}) RETURNS {type_name} LANGUAGE sql '
+        f"STABLE AS $$ SELECT sys.ora_deref_row(r.tab, r.id, '{type_name}'::regtype)"
+        f'::{type_name} $$'
+    )
+
+
+def _drop_type(type_name: str, *, if_exists: bool = False) -> str:
+    # A type's drop, its REF companions first. They depend on the type (the
+    # deref() function returns it), so the type alone could never be dropped or
+    # replaced. No CASCADE: a REF column of the type still holds it, and Oracle
+    # refuses that drop too (ORA-02303).
+    ref = _ref_type_name(type_name)
+    exists = ' IF EXISTS' if if_exists else ''
+    return (
+        f"DO $$ BEGIN IF to_regtype('{ref}') IS NOT NULL THEN "
+        f'DROP FUNCTION sys.deref({ref}); DROP TYPE {ref}; END IF; END $$'
+        f'; DROP TYPE{exists} {type_name}'
+    )
+
+
+def _translate_object_ddl(sql: str) -> str | None:
+    """CREATE TABLE ... OF and DROP TYPE, for REFs (#1127); None for other SQL."""
+    table = _CREATE_OBJECT_TABLE.match(sql)
+    if table:
+        name, type_name = table.groups()
+        return (
+            f'CREATE TABLE {name} (LIKE {type_name}, '
+            f'{_OBJECT_ID_COLUMN} uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE)'
+            '; DELETE FROM sys.ora_object_tables o WHERE NOT EXISTS '
+            '(SELECT 1 FROM pg_class c WHERE c.oid = o.relid)'
+            f"; INSERT INTO sys.ora_object_tables VALUES ('{name}'::regclass, "
+            f"'{type_name}'::regtype) ON CONFLICT (relid) DO UPDATE "
+            'SET typ = excluded.typ'
+        )
+    drop = _DROP_TYPE.match(sql)
+    if drop:
+        return _drop_type(drop.group(1))
+    return None
 
 
 def _translate_ddl(sql: str) -> str:
@@ -1402,7 +1868,7 @@ def _translate_ddl(sql: str) -> str:
         plain = _translate_ddl(
             f'{replaced.group(1)} {replaced.group(2)}{sql[replaced.end() :]}'
         )
-        return f'DROP TYPE IF EXISTS {replaced.group(3)}; {plain}'
+        return f'{_drop_type(replaced.group(3), if_exists=True)}; {plain}'
     varray = _CREATE_TYPE_VARRAY.match(sql)
     if varray:
         name, bound, element = varray.groups()
@@ -1418,12 +1884,18 @@ def _translate_ddl(sql: str) -> str:
         for pattern, replacement in _DDL_TYPE_REWRITES:
             element = pattern.sub(replacement, element)
         return f'CREATE DOMAIN {name} AS {element}[]'
+    object_ddl = _translate_object_ddl(sql)
+    if object_ddl is not None:
+        return object_ddl
     if _CREATE_TYPE_OBJECT.match(sql):
         # `... AS OBJECT (attrs)` → `... AS (attrs)`, then map the attribute types
         # (NUMBER → numeric, VARCHAR2(n) → varchar(n), …) the same way as a table.
         out = _CREATE_TYPE_OBJECT.sub(r'\1', sql, count=1)
         for pattern, replacement in _DDL_TYPE_REWRITES:
             out = pattern.sub(replacement, out)
+        named = _TYPE_NAME_OF_CREATE.match(sql)
+        if named is not None:
+            out += _object_type_companions(named.group(1))
         return out
     view = _translate_replace_view(sql)
     if view is not None:
@@ -1498,9 +1970,6 @@ _IDIOM_REWRITES = [
         'ora_current_timestamp()',
     ),
     (re.compile(r'\bdbtimezone\b', re.IGNORECASE), f"'{_DB_TIME_ZONE_NAME}'::text"),
-    # SESSIONTIMEZONE: the zone a TIMESTAMP is read in on its way into an LTZ
-    # value, the PostgreSQL session's, as an offset (#1208).
-    (re.compile(r'\bsessiontimezone\b', re.IGNORECASE), "to_char(now(), 'TZH:TZM')"),
     # CAST(x AS TIMESTAMP [(p)] WITH LOCAL TIME ZONE): the DDL type rewrite only
     # runs on DDL, so a query's cast is translated here (#1208).
     (
@@ -1511,6 +1980,14 @@ _IDIOM_REWRITES = [
         r'AS timestamptz\1',
     ),
     (re.compile(r'\bsysdate\b', re.IGNORECASE), 'localtimestamp(0)'),
+    # SESSIONTIMEZONE → the zone as ALTER SESSION spelled it, or, before any was
+    # set, the session's current offset in Oracle's `+hh:mm` form: the zone a
+    # TIMESTAMP is read in on its way into an LTZ value (#1208).
+    (
+        re.compile(r'\bsessiontimezone\b', re.IGNORECASE),
+        "coalesce(nullif(current_setting('seerdb.time_zone', true), ''), "
+        "to_char(now(), 'TZH:TZM'))",
+    ),
     # The ROWID pseudo-column → the row's ctid, in Oracle's extended form
     # (sys.ora_rowid). This one rewrite serves a SELECT (returns the str), a
     # `WHERE ROWID = :bind` (compares the bound text) and `SET col = ROWID`, and
@@ -1854,9 +2331,43 @@ def _translate_decode(sql: str) -> str:
     return ''.join(out)
 
 
+# Not after a `.`: the generated `sys.deref(` is already the translation.
+_DEREF_CALL = re.compile(r'(?<![.\w])DEREF\s*\(', re.IGNORECASE)
+
+
+def _translate_deref(sql: str) -> str:
+    # DEREF(x) → (sys.deref(x)) (#1127). The parentheses round the call are what
+    # PostgreSQL needs before a field selection: Oracle's `DEREF(r).name` is
+    # `(sys.deref(r)).name`. The argument is copied to its matching parenthesis,
+    # a string literal inside it taken whole.
+    out: list[str] = []
+    pos = 0
+    for match in _DEREF_CALL.finditer(sql):
+        if match.start() < pos:
+            continue  # inside an argument already copied
+        depth, i, n = 1, match.end(), len(sql)
+        while i < n and depth:
+            if sql[i] == "'":
+                i = sql.find("'", i + 1)
+                if i < 0:
+                    return sql  # unbalanced: leave the statement to fail as is
+            elif sql[i] == '(':
+                depth += 1
+            elif sql[i] == ')':
+                depth -= 1
+            i += 1
+        if depth:
+            return sql
+        inner = _translate_deref(sql[match.end() : i - 1])
+        out.append(sql[pos : match.start()] + f'(sys.deref({inner}))')
+        pos = i
+    return ''.join(out) + sql[pos:]
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
+    sql = _translate_deref(sql)
     sql = _translate_connect_by(sql)
     sql = _translate_signed_year(sql)
     sql = _translate_decode(sql)
@@ -2082,6 +2593,10 @@ _SQLSTATE_TO_ORA = {
     '22P02': 1722,  # invalid_text_representation -> invalid number (TO_NUMBER)
     '3B001': 1086,  # invalid_savepoint_specification -> savepoint never established
     '55P03': 54,  # lock_not_available -> resource busy (a DDL's lock wait, #1191)
+    # A string too long for its VARCHAR2(n) column: Oracle's ORA-12899, "value
+    # too large for column". Unlike 22003 below, this SQLSTATE means exactly one
+    # Oracle error, so the table can carry it (#1127).
+    '22001': 12899,  # string_data_right_truncation -> value too large for column
 }
 
 
@@ -2098,10 +2613,31 @@ _ORA_MESSAGE = {
 }
 
 
+# `22003 numeric_value_out_of_range` covers two different Oracle errors, so the
+# SQLSTATE alone cannot pick the code (#1127). A value too wide for a NUMBER(p,s)
+# column is ORA-01438, "value larger than specified precision allowed for this
+# column"; an arithmetic result that overflows is ORA-01426, "numeric overflow".
+# PostgreSQL tells them apart only in the primary message -- measured:
+#     numeric(3,0) given 123456  -> 22003 "numeric field overflow"
+#     int 2147483647 + 1         -> 22003 "integer out of range"
+# so the column case is matched on its message and everything else under 22003
+# is the arithmetic one. A client that branches on the code -- batcherrors
+# reports it per row -- would otherwise be told ORA-00900, a syntax error, about
+# a statement whose syntax was fine.
+_ORA_COLUMN_PRECISION = 1438
+_ORA_NUMERIC_OVERFLOW = 1426
+
+
 def _ora_code_for(exc) -> int:
     sqlstate = getattr(exc, 'sqlstate', None)
     if not isinstance(sqlstate, str):
         return _ORA_INVALID_SQL
+    if sqlstate == '22003':
+        diag = getattr(exc, 'diag', None)
+        primary = getattr(diag, 'message_primary', None) or str(exc)
+        if 'numeric field overflow' in primary:
+            return _ORA_COLUMN_PRECISION
+        return _ORA_NUMERIC_OVERFLOW
     return _SQLSTATE_TO_ORA.get(sqlstate, _ORA_INVALID_SQL)
 
 
@@ -2326,6 +2862,94 @@ _NOT_EXPLAINABLE = re.compile(
 )
 
 
+_BUILTIN_OIDS = frozenset(
+    _NUMBER_OIDS
+    | _BINARY_FLOAT_OIDS.keys()
+    | _TEMPORAL_OIDS.keys()
+    | _INTERVAL_OIDS
+    | _RAW_OIDS
+    | _TEXT_OIDS
+)
+
+
+def _varchar_column(name: bytes, size: int = 128) -> ColumnMeta:
+    return ColumnMeta(
+        name=name, data_type=TNS_TYPE_VARCHAR, data_length=size, max_size=size
+    )
+
+
+def _number_column(name: bytes) -> ColumnMeta:
+    return ColumnMeta(name=name, data_type=TNS_TYPE_NUMBER, data_length=22, max_size=22)
+
+
+# The attribute cursor GET_TYPE_SHAPE returns, one column per field (#1134).
+_ATTRIBUTE_CURSOR_COLUMNS = (
+    _number_column(b'VERSION'),
+    _varchar_column(b'NAME'),
+    _number_column(b'ATTRIBUTE#'),
+    _varchar_column(b'TYPE_NAME'),
+    _varchar_column(b'TYPE_OWNER'),
+    _varchar_column(b'TYPE_PACKAGE'),
+    ColumnMeta(name=b'ATTR_TOID', data_type=TNS_TYPE_RAW, data_length=16, max_size=16),
+    _varchar_column(b'INSTANTIABLE', 3),
+    _varchar_column(b'SUPERTYPE_OWNER'),
+    _varchar_column(b'SUPERTYPE_NAME'),
+)
+
+
+def _object_type_oid(pg_oid: int) -> bytes:
+    # The 16-byte OID all_types reports for a composite: its PostgreSQL oid,
+    # zero-padded, the same bytes the view's `decode(lpad(to_hex(...)))` builds.
+    return pg_oid.to_bytes(16, 'big')
+
+
+# A REF locator this backend issues (#1127): a tag, the target type's and the
+# object table's pg oids, and the row's hidden object id. It is opaque to the
+# client, which only hands it back.
+_REF_LOCATOR_TAG = b'PGREF1'
+
+
+def _ref_locator(type_pg_oid: int, table_oid: int, row_id: object) -> bytes:
+    raw_id = (
+        row_id.bytes if isinstance(row_id, uuid.UUID) else uuid.UUID(str(row_id)).bytes
+    )
+    return _REF_LOCATOR_TAG + struct.pack('>II', type_pg_oid, table_oid) + raw_id
+
+
+def _parse_ref_locator(locator: bytes) -> tuple[int, int, uuid.UUID] | None:
+    tag = len(_REF_LOCATOR_TAG)
+    if len(locator) != tag + 8 + 16 or not locator.startswith(_REF_LOCATOR_TAG):
+        return None
+    type_pg_oid, table_oid = struct.unpack('>II', locator[tag : tag + 8])
+    return type_pg_oid, table_oid, uuid.UUID(bytes=locator[tag + 8 :])
+
+
+def _pg_oid_of(oid: bytes) -> int | None:
+    # The inverse of _object_type_oid; None for an OID that cannot be one of
+    # ours (a real Oracle OID a client carried over, or a malformed one).
+    if len(oid) != 16:
+        return None
+    value = int.from_bytes(oid, 'big')
+    return value if 0 < value <= 0xFFFFFFFF else None
+
+
+def _object_column_meta(name: str, typ: DbObjectType) -> ColumnMeta:
+    # An object column describes as Oracle's does: ADT with the type's
+    # identity, a 2000-byte data length, no max size and no character set --
+    # the values a real server sends for one (#1127).
+    return ColumnMeta(
+        name=name.upper().encode('utf-8'),
+        data_type=TNS_TYPE_ADT,
+        data_length=2000,
+        max_size=0,
+        charset=0,
+        csfrm=0,
+        type_oid=typ.oid,
+        type_schema=typ.schema.encode('ascii'),
+        type_name=typ.name.encode('ascii'),
+    )
+
+
 class PostgresBackend:
     """A :class:`~seerdb.server.Backend` over a psycopg connection.
 
@@ -2341,14 +2965,19 @@ class PostgresBackend:
     """
 
     capabilities = frozenset({Capability.TRANSACTIONS})
-    # This demo speaks the 11.2 WIRE protocol (field version): it cannot back the
-    # 12c+/23ai wire formats a higher field version would invite, so it pins the
-    # floor the whole conformance suite is baselined at. But it REPORTS release
-    # 12.1 (server_identity, read only from the login banner, never the wire), so
-    # the SQLAlchemy dialect uses native OFFSET/FETCH pagination and identity
-    # columns -- both of which PostgreSQL runs directly -- instead of Oracle's
-    # nested-ROWNUM pagination, which has no faithful PostgreSQL rewrite (#33).
-    field_version = FIELD_VERSION_11_2
+    # This demo speaks the 12.1 WIRE protocol (field version), which is also the
+    # release it reports (server_identity). Those were deliberately apart while
+    # the wire was 11.2: the dialect reads the RELEASE to pick native
+    # OFFSET/FETCH pagination and identity columns -- both of which PostgreSQL
+    # runs directly -- instead of Oracle's nested-ROWNUM pagination, which has no
+    # faithful PostgreSQL rewrite (#33). They now agree.
+    #
+    # 12.1 rather than 12.2, and deliberately: a modern thin client refuses any
+    # server below protocol version 315, which is 12.1's, so this is the LOWEST
+    # version at which one will talk to the Mirror at all (#1127). Going to 12.2
+    # was measured too and costs far more -- and a client can negotiate DOWN to
+    # 12.1 whichever we advertise, so 12.1 has to work regardless.
+    field_version = FIELD_VERSION_12_1
     server_identity = IDENTITY_12_1
 
     def __init__(
@@ -2375,6 +3004,14 @@ class PostgresBackend:
         # Whether the client has taken a SAVEPOINT in the open transaction, which
         # a transaction that has written nothing must keep for it (#1190).
         self._user_savepoint = False
+        # The Oracle object type each PostgreSQL composite oid stands for, with
+        # its registered psycopg CompositeInfo -- or None for an oid that is not
+        # an object type, so a column of it is looked up once (#1127).
+        self._object_types: dict[int, tuple[DbObjectType, CompositeInfo] | None] = {}
+        # REFs (#1127): each `<type>$ref` composite's target type (None for any
+        # other composite), and the registered companion per target type.
+        self._ref_targets: dict[int, int | None] = {}
+        self._ref_composites: dict[int, CompositeInfo] = {}
         # Pipeline mode ships a statement's SAVEPOINT / statement / RELEASE in one
         # network round-trip instead of three (a 3x per-statement latency cut
         # against a remote database). It needs libpq >= 14; older builds fall back
@@ -2421,12 +3058,14 @@ class PostgresBackend:
         # entered offset (#519). Best-effort: a backend that can't create the type
         # just leaves WITH TIME ZONE unsupported, like the orafce idioms above.
         self._tstz_oid: int | None = None
+        self._tstz_info: CompositeInfo | None = None
         try:
             self._conn.execute(_TSTZ_TYPE_DDL)
             info = CompositeInfo.fetch(self._conn, _TSTZ_TYPE)
             if info is not None:
                 register_composite(info, self._conn)
                 self._tstz_oid = info.oid
+                self._tstz_info = info
         except psycopg.Error:
             self._conn.rollback()
         # Create the typed domains and map each domain's oid to the Oracle wire type
@@ -2725,6 +3364,7 @@ class PostgresBackend:
             sql = with_rowid
         params: dict | None = None
         if binds:
+            binds = self._resolve_object_binds(binds)
             sql, params = _translate_binds(sql, binds)
         # Each statement runs inside a SAVEPOINT so a failure rolls back just it
         # (clearing PostgreSQL's aborted-transaction state) and leaves the rest of
@@ -2951,6 +3591,18 @@ class PostgresBackend:
                 for row in rows:
                     row[i] = _to_interval_ym(row[i])
                 columns.append(_intervalym_column_meta(desc.name))
+            elif (
+                desc.type_code not in _BUILTIN_OIDS
+                and (target := self._ref_target(desc.type_code)) is not None
+            ):
+                for row in rows:
+                    row[i] = self._ref_cell(target, row[i])
+                columns.append(self._ref_column_meta(desc.name, target))
+            elif (entry := self._column_object_type(desc.type_code)) is not None:
+                typ, info = entry
+                for row in rows:
+                    row[i] = self._db_object(typ, info, row[i])
+                columns.append(_object_column_meta(desc.name, typ))
             else:
                 columns.append(_column_meta(desc, [r[i] for r in rows], self._tstz_oid))
         if self._has_quoted_names:
@@ -2963,6 +3615,325 @@ class PostgresBackend:
                 name = cursor.description[i].name.encode('utf-8')
                 columns[i] = replace(columns[i], name=name)
         return Result(columns=columns, rows=[tuple(r) for r in rows])
+
+    def _column_object_type(
+        self, pg_oid: int
+    ) -> tuple[DbObjectType, CompositeInfo] | None:
+        # Only an oid no built-in mapping claims can be an object type; the
+        # ora_tstz composite is TIMESTAMP WITH TIME ZONE, not an object.
+        if pg_oid in _BUILTIN_OIDS or pg_oid == self._tstz_oid:
+            return None
+        return self._object_type(pg_oid)
+
+    def _type_kind(self, pg_oid: int) -> tuple[str, str, str, int, int] | None:
+        # (kind, owner, name, element oid, element typmod) of a named type: kind
+        # 'object' for a standalone or table row composite, 'collection' for an
+        # array domain (its element and bound), else None.
+        row = self._conn.execute(
+            'SELECT t.typtype, sys.ora_owner(n.nspname), sys.ora_name(t.typname), '
+            'b.typcategory, b.typelem, t.typtypmod, c.relkind '
+            'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+            'LEFT JOIN pg_type b ON b.oid = t.typbasetype '
+            'LEFT JOIN pg_class c ON c.oid = t.typrelid WHERE t.oid = %s',
+            (pg_oid,),
+        ).fetchone()
+        if row is None:
+            return None
+        (typtype, owner, name, base_category, element, typmod, relkind) = row
+        if typtype == 'c' and relkind in ('c', 'r') and pg_oid != self._tstz_oid:
+            return ('object', owner, name, 0, -1)
+        if typtype == 'd' and base_category == 'A':
+            return ('collection', owner, name, element, typmod)
+        return None
+
+    def _pg_type_name(self, pg_oid: int) -> str:
+        row = self._conn.execute(
+            'SELECT typname FROM pg_type WHERE oid = %s', (pg_oid,)
+        ).fetchone()
+        if row is None:
+            raise UnsupportedFeature(f'type shape: no type has the oid {pg_oid}')
+        return row[0]
+
+    def _type_shape(self, pg_oid: int, typmod: int = -1):
+        """The TDS shape of a type (#1134): a _TdsObject of its attributes, a
+        _TdsCollection of its element, or a scalar's leaf."""
+        kind = self._type_kind(pg_oid)
+        if kind is None:
+            return _tds_scalar(self._pg_type_name(pg_oid), typmod)[0]
+        if kind[0] == 'object':
+            return _TdsObject(
+                tuple(self._type_shape(t, m) for (_n, t, m) in self._attributes(pg_oid))
+            )
+        (_kind, _owner, _name, element, element_typmod) = kind
+        bound = self._conn.execute(
+            "SELECT substring(pg_get_constraintdef(oid) FROM '<=\\s*([0-9]+)')::int "
+            'FROM pg_constraint WHERE contypid = %s',
+            (pg_oid,),
+        ).fetchone()
+        return _TdsCollection(
+            varray=bound is not None and bound[0] is not None,
+            bound=bound[0] if bound and bound[0] is not None else 0,
+            element=self._type_shape(element, element_typmod),
+        )
+
+    def _attributes(self, pg_oid: int) -> list[tuple[str, int, int]]:
+        # (name, type oid, typmod) of a composite's attributes, in order.
+        return self._conn.execute(
+            'SELECT a.attname, a.atttypid, a.atttypmod FROM pg_type t '
+            'JOIN pg_attribute a ON a.attrelid = t.typrelid '
+            'WHERE t.oid = %s AND a.attnum > 0 AND NOT a.attisdropped '
+            "AND a.attname <> 'sys_nc_oid$' ORDER BY a.attnum",
+            (pg_oid,),
+        ).fetchall()
+
+    def _attribute_rows(self, pg_oid: int) -> list[tuple]:
+        # The attribute cursor GET_TYPE_SHAPE returns for an object: one row per
+        # attribute, as 23ai sends it -- a version, the name, the position, the
+        # type name, its owner (a named type's only), its package, its OID, and
+        # whether it is instantiable -- in the order the client reads them.
+        rows = []
+        for position, (attname, atttypid, atttypmod) in enumerate(
+            self._attributes(pg_oid), 1
+        ):
+            kind = self._type_kind(atttypid)
+            if kind is None:
+                type_name = _tds_scalar(self._pg_type_name(atttypid), atttypmod)[1]
+                (owner, toid) = (
+                    None,
+                    bytes(15) + bytes([_BUILTIN_TYPE_OID_BYTE[type_name]]),
+                )
+            else:
+                (_kind, owner, type_name, _e, _m) = kind
+                toid = _object_type_oid(atttypid)
+            rows.append(
+                (
+                    1,
+                    _oracle_column_name(attname),
+                    position,
+                    type_name,
+                    owner,
+                    None,
+                    toid,
+                    'YES',
+                    None,
+                    None,
+                )
+            )
+        return rows
+
+    def _execute_type_shape(self, sql: str, binds: Sequence) -> Result:
+        """python-oracledb's type-metadata block (#1134), answered whole: the
+        type's return code, OID, version, TDS, attribute cursor, and its own
+        schema and name."""
+        names = [name.lower() for (name, _q) in bind_placeholders(sql, dedupe=True)]
+        values: dict[str, object] = {n: b.value for (n, b) in zip(names, binds)}
+        full_name = str(values.get('full_name') or '')
+        attrs_rc = CursorResult(columns=list(_ATTRIBUTE_CURSOR_COLUMNS), rows=[])
+        answer: dict[str, object] = {
+            'ret_val': _TYPE_SHAPE_NOT_FOUND,
+            'oid': None,
+            'version': None,
+            'tds': None,
+            'attrs_rc': attrs_rc,
+            'package_name': None,
+            'schema': None,
+            'name': None,
+        }
+        row_type = full_name.upper().endswith('%ROWTYPE')
+        (schema, _dot, name) = full_name.rpartition('.')
+        if row_type:
+            name = name[: -len('%ROWTYPE')]
+        found = self._conn.execute(
+            'SELECT t.oid FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+            'LEFT JOIN pg_class c ON c.oid = t.typrelid '
+            'WHERE sys.ora_owner(n.nspname) = coalesce(%s, sys.ora_owner(current_schema())) '
+            'AND sys.ora_name(coalesce(c.relname, t.typname)) = %s '
+            "AND coalesce(c.relkind = 'r', false) = %s LIMIT 1",
+            (schema.strip('"') or None, name.strip('"'), row_type),
+        ).fetchone()
+        pg_oid = found[0] if found is not None else None
+        kind = self._type_kind(pg_oid) if pg_oid is not None else None
+        if pg_oid is not None and kind is not None:
+            (_kind, owner, type_name, _e, _m) = kind
+            shape = self._type_shape(pg_oid)
+            answer.update(
+                ret_val=0,
+                oid=_object_type_oid(pg_oid),
+                version=1,
+                tds=_tds(shape),
+                schema=owner,
+                name=f'{name.strip(chr(34))}%ROWTYPE' if row_type else type_name,
+            )
+            if isinstance(shape, _TdsObject):
+                attrs_rc.rows.extend(self._attribute_rows(pg_oid))
+        return Result(out_binds=[answer.get(n, values.get(n)) for n in names])
+
+    def _object_type(self, pg_oid: int) -> tuple[DbObjectType, CompositeInfo] | None:
+        """The Oracle object type a PostgreSQL composite oid stands for (#1127).
+
+        Built the way ``all_types`` / ``all_type_attrs`` build what a client
+        reads, so the backend and the client agree on the OID and the attribute
+        order.
+        The composite is registered with psycopg on first use, so a value of it
+        binds and loads as a tuple rather than its text form. None when the oid
+        is not an object type.
+        """
+        if pg_oid in self._object_types:
+            return self._object_types[pg_oid]
+        oid = _object_type_oid(pg_oid)
+        # The catalogs rather than the sys views, though the answer is the same:
+        # reading a view inside the session's open transaction holds a lock that
+        # the next session's CREATE OR REPLACE VIEW at connect waits on, so a
+        # new connection hung until this one committed.
+        row = self._conn.execute(
+            'SELECT sys.ora_owner(n.nspname), sys.ora_name(t.typname), '
+            'n.nspname, t.typname '
+            'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+            'JOIN pg_class c ON c.oid = t.typrelid '
+            "WHERE t.oid = %s AND t.typtype = 'c' AND c.relkind = 'c' "
+            "AND t.typname !~ '[$]ref$'",
+            (pg_oid,),
+        ).fetchone()
+        entry = None
+        if row is not None:
+            owner, name, pg_schema, pg_name = row
+            attrs = []
+            # information_schema is PostgreSQL's own, never replaced at connect,
+            # so reading it holds nothing a new session waits on. The mapping is
+            # the one all_type_attrs applies.
+            for attr_name, type_name, type_owner in self._conn.execute(
+                'SELECT sys.ora_name(a.attribute_name), '
+                f"CASE WHEN a.attribute_udt_name = '{_TSTZ_TYPE}' "
+                "THEN 'TIMESTAMP WITH TIME ZONE' "
+                "WHEN a.data_type = 'USER-DEFINED' "
+                'THEN sys.ora_name(a.attribute_udt_name) '
+                'ELSE sys.ora_type_name(a.data_type) END, '
+                "CASE WHEN a.data_type = 'USER-DEFINED' "
+                f"AND a.attribute_udt_name <> '{_TSTZ_TYPE}' "
+                'THEN sys.ora_owner(a.attribute_udt_schema) END '
+                'FROM information_schema.attributes a '
+                'WHERE a.udt_schema = %s AND a.udt_name = %s '
+                'ORDER BY a.ordinal_position',
+                (pg_schema, pg_name),
+            ):
+                if type_owner is not None:
+                    raise UnsupportedFeature(
+                        f'object type {owner}.{name}: attribute {attr_name} is '
+                        f'itself an object type ({type_name}), not supported yet'
+                    )
+                attrs.append(
+                    {
+                        'name': attr_name,
+                        'type_name': type_name,
+                        'data_type': type_name_to_tns(type_name),
+                        'charset': None,
+                    }
+                )
+            regtype = self._conn.execute(
+                'SELECT %s::oid::regtype::text', (pg_oid,)
+            ).fetchone()
+            info = CompositeInfo.fetch(self._conn, regtype[0]) if regtype else None
+            if info is not None:
+                register_composite(info, self._conn)
+                entry = (DbObjectType(owner, name, oid, 1, attrs), info)
+        self._object_types[pg_oid] = entry
+        return entry
+
+    def _db_object(
+        self, typ: DbObjectType, info: CompositeInfo, value: object
+    ) -> object:
+        # One composite cell as the DbObject the Mirror encodes. A cursor that
+        # executed before the composite was registered hands the text form
+        # `(7,Alice)`; the registered loader parses that the way psycopg would.
+        if value is None:
+            return None
+        if isinstance(value, str):
+            loader = self._conn.adapters.get_loader(info.oid, psycopg.pq.Format.TEXT)
+            if loader is None:
+                raise UnsupportedFeature(f'object type {typ.name}: no loader')
+            value = loader(info.oid, self._conn).load(value.encode('utf-8'))
+        if not isinstance(value, tuple):
+            raise UnsupportedFeature(f'object type {typ.name}: not a composite value')
+        return typ.newobject(
+            {
+                a['name']: _reconstruct_tstz(v)
+                if a['data_type'] == TNS_TYPE_TIMESTAMPTZ and hasattr(v, 'utc')
+                else v
+                for a, v in zip(typ.attrs, value)
+            }
+        )
+
+    def _ref_cell(self, type_pg_oid: int, value: object) -> DbRef | None:
+        # A `<type>$ref` cell: a tuple once the composite is registered, its text
+        # form `(16842,1c4e...)` before -- both carry the table oid and row id.
+        if value is None:
+            return None
+        if isinstance(value, str):
+            tab, _, rid = value.strip('()').partition(',')
+            value = (int(tab) if tab else None, rid or None)
+        if not isinstance(value, tuple):
+            raise UnsupportedFeature('REF column: not a composite value')
+        return self._db_ref(type_pg_oid, value[0], value[1])
+
+    def _resolve_object_binds(self, binds: Sequence) -> list:
+        # An object (ADT) bind arrives as the image the client packed, bare or
+        # in a BindVar. Decode it against the type the OID names and bind the
+        # composite; a NULL object arrived as None already (#1127).
+        out: list = []
+        for b in binds:
+            value = b.value if isinstance(b, BindVar) else b
+            if isinstance(value, ObjectImage):
+                out.append(self._object_bind_value(value))
+            elif isinstance(value, DbRef):
+                out.append(self._ref_bind_value(value))
+            else:
+                out.append(b)
+        return out
+
+    def _object_bind_value(self, image: ObjectImage) -> object:
+        oid = image.type_oid or b''
+        # A value's toid is the constructed 36-byte form (00 22 02 08 + OID +
+        # extent); the OAC carries the bare 16-byte OID. Accept either.
+        if len(oid) >= 20:
+            oid = oid[4:20]
+        pg_oid = _pg_oid_of(oid)
+        entry = self._object_type(pg_oid) if pg_oid is not None else None
+        if entry is None:
+            raise UnsupportedFeature(
+                f'object bind: no object type has the OID {oid.hex()}'
+            )
+        typ, info = entry
+        factory = info.python_type  # set by register_composite
+        if factory is None:
+            raise UnsupportedFeature(f'object type {typ.name}: not registered')
+        attrs = dict(decode_object_image(image.image, typ.attrs))
+        return factory(
+            *(
+                self._tstz_composite(attrs.get(a['name']))
+                if a['data_type'] == TNS_TYPE_TIMESTAMPTZ
+                else attrs.get(a['name'])
+                for a in typ.attrs
+            )
+        )
+
+    def _tstz_composite(self, value: object) -> object:
+        # An aware datetime as the ora_tstz composite a TIMESTAMP WITH TIME ZONE
+        # attribute is stored as: the instant and the offset it was entered at
+        # (#519). A naive one is taken as UTC.
+        if not isinstance(value, datetime.datetime) or self._tstz_info is None:
+            return value
+        factory = self._tstz_info.python_type
+        if factory is None:
+            return value
+        offset = value.utcoffset() or datetime.timedelta(0)
+        instant = (
+            value
+            if value.tzinfo is not None
+            else value.replace(tzinfo=datetime.timezone.utc)
+        )
+        return factory(
+            instant.astimezone(datetime.timezone.utc), int(offset.total_seconds())
+        )
 
     def _execute_sequential(
         self,
@@ -3074,67 +4045,179 @@ class PostgresBackend:
             )
         return max(affected, 0)
 
-    def _object_type_name(self, table: str) -> str | None:
-        # The Oracle object-type name of a typed table (CREATE TABLE t OF type), or
-        # None if `table` is not one. pg_class.reloftype names the row type; Oracle
-        # folds identifiers to upper case, so the name is compared uppercased.
-        relname = table.split('.')[-1].strip('"').lower()
+    def execute_many_rowcounts(
+        self, sql: str, rows: Sequence[Sequence]
+    ) -> tuple[int, list[int]]:
+        """Array DML reporting the per-iteration affected-row counts (#18).
+
+        The Mirror calls this only when the client asked for
+        ``arraydmlrowcounts`` and did not ask for batcherrors, so the cost here
+        is opt-in.
+
+        Row by row, rather than through ``executemany`` -- and deliberately,
+        because Oracle's semantics for a batch that ABORTS are what decide it.
+        The rows before the failing one really applied and their counts are owed
+        to the client in the error reply, so the batch cannot sit inside one
+        savepoint: rolling that back would undo them. Each iteration gets its own
+        savepoint instead, which is the same per-statement model the rest of this
+        backend uses, and leaves the earlier rows exactly where Oracle leaves
+        them.
+
+        (``executemany(..., returning=True)`` does report per-statement counts
+        through ``nextset()`` and keeps the pipeline, which would be faster. It
+        cannot serve the abort case: once the batch raises, the counts for the
+        rows that did apply are no longer reachable.)
+        """
+        rows = list(rows)
+        if not rows:
+            return 0, []
+        translated = _translate_idioms(
+            _translate_plsql_block(_translate_routine_ddl(_translate_ddl(sql)))
+        )
+        bound_sql, _ = _translate_binds(translated, rows[0])
+        cursor = self._conn.cursor()
+        counts: list[int] = []
+        total = 0
+        for row in rows:
+            _, params = _translate_binds(translated, row)
+            cursor.execute('SAVEPOINT _mirror_stmt')
+            try:
+                cursor.execute(bound_sql, params)
+            except psycopg.Error as exc:
+                self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
+                self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
+                error = _backend_error(exc, original=sql, translated=bound_sql)
+                # What applied before the failure, and how much of it per
+                # iteration: a client that asked for the counts is owed them in
+                # the ERROR reply as much as in a successful one (#1031).
+                error.rowcount = total
+                error.row_counts = counts
+                raise error from exc
+            self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
+            affected = max(cursor.rowcount, 0)
+            counts.append(affected)
+            total += affected
+        return total, counts
+
+    def _object_table_type(self, table: str) -> int | None:
+        # The pg_type oid of an Oracle object table's type (CREATE TABLE t OF
+        # type), from the registry the CREATE filled; None for any other table.
         row = self._conn.execute(
-            'SELECT reloftype::regtype::text FROM pg_class '
-            'WHERE relname = %s AND reloftype <> 0',
-            (relname,),
+            'SELECT o.typ FROM sys.ora_object_tables o WHERE o.relid = to_regclass(%s)',
+            (table,),
         ).fetchone()
-        if row is None or row[0] is None:
+        return None if row is None else int(row[0])
+
+    def _ref_identity(self, type_pg_oid: int) -> tuple[str, str]:
+        # (schema, name) of the object type a REF points at, as all_types has it.
+        row = self._conn.execute(
+            'SELECT sys.ora_owner(n.nspname), sys.ora_name(t.typname) '
+            'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+            'WHERE t.oid = %s',
+            (type_pg_oid,),
+        ).fetchone()
+        if row is None:
+            raise UnsupportedFeature(f'REF: no object type has pg oid {type_pg_oid}')
+        return row[0], row[1]
+
+    def _db_ref(
+        self, type_pg_oid: int, table_oid: int | None, row_id: object
+    ) -> DbRef | None:
+        # A REF value for the client: the private locator plus the identity of
+        # the type it points at, which the describe and the value both carry.
+        if table_oid is None or row_id is None:
             return None
-        return row[0].split('.')[-1].strip('"').upper()
+        schema, name = self._ref_identity(type_pg_oid)
+        return DbRef(
+            _ref_locator(type_pg_oid, table_oid, row_id),
+            type_name=name,
+            type_schema=schema,
+            type_oid=_object_type_oid(type_pg_oid),
+        )
 
     def _execute_ref_select(self, match: 're.Match[str]') -> Result:
-        # Serve `SELECT REF(alias) FROM table alias [rest]` (#139). The referenced
-        # object type comes from the typed table's catalog entry; the REF locator is
-        # stood in by the row's ctid (opaque, and never dereferenced — the DEREF /
-        # bind the test does next is 12c+ and skips on the 11g Mirror). The result is
-        # one REF column of DbRef values carrying the type identity the describe
-        # reports, so the client reads ref.type_name correctly.
+        # Serve `SELECT REF(alias) FROM table alias [rest]` (#139/#1127). The
+        # table must be an Oracle object table; each row's REF is its table oid
+        # and hidden object id, which stay put across UPDATE and VACUUM FULL.
         ref_alias, table, table_alias, rest = match.groups()
-        type_name = self._object_type_name(table)
-        if type_name is None:
+        type_pg_oid = self._object_table_type(table)
+        if type_pg_oid is None:
             raise UnsupportedFeature(
                 f'REF({ref_alias}): {table} is not an object table'
             )
-        query = f'SELECT {table_alias}.ctid::text FROM {table} {table_alias}{rest}'
+        query = (
+            f'SELECT {table_alias}.tableoid, {table_alias}.{_OBJECT_ID_COLUMN} '
+            f'FROM {table} {table_alias}{rest}'
+        )
         cursor = self._conn.cursor()
         cursor.execute('SAVEPOINT _mirror_stmt')
         try:
             cursor.execute(query)
-            ctids = [r[0] for r in cursor.fetchall()]
+            found = cursor.fetchall()
         except psycopg.Error as exc:
             self._conn.execute('ROLLBACK TO SAVEPOINT _mirror_stmt')
             self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
             raise _backend_error(exc) from exc
         self._conn.execute('RELEASE SAVEPOINT _mirror_stmt')
-        schema = 'PUBLIC'
-        oid = b'\x00' * 16  # Oracle carries a 16-byte type OID; unused pre-12c bind
-        column = ColumnMeta(
-            name=f'REF({ref_alias})'.upper().encode('utf-8'),
+        rows = [(self._db_ref(type_pg_oid, tab, rid),) for tab, rid in found]
+        column = self._ref_column_meta(f'REF({ref_alias})', type_pg_oid)
+        return Result(columns=[column], rows=rows)
+
+    def _ref_column_meta(self, name: str, type_pg_oid: int) -> ColumnMeta:
+        schema, type_name = self._ref_identity(type_pg_oid)
+        return ColumnMeta(
+            name=name.upper().encode('utf-8'),
             data_type=TNS_TYPE_REF,
             data_length=4000,
             max_size=0,
             type_name=type_name.encode('ascii'),
             type_schema=schema.encode('ascii'),
-            type_oid=oid,
+            type_oid=_object_type_oid(type_pg_oid),
         )
-        rows = [
-            (
-                DbRef(
-                    ctid.encode('utf-8'),
-                    type_name=type_name,
-                    type_schema=schema,
-                    type_oid=oid,
-                ),
-            )
-            for ctid in ctids
-        ]
-        return Result(columns=[column], rows=rows)
+
+    def _ref_target(self, pg_oid: int) -> int | None:
+        # For a `<type>$ref` companion composite, the pg_type oid of <type>;
+        # None for any other type. Cached per session.
+        if pg_oid in self._ref_targets:
+            return self._ref_targets[pg_oid]
+        row = self._conn.execute(
+            'SELECT target.oid FROM pg_type ref '
+            'JOIN pg_type target ON target.typnamespace = ref.typnamespace '
+            "AND target.typname || '$ref' = ref.typname "
+            "WHERE ref.oid = %s AND ref.typname ~ '[$]ref$'",
+            (pg_oid,),
+        ).fetchone()
+        target = None if row is None else int(row[0])
+        self._ref_targets[pg_oid] = target
+        return target
+
+    def _ref_bind_value(self, ref: DbRef) -> object:
+        # A REF the client binds is the locator this backend handed it; it
+        # becomes the `<type>$ref` composite the column / sys.deref() take.
+        parsed = _parse_ref_locator(ref.bytes)
+        if parsed is None:
+            raise UnsupportedFeature('REF bind: not a locator this backend issued')
+        type_pg_oid, table_oid, row_id = parsed
+        info = self._ref_composites.get(type_pg_oid)
+        if info is None:
+            named = self._conn.execute(
+                "SELECT format('%%I.%%I', n.nspname, t.typname || '$ref') "
+                'FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace '
+                'WHERE t.oid = %s',
+                (type_pg_oid,),
+            ).fetchone()
+            if named is None:
+                raise UnsupportedFeature(f'REF bind: no type with pg oid {type_pg_oid}')
+            ref_name = named[0]
+            info = CompositeInfo.fetch(self._conn, ref_name)
+            if info is None:
+                raise UnsupportedFeature(f'REF bind: no {ref_name} type')
+            register_composite(info, self._conn)
+            self._ref_composites[type_pg_oid] = info
+        factory = info.python_type
+        if factory is None:
+            raise UnsupportedFeature('REF bind: companion type not registered')
+        return factory(table_oid, row_id)
 
     def _domain_type(self, pgresult, index: int) -> int | None:
         # The Oracle wire type if result column `index` comes from one of the typed
@@ -3168,6 +4251,8 @@ class PostgresBackend:
         # return every bind's value in order (input for IN, the routine's result
         # for OUT / IN OUT / the function return) — the Mirror marks them all OUT
         # and the client keeps only the positions it bound as a Var (#483/#503).
+        if _TYPE_SHAPE_BLOCK.search(sql):
+            return self._execute_type_shape(sql, binds)
         values = [b.value for b in binds]
         inner = _CALL_BLOCK.match(sql)
         statement = inner.group(1) if inner else ''
@@ -3367,6 +4452,9 @@ class PostgresBackend:
             return None, []
         return list(row[0]), list(row[1] or ())
 
+    # Oracle's longest password up to 12.1, the release this backend presents.
+    _MAX_PASSWORD_BYTES = 30
+
     def change_password(
         self, username: str, old_password: str, new_password: str
     ) -> None:
@@ -3380,11 +4468,58 @@ class PostgresBackend:
         current = credential_lookup(self._credentials, username)
         if current is not None and old_password != current:
             raise BackendError('invalid username/password; logon denied', ora_code=1017)
+        # A password Oracle would not store is refused the way the protocol route
+        # refuses it, ORA-01017. Up to 12.1 -- the release this backend presents --
+        # the limit is 30 bytes; 12.2 raised it to 1024. Accepting one PostgreSQL
+        # would take left the account with a password no client could log in
+        # with, and every later session failed ORA-01017 instead (#1127).
+        if len(new_password.encode('utf-8')) > self._MAX_PASSWORD_BYTES:
+            raise BackendError('invalid username/password; logon denied', ora_code=1017)
         for name in list(self._credentials):
             if name.upper() == username.upper():
                 self._credentials[name] = new_password
                 return
         self._credentials[username.upper()] = new_password
+
+    # The end-to-end tracing attributes a client sets over the 12c piggyback
+    # (#183). Oracle keeps them on the session and reports them through
+    # SYS_CONTEXT('USERENV', ...); PostgreSQL's equivalent of session-scoped
+    # state is a customised option, so each lands in `seerdb.<name>` and
+    # sys_context (above) reads it back.
+    _END_TO_END_SETTINGS = ('client_identifier', 'module', 'action', 'client_info')
+
+    def set_end_to_end(self, attrs: dict) -> None:
+        """Record the session's tracing attributes (#183).
+
+        Called by the Mirror when the client sends the tracing piggyback. Only
+        the attributes the client actually sent are touched: the piggyback marks
+        each one modified or not, and an unmodified attribute keeps its value
+        rather than being cleared.
+
+        A cleared attribute is stored as the empty string rather than removed --
+        there is no "unset" for a customised option within a session, and
+        sys_context maps '' back to NULL, which is what Oracle reports.
+        """
+        with self._conn.cursor() as cur:
+            for name in self._END_TO_END_SETTINGS:
+                if name not in attrs:
+                    continue
+                value = attrs[name]
+                cur.execute(
+                    'SELECT set_config(%s, %s, false)',
+                    (f'seerdb.{name}', '' if value is None else value),
+                )
+
+    def alter_session(self, statement: str) -> None:
+        """Run the ALTER SESSION a client sent with its login.
+
+        A 12.1+ client pins the session time zone to its own UTC offset this
+        way. It is committed at once: a PostgreSQL SET made inside a transaction
+        is undone if that transaction rolls back, and Oracle's is not.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(_translate_admin(statement))
+        self._conn.commit()
 
     def commit(self) -> None:
         self._conn.commit()
