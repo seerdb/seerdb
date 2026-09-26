@@ -29,6 +29,8 @@ from __future__ import annotations
 from typing import Callable, Protocol
 
 from seerdb.common.tns import (
+    FV2_BIND_IN,
+    FV2_BIND_OUT,
     O8I_STMT_TXN,
     _scan_ora_message,
     decode_8i_block_out,
@@ -36,6 +38,7 @@ from seerdb.common.tns import (
     decode_8i_dcb_describe,
     decode_8i_dml_response,
     decode_8i_exec_response,
+    decode_fv2_bind_directions,
     decode_fv2_block_out,
     decode_fv2_describe,
     decode_fv2_dml_response,
@@ -219,8 +222,9 @@ class Fv2Dialect:
         from seerdb.common.datatypes import Var
 
         bind = bind or []
-        # IN + IN OUT binds carry an input value; every Var is an OUT (IN OUT = a
-        # Var with has_value set).
+        # What the caller's binds suggest: every plain value and every Var holding
+        # one is an input, every Var an output. The server's bind prompt says
+        # which each bind really is, and replaces this guess below.
         input_values = [
             (b._value if isinstance(b, Var) else b)
             for b in bind
@@ -234,6 +238,19 @@ class Fv2Dialect:
         if resp is False:
             raise Exception('Connection closed during 9i PL/SQL block')
         packet = resp[1]
+        # The server returns values only for the binds the block writes, and
+        # takes inputs only for those it reads. A Var used only as input counted
+        # as an output shifted every value after it, decoding the next bind's
+        # bytes as the wrong type (#1242). Its prompt names each bind's
+        # direction, in bind order, so follow that.
+        directions = decode_fv2_bind_directions(packet)
+        if directions is not None and len(directions) == len(bind):
+            input_values = [
+                (b._value if isinstance(b, Var) else b)
+                for b, d in zip(bind, directions)
+                if d & FV2_BIND_IN
+            ]
+            out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
         if input_values:
             # `packet` is the bind prompt (or an OER on a compile error). Send the
             # input values; the reply carries OUT values + RPA + OER.
@@ -511,6 +528,11 @@ class O8iDialect:
         # surfaces any ORA- error regardless (its rowcount is not meaningful here).
         (_row_count, err_code, message) = decode_8i_dml_response(packet)
         _raise_ora(err_code, message)
+        # Values come back only for the binds the block writes; the prompt says
+        # which, as on 9i (#1242), with 8i's bind count at offset 2.
+        directions = decode_fv2_bind_directions(packet, CountAt=2)
+        if directions is not None and len(directions) == len(bind):
+            out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
         if out_positions:
             out_values = decode_8i_block_out(packet, len(out_positions))
             record = {'out_positions': out_positions, 'out_values': out_values}
