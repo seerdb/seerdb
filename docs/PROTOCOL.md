@@ -4931,6 +4931,17 @@ block and signals it in the prompt; the round-trip then differs by direction:
   1-byte indicator` per **OUT and IN OUT** bind, in position order, skipping
   pure-IN binds, immediately before the RPA + OER (`decode_fv2_block_out`).
 
+**The prompt's masks are authoritative (#1242).** The client used to guess the
+directions from its own binds, counting every `Var` as an output. A `Var` the
+block only reads (set with `setvalue`, never assigned) is an IN bind, so no value
+comes back for it, and counting it shifted every value after it: `:1 := :2 * 10`
+with two `Var`s decoded the RPA as the second value. The driver now reads the
+masks (`decode_fv2_bind_directions`: the last `<numbinds>` bytes before the first
+RXD / RPA, since the padding varies), sends inputs for the binds marked IN and
+expects values for those marked OUT. It falls back to the guess only when a reply
+carries no prompt. Captured: `0b0501020001010000001020` is OUT, IN, and
+`0b050103000101000000102030` is OUT, IN, IN OUT.
+
 A **pure-OUT** block (no IN/IN OUT bind) needs no input frame: the server packs
 the prompt, the return RXD and the RPA + OER into a single reply. When inputs
 exist, the prompt is its own packet, the client sends the input RXD, and the
@@ -5241,6 +5252,12 @@ An **IN OUT** bind (#363) is a `Var` whose value is set: it sends its input valu
 comes back in the reply's RXD, both in the same single round trip. Its prompt
 direction is `0x30`. No extra machinery — the inline value path and the OUT-value
 decode above already cover it.
+
+8i's prompt carries the same masks, but its bind count sits at offset **2**
+(`0b 05 <n> 00 00 00 01` then a longer zero pad), not 9i's offset 3: captured
+`0b0502000000010000…0010200702c147…` is OUT, IN, then the one OUT value. A `Var`
+the block only reads gets no value back here either, so the driver takes the OUT
+positions from the masks (#1242).
 
 ### 19.15 Oracle 8i LOB read — the single TTI_LOBOPS READ (#364)
 

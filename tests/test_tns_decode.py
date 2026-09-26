@@ -6419,6 +6419,79 @@ class TestFv2OutBinds(unittest.TestCase):
         self.assertEqual(strip_fv2_bind_prompt(live)[0], 0x07)
 
 
+class TestFv2BindDirections(unittest.TestCase):
+    """The 9i bind prompt names each bind's direction, and the block exchange
+    follows it (#1242). Prompts captured live from 9.2.0.4."""
+
+    # :1 := :2 * 10 with two Vars: OUT, IN.
+    OUT_IN_PROMPT = bytes.fromhex('0b0501020001010000001020')
+    # ... and its reply: one OUT value (70) then the RPA + OER.
+    OUT_IN_VALUES = bytes.fromhex(
+        '0702c147000801020401823751000401010000000101002f'
+        '0000000000000000000000000000010100000000'
+    )
+
+    def test_the_directions_are_read_in_bind_order(self):
+        from seerdb.common.tns import decode_fv2_bind_directions
+
+        self.assertEqual(decode_fv2_bind_directions(self.OUT_IN_PROMPT), [0x10, 0x20])
+        three = bytes.fromhex('0b050103000101000000102030')
+        self.assertEqual(decode_fv2_bind_directions(three), [0x10, 0x20, 0x30])
+        # A pure-OUT block's prompt runs straight into the values' RXD, with
+        # the JDBC-style unpadded section or the live server's padded one.
+        both_out = bytes.fromhex('0b05010200010100000010100702c1020002c103')
+        self.assertEqual(decode_fv2_bind_directions(both_out), [0x10, 0x10])
+        for prompt in (
+            TestFv2OutBinds.OUTNUM_RESP,
+            bytes.fromhex('0b0501010001010000')
+            + bytes.fromhex('10')
+            + TestFv2OutBinds.OUTNUM_RESP[9:],
+        ):
+            self.assertEqual(decode_fv2_bind_directions(prompt), [0x10])
+        self.assertIsNone(decode_fv2_bind_directions(self.OUT_IN_VALUES))
+
+    def test_8i_keeps_its_bind_count_at_offset_2(self):
+        # Captured from 8.1.7: OUT, IN, then the one OUT value's RXD.
+        from seerdb.common.tns import decode_8i_block_out, decode_fv2_bind_directions
+
+        reply = bytes.fromhex(
+            '0b050200000001000000000000000000000010200702c1470000080400f3340d'
+        )
+        self.assertEqual(decode_fv2_bind_directions(reply, CountAt=2), [0x10, 0x20])
+        self.assertEqual(decode_8i_block_out(reply, 1), [bytes.fromhex('c147')])
+
+    def test_an_in_only_var_is_sent_as_input_and_not_read_back(self):
+        # The prompt says OUT, IN: send only the IN Var's value, and read one
+        # OUT value, not two. Counting both Vars as outputs read the RPA as a
+        # second value and failed "malformed Oracle NUMBER".
+        import seerdb
+        from seerdb.client.dialect import RECV, Fv2Dialect, Send
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import encode_tokens_rxd
+
+        out, inp = Var(seerdb.DB_TYPE_NUMBER), Var(seerdb.DB_TYPE_NUMBER)
+        inp.setvalue(0, 7)
+        gen = Fv2Dialect().execute_block('begin :1 := :2 * 10; end;', [out, inp])
+        sent = []
+        reply = None
+        replies = iter([b'open', self.OUT_IN_PROMPT, self.OUT_IN_VALUES, b'close'])
+        try:
+            step = next(gen)
+            while True:
+                if isinstance(step, Send):
+                    sent.append(step)
+                    step = gen.send(None)
+                else:
+                    self.assertIs(step, RECV)
+                    step = gen.send((6, next(replies)))
+        except StopIteration as done:
+            reply = done.value
+        self.assertIn(encode_tokens_rxd([7], b''), [s.data for s in sent])
+        record = reply[4][0]
+        self.assertEqual(record['out_positions'], [0])
+        self.assertEqual(len(record['out_values']), 1)
+
+
 class TestFv2Bfile(unittest.TestCase):
     """Oracle 9i BFILE read (#102, PROTOCOL §19.8): FILE_OPEN -> GETLEN -> READ
     -> FILE_CLOSE over TTI_LOBOPS, where FILE_OPEN returns an open-flagged

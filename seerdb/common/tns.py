@@ -11166,6 +11166,34 @@ def strip_fv2_bind_prompt(Data: bytes) -> bytes:
     return Data
 
 
+# The direction masks in a 9i bind prompt: OUT, IN, and both (IN OUT).
+FV2_BIND_OUT = 0x10
+FV2_BIND_IN = 0x20
+
+
+def decode_fv2_bind_directions(Data: bytes, CountAt: int = 3) -> list[int] | None:
+    """The direction of each bind, from a 9i or 8i bind prompt, or None if `Data`
+    does not open with one (#1242).
+
+    The 9i prompt is `0b 05 01 <n> 00 01 01 00`, padding, then one mask per bind
+    in bind order: 0x10 OUT, 0x20 IN, 0x30 IN OUT (PROTOCOL §19.7). Captured:
+    `0b0501020001010000001020` is OUT, IN. 8i's is `0b 05 <n> 00 00 00 01` and
+    more padding before the same masks, so its count sits at offset 2
+    (`CountAt`). The masks are the last `n` bytes before the first RXD / RPA,
+    or the end of the prompt, since the padding is what varies; a mask is never
+    either token.
+    """
+    if len(Data) < 8 or Data[0] != _FV2_BIND_PROMPT:
+        return None
+    Count = Data[CountAt]
+    End = 8
+    while End < len(Data) and Data[End] not in (TTI_RXD, TTI_RPA):
+        End += 1
+    if End - 8 < Count:
+        return None
+    return list(Data[End - Count : End])
+
+
 # A 9i PL/SQL block reply marks an OUT bind the block never assigned with these
 # four fixed bytes, in place of the usual DALC + indicator. Captured live: a
 # `RETURNING ... INTO` whose statement matched no rows produces one per such

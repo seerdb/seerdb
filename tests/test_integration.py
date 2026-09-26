@@ -1404,6 +1404,19 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('begin :value := :value + 5.25; end;', {'value': var})
         self.assertEqual(var.getvalue(), datetime.datetime(2022, 5, 15, 18, 0, 0))
 
+    def test_a_var_read_only_as_input_beside_an_out_var(self):
+        # A Var the block only reads is an IN bind: no value comes back for it,
+        # and the OUT Var beside it gets its own. On 9i the reply's values were
+        # read one per Var, so the IN one shifted them and failed (#1242).
+        out, inp = self.cur.var(int), self.cur.var(int)
+        inp.setvalue(0, 7)
+        self.cur.execute('begin :1 := :2 * 10; end;', [out, inp])
+        self.assertEqual((out.getvalue(), inp.getvalue()), (70, 7))
+        out, inp = self.cur.var(int), self.cur.var(int)
+        inp.setvalue(0, 8)
+        self.cur.execute('begin :h := :v * 10; end;', {'v': inp, 'h': out})
+        self.assertEqual((out.getvalue(), inp.getvalue()), (80, 8))
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6724,6 +6737,19 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(
                     var.getvalue(), datetime.datetime(2022, 5, 15, 18, 0, 0)
                 )
+
+    async def test_a_var_read_only_as_input_beside_an_out_var(self):
+        # Async twin of CursorIntegration's.
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                out, inp = Cur.var(int), Cur.var(int)
+                inp.setvalue(0, 7)
+                await Cur.execute('begin :1 := :2 * 10; end;', [out, inp])
+                self.assertEqual((out.getvalue(), inp.getvalue()), (70, 7))
+                out, inp = Cur.var(int), Cur.var(int)
+                inp.setvalue(0, 8)
+                await Cur.execute('begin :h := :v * 10; end;', {'v': inp, 'h': out})
+                self.assertEqual((out.getvalue(), inp.getvalue()), (80, 8))
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.
