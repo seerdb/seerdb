@@ -1854,9 +1854,64 @@ def _translate_decode(sql: str) -> str:
     return ''.join(out)
 
 
+# An Oracle identifier may carry `#` (and `$`) after its first character:
+# serial#, statistic#, obj#. PostgreSQL takes `$` but not `#` (#1249).
+_HASH_IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_$#]*')
+_IDENTIFIER_CHAR = re.compile(r'[A-Za-z0-9_$#]')
+
+
+def _quote_hash_identifiers(sql: str) -> str:
+    """Quote each unquoted identifier containing `#` in PostgreSQL's spelling of
+    an unquoted name: lower case, so `serial#` names the dictionary's "serial#"
+    and a column made as `obj#` reads back as OBJ# (#1249).
+
+    String literals, quoted identifiers and comments are copied as they are, and
+    a bind name (`:x#`) is left to the bind rewrite.
+    """
+    if '#' not in sql:
+        return sql
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        char = sql[i]
+        if char in ("'", '"'):
+            end = i + 1
+            while end < n:
+                if sql[end] == char:
+                    if end + 1 < n and sql[end + 1] == char:
+                        end += 2
+                        continue
+                    break
+                end += 1
+            out.append(sql[i : end + 1])
+            i = end + 1
+        elif sql.startswith('--', i):
+            end = sql.find('\n', i)
+            end = n if end < 0 else end
+            out.append(sql[i:end])
+            i = end
+        elif sql.startswith('/*', i):
+            end = sql.find('*/', i + 2)
+            end = n if end < 0 else end + 2
+            out.append(sql[i:end])
+            i = end
+        elif (match := _HASH_IDENTIFIER.match(sql, i)) and (
+            i == 0 or not _IDENTIFIER_CHAR.match(sql[i - 1])
+        ):
+            word = match.group()
+            quote = '#' in word and (i == 0 or sql[i - 1] != ':')
+            out.append(f'"{word.lower()}"' if quote else word)
+            i = match.end()
+        else:
+            out.append(char)
+            i += 1
+    return ''.join(out)
+
+
 def _translate_idioms(sql: str) -> str:
     """Rewrite the Oracle SQL functions / literal idioms the suite uses to their
     PostgreSQL equivalents (#502). Applied to every statement."""
+    sql = _quote_hash_identifiers(sql)
     sql = _translate_connect_by(sql)
     sql = _translate_signed_year(sql)
     sql = _translate_decode(sql)

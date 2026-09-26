@@ -1417,6 +1417,18 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('begin :h := :v * 10; end;', {'v': inp, 'h': out})
         self.assertEqual((out.getvalue(), inp.getvalue()), (80, 8))
 
+    def test_an_identifier_may_contain_a_hash(self):
+        # Oracle takes `#` in an unquoted name after its first character, as its
+        # own dictionary does (serial#, statistic#); it reads back upper-cased
+        # like any unquoted name (#1249).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (obj# NUMBER, name VARCHAR2(10))')
+        self.cur.execute(f"INSERT INTO {self.TABLE} (obj#, name) VALUES (7, 'a#b')")
+        self.cur.execute(
+            f'SELECT t.obj#, name FROM {self.TABLE} t WHERE obj# = :1', [7]
+        )
+        self.assertEqual([d[0] for d in self.cur.description], ['OBJ#', 'NAME'])
+        self.assertEqual(self.cur.fetchall(), [(7, 'a#b')])
+
     def test_decode(self):
         # DECODE with untyped literals, a NULL matching a NULL, several searches
         # and no default; and, as a schema script populates a table, a DECODE of
@@ -6750,6 +6762,23 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 inp.setvalue(0, 8)
                 await Cur.execute('begin :h := :v * 10; end;', {'v': inp, 'h': out})
                 self.assertEqual((out.getvalue(), inp.getvalue()), (80, 8))
+
+    async def test_an_identifier_may_contain_a_hash(self):
+        # Async twin of CursorIntegration's.
+        Table = 'PYO_ASYNC_HASH'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await self._drop_async(Cur, Table)
+                await Cur.execute(
+                    f'CREATE TABLE {Table} (obj# NUMBER, name VARCHAR2(10))'
+                )
+                await Cur.execute(f"INSERT INTO {Table} (obj#, name) VALUES (7, 'a#b')")
+                await Cur.execute(
+                    f'SELECT t.obj#, name FROM {Table} t WHERE obj# = :1', [7]
+                )
+                self.assertEqual([d[0] for d in Cur.description], ['OBJ#', 'NAME'])
+                self.assertEqual(await Cur.fetchall(), [(7, 'a#b')])
+                await self._drop_async(Cur, Table)
 
     async def test_decode(self):
         # Async twin of CursorIntegration's.

@@ -1545,6 +1545,21 @@ def test_kill_session_ends_only_the_session_named() -> None:
         victim.close()
 
 
+def test_an_identifier_containing_a_hash_is_quoted() -> None:
+    # PostgreSQL has no `#` in an unquoted name; quote it in the lower case an
+    # unquoted name is stored in, and leave literals, quoted names, comments and
+    # bind names alone (#1249).
+    from postgres_backend import _quote_hash_identifiers as quote
+
+    assert quote('SELECT sid, serial# FROM v$session') == (
+        'SELECT sid, "serial#" FROM v$session'
+    )
+    assert quote('CREATE TABLE t (OBJ# NUMBER)') == 'CREATE TABLE t ("obj#" NUMBER)'
+    untouched = """SELECT 'a#b', "Obj#" FROM t WHERE x = :b# -- c#\n/* d# */"""
+    assert quote(untouched) == untouched
+    assert quote('SELECT 1 FROM dual') == 'SELECT 1 FROM dual'
+
+
 def test_translate_idioms_rewrites_rowid_pseudocolumn() -> None:
     # The ROWID pseudo-column becomes the row's ctid in Oracle's extended form —
     # one rewrite serving a SELECT, a WHERE ROWID = :bind (text compare), and the
