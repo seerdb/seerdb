@@ -2312,3 +2312,25 @@ def test_utl_raw_length_does_not_recurse_with_schema_on_path() -> None:
         ).rows == [('F0FF',)]
     finally:
         backend.close()
+
+
+def test_an_assignment_into_an_ltz_out_bind_is_read_in_the_session_zone() -> None:
+    # `:ltz := :ltz + 5.25` makes a DATE on the session's clock; going back into
+    # the LTZ it is read in the session zone again, so the value moves by exactly
+    # the days, as on Oracle. The declared type is on the bind, not its value
+    # (#1240, #1245). The session zone must differ from the database's (UTC) for
+    # this to show: Helsinki is +03:00 in May.
+    import datetime
+
+    from seerdb.common.tns_consts import TNS_TYPE_TIMESTAMPLTZ
+    from seerdb.server import BindVar, LtzValue
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend._conn.execute("SET TimeZone = 'Europe/Helsinki'")
+        value = LtzValue.of(datetime.datetime(2022, 5, 10, 12, 0, 0))
+        bind = BindVar(value=value, tns_type=TNS_TYPE_TIMESTAMPLTZ, max_size=11)
+        result = backend.execute('begin :value := :value + 5.25; end;', [bind])
+        assert result.out_binds == [datetime.datetime(2022, 5, 15, 18, 0, 0)]
+    finally:
+        backend.close()

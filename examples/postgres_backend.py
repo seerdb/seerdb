@@ -3297,11 +3297,14 @@ class PostgresBackend:
         by_name = dict(zip(refs, values))
         # A DATE or TIMESTAMP assigned to a TIMESTAMP WITH LOCAL TIME ZONE is read
         # in the session's zone, as Oracle converts it; the cast does that, and
-        # leaves a value that is already an instant alone (#1240).
+        # leaves a value that is already an instant alone (#1240). The declared
+        # type is on the bind, not on its value (#1245).
+        declared = {
+            ref: getattr(bind, 'tns_type', None) for ref, bind in zip(refs, binds)
+        }
         exprs = ', '.join(
             f'CAST(({expr}) AS timestamptz)'
-            if isinstance(by_name.get(ref), BindVar)
-            and by_name[ref].tns_type == TNS_TYPE_TIMESTAMPLTZ
+            if declared.get(ref) == TNS_TYPE_TIMESTAMPLTZ
             else expr
             for ref, expr in assignments
         )
