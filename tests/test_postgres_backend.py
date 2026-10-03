@@ -1858,6 +1858,24 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     assert 'IMMUTABLE' not in from_tz_body
 
 
+def test_xmlelement_takes_its_name_after_name() -> None:
+    # PostgreSQL's XMLELEMENT takes the element name after NAME; Oracle's
+    # usual spelling leaves it out, and folds an unquoted name to upper case
+    # (#1554). A name already after NAME is left alone.
+    assert _translate_idioms('SELECT XMLElement("IntCol", IntCol) FROM t') == (
+        'SELECT XMLELEMENT(NAME "IntCol", IntCol) FROM t'
+    )
+    assert _translate_idioms('SELECT xmlelement ( Emp, 5) FROM dual') == (
+        'SELECT XMLELEMENT(NAME "EMP", 5) FROM dual'
+    )
+    assert _translate_idioms('SELECT XMLElement(NAME "A", 1) FROM dual') == (
+        'SELECT XMLElement(NAME "A", 1) FROM dual'
+    )
+    assert _translate_idioms(
+        'SELECT XMLElement("A", XMLElement("B", 2)) FROM dual'
+    ) == ('SELECT XMLELEMENT(NAME "A", XMLELEMENT(NAME "B", 2)) FROM dual')
+
+
 def test_translate_idioms_functions_and_literals() -> None:
     assert _translate_idioms('SELECT SYSDATE') == 'SELECT localtimestamp(0)'
     # HEXTORAW / RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as

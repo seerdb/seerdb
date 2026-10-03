@@ -3031,11 +3031,18 @@ _REF_SELECT = re.compile(
 )
 
 
+def _xmlelement_name(match: re.Match[str]) -> str:
+    # XMLElement's name as PostgreSQL's NAME takes it: quoted as written, or an
+    # unquoted one upper-cased, as Oracle folds it (#1554).
+    name = match.group(1)
+    return 'XMLELEMENT(NAME ' + (name if name.startswith('"') else f'"{name.upper()}"')
+
+
 # Oracle SQL functions / literal idioms → PostgreSQL (#502). Each is a function
 # call or a literal keyword the suite uses; the rewrites are anchored on the
 # call's `(` or a word boundary, so ordinary identifiers are left alone. Applied
 # to every statement (a DEFAULT SYSDATE in DDL is rewritten too).
-_IDIOM_REWRITES = [
+_IDIOM_REWRITES: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]] = [
     # (HEXTORAW, RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as
     # real PostgreSQL functions — see _HELPER_FUNCTIONS_DDL / __init__ — so their
     # call sites resolve directly and need no rewrite here. TO_CHAR,
@@ -3091,6 +3098,18 @@ _IDIOM_REWRITES = [
             re.IGNORECASE,
         ),
         r"- INTERVAL '\1' \2",
+    ),
+    # XMLElement("name", ...) / XMLElement(name, ...): PostgreSQL's XMLELEMENT
+    # takes the name after the NAME keyword (#1554). Oracle folds an unquoted
+    # name to upper case, as it does any identifier, where PostgreSQL would
+    # fold it to lower; it goes quoted, upper-cased. One already spelt
+    # `NAME x`, which Oracle takes too, and Oracle's EVALNAME are left alone.
+    (
+        re.compile(
+            r'\bXMLELEMENT\s*\(\s*(?!(?:NAME|EVALNAME)\b)("[^"]*"|[A-Za-z_][\w$#]*)',
+            re.IGNORECASE,
+        ),
+        _xmlelement_name,
     ),
     # SYSDATE / SYSTIMESTAMP → the session clock (SYSDATE is to-the-second).
     (re.compile(r'\bsystimestamp\b', re.IGNORECASE), 'ora_systimestamp()'),
