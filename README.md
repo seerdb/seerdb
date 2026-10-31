@@ -11,6 +11,8 @@ database's native wire protocol (TNS/TTC) directly over TCP.
 
 No proprietary client libraries or SDKs are required.
 
+[简体中文简介](README.zh-CN.md)
+
 > **Independent project — not affiliated with Oracle.** seerdb is a clean-room,
 > independent effort and is not affiliated with, endorsed by, or sponsored by
 > Oracle Corporation. Oracle®, Oracle Database, and related names are trademarks
