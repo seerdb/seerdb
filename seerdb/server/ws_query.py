@@ -21,8 +21,9 @@ Protocol (one JSON object per WS text message, request/response)::
     -> {"type":"commit"} | {"type":"rollback"}     <- {"type":"ok"}
     <- {"type":"error","id":7,"code":"UNSUPPORTED","message":"..."}
 
-Auth: ``backend.authenticate(user)`` returns the account's secret, compared
-constant-time against the supplied password. Unlike TNS O5LOGON the client
+Auth: :func:`seerdb.server.session.password_login`, which takes a TNS login's
+steps -- the lock after failed logins, the backend's session opened -- with the
+password compared constant-time to the account's secret. Unlike TNS O5LOGON the client
 sends its plaintext password, protected by ``wss://`` TLS -- acceptable under
 the Mirror's operator-controlled threat model (behind VPN/firewall), and the
 agreed MVP. One statement in flight at a time; binds are a positional JSON list
@@ -35,7 +36,6 @@ from __future__ import annotations
 import base64
 import datetime
 import decimal
-import hmac
 import json
 import logging
 from typing import TYPE_CHECKING, Any
@@ -62,7 +62,8 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_VARCHAR,
     TNS_TYPE_VECTOR,
 )
-from seerdb.server.backend import UnsupportedFeature
+from seerdb.server.backend import BackendError, UnsupportedFeature
+from seerdb.server.framing import SESSION_MESSAGE_LIMIT
 
 if TYPE_CHECKING:
     from seerdb.server.backend import Backend, Result
@@ -171,21 +172,22 @@ def _parse(message: Any) -> dict[str, Any]:
 def serve_query_session(conn: Any, backend: Backend) -> str | None:
     """Run one JSON-over-WebSocket query session on ``conn`` against ``backend``.
 
-    Authenticates first (plaintext password over the wss TLS, compared
-    constant-time to the account secret), then serves query / commit / rollback
+    Logs the client in first (plaintext password over the wss TLS, as a TNS
+    login does otherwise), then serves query / commit / rollback
     until the client disconnects. Returns the logged-in user for the caller's
     log, or None if the session never authenticated. Backend calls run through
     the same per-call context isolation the TNS path uses."""
     from websockets.exceptions import ConnectionClosed
 
-    from seerdb.server.session import _IsolatedBackend
+    from seerdb.server.session import LOGIN_SECONDS, _IsolatedBackend, password_login
 
     be = _IsolatedBackend(backend)
 
-    # Login must come first.
+    # Login must come first, and within the time a TNS login has
+    # (GHSA-wgc5-xh4h-3hhr).
     try:
-        login = _parse(conn.recv())
-    except ConnectionClosed:
+        login = _parse(conn.recv(timeout=LOGIN_SECONDS))
+    except (ConnectionClosed, TimeoutError):
         return None
     except (ValueError, json.JSONDecodeError) as exc:
         _send(conn, _error_payload(None, ValueError(f'bad login message: {exc}')))
@@ -202,10 +204,15 @@ def serve_query_session(conn: Any, backend: Backend) -> str | None:
         return None
     username = str(login.get('user', ''))
     password = str(login.get('password', ''))
-    secret = be.authenticate(username)
-    if secret is None or not hmac.compare_digest(str(secret), password):
-        _send(conn, {'type': 'error', 'code': 'AUTH', 'message': 'invalid credentials'})
+    # As a TNS login: locked names refused, failures delayed and counted, and
+    # the backend's session opened (GHSA-382x-hhhq-35r3, GHSA-7xrq-88jc-3p3x).
+    try:
+        password_login(be, username, password)
+    except BackendError as exc:
+        _send(conn, {'type': 'error', 'code': 'AUTH', 'message': exc.ora_message})
         return None
+    # A logged-in session's statements may be as large as a TNS session's.
+    conn.protocol.max_size = SESSION_MESSAGE_LIMIT
     _send(conn, {'type': 'login_ok'})
 
     # Query / transaction loop.

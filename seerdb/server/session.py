@@ -279,7 +279,7 @@ from seerdb.server.backend import (
     UnsupportedFeature,
     VarcharValue,
 )
-from seerdb.server.framing import SESSION_MESSAGE_LIMIT, PacketStream
+from seerdb.server.framing import PacketStream
 from seerdb.server.handshake import (
     client_compile_cap,
     client_field_version,
@@ -1140,6 +1140,37 @@ def _decoy_secret(user: str) -> str:
     return hmac.new(_DECOY_KEY, user.upper().encode('utf-8'), 'sha256').hexdigest()
 
 
+def password_login(backend: Backend, user: str, password: str) -> None:
+    """Log ``user`` in on ``backend`` with a plaintext ``password``, as
+    :func:`handle_login` logs a TNS client in with its O5LOGON proof: a locked
+    name is refused; an unknown one is checked against a decoy secret, so it is
+    refused at the same point as a wrong password; each failure is delayed and
+    counted toward the lock (GHSA-7xrq-88jc-3p3x); and a good login opens the
+    backend's session, which in per-user mode makes it the user's own role
+    (GHSA-382x-hhhq-35r3). The JSON query endpoint's login. Raises
+    :class:`BackendError` with the ORA code a TNS client is refused with."""
+    if lockout.is_locked(user):
+        raise BackendError(
+            'The account is locked.',
+            ora_code=ORA_ACCOUNT_LOCKED,
+        )
+    secret = backend.authenticate(user)
+    known = secret is not None
+    if secret is None:
+        secret = _decoy_secret(user)
+    matches = hmac.compare_digest(secret.encode('utf-8'), password.encode('utf-8'))
+    if not (known and matches):
+        time.sleep(lockout.failed(user))
+        raise BackendError(
+            'invalid username/password; logon denied',
+            ora_code=ORA_INVALID_USERNAME_PASSWORD,
+        )
+    lockout.succeeded(user)
+    open_session = getattr(backend, 'open_session', None)
+    if open_session is not None:
+        open_session({})
+
+
 def _deny_login(
     stream: PacketStream,
     reason: str,
@@ -1473,7 +1504,7 @@ def serve_session(
         identity=identity,
     )
     stream.settimeout(None)
-    stream.max_message = SESSION_MESSAGE_LIMIT
+    stream.allow_session_messages()
     identity = _backend_identity(backend, identity)
     advertised = field_version
     # Serve the session at the version the client actually negotiated, not the

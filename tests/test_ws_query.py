@@ -96,11 +96,21 @@ class _QueryBackend:
         pass
 
 
-def _serve(**extra) -> Iterator[WsServer]:
+@pytest.fixture(autouse=True)
+def _fresh_lockout(monkeypatch) -> None:
+    # The failed-login counts are the process's: each test starts with none,
+    # and a failure is not delayed.
+    from seerdb.server import lockout
+
+    monkeypatch.setattr(lockout, '_failures', {})
+    monkeypatch.setattr(lockout, '_DELAY_STEP', 0.0)
+
+
+def _serve(backend_factory: Any = _QueryBackend, **extra) -> Iterator[WsServer]:
     server = WsServer(
         host='127.0.0.1',
         port=0,
-        backend_factory=_QueryBackend,
+        backend_factory=backend_factory,
         protocol='query',
         **extra,
     )
@@ -237,6 +247,115 @@ def test_first_message_must_be_login(query_mirror: WsServer) -> None:
     try:
         reply = _rpc(ws, {'type': 'query', 'sql': 'select * from dual'})
         assert reply['type'] == 'error' and reply['code'] == 'PROTOCOL'
+    finally:
+        ws.close()
+
+
+# --------------------------------------------------------------------------- #
+# the login takes a TNS login's steps
+# --------------------------------------------------------------------------- #
+
+
+def _login_once(port: int, user: str, password: str) -> dict:
+    ws = _connect(port)
+    try:
+        return _login(ws, user, password)
+    finally:
+        ws.close()
+
+
+def test_an_unknown_user_is_refused_as_a_wrong_password_is(
+    query_mirror: WsServer,
+) -> None:
+    # GHSA-7xrq-88jc-3p3x: the same answer, so it tells no account apart.
+    unknown = _login_once(query_mirror.port, 'NO_SUCH_USER', 'x')
+    wrong = _login_once(query_mirror.port, 'PYO', 'wrong')
+    assert (
+        unknown
+        == wrong
+        == {
+            'type': 'error',
+            'code': 'AUTH',
+            'message': 'ORA-01017: invalid username/password; logon denied',
+        }
+    )
+
+
+def test_failed_logins_lock_a_name(query_mirror: WsServer, monkeypatch) -> None:
+    # GHSA-7xrq-88jc-3p3x: the query endpoint counts failures toward the lock
+    # the TNS login keeps, and refuses a locked name, ORA-28000.
+    from seerdb.server import lockout
+
+    monkeypatch.setattr(lockout, '_attempts', 3)
+    for _ in range(3):
+        assert _login_once(query_mirror.port, 'PYO', 'wrong')['message'].startswith(
+            'ORA-01017'
+        )
+    assert lockout.is_locked('PYO')
+    reply = _login_once(query_mirror.port, 'PYO', 'pyo123')
+    assert reply['code'] == 'AUTH' and reply['message'].startswith('ORA-28000')
+    lockout.unlock('PYO')
+    assert _login_once(query_mirror.port, 'PYO', 'pyo123') == {'type': 'login_ok'}
+
+
+class _SessionBackend(_QueryBackend):
+    opened: list[dict] = []
+
+    def open_session(self, connect_attrs: dict) -> None:
+        self.opened.append(connect_attrs)
+
+
+def test_a_login_opens_the_backends_session() -> None:
+    # GHSA-382x-hhhq-35r3: as after a TNS login, the backend's session is
+    # opened -- where per-user mode makes it the user's own role -- before any
+    # statement runs.
+    _SessionBackend.opened = []
+    for server in _serve(_SessionBackend):
+        assert _login_once(server.port, 'PYO', 'wrong')['code'] == 'AUTH'
+        assert _SessionBackend.opened == []
+        assert _login_once(server.port, 'PYO', 'pyo123') == {'type': 'login_ok'}
+        assert _SessionBackend.opened == [{}]
+
+
+def test_a_client_that_never_logs_in_is_dropped(
+    query_mirror: WsServer, monkeypatch
+) -> None:
+    # GHSA-wgc5-xh4h-3hhr: within the time a TNS login has.
+    from websockets.exceptions import ConnectionClosed
+
+    from seerdb.server import session
+
+    monkeypatch.setattr(session, 'LOGIN_SECONDS', 0.5)
+    ws = _connect(query_mirror.port)
+    try:
+        with pytest.raises(ConnectionClosed):
+            ws.recv(timeout=10)
+    finally:
+        ws.close()
+
+
+def test_a_large_message_is_refused_before_login_and_taken_after(
+    query_mirror: WsServer,
+) -> None:
+    # GHSA-wgc5-xh4h-3hhr: websockets holds a whole message before the
+    # endpoint reads it, so its cap is a login's until the client has logged
+    # in, and a session's after.
+    from websockets.exceptions import ConnectionClosed
+
+    padding = ' ' * (2 << 20)
+    ws = _connect(query_mirror.port)
+    try:
+        ws.send(json.dumps({'type': 'login', 'user': 'PYO', 'password': padding}))
+        with pytest.raises(ConnectionClosed) as closed:
+            ws.recv(timeout=10)
+        assert closed.value.rcvd is not None and closed.value.rcvd.code == 1009
+    finally:
+        ws.close()
+    ws = _connect(query_mirror.port)
+    try:
+        assert _login(ws)['type'] == 'login_ok'
+        reply = _rpc(ws, {'type': 'query', 'sql': f'select * from dual{padding}'})
+        assert reply['rows'] == [['X']]
     finally:
         ws.close()
 

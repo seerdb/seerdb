@@ -425,6 +425,10 @@ One statement in flight at a time; binds are a positional JSON list of scalars.
 shares `--ws-origin` and `--max-sessions` with the raw-TNS listener. Auth takes
 the account password in the login frame, so it relies on the `wss` TLS — the
 same operator-controlled threat model and milestone-52 caveat above apply.
+Otherwise a login here is a TNS login's: failed logins count toward the same
+lock (*Failed logins*), a client has 60 seconds to log in, and in per-user mode
+the session is the user's own role. Until it has logged in, a client may send
+only messages of up to 1 MiB, on this listener and the raw-TNS one alike.
 Richer typing, LOBs, named binds and streaming are deliberately out of this MVP.
 
 ## Mirror over PostgreSQL
