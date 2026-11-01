@@ -277,7 +277,7 @@ def encode_kv_oci(key: bytes, val: bytes, flags: int = 0) -> bytes:
     """One OCI-dialect (deadbeef) key-value pair (tns._AUTH_PAIR): a ub4
     declared length and the value for the key and for the value (an empty one is
     the ub4 length 0 alone), then a ub4 flags field (the verifier type for
-    AUTH_VFR_DATA, else 0). The write inverse of :func:`_oci_auth_value`."""
+    AUTH_VFR_DATA, else 0). The write inverse of :func:`_oci_auth_values`."""
     return encode_auth_pair_oci(key, val, flags)
 
 
@@ -619,20 +619,37 @@ def parse_osesskey_oci(payload: bytes) -> bytes:
     return _parse_oci_fun_username(payload, TTI_SESS, 'OSESSKEY')
 
 
-def _oci_auth_value(payload: bytes, key: bytes) -> bytes:
+# The most an OCI AUTH may hold. sqlplus's carries 18 pairs of short hex values,
+# a few hundred bytes; the decoder takes time in the square of a message's
+# size, so before the client has authenticated a larger one is refused rather
+# than decoded (GHSA-jhv3-6267-8qhw).
+_OCI_AUTH_LIMIT = 64 * 1024
+
+
+def _oci_auth_values(payload: bytes, keys: tuple[bytes, ...]) -> list[bytes]:
     # In the OCI AUTH, each key-value pair is ``<key> <ub4 declared-len> <DALC
     # value>``: a fixed 4-byte little-endian length precedes the DALC-chunked
     # value (0xFE-marked chunks — the same encoding seerdb's client decoder
     # reads). The value is uppercase-hex ASCII, so unhexlify recovers the bytes.
+    # The message is decoded once for all of ``keys``; each key's first pair
+    # counts.
+    if len(payload) > _OCI_AUTH_LIMIT:
+        raise InterfaceError(
+            f'OCI AUTH of {len(payload)} bytes; a login sends at most {_OCI_AUTH_LIMIT}'
+        )
+    found: dict[bytes, bytes | None] = {}
     for pair in decode_auth_oci(payload)['pairs']:
-        if pair.get('key') != key:
-            continue
-        hexval = pair.get('value')
+        found.setdefault(pair.get('key') or b'', pair.get('value'))
+    values = []
+    for key in keys:
+        if key not in found:
+            raise InterfaceError(f'OCI AUTH: missing {key.decode()}')
+        hexval = found[key]
         # A real AUTH_SESSKEY / AUTH_PASSWORD is always non-empty hex bytes.
         if not hexval:
             raise InterfaceError(f'OCI AUTH: empty {key.decode()}')
-        return unhexlify(hexval)
-    raise InterfaceError(f'OCI AUTH: missing {key.decode()}')
+        values.append(unhexlify(hexval))
+    return values
 
 
 def parse_auth_response_oci(payload: bytes) -> tuple[bytes, bytes, bytes]:
@@ -645,8 +662,7 @@ def parse_auth_response_oci(payload: bytes) -> tuple[bytes, bytes, bytes]:
     AUTH: a 48-byte session key and a 32-byte proof.
     """
     user = _parse_oci_fun_username(payload, TTI_AUTH, 'AUTH')
-    sesskey = _oci_auth_value(payload, b'AUTH_SESSKEY')
-    password = _oci_auth_value(payload, b'AUTH_PASSWORD')
+    (sesskey, password) = _oci_auth_values(payload, (b'AUTH_SESSKEY', b'AUTH_PASSWORD'))
     return user, sesskey, password
 
 
@@ -814,8 +830,9 @@ def parse_changepassword_oci(payload: bytes) -> tuple[bytes, bytes, bytes]:
     them with :func:`~seerdb.common.crypto.decrypt_password`. Unlike the OCI login
     AUTH there is no proof to verify; the live session is the authorisation."""
     user = _parse_oci_fun_username(payload, TTI_AUTH, 'AUTH')
-    old_cipher = _oci_auth_value(payload, b'AUTH_PASSWORD')
-    new_cipher = _oci_auth_value(payload, b'AUTH_NEWPASSWORD')
+    (old_cipher, new_cipher) = _oci_auth_values(
+        payload, (b'AUTH_PASSWORD', b'AUTH_NEWPASSWORD')
+    )
     return user, old_cipher, new_cipher
 
 
