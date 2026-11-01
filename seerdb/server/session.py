@@ -244,7 +244,7 @@ from seerdb.common.tns_consts import (
 )
 from seerdb.server import lockout, stats
 from seerdb.server.auth import (
-    check_auth_complete,
+    AuthWalk,
     derive_conn_key,
     encode_challenge_oci,
     encode_result_oci,
@@ -279,7 +279,7 @@ from seerdb.server.backend import (
     UnsupportedFeature,
     VarcharValue,
 )
-from seerdb.server.framing import PacketStream
+from seerdb.server.framing import PacketStream, ProtocolLimitError
 from seerdb.server.handshake import (
     client_compile_cap,
     client_field_version,
@@ -781,11 +781,10 @@ def handle_login(
             )
         else:
             stream.write_packet(TNS_DATA, encode_challenge(challenge))
-        # A long AUTH spans packets at a small SDU (#1770): read it whole.
+        # A long AUTH spans packets at a small SDU (#1770): read it whole,
+        # walking each packet's bytes once (GHSA-vxvf-jx7x-rcx8).
         whole = _complete_message(
-            stream,
-            _expect(stream, TNS_DATA, 'AUTH'),
-            lambda body: check_auth_complete(body, field_version),
+            stream, _expect(stream, TNS_DATA, 'AUTH'), AuthWalk(field_version)
         )
         if whole is None:
             raise InterfaceError('the client never completed its AUTH')
@@ -2703,6 +2702,13 @@ def _complete_message(
                     f'expected a continuation DATA packet, got type {cont_type}'
                 ) from None
             body = body + cont_body
+            # Grown here, outside the framer's reassembly, a message is held to
+            # the framer's limit all the same: a login's before the client has
+            # authenticated (GHSA-vxvf-jx7x-rcx8).
+            if len(body) > stream.max_message:
+                raise ProtocolLimitError(
+                    f'message of more than {stream.max_message} bytes'
+                )
         except InterfaceError:
             raise
         except Exception as exc:  # noqa: BLE001 - a parse fault must not desync

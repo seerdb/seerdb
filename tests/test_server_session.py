@@ -4370,6 +4370,8 @@ def test_complete_message_reassembles_a_spanning_request() -> None:
     parts = [b'\x03\x60\x00\x01', b'aaaa', b'bbbb-END']
 
     class _Stream:
+        max_message = 1 << 20
+
         def __init__(self) -> None:
             self.reads = 0
 
@@ -4389,6 +4391,33 @@ def test_complete_message_reassembles_a_spanning_request() -> None:
     full = _complete_message(stream, parts[0], parse)
     assert full == b''.join(parts)
     assert stream.reads == 2  # exactly the two continuation packets, no more
+
+
+def test_complete_message_holds_a_message_to_the_streams_limit() -> None:
+    # GHSA-vxvf-jx7x-rcx8: a message grown here, outside the framer's own
+    # reassembly, is held to the framer's limit -- a login's before the client
+    # has authenticated -- and the connection is dropped past it, as the
+    # framer drops one.
+    from seerdb.server.framing import ProtocolLimitError
+    from seerdb.server.session import _complete_message
+
+    class _Stream:
+        max_message = 64 * 1024
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read_packet(self, **_kw):
+            self.reads += 1
+            return (TNS_DATA, b'\x00' * 8192)
+
+    def never_whole(_body: bytes) -> object:
+        raise Truncated('need the rest')
+
+    stream: Any = _Stream()
+    with pytest.raises(ProtocolLimitError):
+        _complete_message(stream, b'\x03\x73\x01', never_whole)
+    assert stream.reads == 8
 
 
 def test_complete_message_returns_a_single_packet_untouched() -> None:
