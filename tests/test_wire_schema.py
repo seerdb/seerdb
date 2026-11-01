@@ -103,6 +103,51 @@ def test_an_unknown_field_kind_is_refused() -> None:
         wire_schema.compile_encoder((('ub3', 'x'),), tns._THIN)
 
 
+def test_a_decode_hands_each_field_a_view_of_the_message() -> None:
+    # GHSA-jhv3-6267-8qhw: each field read the rest of the message as a copy,
+    # so a message of many small items took time in the square of its size --
+    # an OCI AUTH of 1 MiB about 4 s, before its client had authenticated.
+    # Every primitive is now handed a view of the message itself, and the
+    # values it reads are bytes of their own.
+    seen: list[memoryview] = []
+
+    class _Recording:
+        name = 'oci'
+
+        def __getattr__(self, name: str):
+            read = getattr(tns._OCI, name)
+            if not name.startswith('read_'):
+                return read
+
+            def recorded(data):
+                seen.append(data)
+                return read(data)
+
+            return recorded
+
+    schema = (
+        ('const', b'\x03'),
+        ('n4', 'count'),
+        ('each', 'pairs', 'count', (('n4', 'key'), ('value', 'value'))),
+    )
+    pairs = [{'key': i, 'value': bytes([i % 251]) * (i % 7)} for i in range(500)]
+    data = wire_schema.compile_encoder(schema, tns._OCI)(
+        {'count': len(pairs), 'pairs': pairs}
+    )
+    (values, rest) = wire_schema.compile_decoder(schema, _Recording())(
+        data + b'tail', None
+    )
+    assert [(p['key'], p['value']) for p in values['pairs']] == [
+        (p['key'], p['value']) for p in pairs
+    ]
+    assert all(type(p['value']) is bytes for p in values['pairs'])
+    assert rest == b'tail' and type(rest) is bytes
+    # The count, then each pair's two fields: every one a view of one message.
+    assert len(seen) == 1 + 2 * len(pairs)
+    assert all(isinstance(view, memoryview) for view in seen)
+    assert len({id(view.obj) for view in seen}) == 1
+
+
 @pytest.mark.parametrize('version', (6, 24))
 def test_fetch_and_exec_by_cursor_decode_back_in_both_dialects(version: int) -> None:
     # Thin sends a call's token number from 23ai, OCI never (#2064).
