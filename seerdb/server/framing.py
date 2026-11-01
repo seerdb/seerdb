@@ -115,6 +115,16 @@ class PacketStream:
         # change the call itself made is reported on that call's reply.
         self.reply_prefix: Callable[[], bytes] | None = None
 
+    def allow_session_messages(self) -> None:
+        """Raise the message limit to a logged-in session's. A transport that
+        assembles whole messages before this framer reads any of them -- a
+        WebSocket -- keeps a cap of its own, which goes up with it
+        (GHSA-wgc5-xh4h-3hhr)."""
+        self.max_message = SESSION_MESSAGE_LIMIT
+        raise_cap = getattr(self._sock, 'set_message_limit', None)
+        if raise_cap is not None:
+            raise_cap(SESSION_MESSAGE_LIMIT)
+
     def activate_ano(self, channel: AnoChannel) -> None:
         """Turn on per-packet encryption + MAC for every subsequent DATA packet
         (server side of §33). The channel must be a server channel

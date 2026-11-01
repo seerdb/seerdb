@@ -101,6 +101,45 @@ def test_a_client_runs_sql_over_ws(ws_mirror: WsServer) -> None:
         conn.close()
 
 
+def test_a_large_message_is_refused_before_login(ws_mirror: WsServer) -> None:
+    # GHSA-wgc5-xh4h-3hhr: websockets holds a whole message before the TNS
+    # framer reads any of it, so its cap is a login's until the session has
+    # logged in, as the framer's is.
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.client import connect
+
+    ws = connect(f'ws://127.0.0.1:{ws_mirror.port}/', open_timeout=15)
+    try:
+        ws.send(b'\x00' * (2 << 20))
+        with pytest.raises(ConnectionClosed) as closed:
+            ws.recv(timeout=10)
+        assert closed.value.rcvd is not None and closed.value.rcvd.code == 1009
+    finally:
+        ws.close()
+
+
+def test_the_message_cap_rises_with_the_framers_after_login() -> None:
+    # GHSA-wgc5-xh4h-3hhr: once the session has logged in, the WebSocket's
+    # own cap goes up to the framer's, so a client that sends a large message
+    # in one piece is served as before.
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from seerdb.common.ws_transport import WsSocket
+    from seerdb.server.framing import (
+        PRE_LOGIN_MESSAGE_LIMIT,
+        SESSION_MESSAGE_LIMIT,
+        PacketStream,
+    )
+
+    conn = SimpleNamespace(protocol=SimpleNamespace(max_size=PRE_LOGIN_MESSAGE_LIMIT))
+    stream = PacketStream(cast(Any, WsSocket(conn)))
+    assert stream.max_message == PRE_LOGIN_MESSAGE_LIMIT
+    stream.allow_session_messages()
+    assert stream.max_message == SESSION_MESSAGE_LIMIT
+    assert conn.protocol.max_size == SESSION_MESSAGE_LIMIT
+
+
 def test_an_async_client_runs_sql_over_ws(ws_mirror: WsServer) -> None:
     async def run() -> tuple:
         conn = await seerdb.connect_async(

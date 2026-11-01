@@ -74,6 +74,13 @@ class WsSocket:
         (Chunk, self._buf) = (self._buf[:Bufsize], self._buf[Bufsize:])
         return Chunk
 
+    def set_message_limit(self, Limit: int) -> None:
+        """The largest message the connection takes from now on. websockets
+        assembles a whole message before recv returns any of it, so its own cap
+        is what bounds the memory a message takes; PacketStream raises it with
+        its own once the session has logged in (GHSA-wgc5-xh4h-3hhr)."""
+        self._conn.protocol.max_size = Limit
+
     def shutdown(self, How: int) -> None:
         # A WebSocket has no half-close; the following close() tears it down.
         pass

@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from seerdb.common.exceptions import NotSupportedError
 from seerdb.common.tns_consts import FIELD_VERSION_11_2
+from seerdb.server.framing import PRE_LOGIN_MESSAGE_LIMIT
 from seerdb.server.service import BackendFactory, _serve_session_on
 
 if TYPE_CHECKING:
@@ -124,8 +125,10 @@ class WsServer:
             )
         else:
             origins = [*allowed_origins, None]
-        # TNS packets exceed the 1 MiB default message cap (a large array bind),
-        # and the byte pipe carries whatever the framer wrote; lift the cap.
+        # websockets assembles a whole message before the handler reads any of
+        # it, so a connection starts with the cap a login needs, as the TNS
+        # framer does, and is raised to a session's once it has logged in: a
+        # large array bind outgrows the first (GHSA-wgc5-xh4h-3hhr).
         self._server = _serve(
             self._handle,
             host,
@@ -134,7 +137,7 @@ class WsServer:
             # websockets types origins as its Origin NewType over str; the
             # values are plain strings (plus None for no-Origin clients).
             origins=cast('Any', origins),
-            max_size=None,
+            max_size=PRE_LOGIN_MESSAGE_LIMIT,
         )
         (self.host, self.port) = self._server.socket.getsockname()[:2]
 
