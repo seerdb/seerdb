@@ -315,6 +315,41 @@ def test_parse_auth_response_oci_recovers_the_secrets() -> None:
     assert len(password) == 32  # AUTH_PASSWORD proof, 64 hex on the wire
 
 
+def test_an_oci_auth_is_decoded_once(monkeypatch) -> None:
+    # GHSA-jhv3-6267-8qhw: the values the login reads come from one decode of
+    # the message, not one per value.
+    from seerdb.server import auth
+
+    decodes = 0
+    decode = auth.decode_auth_oci
+
+    def counted(payload: bytes):
+        nonlocal decodes
+        decodes += 1
+        return decode(payload)
+
+    monkeypatch.setattr(auth, 'decode_auth_oci', counted)
+    assert auth.parse_auth_response_oci(_OCI_AUTH_SEEDED)[0] == b'pyo'
+    assert decodes == 1
+
+
+def test_an_oci_auth_larger_than_a_login_sends_is_refused_undecoded(
+    monkeypatch,
+) -> None:
+    # GHSA-jhv3-6267-8qhw: decoding takes time in the square of the message's
+    # size and runs before the client has authenticated, so a message past what
+    # sqlplus sends -- a few hundred bytes -- is refused before it is decoded.
+    from seerdb.server import auth
+
+    def never(payload: bytes):  # pragma: no cover - must not be called
+        raise AssertionError('decoded')
+
+    monkeypatch.setattr(auth, 'decode_auth_oci', never)
+    padded = _OCI_AUTH_SEEDED + bytes(64 * 1024)
+    with pytest.raises(InterfaceError, match='a login sends at most 65536'):
+        auth.parse_auth_response_oci(padded)
+
+
 def test_an_oci_pair_count_is_a_ub4_whatever_follows_it() -> None:
     # The count's slot is eight bytes and the client sets only the low four:
     # 10.2 leaves address bytes above them, 11.2 whatever its buffer held. Read
