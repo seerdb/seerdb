@@ -14,15 +14,16 @@ Requires the ``psycopg`` package. Only this module imports it, so the rest of
 ``seerdb`` (the client above all) works without it.
 
 **Requires the** `orafce <https://github.com/orafce/orafce>`_ **PostgreSQL
-extension** for Oracle-compatible SQL functions (``nvl``, ``decode``,
-``to_char`` / ``to_date``, ``add_months``, ``instr``, …). The backend puts its
+extension**, 4.17 or later, for Oracle-compatible SQL functions (``nvl``,
+``decode``, ``to_char`` / ``to_date``, ``add_months``, ``instr``, ``utl_raw``,
+…). The backend puts its
 ``oracle`` schema on the search_path and creates the extension if it can, so
 those idioms need no hand-rolled translation. Install it on the server (e.g.
 Alpine ``apk add postgresql-orafce`` for a matching PG major, or build from
 source with PGXS) — see ``examples/mirror-pg.Dockerfile``.
 
-A handful of scalar Oracle functions — ``hextoraw`` / ``rawtohex``,
-``empty_clob`` / ``empty_blob``, ``from_tz``, ``rowidtochar`` — the backend installs
+A handful of scalar Oracle functions — ``empty_clob`` / ``empty_blob``,
+``from_tz``, ``rowidtochar`` — the backend installs
 itself as real PostgreSQL functions at connect (see ``_HELPER_FUNCTIONS_DDL``), so
 those call sites resolve directly with no rewrite, the same way the ``ora_tstz``
 composite and the ``ora_clob`` / ``ora_blob`` domains back their types. Only bare
@@ -606,13 +607,13 @@ _DATE_ARITHMETIC_DDL = (
 
 # Oracle scalar functions the backend installs as real PostgreSQL functions,
 # rather than rewriting each call site with a regex (#513). A parens-called Oracle
-# function — HEXTORAW('..'), EMPTY_CLOB(), FROM_TZ(ts, 'zone') — resolves
-# case-insensitively to a same-named function on the search_path, so once these
-# exist the call text needs no translation at all. This is the same "install a
-# server-side object" pattern the ora_tstz composite and the ora_clob / ora_blob
-# domains already use. orafce 4.17 also ships hextoraw / rawtohex / empty_clob /
-# empty_blob / from_tz, but as plain text / bytea / timestamptz — the backend keeps
-# its own so empty_clob / empty_blob return the ora_clob / ora_blob domains and
+# function — EMPTY_CLOB(), FROM_TZ(ts, 'zone') — resolves case-insensitively to a
+# same-named function on the search_path, so once these exist the call text
+# needs no translation at all. This is the same "install a server-side object"
+# pattern the ora_tstz composite and the ora_clob / ora_blob domains already use.
+# HEXTORAW / RAWTOHEX are orafce's (4.17). orafce ships empty_clob / empty_blob /
+# from_tz too, but as plain text / bytea / timestamptz — the backend keeps its
+# own so empty_clob / empty_blob return the ora_clob / ora_blob domains and
 # from_tz returns the ora_tstz composite, which the LOB read-back and the
 # offset-preserving WITH TIME ZONE round-trip both rely on.
 # Only the parens-called functions move here; a bare pseudo-constant (SYSDATE,
@@ -726,9 +727,6 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_ltz_text(timestamptz, integer) '
     'RETURNS text LANGUAGE sql STABLE AS $$ '
     'SELECT sys.ora_datetime_text($1::timestamp, $2) $$;'
-    # HEXTORAW('DEADBEEF') → the RAW/bytea value of a hex string.
-    'CREATE OR REPLACE FUNCTION hextoraw(text) RETURNS bytea '
-    "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT decode($1, 'hex') $$;"
     # A value headed for a RAW column or attribute, as Oracle converts it: a
     # character value is hex, as HEXTORAW reads it; a RAW one is itself (#1496).
     # PostgreSQL picks the overload by the value's type -- a string literal or a
@@ -824,9 +822,6 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_is_json(bytea) RETURNS boolean '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN length($1) = 0 THEN NULL '
     'ELSE $1 IS JSON END $$;'
-    # RAWTOHEX(x) → the hex text of a bytea. Oracle returns upper-case hex.
-    'CREATE OR REPLACE FUNCTION rawtohex(bytea) RETURNS text '
-    "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT upper(encode($1, 'hex')) $$;"
     # EMPTY_CLOB() / EMPTY_BLOB() → an empty LOB (the domain type, so a value
     # stored through one is recognised as a LOB on read-back).
     f'CREATE OR REPLACE FUNCTION empty_clob() RETURNS {_CLOB_TYPE} '
@@ -1411,52 +1406,15 @@ _ORAFCE_HELPERS_DDL = (
 )
 
 
-# UTL_RAW — Oracle's RAW/bytea manipulation package (#765). orafce does not ship
-# it, so the backend installs it as PostgreSQL functions in a `utl_raw` schema, and
-# a schema-qualified Oracle call (UTL_RAW.CAST_TO_RAW(...)) resolves to it
-# case-insensitively. A function taking a RAW takes a character value too, as
-# hex, as Oracle converts one (#1496): a text overload beside each, which
-# PostgreSQL picks for a string literal or a str bind. Bytes are the DB charset (UTF-8) for the varchar2/raw casts;
-# BIT_AND/OR/XOR follow Oracle's rule that the unprocessed tail of the longer
-# operand is appended after the shorter one runs out. The bodies qualify
-# pg_catalog.length so utl_raw.length does not recurse into itself when a
-# caller puts utl_raw on the search_path.
+# UTL_RAW — Oracle's RAW/bytea manipulation package (#765) — is orafce's (4.17),
+# in its `utl_raw` schema, which a schema-qualified Oracle call
+# (UTL_RAW.CAST_TO_RAW(...)) reaches case-insensitively. orafce's take a bytea.
+# A function taking a RAW takes a character value too, as hex, as Oracle
+# converts one (#1496): the backend adds a text overload beside each, which
+# PostgreSQL picks for a string literal or a str bind. Adding them takes CREATE
+# on orafce's schema, which an administrator who created orafce may not have
+# granted the Mirror's role, so the part is best effort (_PRIVILEGED_PARTS).
 _UTL_RAW_DDL = """
-CREATE SCHEMA IF NOT EXISTS utl_raw;
-CREATE OR REPLACE FUNCTION utl_raw.cast_to_raw(text) RETURNS bytea
-  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT convert_to($1, 'UTF8') $$;
-CREATE OR REPLACE FUNCTION utl_raw.cast_to_varchar2(bytea) RETURNS text
-  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT convert_from($1, 'UTF8') $$;
-CREATE OR REPLACE FUNCTION utl_raw.length(bytea) RETURNS integer
-  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT pg_catalog.length($1) $$;
-CREATE OR REPLACE FUNCTION utl_raw.substr(bytea, integer, integer DEFAULT NULL)
-  RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
-    SELECT CASE WHEN $2 = 0 THEN NULL
-      WHEN $2 < 0 THEN substring($1 from pg_catalog.length($1) + $2 + 1 for coalesce($3, pg_catalog.length($1)))
-      ELSE substring($1 from $2 for coalesce($3, pg_catalog.length($1))) END $$;
-CREATE OR REPLACE FUNCTION utl_raw.concat(VARIADIC bytea[]) RETURNS bytea
-  LANGUAGE sql IMMUTABLE AS $$
-    SELECT coalesce(string_agg(x, ''::bytea), ''::bytea) FROM unnest($1) AS x $$;
-CREATE OR REPLACE FUNCTION utl_raw._bitop(a bytea, b bytea, op char) RETURNS bytea
-  LANGUAGE plpgsql IMMUTABLE AS $$
-  DECLARE n int := least(pg_catalog.length(a), pg_catalog.length(b)); r bytea := ''::bytea; i int; v int;
-  BEGIN
-    FOR i IN 0 .. n - 1 LOOP
-      v := CASE op WHEN '&' THEN get_byte(a, i) & get_byte(b, i)
-                   WHEN '|' THEN get_byte(a, i) | get_byte(b, i)
-                   ELSE get_byte(a, i) # get_byte(b, i) END;
-      r := r || decode(lpad(to_hex(v), 2, '0'), 'hex');
-    END LOOP;
-    IF pg_catalog.length(a) > n THEN r := r || substring(a from n + 1);
-    ELSIF pg_catalog.length(b) > n THEN r := r || substring(b from n + 1); END IF;
-    RETURN r;
-  END $$;
-CREATE OR REPLACE FUNCTION utl_raw.bit_and(bytea, bytea) RETURNS bytea
-  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop($1, $2, '&') $$;
-CREATE OR REPLACE FUNCTION utl_raw.bit_or(bytea, bytea) RETURNS bytea
-  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop($1, $2, '|') $$;
-CREATE OR REPLACE FUNCTION utl_raw.bit_xor(bytea, bytea) RETURNS bytea
-  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop($1, $2, '#') $$;
 CREATE OR REPLACE FUNCTION utl_raw.cast_to_varchar2(text) RETURNS text
   LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT utl_raw.cast_to_varchar2(decode($1, 'hex')) $$;
 CREATE OR REPLACE FUNCTION utl_raw.length(text) RETURNS integer
@@ -1466,14 +1424,13 @@ CREATE OR REPLACE FUNCTION utl_raw.substr(text, integer, integer DEFAULT NULL)
     SELECT utl_raw.substr(decode($1, 'hex'), $2, $3) $$;
 CREATE OR REPLACE FUNCTION utl_raw.concat(VARIADIC text[]) RETURNS bytea
   LANGUAGE sql IMMUTABLE AS $$
-    SELECT coalesce(string_agg(decode(x, 'hex'), ''::bytea), ''::bytea)
-    FROM unnest($1) AS x $$;
+    SELECT utl_raw.concat(VARIADIC (SELECT array_agg(decode(x, 'hex')) FROM unnest($1) AS x)) $$;
 CREATE OR REPLACE FUNCTION utl_raw.bit_and(text, text) RETURNS bytea
-  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop(decode($1, 'hex'), decode($2, 'hex'), '&') $$;
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT utl_raw.bit_and(decode($1, 'hex'), decode($2, 'hex')) $$;
 CREATE OR REPLACE FUNCTION utl_raw.bit_or(text, text) RETURNS bytea
-  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop(decode($1, 'hex'), decode($2, 'hex'), '|') $$;
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT utl_raw.bit_or(decode($1, 'hex'), decode($2, 'hex')) $$;
 CREATE OR REPLACE FUNCTION utl_raw.bit_xor(text, text) RETURNS bytea
-  LANGUAGE sql IMMUTABLE AS $$ SELECT utl_raw._bitop(decode($1, 'hex'), decode($2, 'hex'), '#') $$;
+  LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT utl_raw.bit_xor(decode($1, 'hex'), decode($2, 'hex')) $$;
 """
 
 
@@ -13945,7 +13902,6 @@ _INSTALLED_SCHEMAS: Final = (
     'dbms_session',
     'dbms_sql',
     'dbms_utility',
-    'utl_raw',
 )
 
 
@@ -14239,7 +14195,32 @@ _EXTENSION_PARTS: Final = {
 }
 # The setup's parts that need privileges a deployment may not grant (an
 # event trigger needs a superuser): best effort, as they always were.
-_PRIVILEGED_PARTS: Final = frozenset({'ddl log', 'ddl guard'})
+_PRIVILEGED_PARTS: Final = frozenset({'ddl log', 'ddl guard', 'utl_raw'})
+
+
+# The oldest orafce the backend serves from (#800): 4.17 ships UTL_RAW, HEXTORAW
+# and RAWTOHEX, which the backend no longer installs itself.
+_ORAFCE_FLOOR: Final = (4, 17)
+
+
+def _refused_orafce(version: str | None) -> str | None:
+    # Why a database's orafce is refused, or None. An older one leaves UTL_RAW,
+    # HEXTORAW and RAWTOHEX missing. A database without orafce is not refused:
+    # the backend starts without it, and the idioms it covers fail as before.
+    if version is None:
+        return None
+    try:
+        found = tuple(int(part) for part in version.split('.')[:2])
+    except ValueError:
+        return None
+    if found >= _ORAFCE_FLOOR:
+        return None
+    return (
+        f'orafce {version} is installed in the database; the Mirror needs 4.17 '
+        'or later. Run ALTER EXTENSION orafce UPDATE as its owner; if a Mirror '
+        'before this release made a utl_raw schema of its own, that update '
+        'fails on it, so drop that schema first'
+    )
 
 
 def _installation_stamp(extensions: str | None) -> str:
@@ -14551,6 +14532,13 @@ class PostgresBackend:
         # before.
         if not installed:
             self._install_part('orafce', 'CREATE EXTENSION IF NOT EXISTS orafce')
+            orafce = self._conn.execute(
+                "SELECT extversion FROM pg_extension WHERE extname = 'orafce'"
+            ).fetchone()
+            refused = _refused_orafce(orafce[0] if orafce else None)
+            if refused is not None:
+                self._conn.close()
+                raise UnsupportedFeature(refused)
         # pgvector, which Oracle's VECTOR types map onto (#1708), where it is
         # installed; without it a VECTOR column is refused, as before.
         # Under a savepoint, so a server without it keeps orafce. Its `vector`
@@ -14665,12 +14653,12 @@ class PostgresBackend:
                 _DATE_ARITHMETIC_DDL,
                 _ROWID_TYPE_DDL,
             )
-            # The Oracle scalar helper functions (hextoraw, rawtohex, empty_clob
-            # / empty_blob, from_tz), so those call sites need no rewrite (#513);
+            # The Oracle scalar helper functions (empty_clob / empty_blob,
+            # from_tz), so those call sites need no rewrite (#513);
             # empty_clob / empty_blob return the LOB domains just created, so
             # this runs after them. The helpers that need orafce go apart, so
-            # they cannot take the others down without it (#1299). Then UTL_RAW
-            # (#765), DBMS_UTILITY (#764), DBMS_LOCK.SLEEP / DBMS_SESSION.SLEEP
+            # they cannot take the others down without it (#1299). Then UTL_RAW's
+            # hex-text overloads (#1496), DBMS_UTILITY (#764), DBMS_LOCK.SLEEP / DBMS_SESSION.SLEEP
             # (#1511), DBMS_APPLICATION_INFO (#1840), DBMS_SQL.RETURN_RESULT
             # (#1617) and DBMS_OUTPUT.GET_LINES's collection type (#1411).
             for part, ddl in (

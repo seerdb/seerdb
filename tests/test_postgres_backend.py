@@ -61,6 +61,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _package_rights,
     _parse_out_assignments,
     _pg_oid_of,
+    _refused_orafce,
     _reject_nonfinite_vectors,
     _reject_unsupported_ddl_types,
     _several_statements,
@@ -5260,14 +5261,25 @@ def test_bind_variables_postgres() -> None:
 # --- Oracle SQL idiom / function translation (#502) — pure, no live PG needed --
 
 
+def test_an_orafce_before_4_17_is_refused() -> None:
+    # 4.17 ships UTL_RAW, HEXTORAW and RAWTOHEX, which the backend no longer
+    # installs (#800). A database without orafce is not refused.
+    for version in ('4.17', '4.17.1', '4.18', '5.0'):
+        assert _refused_orafce(version) is None
+    assert _refused_orafce(None) is None
+    for version in ('4.16', '4.10', '3.25'):
+        refused = _refused_orafce(version)
+        assert refused is not None
+        assert f'orafce {version} is installed' in refused
+        assert 'ALTER EXTENSION orafce UPDATE' in refused
+
+
 def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # The Oracle scalar functions orafce doesn't cover are installed as real
     # PostgreSQL functions (#513) instead of rewritten per call site, so those
     # call sites resolve directly. Each is defined idempotently (CREATE OR
     # REPLACE) and returns the LOB domains where appropriate.
     for name in (
-        'hextoraw',
-        'rawtohex',
         'empty_clob',
         'empty_blob',
         'from_tz',
@@ -5305,7 +5317,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_plsql_number_text with DBMS_OUTPUT's PUT_LINE and PUT of a
     # number (#2181), and sys.ora_datetime_text, sys.ora_zone_text,
     # sys.ora_tstz_text, sys.ora_ltz_text and sys.ora_computed_text (#2162).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 116
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 114
+    # HEXTORAW / RAWTOHEX are orafce's (#800).
+    assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
+    assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(text)' in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION sys.ora_to_raw(bytea)' in _HELPER_FUNCTIONS_DDL
     # Oracle's conversion functions orafce lacks, one overload per argument
@@ -13236,8 +13251,10 @@ def test_dictionary_views_reflect_an_identity_column() -> None:
 
 
 def test_utl_raw_functions() -> None:
-    # UTL_RAW is installed as PostgreSQL functions in a utl_raw schema (orafce ships
-    # none), so a schema-qualified Oracle call round-trips RAW/bytea (#765).
+    # UTL_RAW is orafce's utl_raw schema (4.17), so a schema-qualified Oracle call
+    # round-trips RAW/bytea (#765).
+    from seerdb.server.backend import BackendError
+
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
     try:
 
@@ -13282,6 +13299,16 @@ def test_utl_raw_functions() -> None:
             scalar("SELECT rawtohex(utl_raw.bit_and(hextoraw('FFFF'), hextoraw('F0')))")
             == 'F0FF'
         )
+        # As Oracle 11g, 18c and 23ai answer (#800): SUBSTR reads a position of
+        # 0 or NULL as 1 and refuses a range past the end; a NULL operand of a
+        # bitwise op makes NULL.
+        assert scalar("SELECT rawtohex(utl_raw.substr(hextoraw('4142'), 0))") == '4142'
+        assert (
+            scalar("SELECT rawtohex(utl_raw.substr(hextoraw('4142'), NULL, 1))") == '41'
+        )
+        with pytest.raises(BackendError):
+            backend.execute("SELECT utl_raw.substr(hextoraw('4142'), 2, 2)")
+        assert scalar('SELECT utl_raw.bit_and(NULL, NULL)') is None
     finally:
         backend.close()
 

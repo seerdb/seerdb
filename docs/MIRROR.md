@@ -465,11 +465,15 @@ Both modes translate the same SQL and PL/SQL; only who may do what differs.
 ### What the database needs
 
 - **PostgreSQL**, tested on 16.
-- **[orafce](https://github.com/orafce/orafce)**, which supplies Oracle's
-  built-in functions (`NVL`, `DECODE`, `TO_CHAR`, `ADD_MONTHS`, ...). It is a
-  requirement: without it, much ordinary Oracle SQL fails. The Mirror runs
+- **[orafce](https://github.com/orafce/orafce)** 4.17 or later, which supplies
+  Oracle's built-in functions (`NVL`, `DECODE`, `TO_CHAR`, `ADD_MONTHS`, ...)
+  and `UTL_RAW`. It is a requirement: without it, much ordinary Oracle SQL
+  fails, and an older one is refused. The Mirror runs
   `CREATE EXTENSION IF NOT EXISTS orafce` when it connects; if its role may not
   create extensions, have an administrator create it in the database first.
+  `UTL_RAW` then takes a character argument as hex, as Oracle does, only if
+  the Mirror's role may create in orafce's schema:
+  `GRANT CREATE ON SCHEMA utl_raw TO` the role.
 - **[pgvector](https://github.com/pgvector/pgvector)**, optional, for Oracle's
   `VECTOR` type. Without it a `VECTOR` column is refused.
 - **[plpgsql_check](https://github.com/okbob/plpgsql_check)**, optional, so that
