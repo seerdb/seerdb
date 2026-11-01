@@ -65,7 +65,7 @@ them, beside the encoders they replaced.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 Schema = tuple[tuple[Any, ...], ...]
 # The field kinds a codec packs itself.
@@ -168,84 +168,170 @@ def compile_encoder(schema: Schema, codec: Codec) -> Encoder:
     return lambda values: b''.join([part(values) for part in parts])
 
 
+# Where a decoder is: the rest of the message, as a view.
+_Step = Callable[[memoryview, dict[str, Any], Any], memoryview]
+
+
+def _leaf(value: Any) -> Any:
+    # A primitive read over a view returns a view of its bytes; the decoded
+    # value is bytes of its own, so it outlives the message.
+    return bytes(value) if isinstance(value, memoryview) else value
+
+
+def _decode_part(field: tuple[Any, ...], codec: Codec) -> _Step:
+    # One field's reader: the view after it, from the view before it, with
+    # the field's value set in ``values``. ``given`` is what the caller of the
+    # decoder gave, which an ``each`` hands each of its items.
+    kind = field[0]
+    if kind == 'const':
+        literal = field[1]
+        size = len(literal)
+
+        def const(data: memoryview, values: dict, given: Any) -> memoryview:
+            if data[:size] != literal:
+                raise ValueError(f'expected {literal.hex()} at {data[:8].hex()}')
+            return data[size:]
+
+        return const
+    if kind == 'u8':
+        name = field[1]
+
+        def u8(data: memoryview, values: dict, given: Any) -> memoryview:
+            values[name] = data[0]
+            return data[1:]
+
+        return u8
+    if kind == 'raw':
+
+        def raw(data: memoryview, values: dict, given: Any) -> memoryview:
+            raise ValueError('a raw field has no length to decode by')
+
+        return raw
+    if kind in _BIG_ENDIAN or kind in _LITTLE_ENDIAN:
+        (name, width) = (field[1], _BIG_ENDIAN.get(kind) or _LITTLE_ENDIAN[kind])
+        order: Literal['big', 'little'] = 'big' if kind in _BIG_ENDIAN else 'little'
+
+        def integer(data: memoryview, values: dict, given: Any) -> memoryview:
+            if len(data) < width:
+                raise IndexError(f'{kind} past the end of the message')
+            values[name] = int.from_bytes(data[:width], order)
+            return data[width:]
+
+        return integer
+    if kind == 'cstr':
+        name = field[1]
+
+        def cstr(data: memoryview, values: dict, given: Any) -> memoryview:
+            for end, byte in enumerate(data):
+                if byte == 0:
+                    values[name] = bytes(data[:end])
+                    return data[end + 1 :]
+            raise IndexError('cstr: no terminating NUL')
+
+        return cstr
+    if kind == 'pad':
+        size = field[1]
+
+        def pad(data: memoryview, values: dict, given: Any) -> memoryview:
+            if len(data) < size:
+                raise IndexError('pad past the end of the message')
+            return data[size:]
+
+        return pad
+    if kind == 'derive':
+        (name, function) = (field[1], field[2])
+
+        def derive(data: memoryview, values: dict, given: Any) -> memoryview:
+            values[name] = function(values)
+            return data
+
+        return derive
+    if kind == 'bytes':
+        (name, length) = (field[1], field[2])
+
+        def counted(data: memoryview, values: dict, given: Any) -> memoryview:
+            size = length if isinstance(length, int) else values[length]
+            values[name] = bytes(data[:size])
+            return data[size:]
+
+        return counted
+    if kind in _PRIMITIVES:
+        (name, read) = (field[1], getattr(codec, 'read_' + kind))
+
+        def primitive(data: memoryview, values: dict, given: Any) -> memoryview:
+            (value, data) = read(data)
+            values[name] = _leaf(value)
+            return data
+
+        return primitive
+    if kind in ('when', 'only'):
+        if kind == 'only' and field[1] != codec.name:
+            return lambda data, values, given: data
+        inner = _decode_fields(field[2], codec)
+        test = field[1] if kind == 'when' else None
+
+        def nested(data: memoryview, values: dict, given: Any) -> memoryview:
+            if test is not None and not values[test]:
+                return data
+            # The fields read into a copy of what was read so far, which they
+            # see as what their own ``each`` items are given.
+            more = dict(values)
+            data = inner(data, more, values)
+            values.update(more)
+            return data
+
+        return nested
+    if kind == 'each':
+        (name, count, inner) = (field[1], field[2], _decode_fields(field[3], codec))
+
+        def each(data: memoryview, values: dict, given: Any) -> memoryview:
+            items = []
+            for _ in range(values[count]):
+                # Every item takes at least a byte, so a count past the
+                # message's end fails here, not after billions of empty
+                # items (#2272).
+                if not data:
+                    raise IndexError(f'{name}: count past the end of the message')
+                # Each item sees what the caller gave (a session flag a
+                # `when` in it tests), not the other fields read so far.
+                item = dict(given or {})
+                data = inner(data, item, given)
+                items.append(item)
+            values[name] = items
+            return data
+
+        return each
+    raise ValueError(f'unknown field kind {kind!r}')
+
+
+def _decode_fields(schema: Schema, codec: Codec) -> _Step:
+    steps = [_decode_part(field, codec) for field in schema]
+
+    def fields(data: memoryview, values: dict, given: Any) -> memoryview:
+        for step in steps:
+            data = step(data, values, given)
+        return data
+
+    return fields
+
+
 def compile_decoder(schema: Schema, codec: Codec) -> Decoder:
     """The decoder of ``schema`` in ``codec``'s dialect: the fields' values
     and the bytes that follow the message. A ``when`` that tests what isn't on
     the wire -- the session's field version, say -- reads it from ``given``,
-    which the result includes."""
+    which the result includes.
+
+    Each field is compiled to its reader once, here. The readers walk a view of
+    the message, so a field's rest is not a copy of everything after it, and a
+    decode takes time in proportion to the message rather than to its square
+    (GHSA-jhv3-6267-8qhw); each value is bytes of its own."""
+    walk = _decode_fields(schema, codec)
 
     def decode(
         data: bytes, given: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], bytes]:
         values: dict[str, Any] = dict(given or {})
-        for field in schema:
-            kind = field[0]
-            if kind == 'const':
-                if not data.startswith(field[1]):
-                    raise ValueError(f'expected {field[1].hex()} at {data[:8].hex()}')
-                data = data[len(field[1]) :]
-            elif kind == 'u8':
-                (values[field[1]], data) = (data[0], data[1:])
-            elif kind == 'raw':
-                raise ValueError('a raw field has no length to decode by')
-            elif kind in _BIG_ENDIAN:
-                width = _BIG_ENDIAN[kind]
-                if len(data) < width:
-                    raise IndexError(f'{kind} past the end of the message')
-                (values[field[1]], data) = (
-                    int.from_bytes(data[:width], 'big'),
-                    data[width:],
-                )
-            elif kind in _LITTLE_ENDIAN:
-                width = _LITTLE_ENDIAN[kind]
-                if len(data) < width:
-                    raise IndexError(f'{kind} past the end of the message')
-                (values[field[1]], data) = (
-                    int.from_bytes(data[:width], 'little'),
-                    data[width:],
-                )
-            elif kind == 'cstr':
-                end = data.find(0)
-                if end < 0:
-                    raise IndexError('cstr: no terminating NUL')
-                (values[field[1]], data) = (bytes(data[:end]), data[end + 1 :])
-            elif kind == 'pad':
-                if len(data) < field[1]:
-                    raise IndexError('pad past the end of the message')
-                data = data[field[1] :]
-            elif kind == 'derive':
-                values[field[1]] = field[2](values)
-            elif kind == 'bytes':
-                size = field[2] if isinstance(field[2], int) else values[field[2]]
-                (values[field[1]], data) = (bytes(data[:size]), data[size:])
-            elif kind in _PRIMITIVES:
-                (values[field[1]], data) = getattr(codec, 'read_' + kind)(data)
-            elif kind == 'when':
-                if values[field[1]]:
-                    (more, data) = compile_decoder(field[2], codec)(data, values)
-                    values.update(more)
-            elif kind == 'each':
-                inner = compile_decoder(field[3], codec)
-                items = []
-                for _ in range(values[field[2]]):
-                    # Every item takes at least a byte, so a count past the
-                    # message's end fails here, not after billions of empty
-                    # items (#2272).
-                    if not data:
-                        raise IndexError(
-                            f'{field[1]}: count past the end of the message'
-                        )
-                    # Each item sees what the caller gave (a session flag a
-                    # `when` in it tests), not the other fields read so far.
-                    (item, data) = inner(data, given)
-                    items.append(item)
-                values[field[1]] = items
-            elif kind == 'only':
-                if field[1] == codec.name:
-                    (more, data) = compile_decoder(field[2], codec)(data, values)
-                    values.update(more)
-            else:
-                raise ValueError(f'unknown field kind {kind!r}')
-        return values, data
+        rest = walk(memoryview(data), values, given)
+        return values, bytes(rest)
 
     return decode
