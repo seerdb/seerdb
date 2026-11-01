@@ -37,6 +37,7 @@ import struct
 from binascii import unhexlify
 from hashlib import pbkdf2_hmac, sha512
 from secrets import token_bytes
+from typing import cast
 
 from Crypto.Cipher import AES
 
@@ -54,7 +55,7 @@ from seerdb.common.crypto import (
     pad2,
     server_proof_padded,
 )
-from seerdb.common.exceptions import InterfaceError, Truncated
+from seerdb.common.exceptions import DataError, InterfaceError, Truncated
 from seerdb.common.tns import (
     _CHALLENGE_TRAILER,
     _CHALLENGE_TRAILER_12C,
@@ -67,7 +68,6 @@ from seerdb.common.tns import (
     decode_auth_head,
     decode_auth_oci,
     decode_auth_oci_head,
-    decode_dalc,
     decode_kv,
     decode_ub4,
     encode_auth_pair_oci,
@@ -76,6 +76,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
+    TNS_ESCAPE_CHAR,
+    TNS_LONG_LENGTH_INDICATOR,
     TTI_AUTH,
     TTI_FUN,
     TTI_RPA,
@@ -384,30 +386,125 @@ def _parse_fun_auth(
     return subtype, user, dict(kvs)
 
 
-def check_auth_complete(
-    payload: bytes, field_version: int = FIELD_VERSION_11_2
-) -> None:
-    """Raise ``Truncated`` unless ``payload`` holds a whole thin auth message
-    (#1770).
+class AuthWalk:
+    """Raise ``Truncated`` unless a thin auth message is whole (#1770); called
+    again on the same message grown by a packet, it goes on from where the last
+    call stopped.
 
     A client splits a long AUTH at the SDU -- below about 562 bytes its
     AUTH_CONNECT_STRING crosses into a second packet -- and the parse above reads
     a pair's value by slicing, so a cut one comes back short rather than failing,
     and the login went on with the rest of the message still in the socket, read
-    next as a call. This walks the same layout with the strict primitives, every
-    pair to its end, so a split message says so and is read on.
+    next as a call. This walks the same layout as the strict primitives do --
+    each pair's key and value lengths, their DALC values (a chunked one chunk by
+    chunk, framed as ``decode_chr`` frames it) and its flag -- every pair to its
+    end, so a split message says so and is read on.
+
+    It runs before the client has authenticated, once per packet of a split
+    message. Walking each grown message from its start took time in the square
+    of its pair count for every packet; this walks each byte once, over a view
+    of the message, and keeps only where it stopped (GHSA-vxvf-jx7x-rcx8).
     """
-    if len(payload) < 4:
-        raise Truncated('auth message header')
-    (head, rest) = decode_auth_head(payload, field_version)
-    if len(head['user']) < head['user_length']:
-        raise Truncated('auth message user name')
-    for _ in range(head['pair_count']):
-        for _field in ('key', 'value'):
-            length, rest = decode_ub4(rest)
-            if length:
-                _, rest = decode_dalc(rest)
-        _flag, rest = decode_ub4(rest)
+
+    # The steps of a pair: its key's length and DALC, its value's, its flag.
+    _KEY_LENGTH, _KEY, _VALUE_LENGTH, _VALUE, _FLAG = range(5)
+
+    def __init__(self, field_version: int = FIELD_VERSION_11_2) -> None:
+        self._field_version = field_version
+        # Where the next primitive starts; None before the head is read.
+        self._at: int | None = None
+        self._pairs_left = 0
+        self._step = self._KEY_LENGTH
+        # Inside a chunked DALC, reading its chunks.
+        self._chunked = False
+
+    def __call__(self, payload: bytes) -> None:
+        if self._at is None:
+            if len(payload) < 4:
+                raise Truncated('auth message header')
+            (head, after_head) = decode_auth_head(payload, self._field_version)
+            if len(head['user']) < head['user_length']:
+                raise Truncated('auth message user name')
+            (self._at, self._pairs_left) = (
+                len(payload) - len(after_head),
+                head['pair_count'],
+            )
+        view = memoryview(payload)
+        while self._pairs_left > 0:
+            # The primitives index and slice, which a view does as bytes do.
+            rest = cast(bytes, view[self._at :])
+            if self._step in (self._KEY_LENGTH, self._VALUE_LENGTH, self._FLAG):
+                (length, after) = decode_ub4(rest)
+                self._at += len(rest) - len(after)
+                if self._step == self._FLAG:
+                    (self._pairs_left, self._step) = (self._pairs_left - 1, 0)
+                else:
+                    self._step += 1 if length else 2
+            elif self._chunked:
+                self._chunk(rest)
+            else:
+                self._dalc(rest)
+
+    def _dalc(self, rest: bytes) -> None:
+        # A value as decode_dalc reads it: empty or NULL, the absent-value
+        # marker, a chunked value, or a length byte and that many bytes.
+        assert self._at is not None
+        if not rest:
+            raise Truncated('truncated DALC field')
+        first = rest[0]
+        if first in (0, 255):
+            size = 1
+        elif first == TNS_LONG_LENGTH_INDICATOR:
+            (self._at, self._chunked) = (self._at + 1, True)
+            return
+        elif first == TNS_ESCAPE_CHAR:
+            if len(rest) < 2:
+                raise Truncated('DALC: absent-value marker cut short')
+            size = 2
+        elif len(rest) < first + 1:
+            raise Truncated(f'DALC: {first} bytes, {len(rest) - 1} left')
+        else:
+            size = first + 1
+        (self._at, self._step) = (self._at + size, self._step + 1)
+
+    def _chunk(self, rest: bytes) -> None:
+        # One chunk of a chunked value, as decode_chr reads them: from 12.1 a
+        # ub4 length, a zero one ending the value; before, a length byte, and
+        # after each chunk a byte that is the next one's length or the 0 that
+        # ends the value.
+        assert self._at is not None
+        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+            (size, after) = decode_ub4(rest)
+            if size < 0:
+                # decode_chr took the last bytes of what it had for this; no
+                # client sends it, and a walk that goes on can't read it so.
+                raise DataError(f'chunk: a negative length, {size}')
+            if size == 0:
+                self._at += len(rest) - len(after)
+                (self._chunked, self._step) = (False, self._step + 1)
+                return
+            if len(after) < size:
+                raise Truncated(f'chunk: {size} bytes, {len(after)} left')
+            self._at += len(rest) - len(after) + size
+            return
+        if not rest:
+            raise Truncated('chunked value: no first chunk length')
+        size = rest[0]
+        if len(rest) < size + 2:
+            raise Truncated(f'chunk: {size} bytes, {len(rest) - 1} left')
+        if rest[size + 1] == 0:
+            self._at += size + 2
+            (self._chunked, self._step) = (False, self._step + 1)
+        else:
+            self._at += size + 1
+
+
+def check_auth_complete(
+    payload: bytes, field_version: int = FIELD_VERSION_11_2
+) -> None:
+    """Raise ``Truncated`` unless ``payload`` holds a whole thin auth message
+    (#1770): an :class:`AuthWalk` of it from its start."""
+    AuthWalk(field_version)(payload)
 
 
 def parse_osesskey(payload: bytes, field_version: int = FIELD_VERSION_11_2) -> bytes:

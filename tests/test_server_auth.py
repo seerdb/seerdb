@@ -11,6 +11,7 @@ signal without needing a live server.
 from __future__ import annotations
 
 from binascii import unhexlify
+from collections.abc import Callable, Iterator
 
 import pytest
 
@@ -981,3 +982,154 @@ def test_a_split_auth_is_known_to_be_incomplete(field_version: int) -> None:
     for cut in (len(whole) - 1, len(whole) - 40, 200, 20, 5):
         with pytest.raises(Truncated):
             check_auth_complete(whole[:cut], field_version)
+
+
+def _whole_walk(payload: bytes, field_version: int) -> None:
+    # The completeness check as it was before GHSA-vxvf-jx7x-rcx8: every pair
+    # from the start with the strict primitives. AuthWalk must agree with it.
+    from seerdb.common.exceptions import Truncated
+    from seerdb.common.tns import decode_auth_head, decode_dalc, decode_ub4
+
+    if len(payload) < 4:
+        raise Truncated('auth message header')
+    (head, rest) = decode_auth_head(payload, field_version)
+    if len(head['user']) < head['user_length']:
+        raise Truncated('auth message user name')
+    for _ in range(head['pair_count']):
+        for _field in ('key', 'value'):
+            length, rest = decode_ub4(rest)
+            if length:
+                _, rest = decode_dalc(rest)
+        _flag, rest = decode_ub4(rest)
+
+
+def _outcome(walk: Callable[[bytes], object], payload: bytes) -> str:
+    try:
+        walk(payload)
+    except Exception as exc:  # the kind of refusal is what is compared
+        return type(exc).__name__
+    return 'whole'
+
+
+def _auth_head(field_version: int, pair_count: int) -> bytes:
+    # A thin AUTH's head and user, as _long_auth builds them.
+    from seerdb.common.tns import encode_sb4
+
+    user = b'pyo'
+    head = bytes([0x03, TTI_AUTH, 2, 1]) + encode_sb4(len(user)) + encode_sb4(0x101)
+    head += bytes([1]) + encode_sb4(pair_count) + bytes([1, 1])
+    if field_version >= FIELD_VERSION_12_1:
+        head += bytes([len(user)])
+    return head + user
+
+
+def _auths(field_version: int) -> list[bytes]:
+    # Thin AUTHs with short values, a chunked one (past 252 bytes, framed as the
+    # field version frames it), an empty value, the absent-value marker, and
+    # pairs of three zero integers.
+    from seerdb.common.tns import encode_kv, encode_sb4
+
+    pairs = [
+        (b'AUTH_SESSKEY', b'AB' * 32),
+        (b'AUTH_TOKEN', b't' * 700),
+        (b'AUTH_EMPTY', b''),
+        (b'AUTH_CONNECT_STRING', b'(DESCRIPTION=' + b'x' * 300 + b')'),
+    ]
+    absent = encode_sb4(3) + bytes([3]) + b'KEY' + encode_sb4(1) + bytes([0xFD, 1, 0])
+    return [
+        _long_auth(field_version),
+        _auth_head(field_version, len(pairs))
+        + b''.join(encode_kv(k, v, 0) for k, v in pairs),
+        _auth_head(field_version, 1) + absent,
+        _auth_head(field_version, 50) + b'\x00\x00\x00' * 50,
+    ]
+
+
+@pytest.fixture
+def _codec_at(request: pytest.FixtureRequest) -> Iterator[int]:
+    # The codec's field version for the test's: a chunked value is framed by it.
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, _ENCODE_FIELD_VERSION
+
+    field_version = request.param
+    tokens = (
+        _DECODE_FIELD_VERSION.set(field_version),
+        _ENCODE_FIELD_VERSION.set(field_version),
+    )
+    yield field_version
+    _DECODE_FIELD_VERSION.reset(tokens[0])
+    _ENCODE_FIELD_VERSION.reset(tokens[1])
+
+
+@pytest.mark.parametrize(
+    '_codec_at', [FIELD_VERSION_11_2, FIELD_VERSION_12_1], indirect=True
+)
+def test_the_auth_walk_agrees_with_a_whole_walk(_codec_at: int) -> None:
+    # GHSA-vxvf-jx7x-rcx8: the resumable walk tells a whole AUTH from a cut one
+    # as walking the whole message from its start does, at every cut, whether
+    # it starts afresh or goes on from the shorter message before.
+    from seerdb.server.auth import AuthWalk
+
+    field_version = _codec_at
+    for whole in _auths(field_version):
+        assert _outcome(AuthWalk(field_version), whole) == 'whole'
+        grown = AuthWalk(field_version)
+        for cut in range(len(whole) + 1):
+            expected = _outcome(lambda b: _whole_walk(b, field_version), whole[:cut])
+            assert _outcome(AuthWalk(field_version), whole[:cut]) == expected, cut
+            assert _outcome(grown, whole[:cut]) == expected, cut
+
+
+@pytest.mark.parametrize(
+    '_codec_at', [FIELD_VERSION_11_2, FIELD_VERSION_12_1], indirect=True
+)
+def test_the_auth_walk_refuses_what_a_whole_walk_refuses(_codec_at: int) -> None:
+    # The same answer on pairs of arbitrary bytes, at every cut -- but for a
+    # chunk of a negative length, which the whole walk read as the last bytes
+    # of what it had, and the resumable one refuses.
+    import random
+
+    from seerdb.server.auth import AuthWalk
+
+    field_version = _codec_at
+    rng = random.Random(1770)
+    alphabet = (0, 1, 2, 3, 7, 64, 0x81, 0xFD, 0xFE, 0xFF)
+    for _ in range(300):
+        payload = _auth_head(field_version, rng.randrange(1, 6)) + bytes(
+            rng.choice(alphabet) for _ in range(rng.randrange(1, 60))
+        )
+        grown = AuthWalk(field_version)
+        for cut in range(len(payload) + 1):
+            fresh = _outcome(AuthWalk(field_version), payload[:cut])
+            if fresh == 'DataError':
+                break
+            expected = _outcome(lambda b: _whole_walk(b, field_version), payload[:cut])
+            assert fresh == expected
+            assert _outcome(grown, payload[:cut]) == expected
+
+
+def test_a_split_auth_is_walked_once(monkeypatch) -> None:
+    # GHSA-vxvf-jx7x-rcx8: an AUTH read packet by packet is walked from where
+    # the last packet left off, not from its start for every packet, so the
+    # integers read stay in proportion to the message, not to its square.
+    from seerdb.common.exceptions import Truncated
+    from seerdb.server import auth
+
+    calls = 0
+    decode = auth.decode_ub4
+
+    def counted(data: bytes) -> tuple[int, bytes]:
+        nonlocal calls
+        calls += 1
+        return decode(data)
+
+    monkeypatch.setattr(auth, 'decode_ub4', counted)
+    pairs = 20_000
+    whole = _auth_head(FIELD_VERSION_12_1, pairs) + b'\x00\x00\x00' * pairs
+    packets = range(8192, len(whole), 8192)
+    walk = auth.AuthWalk(FIELD_VERSION_12_1)
+    for end in packets:
+        with pytest.raises(Truncated):
+            walk(whole[:end])
+    walk(whole)
+    # Each pair's three integers once, and a cut one again per packet.
+    assert calls <= 3 * pairs + len(packets) + 1
