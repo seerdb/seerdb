@@ -423,6 +423,29 @@ def test_a_described_column_carries_its_domain_and_annotations() -> None:
     assert (bare['domain_schema'], bare['annotations']) == (None, None)
 
 
+def test_a_described_column_grows_at_the_field_versions_23ai_sends_its_tail() -> None:
+    # Measured against 23ai: a column's describe carries nothing after its
+    # domain through field version 19, the annotation count from 20 (23.1 EXT
+    # 3), and the vector descriptor too from 24 (23.4). Both went out from 18,
+    # which a client at 18 to 23 could not read.
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION, ColumnMeta, _encode_dcb_column
+    from seerdb.common.tns_consts import TNS_TYPE_DATE
+
+    col = ColumnMeta(
+        name=b'SYSDATE', data_type=TNS_TYPE_DATE, data_length=7, max_size=7
+    )
+
+    def size(field_version: int) -> int:
+        token = _ENCODE_FIELD_VERSION.set(field_version)
+        try:
+            return len(_encode_dcb_column(col, 1))
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
+
+    growth = {fv: size(fv) - size(17) for fv in range(17, 25)}
+    assert growth == {17: 0, 18: 0, 19: 0, 20: 1, 21: 1, 22: 1, 23: 1, 24: 4}
+
+
 def test_a_urowid_is_served_with_the_tag_its_kind_carries() -> None:
     # The tag byte tells a client what the rowid is: 0x02 logical, 0x01 physical,
     # both captured from 23ai. Every value used to go out tagged 0x01, so

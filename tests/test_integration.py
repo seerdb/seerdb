@@ -43,7 +43,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_20_1,
     FIELD_VERSION_23_1,
     FIELD_VERSION_23_1_EXT_1,
-    FIELD_VERSION_23_4,
+    FIELD_VERSION_23_1_EXT_3,
 )
 
 # Features the Oracle 9i (fv2) server genuinely lacks, keyed by a substring of
@@ -474,7 +474,12 @@ _SESSION_CONTEXT = _Need(
     'session-context pairs need the fv > 23.1 FAST_AUTH',
     min_fv=FIELD_VERSION_23_1_EXT_1,
 )
-_DOMAINS = _Need('column domains and annotations are 23ai', min_fv=FIELD_VERSION_23_4)
+# The describe carries a column's annotations from 23.1 EXT 3, its domain
+# from 23.1 (measured against 23ai).
+_DOMAINS = _Need(
+    'column annotations need a session at field version 23.1 EXT 3+',
+    min_fv=FIELD_VERSION_23_1_EXT_3,
+)
 del _FV
 # By the server.
 _SODA = _Need('SODA needs an Oracle 18c+ server (DBMS_SODA)', min_server=18)

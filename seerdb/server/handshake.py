@@ -61,6 +61,7 @@ from seerdb.common.tns_consts import (
     TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
     TNS_DATA,
     TNS_GSO_CAN_RECV_ATTENTION,
+    TNS_MSG_TYPE_FAST_AUTH,
     TNS_VERSION_11_2,
     TNS_VERSION_12_1,
     TNS_VERSION_12_2,
@@ -695,3 +696,27 @@ def client_compile_cap(dty_body: bytes, index: int) -> int | None:
         return caps[index]
     except IndexError:
         return None
+
+
+# The bytes between a fast-auth bundle's PRO message and its DTY: the charset,
+# a flag and the ncharset (five), then a version byte that is always 19.1 EXT 1
+# whatever the client speaks, so it says nothing about the session.
+_FAST_AUTH_DTY_GAP = 6
+
+
+def fast_auth_field_version(bundle: bytes) -> int | None:
+    """The TTC field version a 23ai fast-auth client settled on, read from the
+    DTY inside its bundle: the FAST_AUTH header, the PRO message (its version
+    list and its banner, each NUL-terminated), six bytes, then the DTY, whose
+    capability block names the client's real version (§20). ``None`` when the
+    bundle can't be read, as for :func:`client_field_version`.
+
+    Without it a client at field version 18 to 23 -- all of which log in this
+    way -- was served at the version the Mirror presents."""
+    if len(bundle) < 5 or bundle[0] != TNS_MSG_TYPE_FAST_AUTH or bundle[4] != TTI_PRO:
+        return None
+    versions_end = bundle.find(b'\x00', 5)
+    banner_end = bundle.find(b'\x00', versions_end + 1) if versions_end >= 0 else -1
+    if banner_end < 0:
+        return None
+    return client_field_version(bundle[banner_end + 1 + _FAST_AUTH_DTY_GAP :])

@@ -331,6 +331,52 @@ def test_live_seerdb_login_at_a_higher_field_version(version: int) -> None:
     assert result.get('user') == 'PYO'
 
 
+@pytest.mark.parametrize('version', [18, 20, 23])
+def test_a_fast_auth_client_below_the_mirrors_version_is_served_at_its_own(
+    version: int,
+) -> None:
+    # A client at field version 18 or later logs in with the fast-auth bundle.
+    # A Mirror presenting 23ai (24) read no version from it and served the
+    # session at 24, sending each column a describe tail the client's version
+    # does not carry.
+    from seerdb.common.tns_consts import FIELD_VERSION_23_4
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+    result: dict = {}
+    server = threading.Thread(
+        target=_run_mirror_login_at,
+        args=(listen, result, FIELD_VERSION_23_4),
+        daemon=True,
+    )
+    server.start()
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+        field_version=version,
+    )
+    try:
+        assert conn.field_version == version
+        cursor = conn.cursor()
+        cursor.execute('select * from dual')
+        assert cursor.fetchone() == ('X',)
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - the assertions above are the test
+            pass
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+
+
 class _AlterSessionBackend(_DualBackend):
     """Records the ALTER SESSION a client sends with its login; optionally
     refuses it, to show a refusal never fails the login."""

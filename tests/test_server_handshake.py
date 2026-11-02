@@ -515,3 +515,26 @@ def test_the_lob_column_form_follows_the_client() -> None:
     # The same block carries the field version each can speak.
     assert client_field_version(_SQLPLUS_23_DTY) == 27
     assert client_field_version(_SQLPLUS_11_DTY) == 6
+
+
+# The head of the fast-auth bundle the seerdb client sent a live 23ai when
+# capped at field version 18, which 23ai accepted: the FAST_AUTH header, the
+# PRO message, six bytes whose version byte always says 19.1 EXT 1, and the DTY
+# up to its capability block, which names 18. The OSESSKEY that follows is cut.
+_FAST_AUTH_FV18 = bytes.fromhex(
+    '220101000106050403020100736565726462207838365f36342f4c696e75780000000000'
+    '000d0269036903033506000000ea180012010100000000002990030703000100cf000004'
+    '010000001000000c2000b80008640005003e0300000000000003'
+)
+
+
+def test_a_fast_auth_client_is_served_at_the_version_its_bundle_names() -> None:
+    # Every client at field version 18 or later logs in with the bundle, so the
+    # DTY a server reads its version from rides inside it. Not read there, a
+    # client at 18 to 23 was served at the version the Mirror presents.
+    from seerdb.server.handshake import client_field_version, fast_auth_field_version
+
+    assert client_field_version(_FAST_AUTH_FV18) is None
+    assert fast_auth_field_version(_FAST_AUTH_FV18) == 18
+    assert fast_auth_field_version(_FAST_AUTH_FV18[:20]) is None
+    assert fast_auth_field_version(_SQLPLUS_11_DTY) is None

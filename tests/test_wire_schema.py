@@ -269,6 +269,7 @@ def test_a_describe_column_decodes_back_in_both_dialects(version: int) -> None:
                 'has_oaccolid': version >= FIELD_VERSION_12_2,
                 'has_uds': version >= FIELD_VERSION_11_2,
                 'has_domain': version >= FIELD_VERSION_23_1,
+                'has_annotations': False,
                 'has_vector': False,
             }
             decode = wire_schema.compile_decoder(tns._DCB_COLUMN, tns._THIN)
