@@ -150,6 +150,8 @@ functions. This covers:
   `REF` and `DEREF`.
 - **Other features:**
   - `ROWID`, and `UROWID` for index-organized tables;
+  - identity columns (`GENERATED ALWAYS | BY DEFAULT [ON NULL] AS IDENTITY`),
+    on `NUMBER` or an integer type, whose values are a 64-bit sequence's;
   - invisible columns;
   - editions, by name;
   - DIRECTORY objects.
