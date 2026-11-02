@@ -7920,7 +7920,7 @@ def encode_dictionary_token_auth(Dictionary: dict) -> bytes:
 # seerdb's advertised client version, packed the way python-oracledb encodes
 # SESSION_CLIENT_VERSION: (major << 24) | (minor << 20) | (patch << 12). Keep the
 # string in sync with pyproject.toml. (4.0.1 -> 67112960 in the reference capture.)
-_CLIENT_VERSION = '3.4.0'
+_CLIENT_VERSION = '3.5.0'
 
 
 def _packed_client_version(Version: str) -> int:
