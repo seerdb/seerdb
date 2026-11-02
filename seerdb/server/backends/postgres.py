@@ -191,7 +191,10 @@ honest edge of this adapter:
   schema first on its path, so it runs as its owner's role in per-user mode,
   and an unqualified name is the owner's in either mode; USER stays the
   caller. AUTHID CURRENT_USER runs with the caller's rights and path, but for
-  a package, whose members find each other on their creator's path.
+  a package, whose members find each other on their creator's path. In
+  per-user mode, a view, column default or CHECK that calls a user's AUTHID
+  CURRENT_USER routine is refused: PostgreSQL would run it with the rights of
+  whoever reads or writes through it, where Oracle uses its owner's.
 - **Object types, partly** — ``CREATE TYPE ... AS OBJECT`` is a PostgreSQL
   composite, listed in ``all_types`` / ``all_type_attrs`` under an OID that is the
   composite's own ``pg_type`` oid, zero-padded to Oracle's 16 bytes. An object
@@ -5308,6 +5311,45 @@ _IS_DDL = re.compile(
 _DDL_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '1s'"
 # A DROP TABLE or DROP VIEW, and the object it drops (#2201).
 _DROP_RELATION = re.compile(r'(?is)\s*DROP\s+(?:TABLE|VIEW)\s+([\w$#.]+)')
+
+
+def _written_here(xid: str) -> str:
+    # Whether a catalog row's xmin is this transaction's, a subtransaction's
+    # included: a row visible and in progress is the session's own. Those are
+    # no older than the transaction's own xid, which age() counts from, and
+    # that distance puts the 32-bit xid in its epoch. An older row's, frozen
+    # ones too, is not asked about.
+    return (
+        f'CASE WHEN age({xid}) <= 0 THEN pg_xact_status((pg_current_xact_id()'
+        f"::text::bigint - age({xid}))::text::xid8) = 'in progress' ELSE false END"
+    )
+
+
+# A user's invoker-rights routine (AUTHID CURRENT_USER, SECURITY INVOKER) that
+# a stored expression of the statement's -- a view, a default, a CHECK, an
+# index's or a trigger's -- calls, or one the statement made invoker-rights
+# under such an expression (GHSA-x8v7-wcvm-4q7j). Oracle runs it with the
+# rights of the view or table it is called from; PostgreSQL with those of
+# whoever reads or writes it, so in per-user mode a user could have another,
+# an administrator, run their code. Refused until it is AUTHID DEFINER. The
+# installation's and the extensions' routines are not users' roles', and a
+# materialized view is refreshed with its owner's rights. Only the statement's
+# own rows: an older one, made with native SQL, does not refuse another's DDL.
+_INVOKER_CALLS = (
+    "SELECT CASE WHEN d.classid = 'pg_rewrite'::regclass THEN 'view ' || "
+    '(SELECT r.ev_class::regclass::text FROM pg_rewrite r WHERE r.oid = d.objid) '
+    'ELSE pg_describe_object(d.classid, d.objid, d.objsubid) END, '
+    'p.oid::regprocedure::text FROM pg_depend d '
+    'JOIN pg_proc p ON p.oid = d.refobjid AND NOT p.prosecdef '
+    'JOIN pg_auth_members m ON m.member = p.proowner '
+    'AND m.roleid = (SELECT oid FROM pg_roles WHERE rolname = %s) '
+    "WHERE d.refclassid = 'pg_proc'::regclass AND d.classid = ANY (ARRAY["
+    "'pg_rewrite', 'pg_attrdef', 'pg_constraint', 'pg_class', 'pg_trigger'"
+    ']::regclass[]) AND NOT EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_class c '
+    "ON c.oid = r.ev_class WHERE d.classid = 'pg_rewrite'::regclass "
+    "AND r.oid = d.objid AND c.relkind = 'm') "
+    f'AND ({_written_here("d.xmin")} OR {_written_here("p.xmin")}) LIMIT 1'
+)
 # ORA-04063, a view that does not compile (#2201).
 _ORA_VIEW_HAS_ERRORS = 4063
 # CREATE [OR REPLACE] TRIGGER on a table, row or statement, BEFORE or AFTER
@@ -16341,7 +16383,11 @@ class PostgresBackend:
                 )
             try:
                 result = self._execute_sequential(
-                    sql, params, original, prelude=prelude
+                    sql,
+                    params,
+                    original,
+                    prelude=prelude,
+                    check=self._refuse_invoker_calls if self._per_user else None,
                 )
             except BackendError as error:
                 invalid = self._create_invalid(original, error)
@@ -16464,6 +16510,22 @@ class PostgresBackend:
                 f'position, text, message_number) VALUES ({owner_sql}, %s, %s, '
                 '%s, %s, %s, %s, %s)',
                 (*params, name, kind, sequence, line, position, row_text, row_number),
+            )
+
+    def _refuse_invoker_calls(self) -> None:
+        # Per-user mode: a DDL that has a stored expression call a user's
+        # invoker-rights routine is refused (_INVOKER_CALLS).
+        group = _USER_GROUP_READY.get(self._admin_conninfo)
+        if group is None:
+            return
+        found = self._conn.execute(_INVOKER_CALLS, (group,)).fetchone()
+        if found is not None:
+            (caller, routine) = found
+            raise UnsupportedFeature(
+                f'{caller} calls {routine}, an AUTHID CURRENT_USER routine, '
+                'which PostgreSQL would run with the rights of the user who '
+                "reads or writes through it, not with its owner's as Oracle "
+                'does; declare the routine AUTHID DEFINER'
             )
 
     def _compile_checked(self, sql: str) -> Result | None:
@@ -20293,18 +20355,22 @@ class PostgresBackend:
         original: str | None = None,
         *,
         prelude: str | None = None,
+        check: Callable[[], None] | None = None,
     ) -> Result:
         # SAVEPOINT + statement + RELEASE as three round-trips; the fallback path.
         # A `prelude` runs inside the savepoint first, in its round trip (#1915),
         # so a SET LOCAL there is undone with a statement that fails and ends
         # with one that commits.
         # An our-side rejection after the statement ran (UnsupportedFeature on an
-        # unmapped column type) is undone too, and left for the session to map.
+        # unmapped column type) is undone too, and left for the session to map;
+        # so is one `check`'s, run after it.
         cursor = self._conn.cursor()
         try:
             with self._under_savepoint(then=prelude):
                 cursor.execute(sql, params)
                 result = self._build_result(cursor, sql, original or '', params)
+                if check is not None:
+                    check()
         except psycopg.Error as exc:
             # A PostgreSQL failure surfaces as a clean ORA error — never a desync.
             # Map the SQLSTATE to the matching Oracle code so error-conditional
