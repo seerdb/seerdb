@@ -3849,6 +3849,91 @@ def test_a_view_may_not_call_a_users_invoker_rights_routine() -> None:
         pg.close()
 
 
+def test_no_user_is_named_as_a_schema_no_user_may_have() -> None:
+    # A user is an account or a schema of its name (#879), but not the
+    # installation's schemas, nor another role's (GHSA-jgr6-gq6c-g2rm): an
+    # administrator's ALTER USER, DROP USER or CREATE USER of one, or a
+    # user's GRANT to one, is refused, and no role is given it. A schema the
+    # installer made for a user before the Mirror kept accounts is still one.
+    pid = os.getpid()
+    admin, user = f'rs_adm_{pid}', f'rs_user_{pid}'
+    (legacy, foreign, owner) = (
+        f'rs_legacy_{pid}',
+        f'rs_foreign_{pid}',
+        f'rs_own_{pid}',
+    )
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    installed = ('dbms_lob', 'sys', 'system')
+
+    def owners() -> list[str]:
+        rows = pg.execute(
+            'SELECT pg_get_userbyid(nspowner) FROM pg_namespace '
+            'WHERE nspname = ANY (%s) ORDER BY nspname',
+            (list(installed),),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    pg.execute(f'CREATE SCHEMA IF NOT EXISTS {legacy}')
+    pg.execute(f'CREATE ROLE {owner} NOLOGIN')
+    pg.execute(f'CREATE SCHEMA IF NOT EXISTS {foreign} AUTHORIZATION {owner}')
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as login:
+            adm = login(admin, 'adm123')
+            session = None
+            try:
+                theirs = adm.cursor()
+                before = owners()
+                assert before == [pg.info.user] * len(installed)
+                for statement, code in (
+                    ('alter user sys identified by pw123', 1918),
+                    ('alter user system account unlock', 1918),
+                    (f'alter user {foreign} identified by pw123', 1918),
+                    ('drop user dbms_lob cascade', 1918),
+                    (f'drop user {foreign} cascade', 1918),
+                    ('create user system identified by pw123', 1920),
+                    ('create user seerdb_auth identified by pw123', 1920),
+                    (f'create user {foreign} identified by pw123', 1920),
+                ):
+                    with pytest.raises(seerdb.DatabaseError) as raised:
+                        theirs.execute(statement)
+                    assert raised.value.code == code, statement
+                theirs.execute(f'create user {user} identified by pw123')
+                session = login(user, 'pw123')
+                mine = session.cursor()
+                mine.execute('create table rs_t (n number)')
+                for grantee in ('system', foreign):
+                    with pytest.raises(seerdb.DatabaseError) as raised:
+                        mine.execute(f'grant select on rs_t to {grantee}')
+                    assert raised.value.code == 1917
+                assert owners() == before
+                theirs.execute(f'alter user {legacy} identified by pw123')
+                login(legacy, 'pw123').close()
+                adopted = pg.execute(
+                    'SELECT pg_get_userbyid(nspowner) FROM pg_namespace '
+                    'WHERE nspname = %s',
+                    (legacy,),
+                ).fetchone()
+                assert adopted == (legacy,)
+            finally:
+                if session is not None:
+                    session.close()
+                adm.close()
+    finally:
+        _drop_mirror_roles(pg, user, legacy, admin)
+        pg.execute(f'DROP SCHEMA IF EXISTS {foreign} CASCADE')
+        pg.execute(f'DROP ROLE IF EXISTS {owner}')
+        for name in ('sys', 'system', 'seerdb_auth', 'dbms_lob'):
+            # What the code before the fix made of them.
+            if pg.execute(
+                'SELECT 1 FROM pg_roles WHERE rolname = %s', (name,)
+            ).fetchone():
+                for schema in installed:
+                    pg.execute(f'ALTER SCHEMA {schema} OWNER TO {pg.info.user}')
+                pg.execute(f'DROP OWNED BY {name}')
+                pg.execute(f'DROP ROLE {name}')
+        pg.close()
+
+
 def test_per_user_roles_keep_the_users_apart() -> None:
     admin, user = f'pu_adm_{os.getpid()}', f'pu_user_{os.getpid()}'
     pg = psycopg.connect(_CONNINFO, autocommit=True)

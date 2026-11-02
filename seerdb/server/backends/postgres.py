@@ -402,6 +402,7 @@ from seerdb.server import (
     stats,
 )
 from seerdb.server.accounts import (
+    _ACCOUNTS_SCHEMA,
     _ALTER_USER_PASSWORD,
     _CREATE_USER_STATEMENT,
     _DROP_USER_STATEMENT,
@@ -13945,6 +13946,21 @@ _INSTALLED_SCHEMAS: Final = (
     'dbms_sql',
     'dbms_utility',
 )
+# Whether a schema may be a user's (GHSA-jgr6-gq6c-g2rm), and whether it is
+# there: one a user's role may be given, or a user dropped with, is owned by
+# that role or by the installer -- a user's made before the Mirror kept
+# accounts (#879) -- and is none of the installation's, the accounts', an
+# extension's or PostgreSQL's own. Another user's package is another role's.
+_USER_SCHEMA = (
+    'SELECT NOT (n.nspname = ANY (%s) OR n.nspname IN (%s, %s, %s) '
+    "OR starts_with(n.nspname, 'pg_') "
+    'OR EXISTS (SELECT 1 FROM pg_extension e WHERE e.extnamespace = n.oid) '
+    "OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_namespace'::regclass "
+    "AND d.objid = n.oid AND d.deptype = 'e')) AND (n.nspowner = (SELECT nspowner "
+    "FROM pg_namespace WHERE nspname = 'sys') OR n.nspowner = "
+    '(SELECT oid FROM pg_roles WHERE rolname = n.nspname)) '
+    'FROM pg_namespace n WHERE n.nspname = %s'
+)
 
 
 def _scram_verifier(password: str, iterations: int = 4096) -> str:
@@ -21903,9 +21919,17 @@ class PostgresBackend:
         Mirror's and is a member of the users' group. What it makes is its own:
         PostgreSQL grants a function's EXECUTE and a type's USAGE to PUBLIC,
         which an Oracle routine or type is not, so those are taken back. A role
-        of that name the Mirror did not make is another's: ORA-01920.
+        of that name the Mirror did not make is another's: ORA-01920, as is a
+        schema of that name no user may have (_USER_SCHEMA).
         """
         role = sql.Identifier(name.lower())
+        if self._user_schema(conn, name) is False:
+            # Its schema is one no user's role may be given: the
+            # installation's, say (GHSA-jgr6-gq6c-g2rm).
+            raise BackendError(
+                f"user name '{name}' conflicts with another user or role name",
+                ora_code=ORA_USER_NAME_CONFLICT,
+            )
         group = self._ensure_user_group(conn)
         # Ours only if marked so and made by this installer, whose privileges
         # it lent it: another's mark is another installation's user.
@@ -22693,15 +22717,28 @@ class PostgresBackend:
                 )
             )
 
+    def _user_schema(self, conn: psycopg.Connection, name: str) -> bool | None:
+        # Whether user `name`'s schema may be a user's, or None when there is
+        # none (_USER_SCHEMA).
+        row = conn.execute(
+            _USER_SCHEMA,
+            (
+                list(_INSTALLED_SCHEMAS),
+                _ACCOUNTS_SCHEMA,
+                'public',
+                'information_schema',
+                name.lower(),
+            ),
+        ).fetchone()
+        return None if row is None else bool(row[0])
+
     def _user_exists(self, name: str) -> bool:
         # A user is an account or a schema of that name: one made before the
-        # Mirror kept accounts has a schema and no password (#879).
+        # Mirror kept accounts has a schema and no password (#879). Not one
+        # no user may have, the installation's say (_USER_SCHEMA).
         if self._accounts.secret(name) is not None:
             return True
-        row = self._conn.execute(
-            'SELECT to_regnamespace(%s) IS NOT NULL', (f'"{name.lower()}"',)
-        ).fetchone()
-        return bool(row and row[0])
+        return bool(self._user_schema(self._conn, name))
 
     def _user_statement(self, statement: str) -> Result | None:
         """CREATE USER, ALTER USER ... IDENTIFIED BY and DROP USER, on the
@@ -22712,6 +22749,12 @@ class PostgresBackend:
         if created is not None:
             name = _user_name(created.group(1))
             self._require_administrator('CREATE USER')
+            if self._user_schema(self._conn, name) is False:
+                # A schema no user may have: no user of its name may be made.
+                raise BackendError(
+                    f"user name '{name}' conflicts with another user or role name",
+                    ora_code=ORA_USER_NAME_CONFLICT,
+                )
             if self._user_exists(name):
                 # A launcher's account is a user with no schema yet; an Oracle
                 # user always has one, so it gets it here, and the statement is
@@ -22796,6 +22839,12 @@ class PostgresBackend:
             if not self._user_exists(name):
                 raise BackendError(
                     f"user '{name}' does not exist", ora_code=ORA_USER_DOES_NOT_EXIST
+                )
+            if self._user_schema(self._conn, name) is False:
+                # An account named as a schema no user may have, which goes
+                # with none of it.
+                raise BackendError(
+                    'insufficient privileges', ora_code=ORA_INSUFFICIENT_PRIVILEGES
                 )
             schema = sql.Identifier(name.lower())
             proxy_grants = self._has_proxy_grants()

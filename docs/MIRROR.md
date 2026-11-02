@@ -556,6 +556,23 @@ can't both have a user of the same name. A `CREATE USER` or a first login whose
 role already exists, made by something other than the Mirror, is refused with
 ORA-01920.
 
+**Which schemas can be a user's.** A schema with a user's name and no account
+counts as that user, as a user made before the Mirror kept accounts is.
+- It must be owned by that user's role, or by the connection role.
+- It must not be one of these:
+  - the installation's: `sys`, `system` and the packages' (`dbms_lob`, ...);
+  - `seerdb_auth`;
+  - an extension's;
+  - PostgreSQL's: `public`, `information_schema` and `pg_*`.
+
+A user is never made or dropped for any other schema, and no role is given one.
+- `CREATE USER` of such a name, or a first login under one, is ORA-01920.
+- `ALTER USER`, `DROP USER` and a grant are ORA-01918 or ORA-01917.
+
+So don't keep other schemas under the connection role: a user named like one
+would take it over at its first login. A database of the Mirror's own is
+simplest.
+
 **What a user sees and may do:**
 - its own objects, and others' only as PostgreSQL privileges allow; otherwise
   ORA-00942;
