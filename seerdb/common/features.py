@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: MIT
+
+"""What a Mirror session may carry, decided once at login (#2395).
+
+This is the Mirror's table. The server session sets it at login, and the
+encoders read it; it lives here, not in seerdb/server, only because those
+encoders do. The client never uses it: it reads whatever the server sends,
+and decides its own refusals from what the server advertised.
+
+A client's protocol predates some of what a database can hold: sqlplus 11.2
+has no type code for a BOOLEAN. Each such feature gets one verdict per session:
+
+- **native:** carried as the newest protocol carries it;
+- **mapped:** carried in a form the client's protocol has, the one real Oracle
+  sends that client;
+- **refused:** answered with the error a real server returns.
+
+The field version still decides how bytes are laid out (the describe's slots,
+the OAC tails); this table decides only what goes into them. The encoders and
+the session ask it rather than comparing field versions themselves.
+
+The table also holds the choices a sqlplus's own capability block makes at
+login: which LOB cell, TIMESTAMP WITH TIME ZONE cell and release it reads.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import enum
+from dataclasses import dataclass
+
+from seerdb.common.tns_consts import FIELD_VERSION_12_1, FIELD_VERSION_18_1
+
+
+class Carry(enum.Enum):
+    """How a session carries one feature."""
+
+    NATIVE = 'native'
+    MAPPED = 'mapped'
+    REFUSED = 'refused'
+
+
+@dataclass(frozen=True)
+class Features:
+    """One session's verdicts. The defaults are what a session that never
+    logged in gets: the newest forms, as the codec's own defaults are."""
+
+    # The 23ai types and calls that older clients have no form for. Each is
+    # NATIVE at every band until its own change maps or refuses it (#2416-#2419).
+    boolean: Carry = Carry.NATIVE
+    json: Carry = Carry.NATIVE
+    vector: Carry = Carry.NATIVE
+    implicit_results: Carry = Carry.NATIVE
+    # A sqlplus that offered CCAP_LOB_12C (sqlplus 23.26) reads a LOB cell with
+    # the LOB's length and chunk size before the locator; one that did not
+    # (11.2) cannot parse the cell with them. A live 11g answers each in its
+    # own form (#1287).
+    oci_lob_12c: bool = False
+    # Whether a sqlplus reads a TIMESTAMP WITH TIME ZONE cell as the wall clock
+    # with the 0x40 flag (#2018). A live 11g, which the Mirror's pre-12c OCI
+    # replies imitate, sends that form to sqlplus 23.26 and the UTC form to
+    # 11.2. Told apart by the field version the client's own block names, 12.1
+    # or later; the capability bit the server keys on is not pinned down.
+    oci_tstz_local: bool = True
+    # Whether a sqlplus's version call is answered with the full release and
+    # banner_full (#2024). Measured against 18c, 21c and 23ai: sqlplus 23.26 is
+    # sent the full release (SHOW RELEASE 2326020000) and the two-line
+    # banner_full, 11.2 the base release (2300000000) and the one-line banner.
+    # banner_full is 18c's, so the line is drawn at a client of 18.1 or later;
+    # no client between 11.2 and 23.26 has been tried.
+    oci_full_release: bool = True
+
+
+def session_features(
+    field_version: int,
+    *,
+    oci: bool = False,
+    client_field_version: int | None = None,
+    lob_12c: bool = False,
+) -> Features:
+    """The table for a session at ``field_version``. ``oci`` is the sqlplus
+    dialect; for it, ``client_field_version`` is the version its capability
+    block names (None when the block can't be read, which keeps the newer
+    forms) and ``lob_12c`` whether it offered CCAP_LOB_12C."""
+    if not oci:
+        return Features()
+    return Features(
+        oci_lob_12c=lob_12c,
+        oci_tstz_local=client_field_version is None
+        or client_field_version >= FIELD_VERSION_12_1,
+        oci_full_release=client_field_version is None
+        or client_field_version >= FIELD_VERSION_18_1,
+    )
+
+
+# The table of the session the current context serves. Set at login.
+_SESSION_FEATURES: contextvars.ContextVar[Features] = contextvars.ContextVar(
+    'session_features', default=Features()
+)

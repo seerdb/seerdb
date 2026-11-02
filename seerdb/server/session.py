@@ -37,6 +37,7 @@ from seerdb.common.exceptions import (
     NotSupportedError,
     Truncated,
 )
+from seerdb.common.features import _SESSION_FEATURES, Features, session_features
 from seerdb.common.oci import (
     OCI_CMD_COMMIT,
     OCI_CMD_ROLLBACK,
@@ -57,8 +58,6 @@ from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
     _ENCODE_OCI_CALL_SEQ,
-    _ENCODE_OCI_LOB_12C,
-    _ENCODE_OCI_TSTZ_LOCAL,
     _ENCODE_OER_SEQ,
     _ENCODE_SERVER_FIELD_VERSION,
     _ENCODE_TXN_IN_PROGRESS,
@@ -178,7 +177,6 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
-    FIELD_VERSION_18_1,
     FIELD_VERSION_23_1,
     FIELD_VERSION_23_1_EXT_1,
     ORA_INSUFFICIENT_PRIVILEGES,
@@ -664,15 +662,9 @@ def handle_login(
                 )
             )
             # sqlplus's data-type request carries the capability block that says
-            # what the client reads.
-            # Which LOB column form: the one with the LOB's length and chunk
-            # size, if it offered CCAP_LOB_12C (#1287).
-            lob_caps = client_compile_cap(capabilities, CCAP_LOB) or 0
-            _ENCODE_OCI_LOB_12C.set(bool(lob_caps & CCAP_LOB_12C))
-            # Which TIMESTAMP WITH TIME ZONE cell this sqlplus reads (#2018).
-            _ENCODE_OCI_TSTZ_LOCAL.set(sqlplus_reads_local_tstz(capabilities))
-            # Which release and banner its version call is answered with (#2024).
-            _OCI_FULL_RELEASE.set(sqlplus_reads_full_release(capabilities))
+            # what the client reads: which LOB, TIMESTAMP WITH TIME ZONE and
+            # release forms (#1287, #2018, #2024).
+            _SESSION_FEATURES.set(sqlplus_features(capabilities, field_version))
             # And what version it speaks. sqlplus does not come down to what the
             # Mirror advertised, as a thin client does -- sqlplus 23.26 sends 27
             # -- but an OLDER one sends its own, lower, and must be served at
@@ -685,8 +677,10 @@ def handle_login(
                 field_version = negotiated = spoken
                 _DECODE_FIELD_VERSION.set(field_version)
                 _ENCODE_FIELD_VERSION.set(field_version)
+                _SESSION_FEATURES.set(sqlplus_features(capabilities, field_version))
         else:
             stream.send_raw(encode_dty_reply(field_version=field_version))
+            _SESSION_FEATURES.set(session_features(field_version))
         osesskey = _expect_login_message(stream, 'OSESSKEY')
 
     # --- O5LOGON (§4) ---
@@ -1058,38 +1052,18 @@ def _open_backend_session(
 _OCI_MIN_FIELD_VERSION = FIELD_VERSION_10_2
 
 
-def sqlplus_reads_local_tstz(capabilities: bytes) -> bool:
-    """Whether a sqlplus reads a TIMESTAMP WITH TIME ZONE cell as the wall clock
-    with the 0x40 flag, from the capability block it sent (#2018).
-
-    A live 11g sends that form to sqlplus 23.26 and the UTC form to sqlplus
-    11.2, and the Mirror's pre-12c replies imitate 11g. Told apart here by the
-    field version the client's own block names, 12.1 or later; the capability
-    bit the server keys on is not pinned down. A block that cannot be read
-    keeps the newer form."""
-    spoken = client_field_version(capabilities)
-    return spoken is None or spoken >= FIELD_VERSION_12_1
-
-
-# Whether this sqlplus's version call is answered with the full release and
-# banner_full, set per session at login (#2024).
-_OCI_FULL_RELEASE: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    'oci_full_release', default=True
-)
-
-
-def sqlplus_reads_full_release(capabilities: bytes) -> bool:
-    """Whether a sqlplus is told the server's full release and banner_full in
-    its version call, from the capability block it sent (#2024).
-
-    Measured against 18c, 21c and 23ai: sqlplus 23.26 is sent the full release
-    (SHOW RELEASE 2326020000) and the two-line banner_full, sqlplus 11.2 the base
-    release (2300000000) and the one-line banner. banner_full is 18c's, so the
-    line is drawn at a client of 18.1 or later, by the field version its own
-    block names; no client between 11.2 and 23.26 has been tried. A block that
-    cannot be read keeps the newer form."""
-    spoken = client_field_version(capabilities)
-    return spoken is None or spoken >= FIELD_VERSION_18_1
+def sqlplus_features(capabilities: bytes, field_version: int) -> Features:
+    """The feature table for a sqlplus session, from the capability block its
+    data-type request carried (#2395): whether it offered CCAP_LOB_12C, and the
+    field version the block names, which decides the TIMESTAMP WITH TIME ZONE
+    cell and the release it reads (#1287, #2018, #2024)."""
+    lob_caps = client_compile_cap(capabilities, CCAP_LOB) or 0
+    return session_features(
+        field_version,
+        oci=True,
+        client_field_version=client_field_version(capabilities),
+        lob_12c=bool(lob_caps & CCAP_LOB_12C),
+    )
 
 
 def _backend_identity(backend: object, identity: ServerIdentity) -> ServerIdentity:
@@ -1877,7 +1851,9 @@ def _serve_oci_session(
             # What sqlplus prints after "Connected to:" — the release this
             # session introduced itself as (naming the Mirror itself is a
             # separate discussion).
-            banner, release = identity.version_reply(_OCI_FULL_RELEASE.get())
+            banner, release = identity.version_reply(
+                _SESSION_FEATURES.get().oci_full_release
+            )
             stream.write_packet(TNS_DATA, encode_version_banner_oci(banner, release))
             continue
         # Every statement past the first arrives wrapped in an OCCA close-cursors

@@ -42,6 +42,7 @@ from seerdb.common.exceptions import (
     NotSupportedError,
     Truncated,
 )
+from seerdb.common.features import _SESSION_FEATURES
 from seerdb.common.sqltext import (
     bind_placeholders,
     is_plsql,
@@ -12292,13 +12293,6 @@ def encode_long_value_oci(value: object) -> bytes:
 _OCI_LOB_CHUNK_SIZE = 8132
 _OCI_LOB_ROW_METADATA_LEN = 12
 
-# Whether the sqlplus / thick-OCI client offered CCAP_LOB_12C, and so reads a LOB
-# column value with the LOB's length and chunk size in it. Set per session at
-# login from the client's own capabilities (#1287).
-_ENCODE_OCI_LOB_12C: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    'encode_oci_lob_12c', default=False
-)
-
 
 def _oci_lob_byte_size(value: object, is_clob: bool) -> int:
     # The LOB content byte count sqlplus reads from the locator: a CLOB is UTF-16
@@ -12340,7 +12334,7 @@ def encode_lob_locator_oci(
     return _LOB_CELL_OCI(
         {
             'locator_length': len(locator),
-            'has_metadata': _ENCODE_OCI_LOB_12C.get(),
+            'has_metadata': _SESSION_FEATURES.get().oci_lob_12c,
             'size': _lob_value_size(value),
             'chunk_size': _OCI_LOB_CHUNK_SIZE,
             'locator': locator,
@@ -12507,7 +12501,7 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
     if (
         col.data_type == TNS_TYPE_TIMESTAMPTZ
         and isinstance(value, datetime.datetime)
-        and _ENCODE_OCI_TSTZ_LOCAL.get()
+        and _SESSION_FEATURES.get().oci_tstz_local
     ):
         return _oci_timestamptz_value(value)
     return encode_value(_national_wire_value(value, col), col.data_type, _OCI)
@@ -12516,15 +12510,6 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
 # The flag a TIMESTAMP WITH TIME ZONE cell's offset-hour byte carries to OCI:
 # the date and time before it are the wall clock at that offset, not UTC (#2018).
 _OCI_TSTZ_LOCAL_FLAG = 0x40
-# Whether this sqlplus reads that form. Which client gets it, measured against a
-# live 11g (the server the Mirror's pre-12c OCI replies imitate): sqlplus 23.26
-# does, and sqlplus 11.2 gets the thin form, the time in UTC and no flag. Sent
-# the local form, sqlplus 11.2 printed 03:04 +02:00 as 21:04 +66:00. Set per
-# session from the field version the client's own capability block names
-# (12.1 or later); the capability bit the server keys on is not pinned down.
-_ENCODE_OCI_TSTZ_LOCAL: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    'encode_oci_tstz_local', default=True
-)
 
 
 def _oci_timestamptz_value(value: datetime.datetime) -> bytes:

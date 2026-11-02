@@ -3036,20 +3036,20 @@ def _oci_sent_locator(reply: bytes) -> bytes:
 def test_print_binds_the_value_the_block_assigned() -> None:
     # The OUT value is a locator naming the value; `print vc` binds it, and the
     # backend is handed the value as a CLOB (#2015).
-    from seerdb.common.tns import _ENCODE_OCI_LOB_12C
+    from seerdb.common.features import _SESSION_FEATURES, Features
     from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_DATA
     from seerdb.server.backend import ClobValue
     from seerdb.server.session import _serve_oci_session
 
     first: Any = _OciOneCallStream(_OCI_EXEC_ASSIGN_CLOB)
     backend: Any = _OciClobBackend('clob var')
-    token = _ENCODE_OCI_LOB_12C.set(True)
+    token = _SESSION_FEATURES.set(Features(oci_lob_12c=True))
     try:
         _serve_oci_session(
             first, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1
         )
     finally:
-        _ENCODE_OCI_LOB_12C.reset(token)
+        _SESSION_FEATURES.reset(token)
     [reply] = first.sent
     locator = _oci_sent_locator(reply)
     # Replay the print the Mirror's own locator went into.
@@ -3059,13 +3059,13 @@ def test_print_binds_the_value_the_block_assigned() -> None:
     stream: Any = _OciOneCallStream(_OCI_EXEC_ASSIGN_CLOB)
     stream.inbox[1:1] = [(TNS_DATA, bytes(select))]
     backend = _OciClobBackend('clob var')
-    token = _ENCODE_OCI_LOB_12C.set(True)
+    token = _SESSION_FEATURES.set(Features(oci_lob_12c=True))
     try:
         _serve_oci_session(
             stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1
         )
     finally:
-        _ENCODE_OCI_LOB_12C.reset(token)
+        _SESSION_FEATURES.reset(token)
     assert backend.calls[1] == 'SELECT :vc vc FROM SYS.DUAL'
     [bound] = backend.binds[1]
     assert isinstance(bound, ClobValue) and bound == 'clob var'
@@ -3439,21 +3439,31 @@ def test_which_sqlplus_reads_the_local_timestamp_with_time_zone_form() -> None:
     # A live 11g sends sqlplus 23.26 the wall-clock cell with the 0x40 flag and
     # sqlplus 11.2 the UTC one; given the flagged cell, sqlplus 11.2 printed
     # 03:04 +02:00 as 21:04 +66:00 (#2018).
-    from seerdb.server.session import sqlplus_reads_local_tstz
+    from seerdb.server.session import sqlplus_features
 
-    assert sqlplus_reads_local_tstz(_SQLPLUS_23_CAPABILITIES)
-    assert not sqlplus_reads_local_tstz(_SQLPLUS_11_CAPABILITIES)
-    assert sqlplus_reads_local_tstz(b'')
+    assert sqlplus_features(_SQLPLUS_23_CAPABILITIES, 11).oci_tstz_local
+    assert not sqlplus_features(_SQLPLUS_11_CAPABILITIES, 6).oci_tstz_local
+    assert sqlplus_features(b'', 6).oci_tstz_local
 
 
 def test_which_sqlplus_is_told_the_full_release() -> None:
     # 18c, 21c and 23ai tell sqlplus 23.26 the full release and banner_full,
     # and sqlplus 11.2 the base release and the banner (#2024).
-    from seerdb.server.session import sqlplus_reads_full_release
+    from seerdb.server.session import sqlplus_features
 
-    assert sqlplus_reads_full_release(_SQLPLUS_23_CAPABILITIES)
-    assert not sqlplus_reads_full_release(_SQLPLUS_11_CAPABILITIES)
-    assert sqlplus_reads_full_release(b'')
+    assert sqlplus_features(_SQLPLUS_23_CAPABILITIES, 11).oci_full_release
+    assert not sqlplus_features(_SQLPLUS_11_CAPABILITIES, 6).oci_full_release
+    assert sqlplus_features(b'', 6).oci_full_release
+
+
+def test_which_sqlplus_reads_the_12c_lob_cell() -> None:
+    # sqlplus 23.26 offers CCAP_LOB_12C and reads the LOB's length and chunk
+    # size in the cell; sqlplus 11.2 does not (#1287).
+    from seerdb.server.session import sqlplus_features
+
+    assert sqlplus_features(_SQLPLUS_23_CAPABILITIES, 11).oci_lob_12c
+    assert not sqlplus_features(_SQLPLUS_11_CAPABILITIES, 6).oci_lob_12c
+    assert not sqlplus_features(b'', 6).oci_lob_12c
 
 
 def test_a_backend_names_the_release_its_session_runs_on() -> None:
@@ -3482,11 +3492,8 @@ def test_a_backend_names_the_release_its_session_runs_on() -> None:
 
 
 def test_an_older_sqlplus_gets_the_utc_timestamp_with_time_zone_cell() -> None:
-    from seerdb.common.tns import (
-        _ENCODE_OCI_TSTZ_LOCAL,
-        _encode_oci_value,
-        encode_value,
-    )
+    from seerdb.common.features import _SESSION_FEATURES, Features
+    from seerdb.common.tns import _encode_oci_value, encode_value
     from seerdb.common.tns_consts import TNS_TYPE_TIMESTAMPTZ
 
     col = ColumnMeta(
@@ -3495,14 +3502,14 @@ def test_an_older_sqlplus_gets_the_utc_timestamp_with_time_zone_cell() -> None:
     value = datetime.datetime(
         2024, 1, 2, 3, 4, 5, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
     )
-    token = _ENCODE_OCI_TSTZ_LOCAL.set(False)
+    token = _SESSION_FEATURES.set(Features(oci_tstz_local=False))
     try:
         # 11g to sqlplus 11.2: 01:04 UTC, the offset with no flag.
         thin = encode_value(value, TNS_TYPE_TIMESTAMPTZ)
         assert _encode_oci_value(value, col) == thin
         assert thin[-2:] == b'\x16\x3c'
     finally:
-        _ENCODE_OCI_TSTZ_LOCAL.reset(token)
+        _SESSION_FEATURES.reset(token)
     assert _encode_oci_value(value, col)[-2:] == b'\x56\x3c'
 
 
