@@ -119,7 +119,9 @@ clients are not served. What is checked, and how (measured 2026-10-31):
   - queries, DML, DDL and PL/SQL, with binds of every scalar type;
   - array DML with batch errors;
   - LOBs, read and written;
-  - REF CURSORs and implicit results (`DBMS_SQL.RETURN_RESULT`);
+  - REF CURSORs and implicit results (`DBMS_SQL.RETURN_RESULT`), which a
+    client below 12.1 is refused, as 23ai refuses it (*Newer types for older
+    clients*);
   - scrollable cursors;
   - `DBMS_OUTPUT`;
   - object and collection binds and fetches.
@@ -151,6 +153,17 @@ A client whose protocol predates a type gets the form 23ai sends that client
   own choice, not Oracle behaviour.
 - **Binds:** an older client binds a `NUMBER` into a `BOOLEAN` column, and the
   Mirror stores it as 23ai does: nonzero is true.
+- **Implicit results:** a client below 12.1 can't take one. As on 23ai,
+  `DBMS_SQL.RETURN_RESULT` raises ORA-29481 where it's called. Uncaught, the
+  error fails the block. A handler can catch it, and the block then runs on
+  without the result. The ORA-06512 lines that locate the error inside
+  `SYS.DBMS_SQL` on 23ai don't follow it. Over PostgreSQL, catching any
+  exception also undoes what the block did before it
+  ([#2428](https://github.com/seerdb/seerdb/issues/2428)).
+- **Passthrough:** these forms apply to the Mirror over PostgreSQL. A
+  passthrough forwards what its upstream sends, and its upstream session runs
+  at the Mirror's own version
+  ([#2430](https://github.com/seerdb/seerdb/issues/2430)).
 
 ### SQL and PL/SQL over PostgreSQL
 

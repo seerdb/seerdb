@@ -7121,6 +7121,36 @@ def test_a_block_returns_cursors_as_implicit_results() -> None:
         backend.close()
 
 
+def test_a_session_that_refuses_implicit_results_raises_ora_29481() -> None:
+    # For a client below 12.1 (#2419), DBMS_SQL.RETURN_RESULT raises ORA-29481
+    # where it is called, as 23ai does: uncaught it fails the block, a handler
+    # catches it, and a rollback does not lift the refusal.
+    from seerdb.server.backend import BackendError
+
+    block = (
+        'DECLARE c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT 1 AS n FROM dual; '
+        'DBMS_SQL.RETURN_RESULT(c); END;'
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        assert len(backend.execute(block).implicit_results) == 1
+        backend.refuse_implicit_results()
+        backend.rollback()
+        with pytest.raises(BackendError) as refused:
+            backend.execute(block)
+        assert refused.value.ora_code == 29481
+        assert 'Implicit results cannot be returned to client' in str(refused.value)
+        caught = backend.execute(
+            'DECLARE c SYS_REFCURSOR; n NUMBER := 0; BEGIN '
+            'OPEN c FOR SELECT 1 AS n FROM dual; DBMS_SQL.RETURN_RESULT(c); '
+            'EXCEPTION WHEN OTHERS THEN n := 1; END;'
+        )
+        assert caught.implicit_results == []
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_a_ref_cursor_describes_not_null_columns_as_not_nullable() -> None:
     # A REF CURSOR a routine opens over a table (#1618) describes a column
     # straight from a NOT NULL one as not nullable, as a query's result does,

@@ -35,7 +35,9 @@ EXPECTED = {
     # And a VECTOR as a CLOB of its text below field version 7 (#2418).
     'vector': dict.fromkeys(BANDS, Carry.NATIVE)
     | {'10.2': Carry.MAPPED, '11.2': Carry.MAPPED},
-    'implicit_results': dict.fromkeys(BANDS, Carry.NATIVE),
+    # And refuses an implicit result below field version 7 (#2419).
+    'implicit_results': dict.fromkeys(BANDS, Carry.NATIVE)
+    | {'10.2': Carry.REFUSED, '11.2': Carry.REFUSED},
 }
 
 

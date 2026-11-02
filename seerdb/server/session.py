@@ -37,7 +37,12 @@ from seerdb.common.exceptions import (
     NotSupportedError,
     Truncated,
 )
-from seerdb.common.features import _SESSION_FEATURES, Features, session_features
+from seerdb.common.features import (
+    _SESSION_FEATURES,
+    Carry,
+    Features,
+    session_features,
+)
 from seerdb.common.oci import (
     OCI_CMD_COMMIT,
     OCI_CMD_ROLLBACK,
@@ -852,6 +857,7 @@ def handle_login(
         _apply_new_password(backend, user, secret, conn_key, new_password_cipher)
     # The release the backend's session really runs on, where it can say (#2024).
     identity = _backend_identity(backend, identity)
+    _refuse_what_the_client_cannot_take(backend)
     session_id = 0
     if sqlplus:
         stream.send_raw(
@@ -1065,6 +1071,21 @@ def sqlplus_features(capabilities: bytes, field_version: int) -> Features:
         client_field_version=client_field_version(capabilities),
         lob_12c=bool(lob_caps & CCAP_LOB_12C),
     )
+
+
+def _refuse_what_the_client_cannot_take(backend: object) -> None:
+    # The refusals the backend makes itself, where the call runs (#2395): an
+    # implicit result, which 23ai refuses a client below 12.1 inside the block,
+    # catchably (#2419). A backend without the hook serves it.
+    if _SESSION_FEATURES.get().implicit_results is not Carry.REFUSED:
+        return
+    hook = getattr(backend, 'refuse_implicit_results', None)
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception as exc:  # noqa: BLE001 - a refusal never fails a good login
+        logger.warning('backend could not refuse implicit results: %s', exc)
 
 
 def _backend_identity(backend: object, identity: ServerIdentity) -> ServerIdentity:

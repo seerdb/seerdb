@@ -396,6 +396,13 @@ class Backend(Protocol):
         it would see direct. Without it, or answering None, the Mirror presents
         the identity of its field version.
 
+    ``refuse_implicit_results() -> None``
+        Called once, after :meth:`authenticate`, for a client below 12.1, which
+        can't take an implicit result (#2419). From then on the session's
+        ``DBMS_SQL.RETURN_RESULT`` raises ORA-29481 where it is called, as 23ai
+        does, so a handler in the block can catch it and, uncaught, it fails the
+        block. Without it such a client is sent the results.
+
     ``apply_app_context(namespace, values) -> None``
         Set the attributes ``values`` (a dict) of an application context
         namespace, or clear the namespace when ``values`` is None -- what a
