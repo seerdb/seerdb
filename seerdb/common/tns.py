@@ -184,6 +184,8 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
     FIELD_VERSION_23_1_EXT_1,
+    FIELD_VERSION_23_1_EXT_3,
+    FIELD_VERSION_23_4,
     ISO_LATIN_1_CHARSET,
     ORA_ARRAY_DML_ERRORS,
     ORA_LOB_ALREADY_OPENED,
@@ -1732,11 +1734,11 @@ _DCB_COLUMN: wire_schema.Schema = (
                     ('when', 'domain_name_length', (('value', 'domain_name'),)),
                 ),
             ),
+            ('when', 'has_annotations', (('raw', 'annotations'),)),
             (
                 'when',
                 'has_vector',
                 (
-                    ('raw', 'annotations'),
                     ('n4', 'vector_dimensions'),
                     ('u8', 'vector_format'),
                     ('u8', 'vector_flags'),
@@ -2820,7 +2822,8 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
         'has_uds': FieldVersion >= FIELD_VERSION_11_2,
         'has_domain': FieldVersion >= FIELD_VERSION_23_1,
         # The annotation map and vector descriptor are read below, not by the
-        # schema (its `annotations` is a raw slot), so its vector branch is off.
+        # schema (its `annotations` is a raw slot), so both branches are off.
+        'has_annotations': False,
         'has_vector': False,
     }
     (Field, Rest) = _DCB_COLUMN_FROM_THIN(Rest, Given)
@@ -2846,12 +2849,17 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
     VecDims: int | None
     VecFormat: int | None
     VecFlags: int | None
-    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1_EXT_1:  # 23ai (#89)
-        # Each column carries its annotation map and the vector descriptor after
-        # the domain fields (oracledb base.pyx _process_metadata). Both must be
-        # consumed or the row stream desyncs; the annotations are the #89 payload.
-        # The count is sent twice around a 1-byte pointer, and each key/value pair
-        # is followed by a ub4 flags word, with a trailing ub4 flags after the loop.
+    # After the domain fields a 23ai column carries its annotation map, from
+    # field version 23.1 EXT 3, and the vector descriptor, from 23.4. Each must
+    # be consumed exactly where it is sent or the row stream desyncs. Measured
+    # against 23ai, a column's describe grows by nothing through field version
+    # 19, by the annotation count's one byte at 20 to 23, and by the descriptor's
+    # three more at 24; reading both from 18 broke every query of a client
+    # capped at 18 or 19, and a two-column one at 20 to 23.
+    if FieldVersion >= FIELD_VERSION_23_1_EXT_3:  # 23ai (#89)
+        # The annotations are the #89 payload. The count is sent twice around a
+        # 1-byte pointer, and each key/value pair is followed by a ub4 flags
+        # word, with a trailing ub4 flags after the loop.
         (NumAnno, Rest) = decode_ub4(Rest)
         if NumAnno > 0:
             Rest = Rest[1:]  # pointer
@@ -2863,6 +2871,7 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
                 Annotations[Key] = Val or b''
                 (_, Rest) = decode_ub4(Rest)  # per-pair flags
             (_, Rest) = decode_ub4(Rest)  # trailing flags
+    if FieldVersion >= FIELD_VERSION_23_4:
         # Vector descriptor (23.4+): dimensions (ub4) + format + flags (ub1 each).
         # For a native VECTOR column these carry the declared dimension count and
         # element format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 = flexible),
@@ -2873,8 +2882,8 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
         VecFormat, VecFlags = Rest[0], Rest[1]
         Rest = Rest[2:]
     else:
-        # No vector descriptor on the wire (a pre-23.4 server, or one that
-        # negotiates field version <= 17): report None, not a fake 0 format.
+        # No vector descriptor on the wire (a pre-23.4 server, or a session
+        # below field version 24): report None, not a fake 0 format.
         VecDims = VecFormat = VecFlags = None
     Col = {
         'column_name': ColName,
@@ -3204,8 +3213,10 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
             # The column's annotations (#1082) and a descriptor from its own
             # vector metadata. The flags byte is RELAYED, not zeroed: a flexible
             # column says it allows any dimensions there, and a zero told the
-            # client it allows exactly none (#1013).
-            'has_vector': field_version >= FIELD_VERSION_23_1_EXT_1,
+            # client it allows exactly none (#1013). Each from the field version
+            # 23ai sends it at, as the client's reader takes them.
+            'has_annotations': field_version >= FIELD_VERSION_23_1_EXT_3,
+            'has_vector': field_version >= FIELD_VERSION_23_4,
             'annotations': _encode_annotations(col.annotations),
             'vector_dimensions': col.vector_dimensions or 0,
             'vector_format': (col.vector_format or 0) & 0xFF,
@@ -3230,7 +3241,7 @@ def _encode_describe_body(columns: list[ColumnMeta]) -> bytes:
 
 
 def _encode_annotations(annotations: tuple[tuple[bytes, bytes], ...]) -> bytes:
-    # A column's annotation map, as a 23ai (fv >= 23.1 EXT 1) describe carries it: the
+    # A column's annotation map, as a 23ai (fv >= 23.1 EXT 3) describe carries it: the
     # count, a pointer byte, the count again, a pointer byte, then per pair its
     # key, its value and a ub4 flags word, and a trailing ub4 flags. None is a
     # bare count of 0. The inverse of the client's reader (#89), which skips the

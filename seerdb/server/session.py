@@ -289,6 +289,7 @@ from seerdb.server.handshake import (
     encode_fast_auth_reply,
     encode_oci_dty_reply,
     encode_pro_reply,
+    fast_auth_field_version,
     is_ano_negotiation,
     negotiated_tns_version,
     oci_field_version,
@@ -611,10 +612,10 @@ def handle_login(
     after_pro = _expect(stream, TNS_DATA, 'PRO' if sqlplus else 'DTY')
     # The client has already picked min(its own, what the PRO reply advertised)
     # and put the result in this packet's capability block, so the session's real
-    # version is readable here rather than assumed (#816). None for the fast-auth
-    # bundle, whose DTY does not arrive on its own, and for anything unparseable;
-    # the caller then keeps its configured version, as before.
-    negotiated = client_field_version(after_pro)
+    # version is readable here rather than assumed (#816). A fast-auth client's
+    # DTY rides inside its bundle and is read there. None for anything
+    # unparseable; the caller then keeps its configured version, as before.
+    negotiated = client_field_version(after_pro) or fast_auth_field_version(after_pro)
     # What this Mirror presents stays in force for the fields a server writes
     # by its own release, whatever the client negotiated (#1145).
     _ENCODE_SERVER_FIELD_VERSION.set(field_version)

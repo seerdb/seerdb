@@ -5903,6 +5903,65 @@ class TestDcbColumnFv24Annotations(unittest.TestCase):
         self.assertEqual(rest, b'')  # full per-column consume, no desync
 
 
+class TestDcbColumnTailBy23aiFieldVersion(unittest.TestCase):
+    """The annotation map and vector descriptor each start at their own field
+    version. Fixtures are 23ai's replies to `select sysdate, user from dual`
+    from a client capped at 18, 20 and 24: the describe, one row and ORA-01403.
+    A column carries nothing after its domain at 18, the annotation count at
+    20, and the vector descriptor too at 24. Reading both from 18 failed every
+    query at 18 and 19, and a two-column one at 20 to 23."""
+
+    PREFIX = (
+        '10172e9128967ec28e03607a6eb4ef1c61ff787e0b0215032101870102820c0000000101'
+        '0000000000000000010701070753595344415445000000000000'
+    )
+    REPLIES = {
+        18: (
+            '01800000018000000000020369010180023ffe0104010404555345520000010100000001'
+            '0707787e0b0215052200021fe80102010200062201020001640000000707787e0b021505'
+            '220350594f08010604016ceac0000101000000000000040101025969010102057b000001'
+            '010003000000000000000000000000070001010000000002057b0101010300194f52412d'
+            '30313430333a206e6f206461746120666f756e640a1d'
+        ),
+        20: (
+            '0001800000018000000000020369010180023ffe01040104045553455200000101000000'
+            '00010707787e0b0215042f00021fe80102010200062201020001640000000707787e0b02'
+            '15042f0350594f08010604016ceaa9000101000000000000040101024718010102057b00'
+            '0001010003000000000000000000000000070001010000000002057b0101010300194f52'
+            '412d30313430333a206e6f206461746120666f756e640a1d'
+        ),
+        24: (
+            '0000000001800000018000000000020369010180023ffe01040104045553455200000101'
+            '00000000000000010707787e0b0215043a00021fe8010201020006220102000164000000'
+            '0707787e0b0215043a0350594f08010604016ceab200010100000000000004010102471c'
+            '010102057b000001010003000000000000000000000000070001010000000002057b0101'
+            '010300194f52412d30313430333a206e6f206461746120666f756e640a1d'
+        ),
+    }
+
+    def test_each_reply_decodes_at_its_field_version(self):
+        import contextvars
+
+        from seerdb.common.tns import decode_packet
+
+        for fv, tail in self.REPLIES.items():
+            with self.subTest(field_version=fv):
+                body = bytes.fromhex(self.PREFIX + tail)
+                # decode_packet pins the session's field version, which must
+                # not outlive the test: run it in a copy of the context.
+                result = contextvars.copy_context().run(
+                    decode_packet, body, (None, None, []), fv
+                )
+                columns = result[3][1]
+                self.assertEqual(
+                    [c['column_name'] for c in columns], [b'SYSDATE', b'USER']
+                )
+                # The row and the closing error read cleanly only when each
+                # column was consumed exactly.
+                self.assertEqual(result[4][0][1], 'PYO')
+                self.assertEqual(result[1], 1403)
+
+
 class TestFv2Describe(unittest.TestCase):
     """Oracle 9i (field version 2) describe-in-RPA decode (#97, PROTOCOL §19.1).
     Fixture is the real 0x62-describe RPA captured from a live 9.2.0.4 server for
