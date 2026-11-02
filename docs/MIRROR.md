@@ -137,6 +137,7 @@ A client whose protocol predates a type gets the form 23ai sends that client
 |---|---|---|
 | `BOOLEAN` | a `NUMBER` 1 or 0, NULL staying NULL | field version 17 (23.1) for a thin client; for sqlplus, the version its own capabilities name |
 | JSON | a `BLOB` holding the document as text, as 23ai writes it | field version 14 (20.1), by the same rule |
+| `VECTOR` | a `CLOB` holding the vector as text, as 23ai writes it: `[1.0E+000,2.0E+000]`, a sparse vector written out dense | field version 7 (12.1), by the same rule |
 
 - **sqlplus:** sqlplus 11.2 shows such a column exactly as it does against
   23ai. `DESCRIBE` still names a `BOOLEAN` column `BOOLEAN`. sqlplus 10.2
@@ -1150,14 +1151,9 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 The full list, with the reasons, is in the backend module's docstring
 (`seerdb/server/backends/postgres.py`).
 
-Two limits apply to the Mirror itself, whatever the backend:
-- **The clients it serves:** thin clients from 10.2 on, and sqlplus / OCI from
-  10.2 on. Oracle 8i and 9i clients are not served.
-- **`VECTOR` still reaches older clients unadapted.** A `VECTOR` column sent to
-  a client that negotiated an 11.2-era version goes out with its own type
-  code, where real Oracle sends a form the client knows. `BOOLEAN` and JSON
-  are adapted (*Newer types for older clients*); `VECTOR` is planned under
-  [#2395](https://github.com/seerdb/seerdb/issues/2395).
+One limit applies to the Mirror itself, whatever the backend: **the clients it
+serves.** Those are thin clients from 10.2 on, and sqlplus / OCI from 10.2 on.
+Oracle 8i and 9i clients are not served.
 
 ## Troubleshooting
 

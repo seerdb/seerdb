@@ -582,6 +582,103 @@ def test_a_json_column_reaches_an_older_client_as_23ai_sends_it() -> None:
     assert _at_11_2(_lob_queue, [col], [(None,)], False) == []
 
 
+# 23ai's replies for `select to_vector('[1,2,3]') from dual` to the thin client
+# at field version 6 (11.2): the describe, and the LOB read bringing the text,
+# UTF-16 as a CLOB's is. Captured live (#2418).
+_VECTOR_DESCRIBE_AT_11_2 = bytes.fromhex(
+    '10177377988c29f12ca2924225fc01f27d00787e0b020321260001015970800000020fa0'
+    '00000000000100010101010156000000020500010707787e0b02140d0900021fe8010201'
+    '020008010604016bbc980001020000000001010001181800000001000000880000000200'
+    '000003000000700000002101aa0004010101590000000001020003000000000000000000'
+    '0000000600010100000000'
+)
+_VECTOR_READ_AT_11_2 = bytes.fromhex(
+    '0efe38005b0031002e00300045002b003000300030002c0032002e00300045002b003000'
+    '300030002c0033002e00300045002b003000300030005d00080026000182088103000290'
+    '730000002d000000010369000a0000000100001aab82f1000000010000011c040101015b'
+    '0000000000000000000000000000000000000008000000000000'
+)
+
+
+def test_a_vector_reaches_an_11_2_client_as_23ai_sends_it() -> None:
+    # Below field version 7 a VECTOR goes out as 23ai sends it (#2418):
+    # described as a CLOB, length 4000, national form 1 but no charset,
+    # flagged JSON; its value a locator, and the LOB behind it the vector's
+    # text. The Mirror sent type 127, which sqlplus 10.2 and 11.2 refused with
+    # ORA-03115.
+    import array
+
+    from seerdb.common.tns import (
+        ColumnMeta,
+        _decode_dcb_column,
+        _encode_dcb_column,
+        _lob_queue,
+        decode_packet,
+        encode_lob_read_response_thin,
+    )
+    from seerdb.common.tns_consts import TNS_TYPE_VECTOR
+
+    col = ColumnMeta(name=b'V', data_type=TNS_TYPE_VECTOR, data_length=8200, max_size=0)
+    live = _at_11_2(decode_packet, _VECTOR_DESCRIBE_AT_11_2, (None, None, []), 6)
+    (served, _) = _at_11_2(_decode_dcb_column, _at_11_2(_encode_dcb_column, col, 1))
+    fields = (
+        'data_type',
+        'data_length',
+        'max_size',
+        'charset',
+        'csfrm',
+        'is_json',
+        'is_oson',
+    )
+    assert [served[f] for f in fields] == [live[3][1][0][f] for f in fields]
+    vector = array.array('f', [1.0, 2.0, 3.0])
+    [(content, is_clob, _)] = _at_11_2(_lob_queue, [col], [(vector,)], False)
+    assert (content, is_clob) == (
+        '[1.0E+000,2.0E+000,3.0E+000]'.encode('utf-16-be'),
+        True,
+    )
+    # The read reply opens as 23ai's: the LOB data, the text, its terminator.
+    head = 3 + len(content) + 1
+    reply = encode_lob_read_response_thin(content, is_clob=True)
+    assert reply[:head] == _VECTOR_READ_AT_11_2[:head]
+
+
+def test_a_vector_is_written_as_23ai_writes_it_for_an_11_2_client() -> None:
+    # The text 23ai sends an 11.2 client, measured per element format (#2418):
+    # a FLOAT32 to 9 significant digits, a FLOAT64 to 17, integers plain, zero
+    # bare, and a sparse vector written out dense.
+    import array
+
+    from seerdb.common.tns import vector_as_mapped_text
+    from seerdb.common.vector import SparseVector
+
+    cases = [
+        (array.array('f', [1.0, 2.0, 3.0]), '[1.0E+000,2.0E+000,3.0E+000]'),
+        (
+            array.array('f', [0.1, -2.5, 1e10, 0, 3.4e38, 1e-30, 123456789]),
+            '[1.00000001E-001,-2.5E+000,1.0E+010,0,3.39999995E+038,1.0E-030,'
+            '1.23456792E+008]',
+        ),
+        (
+            array.array('d', [0.1, -2.5, 1e100, 0, 1e-300, 0.30000000000000004]),
+            '[1.0000000000000001E-001,-2.5E+000,1.0E+100,0,1.0E-300,'
+            '3.0000000000000004E-001]',
+        ),
+        (array.array('b', [1, -128, 127, 0]), '[1,-128,127,0]'),
+        (array.array('B', [255, 0, 170]), '[255,0,170]'),
+        (
+            SparseVector(10, array.array('I', [1, 4]), array.array('f', [1.5, -2.0])),
+            '[0,1.5E+000,0,0,-2.0E+000,0,0,0,0,0]',
+        ),
+        (
+            SparseVector(10, array.array('I', [2]), array.array('b', [7])),
+            '[0,0,7,0,0,0,0,0,0,0]',
+        ),
+    ]
+    for value, text in cases:
+        assert vector_as_mapped_text(value, None) == text
+
+
 def test_a_json_document_is_written_as_23ai_writes_it() -> None:
     # The text 23ai sends for a JSON value below 20.1, measured against 23ai
     # from documents whose values the PostgreSQL backend hands over parsed

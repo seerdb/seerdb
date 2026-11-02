@@ -61,6 +61,8 @@ class Features:
     # document's text, which 23ai sends the thin client below field version 14
     # and sqlplus 11.2 (#2417).
     json: Carry = Carry.NATIVE
+    # A VECTOR reaches a client below 12.1 as a CLOB holding its text, which
+    # 23ai sends the thin client at field version 6 and sqlplus 11.2 (#2418).
     vector: Carry = Carry.NATIVE
     implicit_results: Carry = Carry.NATIVE
     # A sqlplus that offered CCAP_LOB_12C (sqlplus 23.26) reads a LOB cell with
@@ -107,11 +109,13 @@ def session_features(
 
     boolean = from_version(FIELD_VERSION_23_1)
     json = from_version(FIELD_VERSION_20_1)
+    vector = from_version(FIELD_VERSION_12_1)
     if not oci:
-        return Features(boolean=boolean, json=json)
+        return Features(boolean=boolean, json=json, vector=vector)
     return Features(
         boolean=boolean,
         json=json,
+        vector=vector,
         oci_lob_12c=lob_12c,
         oci_tstz_local=client_field_version is None
         or client_field_version >= FIELD_VERSION_12_1,
