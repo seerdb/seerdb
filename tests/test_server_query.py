@@ -526,6 +526,93 @@ def test_a_boolean_stays_native_for_a_23ai_client() -> None:
         _ENCODE_FIELD_VERSION.reset(enc)
 
 
+# 23ai's replies for a JSON column holding {"a":1}, to the thin client at field
+# version 6 (11.2): the describe, and the LOB read that brings the document.
+# Captured live (#2417).
+_JSON_DESCRIBE_AT_11_2 = bytes.fromhex(
+    '1017a9eb47f034ac4f3cd4ccb4c7258b7a52787e0b02140d020001015971000000020fa0'
+    '00000000000000010101010144000000020d00010707787e0b02140d0200021fe8000000'
+    '08010604016bbba90001050101000000000004010202c216000000000105010e03000000'
+    '000003024a3f000003013d640000000900010100000000'
+)
+_JSON_READ_AT_11_2 = bytes.fromhex(
+    '0efe077b2261223a317d000800260001810801030001fcba000000f5000000010000000a'
+    '0000000100001aab82f1000000010000010704010202c218000000000000000000000000'
+    '03024a3f000003013d640000000b000000000000'
+)
+
+
+def test_a_json_column_reaches_an_older_client_as_23ai_sends_it() -> None:
+    # Below field version 14 a JSON column goes out as 23ai sends it (#2417):
+    # described as a BLOB, length 4000, no charset, flagged JSON and OSON;
+    # its value a locator, and the LOB behind it the document's text. The
+    # Mirror sent type 119, which sqlplus 11.2 dropped the session over
+    # (ORA-03106).
+    from seerdb.common.tns import (
+        ColumnMeta,
+        _decode_dcb_column,
+        _encode_dcb_column,
+        _lob_queue,
+        _thin_column_value,
+        decode_packet,
+        encode_lob_read_response_thin,
+    )
+    from seerdb.common.tns_consts import TNS_TYPE_JSON
+
+    col = ColumnMeta(name=b'D', data_type=TNS_TYPE_JSON, data_length=8200, max_size=0)
+    live = _at_11_2(decode_packet, _JSON_DESCRIBE_AT_11_2, (None, None, []), 6)
+    (served, _) = _at_11_2(_decode_dcb_column, _at_11_2(_encode_dcb_column, col, 1))
+    fields = (
+        'data_type',
+        'data_length',
+        'max_size',
+        'charset',
+        'csfrm',
+        'is_json',
+        'is_oson',
+    )
+    assert [served[f] for f in fields] == [live[3][1][0][f] for f in fields]
+    # The row carries a locator, not the document inline as an OSON column's.
+    assert b'{"a":1}' not in _at_11_2(_thin_column_value, {'a': 1}, col)
+    [(content, is_clob, _)] = _at_11_2(_lob_queue, [col], [({'a': 1},)], False)
+    assert (content, is_clob) == (b'{"a":1}', False)
+    # The read reply opens as 23ai's: the LOB data, the text, its terminator.
+    head = len(b'\x0e\xfe\x07{"a":1}\x00')
+    assert encode_lob_read_response_thin(content)[:head] == _JSON_READ_AT_11_2[:head]
+    assert _at_11_2(_lob_queue, [col], [(None,)], False) == []
+
+
+def test_a_json_document_is_written_as_23ai_writes_it() -> None:
+    # The text 23ai sends for a JSON value below 20.1, measured against 23ai
+    # from documents whose values the PostgreSQL backend hands over parsed
+    # (#2417): plain-decimal numbers, named and upper-case \u escapes, U+2028
+    # and U+2029 escaped, and everything else as it is.
+    from seerdb.common.tns import json_as_text
+
+    cases = [
+        ({'b': 2, 'a': 1}, '{"b":2,"a":1}'),
+        (
+            [1, 2.5, 1000, -0.0, 12345678901234567890, 0.1, 1.5e-07, 12345600.0, 1.0],
+            '[1,2.5,1000,0,12345678901234567890,0.1,0.00000015,12345600,1]',
+        ),
+        ({'x': 1e-06, 'y': 1e-10}, '{"x":0.000001,"y":0.0000000001}'),
+        (
+            'café \n " \\ / \t \x01  ',
+            '"café \\n \\" \\\\ / \\t \\u0001 \\u2028"',
+        ),
+        (
+            '\b \f \r \x1f \x7f \x80   \U0001f600 \xff',
+            '"\\b \\f \\r \\u001F \\u007F \x80 \\u2029 \U0001f600 \xff"',
+        ),
+        (
+            {'t': True, 'f': False, 'z': None, 'o': {}},
+            '{"t":true,"f":false,"z":null,"o":{}}',
+        ),
+    ]
+    for value, text in cases:
+        assert json_as_text(value) == text
+
+
 def test_a_urowid_is_served_with_the_tag_its_kind_carries() -> None:
     # The tag byte tells a client what the rowid is: 0x02 logical, 0x01 physical,
     # both captured from 23ai. Every value used to go out tagged 0x01, so

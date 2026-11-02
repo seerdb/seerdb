@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from seerdb.common.tns_consts import (
     FIELD_VERSION_12_1,
     FIELD_VERSION_18_1,
+    FIELD_VERSION_20_1,
     FIELD_VERSION_23_1,
 )
 
@@ -56,6 +57,9 @@ class Features:
     # length 22, precision 0 and scale 0: what 23ai sends the thin client at
     # every field version below 17, and sqlplus 11.2 (#2416).
     boolean: Carry = Carry.NATIVE
+    # A JSON column reaches a client below 20.1 as a BLOB holding the
+    # document's text, which 23ai sends the thin client below field version 14
+    # and sqlplus 11.2 (#2417).
     json: Carry = Carry.NATIVE
     vector: Carry = Carry.NATIVE
     implicit_results: Carry = Carry.NATIVE
@@ -96,12 +100,18 @@ def session_features(
     speaks 12.1's dialect to every sqlplus from 12.1 on while 23ai sends
     sqlplus 23.26 a native BOOLEAN."""
     client = client_field_version if oci else field_version
-    native_23 = client is None or client >= FIELD_VERSION_23_1
-    boolean = Carry.NATIVE if native_23 else Carry.MAPPED
+
+    def from_version(native_from: int) -> Carry:
+        newer = client is None or client >= native_from
+        return Carry.NATIVE if newer else Carry.MAPPED
+
+    boolean = from_version(FIELD_VERSION_23_1)
+    json = from_version(FIELD_VERSION_20_1)
     if not oci:
-        return Features(boolean=boolean)
+        return Features(boolean=boolean, json=json)
     return Features(
         boolean=boolean,
+        json=json,
         oci_lob_12c=lob_12c,
         oci_tstz_local=client_field_version is None
         or client_field_version >= FIELD_VERSION_12_1,

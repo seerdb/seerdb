@@ -30,7 +30,8 @@ MAPPED_BELOW_23AI = {band: Carry.MAPPED for band in BANDS} | {'23ai': Carry.NATI
 EXPECTED = {
     # 23ai sends a BOOLEAN as a NUMBER below field version 17 (#2416).
     'boolean': MAPPED_BELOW_23AI,
-    'json': dict.fromkeys(BANDS, Carry.NATIVE),
+    # And a JSON column as a BLOB of its text below field version 14 (#2417).
+    'json': MAPPED_BELOW_23AI,
     'vector': dict.fromkeys(BANDS, Carry.NATIVE),
     'implicit_results': dict.fromkeys(BANDS, Carry.NATIVE),
 }
@@ -81,11 +82,24 @@ def test_a_sqlplus_gets_the_23ai_types_by_its_own_version(
 ) -> None:
     # The Mirror speaks 12.1's dialect to every sqlplus from 12.1 on, so the
     # session's version says nothing about the types: 23ai sends sqlplus 23.26
-    # a native BOOLEAN and sqlplus 11.2 a NUMBER (#2416).
+    # a native BOOLEAN and sqlplus 11.2 a NUMBER (#2416), and JSON likewise
+    # (#2417).
     table = session_features(
         FIELD_VERSION_18_1_EXT_1, oci=True, client_field_version=client
     )
     assert table.boolean is boolean
+    assert table.json is boolean
+
+
+@pytest.mark.parametrize(
+    ('client', 'json'),
+    [(13, Carry.MAPPED), (14, Carry.NATIVE), (16, Carry.NATIVE)],
+)
+def test_json_is_native_from_field_version_14(client: int, json: Carry) -> None:
+    # 23ai sends a JSON column as a BLOB to a client at field version 13 and
+    # as JSON from 14 (20.1), measured; BOOLEAN only from 17.
+    assert session_features(client).json is json
+    assert session_features(client).boolean is Carry.MAPPED
 
 
 @pytest.mark.parametrize(

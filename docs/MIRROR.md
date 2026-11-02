@@ -136,9 +136,15 @@ A client whose protocol predates a type gets the form 23ai sends that client
 | type | below 23ai | from |
 |---|---|---|
 | `BOOLEAN` | a `NUMBER` 1 or 0, NULL staying NULL | field version 17 (23.1) for a thin client; for sqlplus, the version its own capabilities name |
+| JSON | a `BLOB` holding the document as text, as 23ai writes it | field version 14 (20.1), by the same rule |
 
 - **sqlplus:** sqlplus 11.2 shows such a column exactly as it does against
-  23ai, `DESCRIBE` included, where it is still named `BOOLEAN`.
+  23ai. `DESCRIBE` still names a `BOOLEAN` column `BOOLEAN`. sqlplus 10.2
+  can't display a `BLOB` at all, and the JSON column is no exception.
+- **JSON text:** it is compact, and numbers are plain decimals (`1.0` is `1`).
+  The keys come in the order the backend keeps them. Over PostgreSQL that is
+  `jsonb`'s sorted order, not the document's
+  ([#2421](https://github.com/seerdb/seerdb/issues/2421)).
 - **The 10.2 band:** 23ai refuses clients at 10.2 outright, so there is no
   Oracle reference there. The Mirror gives them the 11.2 forms. That is its
   own choice, not Oracle behaviour.
@@ -1147,10 +1153,10 @@ The full list, with the reasons, is in the backend module's docstring
 Two limits apply to the Mirror itself, whatever the backend:
 - **The clients it serves:** thin clients from 10.2 on, and sqlplus / OCI from
   10.2 on. Oracle 8i and 9i clients are not served.
-- **Some newer types still reach older clients unadapted.** A JSON or `VECTOR`
-  column sent to a client that negotiated an 11g-era version goes out with its
-  own type code, where real Oracle sends a form the client knows. `BOOLEAN` is
-  adapted (*Newer types for older clients*); the others are planned under
+- **`VECTOR` still reaches older clients unadapted.** A `VECTOR` column sent to
+  a client that negotiated an 11.2-era version goes out with its own type
+  code, where real Oracle sends a form the client knows. `BOOLEAN` and JSON
+  are adapted (*Newer types for older clients*); `VECTOR` is planned under
   [#2395](https://github.com/seerdb/seerdb/issues/2395).
 
 ## Troubleshooting

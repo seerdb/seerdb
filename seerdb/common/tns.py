@@ -3025,11 +3025,11 @@ def _carried(col: ColumnMeta) -> ColumnMeta:
     # The column as this session's client can read it (#2395). A BOOLEAN a
     # client below 23.1 has no type for is described as 23ai describes it to
     # that client: a NUMBER, length 22, precision 0, scale 0, and no charset
-    # (#2416).
-    if (
-        col.data_type == TNS_TYPE_BOOLEAN
-        and _SESSION_FEATURES.get().boolean is Carry.MAPPED
-    ):
+    # (#2416). A JSON column a client below 20.1 has no type for is described
+    # as a BLOB, length 4000, no charset, with the uds flags marking it JSON
+    # and OSON, as 23ai describes it (#2417).
+    features = _SESSION_FEATURES.get()
+    if col.data_type == TNS_TYPE_BOOLEAN and features.boolean is Carry.MAPPED:
         return replace(
             col,
             data_type=TNS_TYPE_NUMBER,
@@ -3040,20 +3040,35 @@ def _carried(col: ColumnMeta) -> ColumnMeta:
             charset=0,
             csfrm=0,
         )
+    if col.data_type == TNS_TYPE_JSON and features.json is Carry.MAPPED:
+        return replace(
+            col,
+            data_type=TNS_TYPE_BLOB,
+            data_length=4000,
+            max_size=0,
+            charset=0,
+            csfrm=0,
+            is_json=True,
+            is_oson=True,
+        )
     return col
 
 
 def _carried_cell(value: object, col: ColumnMeta) -> tuple[object, ColumnMeta]:
-    # A row value and its column, as _carried describes them: a mapped
-    # BOOLEAN's value is 1 or 0, NULL staying NULL (#2416).
+    # A row value and its column, as _carried describes them. A mapped
+    # BOOLEAN's value is 1 or 0 (#2416). A mapped JSON document is a plain
+    # BLOB holding its text, served as a locator and read over TTI_LOBOPS as
+    # 23ai serves it, despite the OSON flag its describe carries (#2417).
+    # NULL stays NULL.
     carried = _carried(col)
-    if (
-        carried is not col
-        and carried.data_type == TNS_TYPE_NUMBER
-        and value is not None
-    ):
-        return (int(bool(value)), carried)
-    return (value, carried)
+    if carried is col:
+        return (value, col)
+    if carried.data_type == TNS_TYPE_NUMBER:
+        return (None if value is None else int(bool(value)), carried)
+    plain = replace(carried, is_json=False, is_oson=False)
+    if value is None:
+        return (None, plain)
+    return (json_as_text(value).encode(), plain)
 
 
 def describe_max_size(col: ColumnMeta) -> int:
@@ -3090,14 +3105,87 @@ _INLINE_LONG_FROM = {
 
 
 def json_as_text(value: object) -> str:
-    """A JSON document as 23ai renders it for a character define (#1106).
+    """A JSON document as 23ai renders it as text: for a character define
+    (#1106), and in the BLOB a client below 20.1 reads a JSON column as (#2417).
 
-    Compact -- no space after ``:`` or ``,`` -- which is what a live server
-    sends, and what the client's own converter then parses.
+    Measured against 23ai:
+    - **Layout:** compact, with no space after ``:`` or ``,``, and keys in
+      the document's order.
+    - **Numbers:** plain decimals, never with an exponent or a trailing zero.
+      ``1.0`` is ``1``, ``1.5e-7`` is ``0.00000015`` and ``-0.0`` is ``0``.
+    - **Strings:**
+      - ``"``, ``\\``, ``\\b``, ``\\f``, ``\\n``, ``\\r`` and ``\\t`` are
+        escaped by name;
+      - every other control character, DEL, U+2028 and U+2029 are escaped
+        as ``\\uXXXX`` in upper-case hex;
+      - everything else, ``/`` included, is written as it is.
     """
-    import json
+    return ''.join(_json_text_parts(value))
 
-    return json.dumps(value, separators=(',', ':'), ensure_ascii=False)
+
+_JSON_NAMED_ESCAPES = {
+    '"': '\\"',
+    '\\': '\\\\',
+    '\b': '\\b',
+    '\f': '\\f',
+    '\n': '\\n',
+    '\r': '\\r',
+    '\t': '\\t',
+}
+
+
+def _json_text_string(text: str) -> str:
+    out = []
+    for char in text:
+        code = ord(char)
+        if char in _JSON_NAMED_ESCAPES:
+            out.append(_JSON_NAMED_ESCAPES[char])
+        elif code < 0x20 or code == 0x7F or code in (0x2028, 0x2029):
+            out.append(f'\\u{code:04X}')
+        else:
+            out.append(char)
+    return '"' + ''.join(out) + '"'
+
+
+def _json_text_number(number: int | float | Decimal) -> str:
+    # A NUMBER as plain decimal digits; a float by its shortest repr, which is
+    # the value the document was parsed to.
+    exact = Decimal(repr(number) if isinstance(number, float) else number)
+    if exact == 0:
+        return '0'
+    text = format(exact, 'f')
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return text
+
+
+def _json_text_parts(value: object) -> Iterator[str]:
+    if value is None:
+        yield 'null'
+    elif isinstance(value, bool):
+        yield 'true' if value else 'false'
+    elif isinstance(value, (int, float, Decimal)):
+        yield _json_text_number(value)
+    elif isinstance(value, str):
+        yield _json_text_string(value)
+    elif isinstance(value, dict):
+        yield '{'
+        for index, (key, item) in enumerate(value.items()):
+            if index:
+                yield ','
+            yield _json_text_string(str(key))
+            yield ':'
+            yield from _json_text_parts(item)
+        yield '}'
+    elif isinstance(value, (list, tuple)):
+        yield '['
+        for index, item in enumerate(value):
+            if index:
+                yield ','
+            yield from _json_text_parts(item)
+        yield ']'
+    else:
+        raise TypeError(f'{type(value).__name__} has no JSON text form')
 
 
 def vector_as_text(value: 'SparseVector | Sequence') -> str:
@@ -12486,6 +12574,7 @@ def _lob_cell(
     # One cell's (wire-content, is_clob, national), or None when it draws no read.
     from seerdb.common.oson import encode_oson
 
+    (value, col) = _carried_cell(value, col)
     if col.data_type not in _LOB_CONTENT_TYPES or value is None:
         return None
     if col.inline_long_csfrm is not None:
