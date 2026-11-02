@@ -13963,6 +13963,26 @@ _USER_SCHEMA = (
 )
 
 
+_ORA_ACCOUNT_LOCKED = 28000
+
+
+def _check_old_password(name: str, current: str, given: str) -> None:
+    # The old password a password change gives (ALTER USER ... REPLACE, or
+    # the protocol's change), checked as a login checks one: a locked name is
+    # refused, the comparison takes as long whatever matches, and a wrong one
+    # is delayed and counted toward the lock (seerdb.server.lockout), so a
+    # session cannot guess its user's password at its own pace.
+    if lockout.is_locked(name):
+        raise BackendError('The account is locked.', ora_code=_ORA_ACCOUNT_LOCKED)
+    if not hmac.compare_digest(current.encode('utf-8'), given.encode('utf-8')):
+        time.sleep(lockout.failed(name))
+        raise BackendError(
+            'invalid username/password; logon denied',
+            ora_code=ORA_INVALID_USERNAME_PASSWORD,
+        )
+    lockout.succeeded(name)
+
+
 def _scram_verifier(password: str, iterations: int = 4096) -> str:
     """A role's SCRAM-SHA-256 verifier, as PostgreSQL stores it (RFC 7677).
 
@@ -22807,11 +22827,7 @@ class PostgresBackend:
             current = self._accounts.secret(name)
             replaced = altered.group(3)
             if replaced is not None and current is not None:
-                if _password_text(replaced) != current:
-                    raise BackendError(
-                        'invalid username/password; logon denied',
-                        ora_code=ORA_INVALID_USERNAME_PASSWORD,
-                    )
+                _check_old_password(name, current, _password_text(replaced))
             self._accounts.set(name, _password_text(altered.group(2)))
             return Result()
         unlocked = _ALTER_USER_UNLOCK.match(statement)
@@ -22967,11 +22983,8 @@ class PostgresBackend:
         # Oracle validates the old password (ALTER USER … REPLACE); do the same
         # against the stored secret (#515).
         current = self._accounts.secret(username)
-        if current is not None and old_password != current:
-            raise BackendError(
-                'invalid username/password; logon denied',
-                ora_code=ORA_INVALID_USERNAME_PASSWORD,
-            )
+        if current is not None:
+            _check_old_password(username, current, old_password)
         # Oracle takes a password of at most 1024 bytes (12.2+; 11g far less).
         # Past that, 23ai answers ORA-28218 up to 1039 bytes (#1713) and
         # ORA-01017 from 1040 -- the 1500-character change a client may try

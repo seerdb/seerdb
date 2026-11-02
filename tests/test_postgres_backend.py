@@ -9692,6 +9692,18 @@ def test_rollback_to_a_savepoint_is_guarded_but_not_released() -> None:
     assert unknown.ora_code == 1086
 
 
+@pytest.fixture
+def _fresh_lockout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The failed-login counts are the process's: start with none, lock after
+    # three, and delay no failure.
+    from seerdb.server import lockout
+
+    monkeypatch.setattr(lockout, '_failures', {})
+    monkeypatch.setattr(lockout, '_attempts', 3)
+    monkeypatch.setattr(lockout, '_DELAY_STEP', 0.0)
+
+
+@pytest.mark.usefixtures('_fresh_lockout')
 def test_change_password_rejects_a_wrong_old_password() -> None:
     from seerdb.server import BackendError
 
@@ -9699,6 +9711,32 @@ def test_change_password_rejects_a_wrong_old_password() -> None:
     with pytest.raises(BackendError) as exc:
         backend.change_password('PYO', 'not-the-old-one', 'whatever')
     assert exc.value.ora_code == 1017
+
+
+@pytest.mark.usefixtures('_fresh_lockout')
+def test_a_wrong_old_password_counts_toward_the_lock() -> None:
+    # A password change's old password is checked as a login's password is:
+    # each wrong one counts, and a locked name is refused even the right one
+    # (ORA-28000), so a session cannot guess its user's password unchecked.
+    # A right one before the lock starts the count over.
+    from seerdb.server import BackendError, lockout
+
+    creds = {'PYO': 'pyo123'}
+    backend = _NoConnPostgresBackend(creds)
+    for _ in range(2):
+        with pytest.raises(BackendError) as exc:
+            backend.change_password('PYO', 'guess', 'whatever')
+        assert exc.value.ora_code == 1017
+    backend.change_password('PYO', 'pyo123', 'pyo456')
+    assert not lockout._failures
+    for _ in range(3):
+        with pytest.raises(BackendError) as exc:
+            backend.change_password('PYO', 'guess', 'whatever')
+        assert exc.value.ora_code == 1017
+    with pytest.raises(BackendError) as exc:
+        backend.change_password('PYO', 'pyo456', 'whatever')
+    assert exc.value.ora_code == 28000
+    assert creds['PYO'] == 'pyo456'
 
 
 def test_change_password_refuses_a_password_oracle_would() -> None:
