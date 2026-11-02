@@ -3787,6 +3787,68 @@ def test_a_public_synonym_needs_create_on_postgresqls_public_schema() -> None:
         pg.close()
 
 
+def test_a_view_may_not_call_a_users_invoker_rights_routine() -> None:
+    # Oracle runs an AUTHID CURRENT_USER routine a view calls with the view's
+    # owner's rights; PostgreSQL with the rights of whoever reads the view, so
+    # a user could have an administrator run their code
+    # (GHSA-x8v7-wcvm-4q7j). Per-user mode refuses the view, a column default
+    # or CHECK that calls one, as it does a view on an invoker-rights package
+    # member; a definer-rights routine or a built-in may be called, and the
+    # administrator reading the view runs the routine as its owner.
+    admin, user = f'iv_adm_{os.getpid()}', f'iv_user_{os.getpid()}'
+    pg = psycopg.connect(_CONNINFO, autocommit=True)
+    try:
+        with _per_user_mirror(_CONNINFO, admin) as login:
+            adm = login(admin, 'adm123')
+            adm.cursor().execute(f'create user {user} identified by pw123')
+            session = login(user, 'pw123')
+            try:
+                mine = session.cursor()
+                for name, authid in (('iv_inv', 'authid current_user'), ('iv_dfn', '')):
+                    mine.execute(
+                        f'create function {name} return varchar2 {authid} is begin '
+                        "return sys_context('USERENV', 'CURRENT_USER'); end;"
+                    )
+                mine.execute(
+                    'create package iv_pk authid current_user as '
+                    'function f return varchar2; end;'
+                )
+                mine.execute(
+                    'create package body iv_pk as function f return varchar2 is '
+                    'begin return user; end; end;'
+                )
+                for statement in (
+                    'create view iv_v1 as select iv_inv() who from dual',
+                    'create view iv_v2 as select iv_pk.f() who from dual',
+                    'create table iv_t1 (a varchar2(30) default iv_inv())',
+                    'create table iv_t2 (a varchar2(30) check (a <> iv_inv()))',
+                ):
+                    with pytest.raises(seerdb.DatabaseError) as raised:
+                        mine.execute(statement)
+                    assert raised.value.code == 3001
+                    assert 'AUTHID CURRENT_USER' in str(raised.value)
+                mine.execute(
+                    "select count(*) from user_objects where object_name like 'IV!_%' "
+                    "escape '!' and object_type in ('VIEW', 'TABLE')"
+                )
+                assert mine.fetchall() == [(0,)]
+                mine.execute(
+                    'create view iv_v as select iv_dfn() who, upper(user) u from dual'
+                )
+                mine.execute('create table iv_t (a varchar2(30) default iv_dfn())')
+                mine.execute(f'grant select on iv_v to {admin}')
+                mine.execute(f'grant execute on iv_dfn to {admin}')
+                theirs = adm.cursor()
+                theirs.execute(f'select who, u from {user}.iv_v')
+                assert theirs.fetchall() == [(user.upper(), admin.upper())]
+            finally:
+                session.close()
+                adm.close()
+    finally:
+        _drop_mirror_roles(pg, user, admin)
+        pg.close()
+
+
 def test_per_user_roles_keep_the_users_apart() -> None:
     admin, user = f'pu_adm_{os.getpid()}', f'pu_user_{os.getpid()}'
     pg = psycopg.connect(_CONNINFO, autocommit=True)

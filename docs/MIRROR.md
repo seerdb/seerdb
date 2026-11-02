@@ -682,6 +682,16 @@ the owner's tables.
   unqualified names on its owner's path, because its members find each other
   through it.
 - **`ALL_PROCEDURES.AUTHID`** shows which.
+- **Invoker-rights routines in views, defaults and CHECKs:** refused in
+  per-user mode, with ORA-03001. On Oracle, an `AUTHID CURRENT_USER` routine
+  that a view calls runs with the view owner's rights. PostgreSQL runs it with
+  the rights of whoever reads the view, and does the same for a column default
+  or a CHECK constraint with whoever writes the row. A user could then have
+  someone else, an administrator say, run their code. So a view, default or
+  CHECK may not call a user's `AUTHID CURRENT_USER` routine, a package
+  member's included. Declare the routine `AUTHID DEFINER`, Oracle's default,
+  instead. When the routine and the view have the same owner, that runs it
+  exactly as Oracle would. Built-in functions are not affected.
 
 In single-role mode, grants are checked and recorded the same way, but every
 user is the one role, so they enforce nothing beyond who sees a type.
@@ -764,6 +774,21 @@ Oracle SQL. `ALTER SESSION SET seerdb_dialect` is refused with ORA-02248, as
 Oracle refuses a parameter it doesn't have. On, it is available to every
 account, which is why the role matters.
 
+**Native SQL in per-user mode has PostgreSQL's rules, not Oracle's.** The
+Mirror's checks apply to Oracle SQL only. With native SQL, a user can create
+what PostgreSQL allows, including code that runs with the rights of another
+user who touches their objects:
+- a `SECURITY INVOKER` function called from a view, a default, a CHECK or an
+  index expression;
+- a trigger whose function is `SECURITY INVOKER`, which runs as whoever
+  writes the table;
+- a row-level security policy that calls such a function.
+
+This is how PostgreSQL behaves for its own users, and its documentation warns
+about it. A user, an administrator above all, should not read or write
+another user's objects without trusting their owner. Turn native SQL on in
+per-user mode only for users who may run code with each other's rights.
+
 ## Passthrough
 
 The passthrough presents what its upstream speaks: it logs in once at start-up
@@ -842,7 +867,8 @@ model until the review closes.
     read any file the PostgreSQL role can, through DIRECTORY objects. Serve
     only accounts that may see each other's data (*One tenant per database*).
   - With per-user roles, those are the configured administrators' alone, and
-    PostgreSQL keeps the users apart (*Per-user roles*).
+    PostgreSQL keeps the users apart (*Per-user roles*). With native SQL on,
+    a user can have another run their code (*Native PostgreSQL*).
 - **What the role may do.** The connection role is the boundary of
   single-role mode, and with native SQL a client can use whatever it may
   (*Which role to connect as*). Never a superuser; no server-file or
