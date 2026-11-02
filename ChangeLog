@@ -1,6 +1,14 @@
 Entries are sorted chronologically from oldest to youngest within each release,
 releases are sorted from youngest to oldest.
 
+version 3.5.0:
+- **The package description** on PyPI now names both the client and the Mirror (#2402).
+- **A short introduction in Simplified Chinese**, `README.zh-CN.md` (#2403).
+- **Mirror (tech preview): over PostgreSQL, orafce must be 4.17 or later where it is installed**. `UTL_RAW`, `HEXTORAW` and `RAWTOHEX` now come from orafce, and the Mirror's own copies are gone. A database with an older orafce is refused with how to update it; one without orafce starts as before (#2404).
+- **Mirror (tech preview): security fixes from the review in #1687**, in the WebSocket listeners' logins (#2405), the decoding of a login's AUTH message (#2406, #2407) and per-user mode (#2409, #2410). Their advisories are published with this release.
+- **The wire-schema decoder no longer copies a message for each field it reads**: it reads through a view of the message, so its cost grows with the message's length, not with its square. This applies to the client and the Mirror alike (#2408).
+- **Mirror (tech preview): a password change's old password is checked as a login's password is**: it counts toward the account lock and is delayed when wrong (#2411).
+
 version 3.4.0:
 - **One wire schema per message, for the client too** (#2293): every message the client reads or writes, on 8i, 9i and 10g+, now compiles from one description shared with the Mirror. Each schema round-trips: what a decoder reads re-encodes as it came (#2290). No behaviour change, except that **8i fetches are 10-15% slower**, because each cell is decoded through the schema layer (#2329).
 - **Fixes on 9i and 8i**:

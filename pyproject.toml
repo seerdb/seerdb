@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seerdb"
-version = "3.4.0"
+version = "3.5.0"
 description = "Pure-Python client and server for a proprietary database's wire protocol: talk to it from Python (8i-26ai), or serve its clients from PostgreSQL. No vendor libraries."
 readme = "README.md"
 license = "MIT"
