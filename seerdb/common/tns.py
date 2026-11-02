@@ -3027,7 +3027,10 @@ def _carried(col: ColumnMeta) -> ColumnMeta:
     # that client: a NUMBER, length 22, precision 0, scale 0, and no charset
     # (#2416). A JSON column a client below 20.1 has no type for is described
     # as a BLOB, length 4000, no charset, with the uds flags marking it JSON
-    # and OSON, as 23ai describes it (#2417).
+    # and OSON, as 23ai describes it (#2417). A VECTOR a client below 12.1
+    # has no type for is described as a CLOB, length 4000, national form 1
+    # but no charset, with the uds flag marking it JSON, as 23ai describes it
+    # (#2418).
     features = _SESSION_FEATURES.get()
     if col.data_type == TNS_TYPE_BOOLEAN and features.boolean is Carry.MAPPED:
         return replace(
@@ -3051,6 +3054,17 @@ def _carried(col: ColumnMeta) -> ColumnMeta:
             is_json=True,
             is_oson=True,
         )
+    if col.data_type == TNS_TYPE_VECTOR and features.vector is Carry.MAPPED:
+        return replace(
+            col,
+            data_type=TNS_TYPE_CLOB,
+            data_length=4000,
+            max_size=0,
+            charset=0,
+            csfrm=_CSFRM_DB,
+            is_json=True,
+            is_oson=False,
+        )
     return col
 
 
@@ -3058,8 +3072,9 @@ def _carried_cell(value: object, col: ColumnMeta) -> tuple[object, ColumnMeta]:
     # A row value and its column, as _carried describes them. A mapped
     # BOOLEAN's value is 1 or 0 (#2416). A mapped JSON document is a plain
     # BLOB holding its text, served as a locator and read over TTI_LOBOPS as
-    # 23ai serves it, despite the OSON flag its describe carries (#2417).
-    # NULL stays NULL.
+    # 23ai serves it, despite the OSON flag its describe carries (#2417). A
+    # mapped VECTOR is a plain CLOB holding its text, served the same way
+    # (#2418). NULL stays NULL.
     carried = _carried(col)
     if carried is col:
         return (value, col)
@@ -3068,6 +3083,8 @@ def _carried_cell(value: object, col: ColumnMeta) -> tuple[object, ColumnMeta]:
     plain = replace(carried, is_json=False, is_oson=False)
     if value is None:
         return (None, plain)
+    if col.data_type == TNS_TYPE_VECTOR:
+        return (vector_as_mapped_text(value, col.vector_format), plain)
     return (json_as_text(value).encode(), plain)
 
 
@@ -3215,6 +3232,50 @@ def vector_as_text(value: 'SparseVector | Sequence') -> str:
         values = ','.join(element(v) for v in value.values)
         return f'[{value.num_dimensions},[{indices}],[{values}]]'
     return '[' + ','.join(element(v) for v in value) + ']'
+
+
+# The significant digits 23ai writes a float element with, by its array
+# typecode: a FLOAT32's nine, a FLOAT64's seventeen -- each the most that
+# tells every value of the type apart.
+_VECTOR_TEXT_DIGITS = {'f': 9, 'd': 17}
+
+
+def vector_as_mapped_text(value: object, vector_format: int | None) -> str:
+    """A VECTOR as the CLOB text 23ai sends a client below 12.1 (#2418).
+
+    Measured against 23ai at field version 6:
+    - **Float elements:** in scientific form with a three-digit exponent, to a
+      FLOAT32's 9 significant digits or a FLOAT64's 17, trailing zeros dropped
+      but one decimal kept (0.1 as FLOAT32 is ``1.00000001E-001``, 2 is
+      ``2.0E+000``).
+    - **INT8 and BINARY elements:** integers.
+    - **Zero:** ``0``, in every format.
+    - **A sparse vector:** written out dense, its missing elements zero.
+    """
+    vector = _vector_as(value, vector_format)
+    if isinstance(vector, SparseVector):
+        typecode = getattr(vector.values, 'typecode', 'f')
+        items: list[object] = [0] * vector.num_dimensions
+        for index, item in zip(vector.indices, vector.values):
+            items[int(index)] = item
+    else:
+        typecode = getattr(vector, 'typecode', 'f')
+        items = list(cast('Sequence', vector))
+    digits = _VECTOR_TEXT_DIGITS.get(typecode)
+
+    def element(item: object) -> str:
+        if digits is None or isinstance(item, int):
+            return str(int(cast('int', item)))
+        number = float(cast('float', item))
+        if number == 0:
+            return '0'
+        (mantissa, _, exponent) = f'{number:.{digits - 1}E}'.partition('E')
+        mantissa = mantissa.rstrip('0')
+        if mantissa.endswith('.'):
+            mantissa += '0'
+        return f'{mantissa}E{exponent[0]}{int(exponent[1:]):03d}'
+
+    return '[' + ','.join(element(item) for item in items) + ']'
 
 
 def _effective_describe_type(col: ColumnMeta) -> int:

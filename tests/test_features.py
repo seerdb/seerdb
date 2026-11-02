@@ -32,7 +32,9 @@ EXPECTED = {
     'boolean': MAPPED_BELOW_23AI,
     # And a JSON column as a BLOB of its text below field version 14 (#2417).
     'json': MAPPED_BELOW_23AI,
-    'vector': dict.fromkeys(BANDS, Carry.NATIVE),
+    # And a VECTOR as a CLOB of its text below field version 7 (#2418).
+    'vector': dict.fromkeys(BANDS, Carry.NATIVE)
+    | {'10.2': Carry.MAPPED, '11.2': Carry.MAPPED},
     'implicit_results': dict.fromkeys(BANDS, Carry.NATIVE),
 }
 
