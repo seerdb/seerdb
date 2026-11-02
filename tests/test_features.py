@@ -24,10 +24,12 @@ BANDS = {
     '23ai': FIELD_VERSION_23_4,
 }
 
-# What each feature is carried as, per band. Today every one goes out native
-# at every band; each change that maps or refuses one edits its row here.
+# What each feature is carried as, per band; each change that maps or refuses
+# one edits its row here.
+MAPPED_BELOW_23AI = {band: Carry.MAPPED for band in BANDS} | {'23ai': Carry.NATIVE}
 EXPECTED = {
-    'boolean': dict.fromkeys(BANDS, Carry.NATIVE),
+    # 23ai sends a BOOLEAN as a NUMBER below field version 17 (#2416).
+    'boolean': MAPPED_BELOW_23AI,
     'json': dict.fromkeys(BANDS, Carry.NATIVE),
     'vector': dict.fromkeys(BANDS, Carry.NATIVE),
     'implicit_results': dict.fromkeys(BANDS, Carry.NATIVE),
@@ -58,7 +60,32 @@ def test_a_thin_session_takes_no_sqlplus_forms() -> None:
     table = session_features(
         FIELD_VERSION_11_2, client_field_version=FIELD_VERSION_11_2, lob_12c=True
     )
-    assert table == Features()
+    default = Features()
+    assert (table.oci_lob_12c, table.oci_tstz_local, table.oci_full_release) == (
+        default.oci_lob_12c,
+        default.oci_tstz_local,
+        default.oci_full_release,
+    )
+
+
+@pytest.mark.parametrize(
+    ('client', 'boolean'),
+    [
+        (FIELD_VERSION_11_2, Carry.MAPPED),
+        (27, Carry.NATIVE),  # sqlplus 23.26
+        (None, Carry.NATIVE),  # a block that can't be read keeps the newer forms
+    ],
+)
+def test_a_sqlplus_gets_the_23ai_types_by_its_own_version(
+    client: int | None, boolean: Carry
+) -> None:
+    # The Mirror speaks 12.1's dialect to every sqlplus from 12.1 on, so the
+    # session's version says nothing about the types: 23ai sends sqlplus 23.26
+    # a native BOOLEAN and sqlplus 11.2 a NUMBER (#2416).
+    table = session_features(
+        FIELD_VERSION_18_1_EXT_1, oci=True, client_field_version=client
+    )
+    assert table.boolean is boolean
 
 
 @pytest.mark.parametrize(

@@ -30,7 +30,11 @@ import contextvars
 import enum
 from dataclasses import dataclass
 
-from seerdb.common.tns_consts import FIELD_VERSION_12_1, FIELD_VERSION_18_1
+from seerdb.common.tns_consts import (
+    FIELD_VERSION_12_1,
+    FIELD_VERSION_18_1,
+    FIELD_VERSION_23_1,
+)
 
 
 class Carry(enum.Enum):
@@ -48,6 +52,9 @@ class Features:
 
     # The 23ai types and calls that older clients have no form for. Each is
     # NATIVE at every band until its own change maps or refuses it (#2416-#2419).
+    # A BOOLEAN reaches a client below 23.1 as a NUMBER 1 / 0, described with
+    # length 22, precision 0 and scale 0: what 23ai sends the thin client at
+    # every field version below 17, and sqlplus 11.2 (#2416).
     boolean: Carry = Carry.NATIVE
     json: Carry = Carry.NATIVE
     vector: Carry = Carry.NATIVE
@@ -82,10 +89,19 @@ def session_features(
     """The table for a session at ``field_version``. ``oci`` is the sqlplus
     dialect; for it, ``client_field_version`` is the version its capability
     block names (None when the block can't be read, which keeps the newer
-    forms) and ``lob_12c`` whether it offered CCAP_LOB_12C."""
+    forms) and ``lob_12c`` whether it offered CCAP_LOB_12C.
+
+    The 23ai features follow the client's own version: the session's for a
+    thin client, and for sqlplus the one its block names, since the Mirror
+    speaks 12.1's dialect to every sqlplus from 12.1 on while 23ai sends
+    sqlplus 23.26 a native BOOLEAN."""
+    client = client_field_version if oci else field_version
+    native_23 = client is None or client >= FIELD_VERSION_23_1
+    boolean = Carry.NATIVE if native_23 else Carry.MAPPED
     if not oci:
-        return Features()
+        return Features(boolean=boolean)
     return Features(
+        boolean=boolean,
         oci_lob_12c=lob_12c,
         oci_tstz_local=client_field_version is None
         or client_field_version >= FIELD_VERSION_12_1,

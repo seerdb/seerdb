@@ -446,6 +446,86 @@ def test_a_described_column_grows_at_the_field_versions_23ai_sends_its_tail() ->
     assert growth == {17: 0, 18: 0, 19: 0, 20: 1, 21: 1, 22: 1, 23: 1, 24: 4}
 
 
+# 23ai's reply to `select b from t` for a BOOLEAN column holding TRUE and
+# FALSE, to the thin client at field version 6 (11.2): the describe, the two
+# rows and ORA-01403. Captured live (#2416).
+_BOOLEAN_AT_11_2 = bytes.fromhex(
+    '1017f71aa1e49e06482ffb7f5e1aa4b6a55a787e0b02140c370116010159020000000116'
+    '0000000000000001010101014200000000010707787e0b02140c380101021fe8010a010a'
+    '00062201010001640000000702c10207018008010604016bbb0c00010501010000000000'
+    '04010202c1de010202057b00000105010e03000000000003024a3b0204000003013d6401'
+    '0100000a00010100000000194f52412d30313430333a206e6f206461746120666f756e64'
+    '0a'
+)
+
+
+def _at_11_2(func, *args):
+    # Run an encoder or decoder as an 11.2 thin session's, in a copied context.
+    import contextvars
+
+    from seerdb.common.features import _SESSION_FEATURES, session_features
+    from seerdb.common.tns import _DECODE_FIELD_VERSION, _ENCODE_FIELD_VERSION
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2
+
+    def run():
+        _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+        _DECODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+        _SESSION_FEATURES.set(session_features(FIELD_VERSION_11_2))
+        return func(*args)
+
+    return contextvars.copy_context().run(run)
+
+
+def test_a_boolean_reaches_an_older_client_as_23ai_sends_it() -> None:
+    # Below field version 17 a BOOLEAN goes out as 23ai sends it: described as
+    # a NUMBER with length 22, precision 0, scale 0 and no charset, and each
+    # value as the NUMBER 1 or 0 (#2416). The Mirror sent type 252, which
+    # sqlplus 10.2 and 11.2 refused with ORA-03115.
+    from seerdb.common.tns import (
+        ColumnMeta,
+        _decode_dcb_column,
+        _encode_dcb_column,
+        _thin_column_value,
+        decode_packet,
+    )
+    from seerdb.common.tns_consts import TNS_TYPE_BOOLEAN
+
+    col = ColumnMeta(name=b'B', data_type=TNS_TYPE_BOOLEAN, data_length=1, max_size=1)
+    live = _at_11_2(decode_packet, _BOOLEAN_AT_11_2, (None, None, []), 6)
+    (served, _) = _at_11_2(_decode_dcb_column, _at_11_2(_encode_dcb_column, col, 1))
+    fields = ('data_type', 'data_length', 'precision', 'data_scale', 'charset', 'csfrm')
+    assert [served[f] for f in fields] == [live[3][1][0][f] for f in fields]
+    assert live[4] == [[1], [0]]
+    # Each cell as 23ai wrote it, byte for byte.
+    for value in (True, False):
+        cell = _at_11_2(_thin_column_value, value, col)
+        assert cell in _BOOLEAN_AT_11_2
+    assert _at_11_2(_thin_column_value, True, col) == bytes.fromhex('02c102')
+    assert _at_11_2(_thin_column_value, False, col) == bytes.fromhex('0180')
+    assert _at_11_2(_thin_column_value, None, col) == b'\x00'
+
+
+def test_a_boolean_stays_native_for_a_23ai_client() -> None:
+    from seerdb.common.features import _SESSION_FEATURES, session_features
+    from seerdb.common.tns import (
+        _ENCODE_FIELD_VERSION,
+        ColumnMeta,
+        _encode_dcb_column,
+        _thin_column_value,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_23_4, TNS_TYPE_BOOLEAN
+
+    col = ColumnMeta(name=b'B', data_type=TNS_TYPE_BOOLEAN, data_length=1, max_size=1)
+    enc = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_23_4)
+    features = _SESSION_FEATURES.set(session_features(FIELD_VERSION_23_4))
+    try:
+        assert _encode_dcb_column(col, 1)[0] == TNS_TYPE_BOOLEAN
+        assert _thin_column_value(True, col) != bytes.fromhex('02c102')
+    finally:
+        _SESSION_FEATURES.reset(features)
+        _ENCODE_FIELD_VERSION.reset(enc)
+
+
 def test_a_urowid_is_served_with_the_tag_its_kind_carries() -> None:
     # The tag byte tells a client what the rowid is: 0x02 logical, 0x01 physical,
     # both captured from 23ai. Every value used to go out tagged 0x01, so

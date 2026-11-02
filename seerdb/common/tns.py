@@ -42,7 +42,7 @@ from seerdb.common.exceptions import (
     NotSupportedError,
     Truncated,
 )
-from seerdb.common.features import _SESSION_FEATURES
+from seerdb.common.features import _SESSION_FEATURES, Carry
 from seerdb.common.sqltext import (
     bind_placeholders,
     is_plsql,
@@ -3021,6 +3021,41 @@ _DESCRIBE_SIZED_TYPES = frozenset(
 )
 
 
+def _carried(col: ColumnMeta) -> ColumnMeta:
+    # The column as this session's client can read it (#2395). A BOOLEAN a
+    # client below 23.1 has no type for is described as 23ai describes it to
+    # that client: a NUMBER, length 22, precision 0, scale 0, and no charset
+    # (#2416).
+    if (
+        col.data_type == TNS_TYPE_BOOLEAN
+        and _SESSION_FEATURES.get().boolean is Carry.MAPPED
+    ):
+        return replace(
+            col,
+            data_type=TNS_TYPE_NUMBER,
+            data_length=22,
+            max_size=22,
+            precision=0,
+            scale=0,
+            charset=0,
+            csfrm=0,
+        )
+    return col
+
+
+def _carried_cell(value: object, col: ColumnMeta) -> tuple[object, ColumnMeta]:
+    # A row value and its column, as _carried describes them: a mapped
+    # BOOLEAN's value is 1 or 0, NULL staying NULL (#2416).
+    carried = _carried(col)
+    if (
+        carried is not col
+        and carried.data_type == TNS_TYPE_NUMBER
+        and value is not None
+    ):
+        return (int(bool(value)), carried)
+    return (value, carried)
+
+
 def describe_max_size(col: ColumnMeta) -> int:
     """The maximum size to describe ``col`` with: its declared size for the types
     that have one, and 0 for every other type, matching a live server."""
@@ -3173,6 +3208,7 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
     # column at its position, #84, #814), 23.1 the SQL domain and 23.1 EXT 1
     # (23ai fv24) the annotations and vector descriptor (§20.5). Fields the
     # client skips are well-formed zeros.
+    col = _carried(col)
     field_version = _ENCODE_FIELD_VERSION.get()
     return _DCB_COLUMN_THIN(
         {
@@ -3513,6 +3549,7 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
     # encoder. The column is needed for the element format, so an INT8 or FLOAT64
     # vector keeps the width it was declared with rather than being re-encoded as
     # float32.
+    (value, col) = _carried_cell(value, col)
     if (
         col.data_type in _FRAMED_CELL_TYPES
         or col.is_oson
@@ -10983,6 +11020,7 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # one typed column (#2050): an opaque type, with the type's id, version,
     # schema and name.
     del position  # OCI's column carries none
+    col = _carried(col)
     field_version = _ENCODE_FIELD_VERSION.get()
     wide = field_version >= FIELD_VERSION_12_1
     xmltype = oci_is_xmltype(col)
@@ -12494,6 +12532,7 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
     # A row value in the OCI dialect: a LOB column emits its locator (content comes
     # later over TTI_LOBOPS, #405); a LONG / LONG RAW column streams inline via the
     # chunked form (#407); everything else is the ordinary inline DALC value.
+    (value, col) = _carried_cell(value, col)
     if col.data_type in _OCI_LOB_TYPES:
         return encode_lob_locator_oci(
             value, col.data_type == TNS_TYPE_CLOB, col.csfrm == _CSFRM_NCHAR, slot
