@@ -3056,16 +3056,17 @@ def test_lob_column_value_carries_the_lob_length_and_chunk_size() -> None:
     # its locator length (ub4), the LOB's length (ub8, characters for a CLOB),
     # its chunk size (ub4), then the locator; sqlplus cannot parse the row
     # without the middle two. sqlplus 11.2 gets the bare form (#1287).
-    from seerdb.common.tns import _ENCODE_OCI_LOB_12C, encode_lob_locator_oci
+    from seerdb.common.features import _SESSION_FEATURES, Features
+    from seerdb.common.tns import encode_lob_locator_oci
 
     bare = encode_lob_locator_oci('short clob', is_clob=True)
-    token = _ENCODE_OCI_LOB_12C.set(True)
+    token = _SESSION_FEATURES.set(Features(oci_lob_12c=True))
     try:
         value = encode_lob_locator_oci('short clob', is_clob=True)
         blob = encode_lob_locator_oci(b'\x01\x02', is_clob=False)
         null = encode_lob_locator_oci(None, is_clob=True)
     finally:
-        _ENCODE_OCI_LOB_12C.reset(token)
+        _SESSION_FEATURES.reset(token)
     assert int.from_bytes(value[4:12], 'little') == 10  # characters
     assert int.from_bytes(value[12:16], 'little') == 8132  # 11g's chunk size
     # Around them, the bare form a client without CCAP_LOB_12C reads.
