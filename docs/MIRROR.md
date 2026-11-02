@@ -128,6 +128,23 @@ clients are not served. What is checked, and how (measured 2026-10-31):
 - **Two seerdb extensions:** a WebSocket listener for browser clients, and a
   JSON query endpoint (*The WebSocket listener*).
 
+### Newer types for older clients
+
+A client whose protocol predates a type gets the form 23ai sends that client
+([#2395](https://github.com/seerdb/seerdb/issues/2395)):
+
+| type | below 23ai | from |
+|---|---|---|
+| `BOOLEAN` | a `NUMBER` 1 or 0, NULL staying NULL | field version 17 (23.1) for a thin client; for sqlplus, the version its own capabilities name |
+
+- **sqlplus:** sqlplus 11.2 shows such a column exactly as it does against
+  23ai, `DESCRIBE` included, where it is still named `BOOLEAN`.
+- **The 10.2 band:** 23ai refuses clients at 10.2 outright, so there is no
+  Oracle reference there. The Mirror gives them the 11.2 forms. That is its
+  own choice, not Oracle behaviour.
+- **Binds:** an older client binds a `NUMBER` into a `BOOLEAN` column, and the
+  Mirror stores it as 23ai does: nonzero is true.
+
 ### SQL and PL/SQL over PostgreSQL
 
 Oracle SQL and PL/SQL are translated as they arrive, with
@@ -1130,13 +1147,11 @@ The full list, with the reasons, is in the backend module's docstring
 Two limits apply to the Mirror itself, whatever the backend:
 - **The clients it serves:** thin clients from 10.2 on, and sqlplus / OCI from
   10.2 on. Oracle 8i and 9i clients are not served.
-- **Newer types reach older clients unadapted.** A column of a type newer than
-  the client's protocol, such as 23ai's `BOOLEAN` or `VECTOR` sent to a client
-  that negotiated an 11g-era version, goes out with its own type code. Real
-  Oracle sends those clients a form they know. Carrying such features to older
-  clients in a form they can read is planned:
-  [#2394](https://github.com/seerdb/seerdb/issues/2394) measures it, and
-  [#2395](https://github.com/seerdb/seerdb/issues/2395) is the design.
+- **Some newer types still reach older clients unadapted.** A JSON or `VECTOR`
+  column sent to a client that negotiated an 11g-era version goes out with its
+  own type code, where real Oracle sends a form the client knows. `BOOLEAN` is
+  adapted (*Newer types for older clients*); the others are planned under
+  [#2395](https://github.com/seerdb/seerdb/issues/2395).
 
 ## Troubleshooting
 
