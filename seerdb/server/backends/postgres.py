@@ -1554,11 +1554,19 @@ CREATE OR REPLACE PROCEDURE dbms_application_info.read_client_info(
 # client as an implicit result. orafce's DBMS_SQL has no such procedure. This
 # one names the cursor's portal in a notice, and the backend fetches the rows
 # once the block has run; TO_CLIENT is taken, and every result goes to the
-# client, as there is no caller in between to give it to.
+# client, as there is no caller in between to give it to. A client below 12.1
+# can't take one: 23ai raises ORA-29481 here, inside the block, where a handler
+# can catch it and where, uncaught, it fails the block whole (#2419).
 _DBMS_SQL_RETURN_RESULT_DDL = """
 CREATE SCHEMA IF NOT EXISTS dbms_sql;
 CREATE OR REPLACE PROCEDURE dbms_sql.return_result(rc refcursor, to_client boolean DEFAULT true)
-  LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE '%', 'seerdb: implicit result ' || rc; END $$;
+  LANGUAGE plpgsql AS $$ BEGIN
+    IF current_setting('seerdb.implicit_results', true) = 'refused' THEN
+      RAISE EXCEPTION USING ERRCODE = 'P0001',
+        MESSAGE = 'ORA-29481: Implicit results cannot be returned to client.';
+    END IF;
+    RAISE NOTICE '%', 'seerdb: implicit result ' || rc;
+  END $$;
 """
 
 
@@ -23195,6 +23203,14 @@ class PostgresBackend:
                 return
             statement = rest
         self._at_once(_translate_admin(statement))
+
+    @_while_connected
+    def refuse_implicit_results(self) -> None:
+        """Refuse implicit results for the rest of the session: its client is
+        below 12.1 (#2419). DBMS_SQL.RETURN_RESULT then raises ORA-29481 where
+        it is called, as 23ai does, so a handler in the block can catch it. It
+        is committed at once, so a rollback cannot undo it."""
+        self._at_once("SELECT set_config('seerdb.implicit_results', 'refused', false)")
 
     def txn_priority(self) -> str:
         """The session's transaction priority, as 23ai reports it (#1779)."""

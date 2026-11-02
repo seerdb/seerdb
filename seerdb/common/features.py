@@ -64,6 +64,10 @@ class Features:
     # A VECTOR reaches a client below 12.1 as a CLOB holding its text, which
     # 23ai sends the thin client at field version 6 and sqlplus 11.2 (#2418).
     vector: Carry = Carry.NATIVE
+    # An implicit result (DBMS_SQL.RETURN_RESULT) is refused to a client below
+    # 12.1: 23ai raises ORA-29481 at the call, to the thin client at field
+    # version 6 and to sqlplus 11.2. The backend raises it, where the block
+    # runs, so a handler can catch it (#2419).
     implicit_results: Carry = Carry.NATIVE
     # A sqlplus that offered CCAP_LOB_12C (sqlplus 23.26) reads a LOB cell with
     # the LOB's length and chunk size before the locator; one that did not
@@ -110,12 +114,19 @@ def session_features(
     boolean = from_version(FIELD_VERSION_23_1)
     json = from_version(FIELD_VERSION_20_1)
     vector = from_version(FIELD_VERSION_12_1)
+    implicit_results = Carry.REFUSED if vector is Carry.MAPPED else Carry.NATIVE
     if not oci:
-        return Features(boolean=boolean, json=json, vector=vector)
+        return Features(
+            boolean=boolean,
+            json=json,
+            vector=vector,
+            implicit_results=implicit_results,
+        )
     return Features(
         boolean=boolean,
         json=json,
         vector=vector,
+        implicit_results=implicit_results,
         oci_lob_12c=lob_12c,
         oci_tstz_local=client_field_version is None
         or client_field_version >= FIELD_VERSION_12_1,

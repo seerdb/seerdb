@@ -377,6 +377,66 @@ def test_a_fast_auth_client_below_the_mirrors_version_is_served_at_its_own(
     assert result.get('error') is None, result.get('error')
 
 
+class _ImplicitResultsBackend(_DualBackend):
+    """Records whether the login asked it to refuse implicit results."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused = False
+
+    def refuse_implicit_results(self) -> None:
+        self.refused = True
+
+
+@pytest.mark.parametrize(('version', 'refused'), [(6, True), (7, False), (24, False)])
+def test_a_client_below_12_1_has_implicit_results_refused(
+    version: int, refused: bool
+) -> None:
+    # 23ai refuses an implicit result to a client below 12.1, with ORA-29481
+    # where DBMS_SQL.RETURN_RESULT is called (#2419). The login asks the
+    # backend to do the same for such a client, and only for it.
+    from seerdb.common.tns_consts import FIELD_VERSION_23_4
+
+    backend = _ImplicitResultsBackend()
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+    result: dict = {}
+
+    def serve() -> None:
+        conn, _ = listen.accept()
+        try:
+            result['user'] = serve_session(
+                PacketStream(conn), backend, field_version=FIELD_VERSION_23_4
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test thread
+            result['error'] = exc
+        finally:
+            conn.close()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    client = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+        field_version=version,
+    )
+    try:
+        assert client.field_version == version
+    finally:
+        client.close()
+        server.join(timeout=5)
+        listen.close()
+    assert result.get('error') is None, result.get('error')
+    assert backend.refused is refused
+
+
 class _AlterSessionBackend(_DualBackend):
     """Records the ALTER SESSION a client sends with its login; optionally
     refuses it, to show a refusal never fails the login."""
