@@ -24,7 +24,7 @@ import hmac
 import logging
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from secrets import token_bytes
 from typing import NoReturn, ParamSpec, TypeVar
@@ -107,6 +107,7 @@ from seerdb.common.tns import (
     encode_fetch_response,
     encode_fetch_terminator_oci,
     encode_implicit_results,
+    encode_implicit_results_oci,
     encode_kod_named_reply,
     encode_kod_reply,
     encode_lob_describe_oci,
@@ -2363,13 +2364,29 @@ def _answer_query_oci(
             ),
         )
         return None, [], {}
+    if ref_cursors is None:
+        ref_cursors = _OciRefCursors()
+    # A block that called DBMS_SQL.RETURN_RESULT hands its result sets back as a
+    # TTI_IRD block naming one cursor per set, and sqlplus fetches each as it
+    # fetches a REF CURSOR, so each set is parked on a cursor of its own first
+    # (#2431). A client below 12.1 cannot take them (#2419): it gets the status
+    # alone, as before.
+    implicit = b''
+    if (
+        result.implicit_results
+        and _SESSION_FEATURES.get().implicit_results is not Carry.REFUSED
+    ):
+        implicit = encode_implicit_results_oci(
+            [
+                (list(columns), ref_cursors.open(columns, rows))
+                for columns, rows in result.implicit_results
+            ]
+        )
     if result.out_binds:
         # A PL/SQL block that assigned OUT binds (sqlplus VARIABLE / EXEC) — return
         # the values so the client reads them back into its bound buffers.
         if blocks is not None:
             blocks.remember(request)
-        if ref_cursors is None:
-            ref_cursors = _OciRefCursors()
         stream.write_packet(
             TNS_DATA,
             encode_out_bind_response_oci(
@@ -2396,13 +2413,15 @@ def _answer_query_oci(
                     )
                 ]
                 or None,
+                implicit_results=implicit,
             ),
         )
         return None, [], {}
     if not result.columns:
         stream.write_packet(
             TNS_DATA,
-            _oci_no_row_status(
+            implicit
+            + _oci_no_row_status(
                 request.sql,
                 result.rowcount,
                 seq,
@@ -3083,10 +3102,16 @@ class _OciRefCursors:
             return value
         if not value.columns:
             return RefCursorOutBind(columns=[], cursor_id=0)
+        cursor_id = self.open(value.columns, value.rows)
+        return RefCursorOutBind(columns=list(value.columns), cursor_id=cursor_id)
+
+    def open(self, columns: Sequence[ColumnMeta], rows: Iterable[tuple]) -> int:
+        # Park a result under a new cursor id for sqlplus to fetch: a REF
+        # CURSOR's, or an implicit result's (#2431).
         cursor_id = self._next_id
         self._next_id += 1
-        self._open[cursor_id] = (list(value.columns), list(value.rows))
-        return RefCursorOutBind(columns=list(value.columns), cursor_id=cursor_id)
+        self._open[cursor_id] = (list(columns), list(rows))
+        return cursor_id
 
     def take_streamed(self, body: bytes) -> tuple[list[ColumnMeta], list[tuple]] | None:
         # A re-executed cursor whose rows carry a LOB or LONG, handed over whole:

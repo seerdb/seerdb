@@ -35,8 +35,10 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_VARCHAR,
     TTI_END_OF_RESPONSE,
     TTI_FUN,
+    TTI_IRD,
     TTI_MSG_TYPE_PIGGYBACK,
     TTI_PRO,
+    TTI_RPA,
     VERSION_11_2_0_2,
     VERSION_12_1_0_2,
     VERSION_12_2_0_1,
@@ -2908,6 +2910,187 @@ def test_a_drained_refcursor_is_forgotten() -> None:
     _opened, served, again = stream.sent
     assert served.count(b'\x07\x02\xc1') == 2
     assert b'\x07\x02\xc1' not in again
+
+
+# sqlplus 23.26 against a live 21c, which logs it in as the Mirror does (#2431):
+# `declare c sys_refcursor; begin open c for select 1 as n from dual;
+# dbms_sql.return_result(c); end;`. The reply opens with the TTI_IRD block,
+# naming cursor 3, and sqlplus re-executes cursor 3 as it does a REF CURSOR's.
+_OCI_EXEC_RETURN_RESULT = bytes.fromhex(
+    '035e0b2100040000000000feffffffffffffff26010000feffffffffffffff0d'
+    '000000fefffffffffffffffeffffffffffffff00000000010000000000000000'
+    '00000000000000000000000000000000000000feffffffffffffff0000000000'
+    '000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000'
+    '000000fefffffffffffffffeffffffffffffff00000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '000000000000000000000000000000626465636c6172652063207379735f7265'
+    '66637572736f723b20626567696e206f70656e206320666f722073656c656374'
+    '2031206173206e2066726f6d206475616c3b2064626d735f73716c2e72657475'
+    '726e5f726573756c742863293b20656e643b0100000001000000000000000000'
+    '0000000000000000000000000000090000000000000000800000000000000000'
+    '000000000000'
+)
+_OCI_IMPLICIT_RESULT = bytes.fromhex(
+    '1b01000000000002000000010000005c01020000810200000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '00010101000000014e00000000000000000000000000000700000007605031ba'
+    '5a7f0000000000e81f000000000000000000000000000003000000'
+)
+# The same with a second result, `select 'x' as s, 2 as m from dual`, on cursor 4.
+_OCI_IMPLICIT_RESULTS_TWO = bytes.fromhex(
+    '1b02000000000002000000010000005c01020000810200000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000'
+    '00010101000000014e00000000000000000000000000000700000007601033d9'
+    'bf7f0000000000e81f0000000000000000000000000000030000000000030000'
+    '00020000005c0160800000010000000000000000000000000000000000000000'
+    '00000000000000000000006903010001000000fe3f0000010101000000015300'
+    '0000000000000000000000000001020000810200000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000101'
+    '01000000014d00000000000000000100000000000700000007601033d9bf7f00'
+    '00000000e81f000000000000000000000000000004000000'
+)
+_IMPLICIT_N = [
+    ColumnMeta(name=b'N', data_type=TNS_TYPE_NUMBER, data_length=2, max_size=2)
+]
+_IMPLICIT_S_M = [
+    ColumnMeta(name=b'S', data_type=TNS_TYPE_CHAR, data_length=1, max_size=1),
+    ColumnMeta(name=b'M', data_type=TNS_TYPE_NUMBER, data_length=2, max_size=2),
+]
+
+
+@pytest.mark.parametrize(
+    ('live', 'results'),
+    [
+        (_OCI_IMPLICIT_RESULT, [(_IMPLICIT_N, 3)]),
+        (_OCI_IMPLICIT_RESULTS_TWO, [(_IMPLICIT_N, 3), (_IMPLICIT_S_M, 4)]),
+    ],
+    ids=['one', 'two'],
+)
+def test_the_implicit_results_block_is_framed_as_the_live_one(
+    live: bytes, results: list
+) -> None:
+    # The frame -- the count, the zero bytes before each describe, the
+    # describe-time tail and the cursor ids -- is the live server's, with the date
+    # and the dcbmdbz it fills in zeroed, as the Mirror sends them. Each describe
+    # is the Mirror's own, the one its queries carry, and as long as the live one.
+    from seerdb.common.tns import (
+        _describe_trailer,
+        _oci_describe_body,
+        encode_implicit_results_oci,
+    )
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+
+    block = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1, encode_implicit_results_oci, results
+    )
+    tail = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1, lambda: _describe_trailer(oci=True)
+    )
+    expected = bytearray(live)
+    at = 7
+    for columns, _cursor in results:
+        body = _at_field_version(FIELD_VERSION_18_1_EXT_1, _oci_describe_body, columns)
+        expected[at : at + len(body)] = body
+        at += len(body)
+        expected[at + 6 : at + 13] = bytes(7)  # the describe-time date
+        expected[at + 17 : at + 19] = bytes(2)  # dcbmdbz
+        at += len(tail) + 4 + 2  # the cursor id, then the next result's two zeros
+    assert len(block) == len(live)
+    assert block == bytes(expected)
+
+
+class _OciImplicitBackend(_OciCountingBackend):
+    def __init__(self, out_binds: list | None = None) -> None:
+        super().__init__()
+        self.out_binds = out_binds or []
+
+    def execute(self, sql: str, binds=()) -> Result:
+        self.calls.append(sql)
+        return Result(
+            out_binds=self.out_binds,
+            implicit_results=[(_IMPLICIT_N, [(1,)])],
+        )
+
+
+def test_an_implicit_result_is_fetched_as_a_refcursor_is() -> None:
+    # The block's result reached sqlplus as nothing at all: the reply was the
+    # status alone (#2431). It now names a cursor, and the re-execute of that
+    # cursor answers the row and ends the fetch, as a live 21c does.
+    from seerdb.common.tns import encode_implicit_results_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1, TNS_DATA
+    from seerdb.server.session import _OCI_REF_CURSOR_FIRST_ID, _serve_oci_session
+
+    cursor = _OCI_REF_CURSOR_FIRST_ID
+    reexec = bytearray(_OCI_REEXEC_REFCURSOR)
+    reexec[7:11] = cursor.to_bytes(4, 'little')
+    stream: Any = _OciOneCallStream(_OCI_EXEC_RETURN_RESULT)
+    stream.inbox[1:1] = [(TNS_DATA, bytes(reexec))]
+    backend: Any = _OciImplicitBackend()
+    _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1)
+    executed, fetched = stream.sent
+    block = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1,
+        encode_implicit_results_oci,
+        [(_IMPLICIT_N, cursor)],
+    )
+    assert executed.startswith(block)
+    assert executed[len(block) :].startswith(bytes([TTI_RPA]))
+    assert fetched.count(b'\x07\x02\xc1') == 1
+    assert b'ORA-01403' in fetched
+
+
+def test_an_implicit_result_follows_the_out_values() -> None:
+    # A block with OUT binds as well: the values, then the TTI_IRD block, then
+    # the status, as a live 21c sends them.
+    from seerdb.common.tns import encode_implicit_results_oci
+    from seerdb.common.tns_consts import FIELD_VERSION_18_1_EXT_1
+    from seerdb.server.session import _OCI_REF_CURSOR_FIRST_ID, _serve_oci_session
+
+    def reply(backend: Any) -> bytes:
+        stream: Any = _OciOneCallStream(_OCI_EXEC_OPEN_REFCURSOR)
+        _serve_oci_session(
+            stream, backend, 'PYO', field_version=FIELD_VERSION_18_1_EXT_1
+        )
+        [sent] = stream.sent
+        return sent
+
+    opened = CursorResult(columns=_REFCURSOR_COLUMNS, rows=[(1, 'a')])
+    plain = reply(_OciRefCursorBackend(1))
+    both = reply(_OciImplicitBackend([opened]))
+    block = _at_field_version(
+        FIELD_VERSION_18_1_EXT_1,
+        encode_implicit_results_oci,
+        [(_IMPLICIT_N, _OCI_REF_CURSOR_FIRST_ID)],
+    )
+    values, status = both.split(block)
+    # The REF CURSOR's value ends on its cursor id and its return code.
+    assert values.endswith(
+        (_OCI_REF_CURSOR_FIRST_ID + 1).to_bytes(4, 'little') + bytes(2)
+    )
+    assert status.startswith(bytes([TTI_RPA]))
+    assert plain.endswith(status)
+
+
+def test_sqlplus_below_12_1_gets_no_implicit_results() -> None:
+    # A client below 12.1 cannot read the block (#2419): a backend that served
+    # the results anyway is answered with the status alone, as before.
+    from seerdb.common.features import _SESSION_FEATURES, Carry, Features
+    from seerdb.common.tns_consts import FIELD_VERSION_11_2
+    from seerdb.server.session import _serve_oci_session
+
+    sent = []
+    backends: list[Any] = [_OciCountingBackend(), _OciImplicitBackend()]
+    for backend in backends:
+        stream: Any = _OciOneCallStream(_OCI_EXEC_RETURN_RESULT)
+        token = _SESSION_FEATURES.set(Features(implicit_results=Carry.REFUSED))
+        try:
+            _serve_oci_session(stream, backend, 'PYO', field_version=FIELD_VERSION_11_2)
+        finally:
+            _SESSION_FEATURES.reset(token)
+        sent += stream.sent
+    assert sent[1] == sent[0]
+    assert sent[1][0] != TTI_IRD
 
 
 # sqlplus 23.26 reading a REF CURSOR's CLOB from a live 18c (#2033): a TTI_LOBOPS
