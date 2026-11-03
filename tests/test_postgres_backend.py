@@ -7121,6 +7121,37 @@ def test_a_block_returns_cursors_as_implicit_results() -> None:
         backend.close()
 
 
+def test_an_implicit_result_describes_its_columns_as_the_query_does() -> None:
+    # An implicit result's columns were described from the bare PostgreSQL
+    # types: a TO_CLOB item came back a VARCHAR2, where the same query and a
+    # REF CURSOR over it describe a CLOB (#2434; #2071 for a REF CURSOR).
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('DROP TABLE IF EXISTS t_2434')
+        backend.execute('CREATE TABLE t_2434 (c CLOB, b BLOB, d DATE, n NVARCHAR2(5))')
+        backend.execute(
+            "INSERT INTO t_2434 VALUES ('x', HEXTORAW('01'), SYSDATE, 'ab')"
+        )
+        query = "SELECT c, b, d, n, TO_CLOB('y') tc FROM t_2434"
+        plain = backend.execute(query).columns
+        result = backend.execute(
+            f'DECLARE rc SYS_REFCURSOR; BEGIN OPEN rc FOR {query}; '
+            'DBMS_SQL.RETURN_RESULT(rc); END;'
+        )
+        [(columns, _rows)] = result.implicit_results
+        assert [(c.data_type, c.csfrm) for c in columns] == [
+            (c.data_type, c.csfrm) for c in plain
+        ]
+        assert [c.data_type for c in columns][:2] == [TNS_TYPE_CLOB, TNS_TYPE_BLOB]
+        assert columns[4].data_type == TNS_TYPE_CLOB
+    finally:
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS t_2434')
+        backend.close()
+
+
 def test_a_session_that_refuses_implicit_results_raises_ora_29481() -> None:
     # For a client below 12.1 (#2419), DBMS_SQL.RETURN_RESULT raises ORA-29481
     # where it is called, as 23ai does: uncaught it fails the block, a handler
