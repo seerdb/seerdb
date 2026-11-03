@@ -1023,6 +1023,60 @@ def test_the_login_reply_reports_the_priority() -> None:
     assert sink == {TNS_KEYWORD_NUM_TXN_PRIORITY: 'HIGH'}
 
 
+@pytest.mark.parametrize(
+    ('presented', 'client', 'reported'),
+    [
+        (24, 6, None),  # 23ai advertises it to 11.2, but reports none
+        (24, 7, 'HIGH'),  # and reports it from 12.1 on
+        (24, 24, 'HIGH'),
+        (7, 7, 'not advertised'),  # a Mirror presenting 12.1 has no such thing
+    ],
+)
+def test_the_priority_is_reported_at_login_as_23ai_reports_it(
+    presented: int, client: int, reported: str | None
+) -> None:
+    # The Mirror advertised priority to a 12.1 client, as 23ai does, but
+    # reported it at login only from 23.1: the client saw a supported feature
+    # with no value (#2438).
+    from seerdb.common.exceptions import NotSupportedError
+
+    def run(listen: socket.socket) -> None:
+        conn, _ = listen.accept()
+        try:
+            serve_session(
+                PacketStream(conn), _PriorityBackend(), field_version=presented
+            )
+        finally:
+            conn.close()
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    server = threading.Thread(target=run, args=(listen,), daemon=True)
+    server.start()
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=listen.getsockname()[1],
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+        field_version=client,
+    )
+    try:
+        try:
+            priority = conn.transaction_priority
+            seen = None if priority is None else priority.name
+        except NotSupportedError:
+            seen = 'not advertised'
+    finally:
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+    assert seen == reported
+
+
 # The close-temp-LOBs piggyback a thin client sent a live 23ai in front of its
 # second large-LOB insert (fv24: the ub8 token follows the sequence byte): a
 # FREE_TEMP | ARRAY over one 40-byte (ub2-prefixed) locator, then `03 04 ...`, the
