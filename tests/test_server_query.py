@@ -574,12 +574,12 @@ def test_a_json_column_reaches_an_older_client_as_23ai_sends_it() -> None:
     assert [served[f] for f in fields] == [live[3][1][0][f] for f in fields]
     # The row carries a locator, not the document inline as an OSON column's.
     assert b'{"a":1}' not in _at_11_2(_thin_column_value, {'a': 1}, col)
-    [(content, is_clob, _)] = _at_11_2(_lob_queue, [col], [({'a': 1},)], False)
+    [(content, is_clob, _)] = _at_11_2(_lob_queue, [col], [({'a': 1},)])
     assert (content, is_clob) == (b'{"a":1}', False)
     # The read reply opens as 23ai's: the LOB data, the text, its terminator.
     head = len(b'\x0e\xfe\x07{"a":1}\x00')
     assert encode_lob_read_response_thin(content)[:head] == _JSON_READ_AT_11_2[:head]
-    assert _at_11_2(_lob_queue, [col], [(None,)], False) == []
+    assert _at_11_2(_lob_queue, [col], [(None,)]) == []
 
 
 # 23ai's replies for `select to_vector('[1,2,3]') from dual` to the thin client
@@ -632,7 +632,7 @@ def test_a_vector_reaches_an_11_2_client_as_23ai_sends_it() -> None:
     )
     assert [served[f] for f in fields] == [live[3][1][0][f] for f in fields]
     vector = array.array('f', [1.0, 2.0, 3.0])
-    [(content, is_clob, _)] = _at_11_2(_lob_queue, [col], [(vector,)], False)
+    [(content, is_clob, _)] = _at_11_2(_lob_queue, [col], [(vector,)])
     assert (content, is_clob) == (
         '[1.0E+000,2.0E+000,3.0E+000]'.encode('utf-16-be'),
         True,
@@ -3423,24 +3423,113 @@ def test_oci_lob_contents_reports_type_and_wire_bytes() -> None:
     assert got == [('hi'.encode('utf-16-be'), True), (b'\xca\xfe', False)]
 
 
-def test_oci_lob_contents_encodes_a_json_cell_as_its_oson_image() -> None:
-    # A native JSON column reads back over the LOB path like a CLOB / BLOB, but
-    # its content is the value's OSON image (is_clob False — the client decodes
-    # OSON, not text). NULL is skipped like any other LOB (#30/#50/#70).
-    from seerdb.common.oson import decode_oson, encode_oson
-    from seerdb.common.tns import ColumnMeta, oci_lob_contents
+# 21c's cell for a JSON column holding {"a":1}, sent sqlplus 23.26 in the row
+# after its define re-execute: the locator's length, the image's size, the
+# chunk size, the 26-byte OSON image prefetched, the 40-byte locator and a
+# zero byte. Captured live (#2420).
+_JSON_CELL_21C = bytes.fromhex(
+    '280000001a00000000000000587f00001aff4a5a012106010002000800002c0000016184'
+    '0101000521c1022800260004610800000001000000000000001a00000000000000000000'
+    '000000000000000000000000'
+)
+
+
+def test_a_prefetched_json_cell_is_21cs_byte_for_byte() -> None:
+    # Given 21c's own OSON image, the Mirror's cell is 21c's exactly (#2420).
+    from seerdb.common.tns import _oci_prefetched_lob_cell
+
+    image = _JSON_CELL_21C[17 : 17 + 26]
+    assert _oci_prefetched_lob_cell(image) == _JSON_CELL_21C
+
+
+def test_a_prefetched_cell_reports_21cs_chunk_size_and_frames_a_long_image() -> None:
+    # 21c reports a chunk size of 32600 for an image of up to 7968 bytes and
+    # 8060 above, measured to the byte. An image past 252 bytes is chunked
+    # with one-byte lengths, as the Mirror's dialect frames a value: sqlplus
+    # 23.26 printed 326-byte and 40 KB documents so, and refused the ub4
+    # lengths 21c uses at its own, higher, field version with ORA-03106.
+    import struct
+
+    from seerdb.common.tns import _oci_prefetched_lob_cell
+
+    def chunk_size(size: int) -> int:
+        return struct.unpack('<I', _oci_prefetched_lob_cell(bytes(size))[12:16])[0]
+
+    assert (chunk_size(7968), chunk_size(7970)) == (32600, 8060)
+    cell = _oci_prefetched_lob_cell(b'\xaa' * 326)
+    assert cell[16] == 0xFE
+    image = b''
+    at = 17
+    while cell[at]:
+        image += cell[at + 1 : at + 1 + cell[at]]
+        at += 1 + cell[at]
+    assert image == b'\xaa' * 326
+    assert struct.unpack('>I', cell[at + 1 + 15 : at + 1 + 19])[0] == 326
+
+
+def test_the_oci_describe_carries_the_json_uds_flags() -> None:
+    # The uds flags an OCI describe carries, measured: 0x05000000 for a native
+    # JSON column (21c to sqlplus 23.26) and for a CLOB flagged JSON (23ai's
+    # VECTOR to sqlplus 11.2), 0x0D000000 for a BLOB flagged JSON and OSON
+    # (23ai's JSON to sqlplus 11.2). The Mirror sent zero (#2420).
+    import contextvars
+
+    from seerdb.common.tns import (
+        _DECODE_FIELD_VERSION,
+        _ENCODE_FIELD_VERSION,
+        ColumnMeta,
+        _decode_describe_oci,
+        encode_lob_describe_oci,
+    )
+    from seerdb.common.tns_consts import (
+        FIELD_VERSION_18_1_EXT_1,
+        TNS_TYPE_BLOB,
+        TNS_TYPE_CLOB,
+        TNS_TYPE_JSON,
+        TNS_TYPE_NUMBER,
+    )
+
+    def uds(col: ColumnMeta) -> int:
+        def run() -> int:
+            _ENCODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+            _DECODE_FIELD_VERSION.set(FIELD_VERSION_18_1_EXT_1)
+            reply = encode_lob_describe_oci([col], sequence=1)
+            return _decode_describe_oci(reply)[0]['uds_flags']
+
+        return contextvars.copy_context().run(run)
+
+    def column(data_type: int, is_json: bool = False, is_oson: bool = False):
+        return ColumnMeta(
+            name=b'D',
+            data_type=data_type,
+            data_length=4000,
+            max_size=0,
+            is_json=is_json,
+            is_oson=is_oson,
+        )
+
+    assert uds(column(TNS_TYPE_JSON)) == 0x05000000
+    assert uds(column(TNS_TYPE_CLOB, is_json=True)) == 0x05000000
+    assert uds(column(TNS_TYPE_BLOB, is_json=True, is_oson=True)) == 0x0D000000
+    assert uds(column(TNS_TYPE_NUMBER)) == 0
+
+
+def test_an_oci_json_cell_carries_its_oson_image_and_queues_no_lob() -> None:
+    # A native JSON column goes to sqlplus as a LOB cell with the value's OSON
+    # image prefetched, so sqlplus issues no TTI_LOBOPS read and nothing is
+    # queued for one (#2420). Queued as a LOB, as it was, sqlplus 23.26 failed
+    # with ORA-24813. NULL is the bare cell, as for any LOB.
+    from seerdb.common.oson import encode_oson
+    from seerdb.common.tns import ColumnMeta, _encode_oci_value, oci_lob_contents
     from seerdb.common.tns_consts import TNS_TYPE_JSON
 
-    cols = [
-        ColumnMeta(name=b'D', data_type=TNS_TYPE_JSON, data_length=4000, max_size=0)
-    ]
+    col = ColumnMeta(name=b'D', data_type=TNS_TYPE_JSON, data_length=8200, max_size=0)
     doc = {'hello': 'world', 'n': 42, 'arr': [1, 2, 3]}
-    got = oci_lob_contents(cols, [(doc,), (None,)], for_oci=True)
-    assert len(got) == 1
-    image, is_clob = got[0]
-    assert is_clob is False
-    assert image == encode_oson(doc)
-    assert decode_oson(image) == doc
+    assert oci_lob_contents([col], [(doc,), (None,)]) == []
+    image = encode_oson(doc, allow_wide=True)
+    cell = _encode_oci_value(doc, col)
+    assert cell[16:17] == bytes([len(image)]) and cell[17 : 17 + len(image)] == image
+    assert _encode_oci_value(None, col) == bytes(4)
 
 
 def test_a_thin_json_cell_rides_in_the_row_and_queues_no_lob() -> None:
@@ -3462,8 +3551,6 @@ def test_a_thin_json_cell_rides_in_the_row_and_queues_no_lob() -> None:
     assert oci_lob_contents([col], [(doc,)]) == []
     image = encode_oson(doc, allow_wide=True)
     assert encode_prefetched_lob_value_thin(image) in encode_rows([(doc,)], [col])
-    # The OCI (sqlplus) path does read it over TTI_LOBOPS, so it still queues.
-    assert len(oci_lob_contents([col], [(doc,)], for_oci=True)) == 1
 
 
 def test_encode_value_emits_a_thin_lob_locator_for_a_json_column() -> None:
@@ -3524,27 +3611,25 @@ def test_parse_exec_decodes_a_native_json_bind_as_a_json_value() -> None:
     assert request.binds[0].value == doc
 
 
-def test_oci_lob_contents_encodes_a_vector_cell_by_element_format() -> None:
-    # A native VECTOR column reads back over the LOB path with its binary image;
-    # the column's element format (ColumnMeta.vector_format) drives the re-encode
-    # so INT8 stays integral, not a default FLOAT32 (#55).
-    from seerdb.common.tns import ColumnMeta, oci_lob_contents
+def test_an_oci_vector_cell_carries_its_image_by_element_format() -> None:
+    # A native VECTOR column goes to sqlplus as JSON's does: a LOB cell with the
+    # binary image prefetched, nothing queued for a TTI_LOBOPS read (#2420).
+    # The column's element format (ColumnMeta.vector_format) drives the
+    # re-encode, so INT8 stays integral, not a default FLOAT32 (#55).
+    from seerdb.common.tns import ColumnMeta, _encode_oci_value, oci_lob_contents
     from seerdb.common.tns_consts import TNS_TYPE_VECTOR
     from seerdb.common.vector import decode_vector
 
-    cols = [
-        ColumnMeta(
-            name=b'V',
-            data_type=TNS_TYPE_VECTOR,
-            data_length=0,
-            max_size=0,
-            vector_format=4,  # INT8
-        )
-    ]
-    got = oci_lob_contents(cols, [([1, -2, 3, -4],), (None,)], for_oci=True)
-    assert len(got) == 1
-    image, is_clob = got[0]
-    assert is_clob is False
+    col = ColumnMeta(
+        name=b'V',
+        data_type=TNS_TYPE_VECTOR,
+        data_length=0,
+        max_size=0,
+        vector_format=4,  # INT8
+    )
+    assert oci_lob_contents([col], [([1, -2, 3, -4],), (None,)]) == []
+    cell = _encode_oci_value([1, -2, 3, -4], col)
+    image = cell[17 : 17 + cell[16]]
     decoded = decode_vector(image)
     # decode_vector reports the element format in the array's typecode ('b' is
     # INT8), so the cell keeps the width it was declared with (#826).
