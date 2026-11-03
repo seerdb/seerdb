@@ -151,8 +151,7 @@ A client whose protocol predates a type gets the form 23ai sends that client
   out in JSON's form, which is the Mirror's choice.
 - **JSON text:** it is compact, and numbers are plain decimals (`1.0` is `1`).
   The keys come in the order the backend keeps them. Over PostgreSQL that is
-  `jsonb`'s sorted order, not the document's
-  ([#2421](https://github.com/seerdb/seerdb/issues/2421)).
+  `jsonb`'s order, not the document's (*Deliberate differences from Oracle*).
 - **The 10.2 band:** 23ai refuses clients at 10.2 outright, so there is no
   Oracle reference there. The Mirror gives them the 11.2 forms. That is its
   own choice, not Oracle behaviour.
@@ -208,6 +207,28 @@ functions. This covers:
   translation and run as PostgreSQL (*Native PostgreSQL*).
 
 Each area has limits, listed under *Known limits*.
+
+### Deliberate differences from Oracle
+
+In a few places the Mirror over PostgreSQL accepts slightly wider input than
+Oracle does. This is a choice, not a gap: Oracle's stricter behaviour would
+cost far more to reproduce than anyone gains from it.
+
+- **JSON duplicate keys.** A document such as `{"a": "a comment", "a": 1}` is
+  accepted, and only the last value is kept: `{"a":1}`. That's how most JSON
+  parsers treat it, Oracle's own `IS JSON` included unless it's given
+  `WITH UNIQUE KEYS`. Duplicate keys are a known way to write a comment in
+  JSON. 23ai's JSON type refuses such a document with ORA-40473. The Mirror
+  keeps the last value on every path: a literal, a bind and `JSON('...')`.
+  `IS JSON WITH UNIQUE KEYS` still answers as Oracle's does
+  ([#2421](https://github.com/seerdb/seerdb/issues/2421)).
+- **JSON key order.** JSON objects are unordered, and two documents that differ
+  only in key order are equal, by `JSON_EQUAL` on Oracle and by `=` here. A
+  JSON column is stored as PostgreSQL's `jsonb`, which keeps its keys in its
+  own order: `{"b":2,"a":1}` reads back as `{"a":1,"b":2}`. 23ai keeps the order
+  the keys were written in. The difference shows only where a document's text is
+  compared or shown
+  ([#2421](https://github.com/seerdb/seerdb/issues/2421)).
 
 ### Not served
 
@@ -1171,7 +1192,9 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **A quoted lower-case identifier**, such as `"t1"`, comes back upper-case.
 
 The full list, with the reasons, is in the backend module's docstring
-(`seerdb/server/backends/postgres.py`).
+(`seerdb/server/backends/postgres.py`). Where the backend accepts more than
+Oracle on purpose, such as JSON with duplicate keys, it's listed under
+*Deliberate differences from Oracle*.
 
 One limit applies to the Mirror itself, whatever the backend: **the clients it
 serves.** Those are thin clients from 10.2 on, and sqlplus / OCI from 10.2 on.
