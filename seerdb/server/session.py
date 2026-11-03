@@ -934,9 +934,17 @@ def _txn_priority_hooks(
 
 def _backend_txn_priority(backend: Backend, field_version: int) -> str | None:
     # The priority to report at login, or None when there is none to report: a
-    # backend without the hooks, or a version below 23ai, which has no such thing.
+    # backend without the hooks, or a Mirror presenting a release below 23ai,
+    # which advertised no such thing. 23ai advertises it to every client by its
+    # own release, but reports it at login only to a client from 12.1 on: none
+    # to one at 11.2 (#2438).
     hooks = _txn_priority_hooks(backend)
-    if hooks is None or field_version < FIELD_VERSION_23_1:
+    presented = _ENCODE_SERVER_FIELD_VERSION.get() or field_version
+    if (
+        hooks is None
+        or presented < FIELD_VERSION_23_1
+        or field_version < FIELD_VERSION_12_1
+    ):
         return None
     try:
         return hooks[0]()
