@@ -1192,6 +1192,17 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   third. PostgreSQL catches an exception by rolling back a subtransaction
   around the protected code, and only PostgreSQL itself could change that
   ([#2428](https://github.com/seerdb/seerdb/issues/2428)).
+- **`SQLCODE` and `SQLERRM`** in a handler give the code the error would reach
+  the client with, +100 for `NO_DATA_FOUND`, and 0 outside a handler, as on
+  Oracle. `SQLERRM`'s text is Oracle's for the common errors and PostgreSQL's
+  for the rest. A unique violation, for one, doesn't carry 23ai's
+  constraint-and-columns text. Where the Mirror reports an error under a
+  different code than Oracle, `SQLCODE` gives the Mirror's: a failed
+  `TO_NUMBER` in a PL/SQL assignment is -1722 here, -6502 on Oracle.
+  `SQLERRM(n)` knows only the messages the Mirror itself uses.
+- **Exceptions a block declares itself** (`e EXCEPTION`, `RAISE e`,
+  `PRAGMA EXCEPTION_INIT`) aren't supported yet
+  ([#2444](https://github.com/seerdb/seerdb/issues/2444)).
 - **Object types** have no methods. A collection computed in a query fetches as
   a plain array.
 - **Privileges.** Object grants are enforced with per-user roles only. In

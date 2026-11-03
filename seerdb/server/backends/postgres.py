@@ -10579,8 +10579,40 @@ def _routine_body(body: str) -> str:
     # The blocks nested in it declare their own (#2182).
     block = block[: len('BEGIN')] + _nested_declarations(block[len('BEGIN') :])
     if not declarations:
+        return _with_error_functions(block)
+    return _with_error_functions(
+        f'DECLARE {_translate_routine_types(declarations)} {block}'
+    )
+
+
+# PL/SQL's SQLCODE, SQLERRM and SQLERRM(n) (#2429), which PL/pgSQL has none of.
+_ERROR_REFERENCE = re.compile(r'(?i)\b(?:(SQLCODE)\b|SQLERRM\b(\s*\()?)')
+# What they read outside a handler: no error. Inside one, PL/pgSQL's own
+# SQLSTATE and SQLERRM shadow these, its nested handlers' theirs in turn, so
+# each reads the error of the handler it is in, as on Oracle.
+_NO_ERROR_DECLARATIONS = "sqlstate text := '00000'; sqlerrm text := ''; "
+
+
+def _with_error_functions(block: str) -> str:
+    """`block`, a PL/pgSQL body -- [DECLARE ...] BEGIN ... END -- with its
+    SQLCODE and SQLERRM read as PL/SQL's (#2429): the code and text of the error
+    the handler it is in caught, from PL/pgSQL's SQLSTATE and SQLERRM, and no
+    error outside a handler. A body that names neither is unchanged."""
+    (masked, contents) = _mask_quoted(block)
+    if not _ERROR_REFERENCE.search(masked):
         return block
-    return f'DECLARE {_translate_routine_types(declarations)} {block}'
+
+    def read(found: re.Match[str]) -> str:
+        if found.group(1):
+            return 'sys.ora_sqlcode(sqlstate, sqlerrm)'
+        if found.group(2):
+            return 'sys.ora_sqlerrm_of('
+        return 'sys.ora_sqlerrm(sqlstate, sqlerrm)'
+
+    masked = _ERROR_REFERENCE.sub(read, masked).lstrip()
+    if re.match(r'(?i)DECLARE\b', masked):
+        masked = masked[len('DECLARE') :]
+    return _unmask_quoted(f'DECLARE {_NO_ERROR_DECLARATIONS}{masked}', contents)
 
 
 def _nested_declarations(body: str) -> str:
@@ -12158,7 +12190,7 @@ def _translate_plsql_block(
     body = _nested_declarations(body)
     if routine_kind is not None:
         body = _perform_bare_calls(body, routine_kind)
-    return f'DO $$ {declare}BEGIN {body.strip()} END $$'
+    return f'DO $$ {_with_error_functions(f"{declare}BEGIN {body.strip()} END")} $$'
 
 
 # A local function in a block's declarations: FUNCTION name [(params)] RETURN
@@ -12283,15 +12315,17 @@ def _hoist_local_functions(sql: str) -> str | None:
         returns = _translate_routine_types(return_type.strip())
         local = _translate_routine_types(local.strip())
         declare = f'DECLARE {qualify(local)} ' if local else ''
+        created = _with_error_functions(f'{declare}BEGIN {qualify(body.strip())} END')
         statements.append(
             f'{_HOISTED_FUNCTION}{name}; '
             f'CREATE FUNCTION pg_temp.{name}{params} RETURNS {returns} '
-            f'LANGUAGE plpgsql AS $f$ {declare}BEGIN {qualify(body.strip())} END $f$;'
+            f'LANGUAGE plpgsql AS $f$ {created} $f$;'
         )
     declare = _translate_routine_types(''.join(declarations).strip())
     declare = f'DECLARE {qualify(declare)} ' if declare else ''
     body = qualify(rest.group(2).strip())
-    return ' '.join(statements) + f' DO $$ {declare}BEGIN {body} END $$'
+    block = _with_error_functions(f'{declare}BEGIN {body} END')
+    return ' '.join(statements) + f' DO $$ {block} $$'
 
 
 # The anonymous block a thin callproc / callfunc sends: BEGIN name(:a, :b); END;
@@ -12844,6 +12878,64 @@ _NUMBER_CHARACTERS = frozenset('0123456789.+-eE')
 # invalid number (#2441).
 _INVALID_JSON = re.compile(r'invalid input syntax for type json\b')
 _ORA_JSON_SYNTAX_ERROR = 40441
+
+
+# PL/SQL's SQLCODE and SQLERRM (#2429), as functions of the SQLSTATE and message
+# a PL/pgSQL handler sees. SQLCODE is the code the error would reach the client
+# with uncaught (_ora_code_for), generated from the same tables. SQLERRM is that
+# code with its canonical text (_ORA_MESSAGE), or else PostgreSQL's message: the
+# texts the relay builds from an error's diagnostics, a unique violation's
+# among them, are out of a handler's reach. Oracle's own conventions on top:
+# NO_DATA_FOUND's SQLCODE is +100, and with no error SQLCODE is 0 and SQLERRM
+# 'ORA-0000: normal, successful completion'. SQLERRM(n) names a code's text:
+# the ones the Mirror knows, and 'ORA-nnnnn: ' with none for the rest, as
+# Oracle gives the user range.
+_PLSQL_ERROR_DDL = (
+    'CREATE OR REPLACE FUNCTION sys.ora_error_message(integer) RETURNS text '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE $1 '
+    + ''.join(
+        f'WHEN {code} THEN {_sql_text(text)} '
+        for code, text in {
+            **_ORA_MESSAGE,
+            _ORA_JSON_SYNTAX_ERROR: 'JSON syntax error',
+        }.items()
+    )
+    + 'END $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_sqlcode(text, text) RETURNS integer '
+    "LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN $1 = '00000' THEN 0 "
+    "WHEN $1 = 'P0002' THEN 100 "
+    "WHEN $1 = 'P0001' AND $2 ~ '^ORA-[0-9]{5}: ' THEN -substr($2, 5, 5)::integer "
+    "WHEN $1 = '42501' AND $2 LIKE 'permission denied for schema%' "
+    f'THEN -{ORA_TABLE_OR_VIEW_DOES_NOT_EXIST} '
+    f"WHEN $1 = '42501' THEN -{ORA_INSUFFICIENT_PRIVILEGES} "
+    + ''.join(
+        f"WHEN $1 = '42601' AND strpos($2, {_sql_text(text)}) > 0 THEN -{code} "
+        for text, code in _INSERT_ARITY
+    )
+    + "WHEN $1 = '22003' AND strpos($2, 'numeric field overflow') > 0 "
+    f'THEN -{ORA_VALUE_LARGER_THAN_PRECISION} '
+    f"WHEN $1 = '22003' THEN -{ORA_NUMERIC_OVERFLOW} "
+    "WHEN $1 = '22P02' AND $2 ~ '^invalid input syntax for type json' "
+    f'THEN -{_ORA_JSON_SYNTAX_ERROR} '
+    + ''.join(
+        f"WHEN $1 = '{state}' THEN -{code} " for state, code in _SQLSTATE_TO_ORA.items()
+    )
+    + f'ELSE -{ORA_INVALID_SQL_STATEMENT} END $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_sqlerrm_of(numeric) RETURNS text '
+    'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE WHEN $1 = 0 '
+    "THEN 'ORA-0000: normal, successful completion' "
+    f"WHEN $1 = 100 THEN 'ORA-01403: ' || sys.ora_error_message({ORA_NO_DATA_FOUND}) "
+    "WHEN $1 = 1 THEN 'User-Defined Exception' "
+    "WHEN $1 > 0 THEN ' -' || $1 || ': non-ORACLE exception ' "
+    "ELSE 'ORA-' || lpad((-$1)::text, 5, '0') || ': ' "
+    "|| coalesce(sys.ora_error_message((-$1)::integer), '') END $$;"
+    'CREATE OR REPLACE FUNCTION sys.ora_sqlerrm(text, text) RETURNS text '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT CASE '
+    "WHEN $1 = 'P0001' AND $2 ~ '^ORA-[0-9]{5}: ' THEN $2 "
+    "WHEN $1 IN ('00000', 'P0002') THEN sys.ora_sqlerrm_of(sys.ora_sqlcode($1, $2)) "
+    "ELSE 'ORA-' || lpad((-sys.ora_sqlcode($1, $2))::text, 5, '0') || ': ' "
+    '|| coalesce(sys.ora_error_message(-sys.ora_sqlcode($1, $2)), $2) END $$;'
+)
 
 
 class _InvalidNumber(BackendError):
@@ -14388,6 +14480,7 @@ _INSTALLATION_DIGEST: Final = hashlib.sha256(
             _DBMS_APPLICATION_INFO_DDL,
             _DBMS_SQL_RETURN_RESULT_DDL,
             _DBMS_OUTPUT_LINES_DDL,
+            _PLSQL_ERROR_DDL,
             _VECTOR_DDL,
             _DICTIONARY_STAMP,
             _DDL_LOG_DDL,
@@ -14869,7 +14962,8 @@ class PostgresBackend:
             # they cannot take the others down without it (#1299). Then UTL_RAW's
             # hex-text overloads (#1496), DBMS_UTILITY (#764), DBMS_LOCK.SLEEP / DBMS_SESSION.SLEEP
             # (#1511), DBMS_APPLICATION_INFO (#1840), DBMS_SQL.RETURN_RESULT
-            # (#1617) and DBMS_OUTPUT.GET_LINES's collection type (#1411).
+            # (#1617), DBMS_OUTPUT.GET_LINES's collection type (#1411) and PL/SQL's
+            # SQLCODE and SQLERRM (#2429).
             for part, ddl in (
                 ('helpers', _HELPER_FUNCTIONS_DDL),
                 ('orafce helpers', _ORAFCE_HELPERS_DDL),
@@ -14879,6 +14973,7 @@ class PostgresBackend:
                 ('dbms_application_info', _DBMS_APPLICATION_INFO_DDL),
                 ('dbms_sql', _DBMS_SQL_RETURN_RESULT_DDL),
                 ('dbms_output', _DBMS_OUTPUT_LINES_DDL),
+                ('plsql errors', _PLSQL_ERROR_DDL),
             ):
                 self._install_part(part, ddl)
         # Oracle data-dictionary emulation (#759): SYS_CONTEXT + catalog views.
