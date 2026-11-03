@@ -1183,6 +1183,15 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **PL/SQL packages, partly.** They have no package variables or initialization
   section. A `COMMIT` inside a routine waits until the call ends. A `ROLLBACK`
   inside one fails.
+- **A caught exception undoes more than on Oracle.** Oracle undoes only the
+  statement that failed. When a PL/SQL block's handler catches an exception,
+  everything the block did before it is undone too, including work in
+  routines it called and in nested blocks. Take a block that inserts a row,
+  calls a procedure that inserts another and raises, then catches the error
+  and inserts a third. Oracle keeps all three rows; the Mirror keeps only the
+  third. PostgreSQL catches an exception by rolling back a subtransaction
+  around the protected code, and only PostgreSQL itself could change that
+  ([#2428](https://github.com/seerdb/seerdb/issues/2428)).
 - **Object types** have no methods. A collection computed in a query fetches as
   a plain array.
 - **Privileges.** Object grants are enforced with per-user roles only. In
