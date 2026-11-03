@@ -252,6 +252,7 @@ from __future__ import annotations
 
 import array
 import base64
+import contextvars
 import datetime
 import decimal
 import functools
@@ -10579,8 +10580,8 @@ def _routine_body(body: str) -> str:
     # The blocks nested in it declare their own (#2182).
     block = block[: len('BEGIN')] + _nested_declarations(block[len('BEGIN') :])
     if not declarations:
-        return _with_error_functions(block)
-    return _with_error_functions(
+        return _with_plsql_errors(block)
+    return _with_plsql_errors(
         f'DECLARE {_translate_routine_types(declarations)} {block}'
     )
 
@@ -10591,6 +10592,12 @@ _ERROR_REFERENCE = re.compile(r'(?i)\b(?:(SQLCODE)\b|SQLERRM\b(\s*\()?)')
 # SQLSTATE and SQLERRM shadow these, its nested handlers' theirs in turn, so
 # each reads the error of the handler it is in, as on Oracle.
 _NO_ERROR_DECLARATIONS = "sqlstate text := '00000'; sqlerrm text := ''; "
+
+
+def _with_plsql_errors(block: str) -> str:
+    # A PL/pgSQL body with PL/SQL's own exceptions (#2444), then its SQLCODE
+    # and SQLERRM (#2429), as PL/pgSQL takes them.
+    return _with_error_functions(_with_user_exceptions(block))
 
 
 def _with_error_functions(block: str) -> str:
@@ -10613,6 +10620,273 @@ def _with_error_functions(block: str) -> str:
     if re.match(r'(?i)DECLARE\b', masked):
         masked = masked[len('DECLARE') :]
     return _unmask_quoted(f'DECLARE {_NO_ERROR_DECLARATIONS}{masked}', contents)
+
+
+# PL/SQL's own exceptions (#2444): `e EXCEPTION;`, RAISE e, WHEN e, and PRAGMA
+# EXCEPTION_INIT. PL/pgSQL has none of them. Each declared exception becomes a
+# SQLSTATE of its own, U and four letters or digits from a hash of its identity:
+# PostgreSQL has no class starting with U. A handler for one code catches only
+# that code, so WHEN e is a rename of the condition, whatever the handler list
+# around it. A local exception's identity is its unit and place, so a nested
+# block's own `e` is not the outer one, as on Oracle. A package's is the package
+# and the name, so `pk.e` names it from any unit, with no package state.
+_PACKAGE_UNIT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    'package_unit', default=None
+)
+# Oracle's predefined exceptions PL/pgSQL names otherwise: NO_DATA_FOUND and
+# TOO_MANY_ROWS it names the same. VALUE_ERROR is a conversion, a truncation or
+# an overflow in PL/SQL, which PostgreSQL files under three conditions.
+_PREDEFINED_EXCEPTIONS = {
+    'ZERO_DIVIDE': ('division_by_zero',),
+    'DUP_VAL_ON_INDEX': ('unique_violation',),
+    'INVALID_NUMBER': ('invalid_text_representation',),
+    'VALUE_ERROR': (
+        'invalid_text_representation',
+        'string_data_right_truncation',
+        'numeric_value_out_of_range',
+    ),
+    'CASE_NOT_FOUND': ('case_not_found',),
+    'CURSOR_ALREADY_OPEN': ('duplicate_cursor',),
+    'INVALID_CURSOR': ('invalid_cursor_state', 'invalid_cursor_name'),
+}
+# Oracle's other predefined exceptions, which have no PostgreSQL condition:
+# left as written, so a handler naming one fails to compile as before, rather
+# than being read as a package's own exception that nothing raises.
+_UNMAPPED_EXCEPTIONS = frozenset(
+    {
+        'OTHERS',
+        'NO_DATA_FOUND',
+        'TOO_MANY_ROWS',
+        'ACCESS_INTO_NULL',
+        'COLLECTION_IS_NULL',
+        'LOGIN_DENIED',
+        'NOT_LOGGED_ON',
+        'PROGRAM_ERROR',
+        'ROWTYPE_MISMATCH',
+        'SELF_IS_NULL',
+        'STORAGE_ERROR',
+        'SUBSCRIPT_BEYOND_COUNT',
+        'SUBSCRIPT_OUTSIDE_LIMIT',
+        'SYS_INVALID_ROWID',
+        'TIMEOUT_ON_RESOURCE',
+    }
+)
+# What a user-defined exception says, in a handler and to the client.
+_USER_EXCEPTION_MESSAGE = 'User-Defined Exception'
+_EXCEPTION_DECLARATION = re.compile(r'\s*;')
+_EXCEPTION_INIT = re.compile(
+    r'(?i)\s*PRAGMA\s+EXCEPTION_INIT\s*\(\s*([\w$#]+)\s*,\s*([+-]?\s*\d+)\s*\)\s*;'
+)
+# The words a RAISE takes that are not an exception's name.
+_RAISE_LEVELS = frozenset(
+    {'EXCEPTION', 'NOTICE', 'WARNING', 'INFO', 'LOG', 'DEBUG', 'USING', 'SQLSTATE'}
+)
+
+
+def _user_exception_state(identity: str) -> str:
+    # The SQLSTATE an exception's identity hashes to: U, then four of 0-9A-Z.
+    number = int.from_bytes(hashlib.sha1(identity.encode()).digest()[:8], 'big')
+    digits = ''
+    for _ in range(4):
+        (number, digit) = divmod(number, 36)
+        digits += '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'[digit]
+    return 'U' + digits
+
+
+def _package_exception_state(package: str, name: str) -> str:
+    # A package exception's code, the same from every unit that names it: by
+    # the package's own name, without its schema, and the exception's.
+    unit = package.replace('"', '').rpartition('.')[2].lower()
+    return _user_exception_state(f'package {unit}.{name.lower()}')
+
+
+@functools.cache
+def _states_by_ora_code() -> dict[int, str | None]:
+    # The SQLSTATE an Oracle error is raised as, for EXCEPTION_INIT; None for a
+    # code more than one SQLSTATE stands for.
+    states: dict[int, str | None] = {ORA_NO_DATA_FOUND: 'P0002'}
+    for state, code in _SQLSTATE_TO_ORA.items():
+        states[code] = None if code in states and states[code] != state else state
+    return states
+
+
+def _initialised_state(name: str, code: int) -> str:
+    # The SQLSTATE an EXCEPTION_INIT binds `name` to, or refused at compile.
+    ora = abs(code)
+    if code == 100:
+        ora = ORA_NO_DATA_FOUND
+    if 20000 <= ora <= 20999:
+        raise UnsupportedFeature(
+            f'PRAGMA EXCEPTION_INIT({name}, {code}) for an application error is '
+            'not supported yet (#2444)'
+        )
+    state = _states_by_ora_code().get(ora)
+    if state is None:
+        raise UnsupportedFeature(
+            f'PRAGMA EXCEPTION_INIT({name}, {code}): no PostgreSQL error is '
+            f'ORA-{ora:05d} alone'
+        )
+    return state
+
+
+class _ExceptionFrame:
+    # A block, or a CASE, in the walk over a body: a block's exceptions by name,
+    # each its SQLSTATE and whether EXCEPTION_INIT bound it to Oracle's error.
+    def __init__(self, kind: str, declaring: bool = False) -> None:
+        self.kind = kind
+        self.declaring = declaring
+        self.handlers = False
+        self.exceptions: dict[str, tuple[str, bool]] = {}
+
+
+def _with_user_exceptions(block: str) -> str:
+    """`block`, a PL/pgSQL body -- [DECLARE ...] BEGIN ... END -- with PL/SQL's
+    own exceptions as PL/pgSQL takes them (#2444): each declared exception and
+    its EXCEPTION_INIT gone from the declarations, and each RAISE and handler
+    naming one, or one of Oracle's predefined exceptions, naming its SQLSTATE
+    or PostgreSQL's condition. A body that declares or names none is unchanged."""
+    (masked, contents) = _mask_quoted(block)
+    words = list(_words(masked))
+    upper = {word for word, _s, _e in words}
+    package = _PACKAGE_UNIT.get()
+    if not upper & {'EXCEPTION', 'RAISE'} and not upper & _PREDEFINED_EXCEPTIONS.keys():
+        return block
+    edits: list[tuple[int, int, str]] = []
+    frames: list[_ExceptionFrame] = []
+    seed = hashlib.sha1(masked.encode()).hexdigest()
+
+    def resolve(name: str) -> tuple[str, bool] | tuple[str, ...] | None:
+        # A name's SQLSTATE and whether it is Oracle's error, or PostgreSQL's
+        # conditions for a predefined one; None for a name this does not know.
+        key = name.upper()
+        if '.' in key:
+            parts = name.split('.')
+            return (_package_exception_state(parts[-2], parts[-1]), False)
+        for frame in reversed(frames):
+            if key in frame.exceptions:
+                return frame.exceptions[key]
+        if key in _PREDEFINED_EXCEPTIONS:
+            return _PREDEFINED_EXCEPTIONS[key]
+        if package is not None and key not in _UNMAPPED_EXCEPTIONS:
+            return (_package_exception_state(package, name), False)
+        return None
+
+    def name_at(index: int) -> tuple[str, int, int]:
+        # The name starting at word `index`, dotted parts and all.
+        (_word, start, end) = words[index]
+        while True:
+            dot = re.match(r'\s*\.\s*', masked[end:])
+            nxt = index + 1
+            if dot is None or nxt >= len(words) or words[nxt][1] != end + dot.end():
+                return masked[start:end], start, end
+            (index, end) = (nxt, words[nxt][2])
+
+    i = 0
+    after_end = False
+    while i < len(words):
+        (word, start, end) = words[i]
+        following = words[i + 1] if i + 1 < len(words) else None
+        if after_end and word in ('IF', 'LOOP', 'CASE'):
+            if word == 'CASE' and frames and frames[-1].kind == 'case':
+                frames.pop()
+            after_end = False
+            i += 1
+            continue
+        after_end = False
+        top = frames[-1] if frames else None
+        if word == 'DECLARE':
+            frames.append(_ExceptionFrame('block', declaring=True))
+        elif word == 'BEGIN':
+            if top is not None and top.kind == 'block' and top.declaring:
+                top.declaring = False
+            else:
+                frames.append(_ExceptionFrame('block'))
+        elif word == 'CASE':
+            frames.append(_ExceptionFrame('case'))
+        elif word == 'END':
+            after_end = following is not None and not masked[end : following[1]].strip()
+            if after_end and following is not None and following[0] in ('IF', 'LOOP'):
+                pass  # its own keyword follows; the next turn passes it over
+            elif after_end and following is not None and following[0] == 'CASE':
+                pass  # END CASE: the CASE frame goes with its keyword
+            elif frames:
+                frames.pop()
+        elif (
+            word == 'EXCEPTION'
+            and top is not None
+            and top.kind == 'block'
+            and top.declaring
+            and i > 0
+            and (declared := _EXCEPTION_DECLARATION.match(masked, end)) is not None
+        ):
+            # `name EXCEPTION;` in a block's declarations.
+            (name, name_start, _name_end) = words[i - 1]
+            top.exceptions[name] = (
+                _user_exception_state(f'{seed}:{name_start}:{name}'),
+                False,
+            )
+            edits.append((name_start, declared.end(), ''))
+        elif word == 'PRAGMA' and top is not None and top.declaring:
+            init = _EXCEPTION_INIT.match(masked, start)
+            if init is not None:
+                name = init.group(1).upper()
+                code = int(init.group(2).replace(' ', ''))
+                top.exceptions[name] = (_initialised_state(name, code), True)
+                edits.append((start, init.end(), ''))
+        elif word == 'EXCEPTION' and top is not None and top.kind == 'block':
+            if i == 0 or words[i - 1][0] != 'RAISE':
+                top.handlers = True
+        elif (
+            word == 'RAISE'
+            and following is not None
+            and following[0] not in _RAISE_LEVELS
+        ):
+            (name, name_start, name_end) = name_at(i + 1)
+            if re.match(r'\s*;', masked[name_end:]):
+                found = resolve(name)
+                if found is not None:
+                    edits.append((start, name_end, _raise_of(found)))
+        elif (
+            word == 'WHEN' and top is not None and top.kind == 'block' and top.handlers
+        ):
+            j = i + 1
+            while j < len(words) and words[j][0] != 'THEN':
+                if words[j][0] != 'OR':
+                    (name, name_start, name_end) = name_at(j)
+                    found = resolve(name)
+                    if found is not None:
+                        edits.append((name_start, name_end, _condition_of(found)))
+                    while j + 1 < len(words) and words[j + 1][1] < name_end:
+                        j += 1
+                j += 1
+            i = j
+        i += 1
+    if not edits:
+        return block
+    for edit_start, edit_end, text in sorted(edits, reverse=True):
+        masked = masked[:edit_start] + text + masked[edit_end:]
+    return _unmask_quoted(masked, contents)
+
+
+def _condition_of(found: tuple) -> str:
+    # A handler's condition for a resolved exception.
+    if len(found) == 2 and isinstance(found[1], bool):
+        return f"SQLSTATE '{found[0]}'"
+    return ' OR '.join(found)
+
+
+def _raise_of(found: tuple) -> str:
+    # The RAISE of a resolved exception, its message the one the client gets.
+    if len(found) == 2 and isinstance(found[1], bool):
+        (state, oracle) = found
+        message = _USER_EXCEPTION_MESSAGE
+        if oracle:
+            code = _SQLSTATE_TO_ORA.get(state)
+            message = _ORA_MESSAGE.get(code, message) if code else message
+        return (
+            f"RAISE EXCEPTION USING ERRCODE = '{state}', MESSAGE = {_sql_text(message)}"
+        )
+    return f'RAISE {found[0]}'
 
 
 def _nested_declarations(body: str) -> str:
@@ -11616,12 +11890,17 @@ def _package_routine(
     params = f'({member.params})' if member.params is not None else ''
     returns = f' RETURN {member.returns}' if member.returns else ''
     name = f'{package}.{member.name}'
-    translated = _translate_routine_ddl(
-        f'CREATE OR REPLACE {member.kind} {name}{params}{returns} IS {body}',
-        user_routines,
-        mark=False,
-        routine_kind=routine_kind,
-    )
+    # Its own package's exceptions are named without the package (#2444).
+    token = _PACKAGE_UNIT.set(package)
+    try:
+        translated = _translate_routine_ddl(
+            f'CREATE OR REPLACE {member.kind} {name}{params}{returns} IS {body}',
+            user_routines,
+            mark=False,
+            routine_kind=routine_kind,
+        )
+    finally:
+        _PACKAGE_UNIT.reset(token)
     return translated.removeprefix(f'DROP {member.kind} IF EXISTS {name}; ')
 
 
@@ -12190,7 +12469,7 @@ def _translate_plsql_block(
     body = _nested_declarations(body)
     if routine_kind is not None:
         body = _perform_bare_calls(body, routine_kind)
-    return f'DO $$ {_with_error_functions(f"{declare}BEGIN {body.strip()} END")} $$'
+    return f'DO $$ {_with_plsql_errors(f"{declare}BEGIN {body.strip()} END")} $$'
 
 
 # A local function in a block's declarations: FUNCTION name [(params)] RETURN
@@ -12315,7 +12594,7 @@ def _hoist_local_functions(sql: str) -> str | None:
         returns = _translate_routine_types(return_type.strip())
         local = _translate_routine_types(local.strip())
         declare = f'DECLARE {qualify(local)} ' if local else ''
-        created = _with_error_functions(f'{declare}BEGIN {qualify(body.strip())} END')
+        created = _with_plsql_errors(f'{declare}BEGIN {qualify(body.strip())} END')
         statements.append(
             f'{_HOISTED_FUNCTION}{name}; '
             f'CREATE FUNCTION pg_temp.{name}{params} RETURNS {returns} '
@@ -12324,7 +12603,7 @@ def _hoist_local_functions(sql: str) -> str | None:
     declare = _translate_routine_types(''.join(declarations).strip())
     declare = f'DECLARE {qualify(declare)} ' if declare else ''
     body = qualify(rest.group(2).strip())
-    block = _with_error_functions(f'{declare}BEGIN {body} END')
+    block = _with_plsql_errors(f'{declare}BEGIN {body} END')
     return ' '.join(statements) + f' DO $$ {block} $$'
 
 
@@ -12625,6 +12904,12 @@ _SQLSTATE_TO_ORA = {
 # exist" (#529). A code with no entry keeps PostgreSQL's message (still prefixed
 # with its ORA-NNNNN by the Mirror), which is right where the English text varies
 # by Oracle version anyway (e.g. ORA-01722).
+# A PL/SQL block's own exception that nothing caught (#2444), and the
+# SQLSTATE one is raised with: U and four of 0-9A-Z.
+_ORA_UNHANDLED_USER_EXCEPTION = 6510
+_USER_EXCEPTION_STATE = re.compile(r'U[0-9A-Z]{4}\Z')
+
+
 _ORA_MESSAGE = {
     ORA_RESOURCE_BUSY: 'resource busy and acquire with NOWAIT specified or timeout expired',
     ORA_TOO_MANY_VALUES: 'too many values',
@@ -12639,6 +12924,7 @@ _ORA_MESSAGE = {
     ORA_TYPE_HAS_DEPENDENTS: 'cannot drop or replace a type with type or table dependents',
     # The same in every release (#2110).
     ORA_NAME_ALREADY_USED: 'name is already used by an existing object',
+    _ORA_UNHANDLED_USER_EXCEPTION: 'PL/SQL: unhandled user-defined exception',
 }
 
 
@@ -12706,6 +12992,9 @@ def _ora_code_for(exc) -> int:
         if 'numeric field overflow' in primary:
             return ORA_VALUE_LARGER_THAN_PRECISION
         return ORA_NUMERIC_OVERFLOW
+    if _USER_EXCEPTION_STATE.match(sqlstate):
+        # A PL/SQL block's own exception, raised and not caught (#2444).
+        return _ORA_UNHANDLED_USER_EXCEPTION
     return _SQLSTATE_TO_ORA.get(sqlstate, ORA_INVALID_SQL_STATEMENT)
 
 
@@ -12904,6 +13193,8 @@ _PLSQL_ERROR_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_sqlcode(text, text) RETURNS integer '
     "LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN $1 = '00000' THEN 0 "
     "WHEN $1 = 'P0002' THEN 100 "
+    # A user-defined exception, its SQLSTATE U and four (#2444).
+    "WHEN $1 ~ '^U[0-9A-Z]{4}$' THEN 1 "
     "WHEN $1 = 'P0001' AND $2 ~ '^ORA-[0-9]{5}: ' THEN -substr($2, 5, 5)::integer "
     "WHEN $1 = '42501' AND $2 LIKE 'permission denied for schema%' "
     f'THEN -{ORA_TABLE_OR_VIEW_DOES_NOT_EXIST} '
@@ -12932,7 +13223,8 @@ _PLSQL_ERROR_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_sqlerrm(text, text) RETURNS text '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT CASE '
     "WHEN $1 = 'P0001' AND $2 ~ '^ORA-[0-9]{5}: ' THEN $2 "
-    "WHEN $1 IN ('00000', 'P0002') THEN sys.ora_sqlerrm_of(sys.ora_sqlcode($1, $2)) "
+    "WHEN $1 IN ('00000', 'P0002') OR $1 ~ '^U[0-9A-Z]{4}$' "
+    'THEN sys.ora_sqlerrm_of(sys.ora_sqlcode($1, $2)) '
     "ELSE 'ORA-' || lpad((-sys.ora_sqlcode($1, $2))::text, 5, '0') || ': ' "
     '|| coalesce(sys.ora_error_message(-sys.ora_sqlcode($1, $2)), $2) END $$;'
 )
