@@ -5453,8 +5453,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_package_unusable (#1605), sys.ora_is_json's two (#1614) and
     # sys.ora_commit_request (#1630), sys.ora_rr_shift and the two
     # sys.ora_rr_year (#1638), sys.ora_plsql_call and sys.ora_ndf_to_null
-    # (#1612), ora_boolean_number (#1705), the SQL/JSON helpers: the two
-    # sys.ora_json, six sys.ora_json_scalar and sys.ora_json_serialize (#1707),
+    # (#1612), ora_boolean_number (#1705), the SQL/JSON helpers: the three
+    # sys.ora_json (#1707, its character overload #2441), six
+    # sys.ora_json_scalar and sys.ora_json_serialize (#1707),
     # the four BOOLEAN / number comparisons behind = and <> (#1743), and
     # PL/SQL's sys.ora_plsql_pad with its rpad / lpad (#2061), and the three
     # two-argument concat (#2093), sys.ora_late's two (#2138),
@@ -5465,7 +5466,7 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # number (#2181), and sys.ora_datetime_text, sys.ora_zone_text,
     # sys.ora_tstz_text, sys.ora_ltz_text and sys.ora_computed_text (#2162),
     # and sys.ora_identity_on_null (#2413).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 115
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 116
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -11954,6 +11955,56 @@ def test_json_constructor_values_keep_their_type() -> None:
             ]
     finally:
         backend.rollback()
+        backend.close()
+
+
+def test_any_text_value_is_stored_into_a_json_column() -> None:
+    # 23ai converts text into a JSON column whatever its type, as it does an
+    # untyped literal. The Mirror took only the literal and refused the rest,
+    # "column j is of type jsonb but expression is of type character varying"
+    # (#2441). Invalid text is ORA-40441, as on 23ai; a duplicate key keeps its
+    # last value on this path as on every other (#2421).
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.execute('DROP TABLE IF EXISTS t_2441')
+        backend.execute('DROP TABLE IF EXISTS t_2441s')
+        backend.execute('CREATE TABLE t_2441 (id NUMBER, j JSON)')
+        backend.execute('CREATE TABLE t_2441s (v VARCHAR2(100), c CLOB)')
+        backend.execute("""INSERT INTO t_2441s VALUES ('{"s":1}', '{"c":1}')""")
+        for statement in (
+            """INSERT INTO t_2441 SELECT 1, '{"a":1}' FROM dual""",
+            """INSERT INTO t_2441 VALUES (2, '{"a":' || '2}')""",
+            'INSERT INTO t_2441 SELECT 3, v FROM t_2441s',
+            'INSERT INTO t_2441 SELECT 4, c FROM t_2441s',
+            """INSERT INTO t_2441 VALUES (5, '{"n":' || TO_CHAR(5) || '}')""",
+            """INSERT INTO t_2441 SELECT 6, '{"d":1,"d":2}' FROM dual""",
+        ):
+            backend.execute(statement)
+        backend.execute('UPDATE t_2441 SET j = (SELECT v FROM t_2441s) WHERE id = 1')
+        rows = backend.execute('SELECT id, j FROM t_2441 ORDER BY id').rows
+        assert [tuple(row) for row in rows] == [
+            (1, {'s': 1}),
+            (2, {'a': 2}),
+            (3, {'s': 1}),
+            (4, {'c': 1}),
+            (5, {'n': 5}),
+            (6, {'d': 2}),
+        ]
+        for statement in (
+            "INSERT INTO t_2441 VALUES (7, 'not json')",
+            "INSERT INTO t_2441 SELECT 8, 'not json' FROM dual",
+        ):
+            with pytest.raises(BackendError) as refused:
+                backend.execute(statement)
+            assert refused.value.ora_code == 40441
+            assert 'JSON syntax error' in str(refused.value)
+            backend.rollback()
+    finally:
+        backend.rollback()
+        backend.execute('DROP TABLE IF EXISTS t_2441')
+        backend.execute('DROP TABLE IF EXISTS t_2441s')
         backend.close()
 
 
