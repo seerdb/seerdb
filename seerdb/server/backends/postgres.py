@@ -11931,9 +11931,12 @@ def _bind_block(
 
     A DO block takes no parameters and returns nothing, so each bind becomes a
     local of the block -- `locals_` maps its name to (slot, PostgreSQL type,
-    initial literal) -- and before the block ends it leaves each local's value
-    in a setting the backend reads back: '' for NULL, else 'v' and the text. A
-    REF CURSOR's value is its portal name.
+    initial literal) -- and once the block's own body is done it leaves each
+    local's value in a setting the backend reads back: '' for NULL, else 'v' and
+    the text. A REF CURSOR's value is its portal name. The body runs as a block
+    of its own, so the values are kept on every path that ends normally: they
+    were kept at the end of the body, which with an EXCEPTION section is its
+    last handler, and only that handler kept them (#2446).
     """
     names = {name: f'mirror_bind_{slot}' for name, (slot, _t, _i) in locals_.items()}
     match = _ANON_BLOCK.match(_replace_binds(sql, names))
@@ -11951,7 +11954,7 @@ def _bind_block(
         for name, (slot, _t, _i) in locals_.items()
     )
     return _translate_plsql_block(
-        f'{declare} BEGIN {body.rstrip()}{keep} END;', routine_kind
+        f'{declare} BEGIN BEGIN {body.rstrip()} END;{keep} END;', routine_kind
     )
 
 

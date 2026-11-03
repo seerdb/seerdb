@@ -6141,6 +6141,48 @@ def test_a_block_reads_its_binds_back_in_its_own_round_trip(
         backend.close()
 
 
+def test_a_blocks_binds_come_back_whichever_way_it_ends() -> None:
+    # A block with an EXCEPTION section kept its binds only when its last
+    # handler ran: they were saved at the end of the body, which is that
+    # handler. On the success path, or through another handler, every bind
+    # came back NULL (#2446).
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for block, expected in (
+            ("begin :1 := 'x'; exception when others then null; end;", 'x'),
+            (
+                "begin :1 := 'x'; exception when no_data_found then null; "
+                'when others then null; end;',
+                'x',
+            ),
+            (
+                'begin raise no_data_found; exception when no_data_found then '
+                ":1 := 'ndf'; when others then :1 := 'others'; end;",
+                'ndf',
+            ),
+            (
+                'begin raise too_many_rows; exception when no_data_found then '
+                ":1 := 'ndf'; when others then :1 := 'others'; end;",
+                'others',
+            ),
+            (
+                "declare v varchar2(9) := 'dv'; begin :1 := v; "
+                'exception when others then null; end;',
+                'dv',
+            ),
+        ):
+            (value,) = backend.execute(
+                block, [BindVar(None, TNS_TYPE_VARCHAR, 10)]
+            ).out_binds
+            assert value == expected, block
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_a_block_returning_several_rows_into_a_bind_is_ora_01422() -> None:
     # PL/SQL's single-row RETURNING INTO found two rows (#1209).
     from seerdb.common.tns_consts import TNS_TYPE_NUMBER
