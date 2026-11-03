@@ -8245,6 +8245,71 @@ The same behaviour was found independently in the sibling ODBC driver
 (seerdb/SeerODBC#55). The Mirror's side, re-deriving when it breaks for an error
 with encryption required, is #1346.
 
+
+### 33.7 The KERBEROS5 authentication exchange (#2378)
+
+A Kerberos login offers the `KERBEROS5` method in the authentication service of
+the negotiation, and the server authenticates the user from the ticket inside
+ANO. The TTC login that follows has no O5LOGON at all. Measured with sqlplus
+23.26 against Oracle 26ai Free (23.26), whose `sqlnet.ora` lists
+`KERBEROS5PRE, KERBEROS5`, and reproduced by seerdb's client.
+
+**The offer.** The client's authentication service carries two more
+sub-packets after the version, the marker `0xe0e1` and the status `0xfcff`:
+`ub1 1` and `string "KERBEROS5"`.
+
+**The selection.** The server's authentication service answers:
+
+```
+version, status 0xfaff (a method selected), ub1 1, string "KERBEROS5",
+version, ub4 9, ub4 2
+```
+
+**The method's rounds.** Then come containers carrying the authentication
+service alone, one service, error 0:
+
+| # | from | sub-packets |
+|---|---|---|
+| 1 | client | version, `ub4 9`, `ub4 2` (the selection's two words, echoed), `ub1 0` |
+| 2 | server | `string` service name (`oracle`), `string` host (`sulaco.local`) |
+| 3 | client | `ub2` address type (Kerberos's: 2 IPv4, 24 IPv6), `ub4` address length, `bytes` the client's address, `bytes` the AP-REQ |
+| 4 | server | `ub1 0`, `bytes` the AP-REP |
+| 5 | client | `bytes` the credentials to forward: a KRB-CRED with the user's TGT, or **empty** |
+
+- **The principal comes from the server.** The client builds the service
+  principal from round 2, `<service>/<host>`, not from the host it connected
+  to. Through a proxy on `localhost`, sqlplus still asked for
+  `oracle/sulaco.local`.
+- **Raw Kerberos messages.** The AP-REQ and AP-REP are the messages
+  themselves (ASN.1 APPLICATION 14 and 15), not GSS-API tokens. A GSS-API
+  initiator's token unwraps to an AP-REQ the server accepts (its authenticator
+  carries GSS-API's checksum, type 0x8003). The server's AP-REP wraps back
+  into the GSS token the initiator completes the context with: `0x60`, a DER
+  length, the Kerberos mechanism's OID `1.2.840.113554.1.2.2`, then TOK_ID
+  `01 00` for an AP-REQ or `02 00` for an AP-REP.
+- **Forwarding is optional.** sqlplus forwards the user's TGT in round 5 when
+  the ticket is forwardable, and sends an empty `bytes` sub-packet otherwise.
+  Both log in. seerdb always sends the empty one, so the user's ticket is never
+  delegated to the database.
+- **The server answers round 5 with nothing,** and the login goes on.
+
+**The TTC login after it.** There is no OSESSKEY and no challenge: one
+TTI_AUTH with no user (user pointer 0, length 0), logon mode `NoNewPass` (0x1),
+and only the session-context pairs, as token authentication's (§20.6) has. The
+server's reply is the session (`AUTH_VERSION_STRING` and the rest), with no
+server proof.
+- **Before field version 18,** that AUTH follows the usual PRO and DTY
+  rounds.
+- **From 18 on,** it rides in the fast-auth bundle where the OSESSKEY goes
+  (§20), and the bundled reply's RPA is the session rather than a challenge.
+  Sent as a separate round at field version 18 or above, the classic sequence
+  fails with ORA-03120.
+
+The session is then the externally identified user the ticket's principal maps
+to (`CREATE USER ... IDENTIFIED EXTERNALLY AS 'pyo@REALM'`): `USERENV`
+`AUTHENTICATION_METHOD` is `KERBEROS`, and `AUTHENTICATED_IDENTITY` the
+principal.
+
 ## 34. End-user security context (#460, post-23ai / milestone #29)
 
 An **end-user security context** attaches a distinct end-user identity plus

@@ -999,6 +999,7 @@ class OracleConnect(_ConnectionLogic):
         negotiation_cache: bool = False,
         oall8: bool = False,
         access_token: object = None,
+        externalauth: bool = False,
         shardingkey: object = None,
         supershardingkey: object = None,
     ):
@@ -1131,6 +1132,11 @@ class OracleConnect(_ConnectionLogic):
         # Token-based auth (#125): a JWT str (OAuth2) or (token, private_key)
         # (OCI IAM), resolved at connect time into the token + optional PEM key.
         self.access_token = access_token
+        # Kerberos (#2378): the server knows the user from the ticket the
+        # ANO exchange carries, so a login with it names none.
+        self.externalauth = bool(externalauth)
+        if self.externalauth and password:
+            raise InterfaceError('externalauth=True takes no password')
         self._token_auth = False  # set once the token AUTH is sent
 
         # Wallet-based mutual TLS (#127). When a wallet is given, resolve the
@@ -1265,6 +1271,33 @@ class OracleConnect(_ConnectionLogic):
 
     def state_to_dict(self, Type: DictionaryType) -> dict:
         return self._make_dict(Type)
+
+    def _send_external_auth(self) -> None:
+        # The AUTH of a Kerberos login (#2378): the session context alone.
+        from seerdb.common.tns import encode_dictionary_external_auth
+
+        Dict = self._make_dict(DictionaryType.description)
+        self.send(TNS_DATA, encode_dictionary_external_auth(Dict))
+
+    def _kerberos_rounds(self, Response: dict) -> None:
+        # The KERBEROS5 rounds after the negotiation reply (#2378): see
+        # seerdb.client.kerberos. The server must have selected it.
+        from seerdb.client.kerberos import KerberosExchange, kerberos_selected
+        from seerdb.common.ano import decode_container
+
+        if not kerberos_selected(Response):
+            raise OperationalError(
+                'externalauth=True: the server did not select Kerberos (KERBEROS5)'
+            )
+        Exchange = KerberosExchange(self._sock.getsockname())
+        self.send(TNS_DATA, Exchange.first(Response))
+        while not Exchange.done:
+            Received = self.recv(b'', b'')
+            if Received is False:
+                raise OperationalError('Kerberos login: connection closed by server')
+            Round = Exchange.next(decode_container(Received[1]))
+            if Round is not None:
+                self.send(TNS_DATA, Round)
 
     def _send_token_auth(self) -> None:
         # Token auth (#125): build and send the single token AUTH message. For
@@ -1620,6 +1653,10 @@ class OracleConnect(_ConnectionLogic):
                     Acfl1 = Packet[15] if len(Packet) > 15 else 0
                     if (Acfl0 & 0x01) and not (Acfl0 & 0x04) and not (Acfl1 & 0x08):
                         self._negotiate_ano()
+                    elif self.externalauth:
+                        raise OperationalError(
+                            'externalauth=True: the server offers no native authentication (ANO)'
+                        )
                     # Negotiation cache (#438): a prior login on this target
                     # recorded a fast-auth field version — skip the bare PRO probe
                     # (it exists only to learn that) and go straight to the bundle.
@@ -1684,6 +1721,12 @@ class OracleConnect(_ConnectionLogic):
                                             self._o7_session_pairs(),
                                         ),
                                     )
+                            elif self.externalauth:
+                                # Kerberos (#2378): the ANO exchange
+                                # authenticated the user; one AUTH with
+                                # no user and no proof, as token auth's.
+                                self._token_auth = True
+                                self._send_external_auth()
                             elif self.access_token is not None:
                                 # Token auth (#125): skip OSESSKEY entirely and
                                 # send the single token AUTH message; the reply is
@@ -1867,14 +1910,24 @@ class OracleConnect(_ConnectionLogic):
         # legacy handshake does.
         Pro = encode_dictionary(self._make_dict(DictionaryType.pro))
         Dty = encode_dictionary(self._make_dict(DictionaryType.dty))
-        Sess = encode_dictionary(self._make_dict(DictionaryType.sess))
+        if self.externalauth:
+            # Kerberos (#2378): the bundle carries the userless AUTH where the
+            # OSESSKEY goes, and its reply is the session, as token auth's is.
+            from seerdb.common.tns import encode_dictionary_external_auth
+
+            Sess = encode_dictionary_external_auth(
+                self._make_dict(DictionaryType.description)
+            )
+            self._token_auth = True
+        else:
+            Sess = encode_dictionary(self._make_dict(DictionaryType.sess))
         self.send(TNS_DATA, encode_fast_auth(Pro, Dty, Sess))
         Received = self._next_data_packet()
         if Received is False:
             logger.debug('fast_auth: connection closed by peer')
             return 1
         (Type, Packet) = Received
-        Off = find_fast_auth_rpa(Packet) if Type == TNS_DATA else -1
+        Off = find_fast_auth_rpa(Packet, self.externalauth) if Type == TNS_DATA else -1
         if Off < 0:
             logger.error(
                 'fast_auth: no auth challenge in bundled reply (type=%s, head=%r)',
@@ -3474,7 +3527,7 @@ class OracleConnect(_ConnectionLogic):
         Request = ano.encode_ano(
             [
                 ano.supervisor_service(),
-                ano.auth_service(),
+                ano.auth_service(kerberos=self.externalauth),
                 ano.encryption_service(
                     [
                         'RC4_40',
@@ -3498,6 +3551,8 @@ class OracleConnect(_ConnectionLogic):
             raise OperationalError('ANO negotiation: connection closed by server')
         (_Type, Payload) = Received
         Response = ano.decode_container(Payload)
+        if self.externalauth:
+            self._kerberos_rounds(Response)
         ByType = {S['type']: S for S in Response['services']}
         EncId = ByType[ano.SERVICE_ENCRYPTION]['subpackets'][1][1]
         IntId = ByType[ano.SERVICE_DATA_INTEGRITY]['subpackets'][1][1]

@@ -221,6 +221,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         negotiation_cache: bool = False,
         oall8: bool = False,
         access_token: object = None,
+        externalauth: bool = False,
         shardingkey: object = None,
         supershardingkey: object = None,
     ):
@@ -351,6 +352,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._session_keywords: dict[int, str | None] = {}
         # Token auth (#125), resolved at connect time.
         self.access_token = access_token
+        # Kerberos (#2378): the server knows the user from the ticket the
+        # ANO exchange carries, so a login with it names none.
+        self.externalauth = bool(externalauth)
+        if self.externalauth and password:
+            raise InterfaceError('externalauth=True takes no password')
         self._token_auth = False
 
         # Wallet-based mutual TLS (#127); see OracleConnect for the full note.
@@ -441,6 +447,32 @@ class AsyncOracleConnect(_ConnectionLogic):
         seq = self.seq
         self.seq = self.seq % MAX_SEQ_NUM + 1
         return seq
+
+    async def _send_external_auth(self) -> None:
+        # Async port of OracleConnect._send_external_auth (#2378).
+        from seerdb.common.tns import encode_dictionary_external_auth
+
+        Dict = self._make_dict(DictionaryType.description)
+        await self.send(TNS_DATA, encode_dictionary_external_auth(Dict))
+
+    async def _kerberos_rounds(self, Response: dict) -> None:
+        # Async port of OracleConnect._kerberos_rounds (#2378).
+        from seerdb.client.kerberos import KerberosExchange, kerberos_selected
+        from seerdb.common.ano import decode_container
+
+        if not kerberos_selected(Response):
+            raise OperationalError(
+                'externalauth=True: the server did not select Kerberos (KERBEROS5)'
+            )
+        Exchange = KerberosExchange(self._wr.get_extra_info('sockname'))
+        await self.send(TNS_DATA, Exchange.first(Response))
+        while not Exchange.done:
+            Received = await self.recv(b'', b'')
+            if Received is False:
+                raise OperationalError('Kerberos login: connection closed by server')
+            Round = Exchange.next(decode_container(Received[1]))
+            if Round is not None:
+                await self.send(TNS_DATA, Round)
 
     async def _send_token_auth(self) -> None:
         # Async port of OracleConnect._send_token_auth (#125).
@@ -851,6 +883,10 @@ class AsyncOracleConnect(_ConnectionLogic):
                     Acfl1 = Packet[15] if len(Packet) > 15 else 0
                     if (Acfl0 & 0x01) and not (Acfl0 & 0x04) and not (Acfl1 & 0x08):
                         await self._negotiate_ano()
+                    elif self.externalauth:
+                        raise OperationalError(
+                            'externalauth=True: the server offers no native authentication (ANO)'
+                        )
                     # Negotiation cache (#438): skip the bare PRO probe on a
                     # reconnect to a target with a cached fast-auth field version.
                     if self.negotiation_cache and not self._skip_nego_cache:
@@ -907,6 +943,12 @@ class AsyncOracleConnect(_ConnectionLogic):
                                         self._o7_session_pairs(),
                                     ),
                                 )
+                            elif self.externalauth:
+                                # Kerberos (#2378): the ANO exchange
+                                # authenticated the user; one AUTH with
+                                # no user and no proof, as token auth's.
+                                self._token_auth = True
+                                await self._send_external_auth()
                             elif self.access_token is not None:
                                 # Token auth (#125): skip OSESSKEY, send the token
                                 # AUTH; the reply is the auth result (no proof).
@@ -1054,7 +1096,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         Request = ano.encode_ano(
             [
                 ano.supervisor_service(),
-                ano.auth_service(),
+                ano.auth_service(kerberos=self.externalauth),
                 ano.encryption_service(
                     [
                         'RC4_40',
@@ -1078,6 +1120,8 @@ class AsyncOracleConnect(_ConnectionLogic):
             raise OperationalError('ANO negotiation: connection closed by server')
         (_Type, Payload) = Received
         Response = ano.decode_container(Payload)
+        if self.externalauth:
+            await self._kerberos_rounds(Response)
         ByType = {S['type']: S for S in Response['services']}
         EncId = ByType[ano.SERVICE_ENCRYPTION]['subpackets'][1][1]
         IntId = ByType[ano.SERVICE_DATA_INTEGRITY]['subpackets'][1][1]
@@ -1104,14 +1148,23 @@ class AsyncOracleConnect(_ConnectionLogic):
         # auth-challenge RPA out of the bundled reply to the phase-two path.
         Pro = encode_dictionary(self._make_dict(DictionaryType.pro))
         Dty = encode_dictionary(self._make_dict(DictionaryType.dty))
-        Sess = encode_dictionary(self._make_dict(DictionaryType.sess))
+        if self.externalauth:
+            # Kerberos (#2378): the userless AUTH where the OSESSKEY goes.
+            from seerdb.common.tns import encode_dictionary_external_auth
+
+            Sess = encode_dictionary_external_auth(
+                self._make_dict(DictionaryType.description)
+            )
+            self._token_auth = True
+        else:
+            Sess = encode_dictionary(self._make_dict(DictionaryType.sess))
         await self.send(TNS_DATA, encode_fast_auth(Pro, Dty, Sess))
         Received = await self._next_data_packet()
         if Received is False:
             logger.debug('fast_auth (async): connection closed by peer')
             return 1
         (Type, Packet) = Received
-        Off = find_fast_auth_rpa(Packet) if Type == TNS_DATA else -1
+        Off = find_fast_auth_rpa(Packet, self.externalauth) if Type == TNS_DATA else -1
         if Off < 0:
             from seerdb.common.exceptions import OperationalError
 

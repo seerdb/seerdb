@@ -60,6 +60,11 @@ What works:
   signs the request header with RSA-SHA256), or a zero-arg callable returning
   either — so a short-lived token can be refreshed per connection. Sync and
   async. Needs the `token` extra — `pip install seerdb[token]`
+- Kerberos login: `connect(externalauth=True)` with no user or password logs in
+  as the principal of the ticket in your Kerberos credential cache (`kinit`),
+  through the KERBEROS5 native-authentication exchange. The ticket is never
+  forwarded to the database. Sync and async. Needs the `kerberos` extra —
+  `pip install seerdb[kerberos]`
 - Session setup and teardown
 - SQL statement execution, full result-set decoding (DCB / RXH / RXD / BVC)
 - DB-API 2.0 surface: `seerdb.connect()`, `Connection.cursor()`,
@@ -397,15 +402,18 @@ Core (installed automatically):
 - [pyarrow](https://pypi.org/project/pyarrow/) — backs the Arrow / DataFrame
   bulk fetch (`cursor.fetch_df_all` / `fetch_df_batches`)
 
-Optional — [cryptography](https://pypi.org/project/cryptography/) is the only
-extra dependency, needed by two features that pycryptodome can't cover. It is
-imported lazily, so the core install stays lean and `import seerdb` works without
-it; install the matching extra only if you use the feature:
+Optional — [cryptography](https://pypi.org/project/cryptography/), needed by
+two features that pycryptodome can't cover, and
+[gssapi](https://pypi.org/project/gssapi/) for Kerberos. Each is imported
+lazily, so the core install stays lean and `import seerdb` works without them;
+install the matching extra only if you use the feature:
 
 - `pip install "seerdb[token]"` — **token-based auth** (`access_token=`): OAuth2 /
   OCI IAM sign the auth header with RSA-SHA256.
 - `pip install "seerdb[wallet]"` — **wallet mutual TLS**: decoding an Oracle / ADB
   wallet (X.509 / PKCS#12).
+- `pip install "seerdb[kerberos]"` — **Kerberos login** (`externalauth=True`):
+  the ticket from your Kerberos credential cache, through GSS-API.
 
 ## Installation
 
