@@ -214,12 +214,16 @@ In a few places the Mirror over PostgreSQL accepts slightly wider input than
 Oracle does. This is a choice, not a gap: Oracle's stricter behaviour would
 cost far more to reproduce than anyone gains from it.
 
-- **JSON duplicate keys.** A document such as `{"a": "a comment", "a": 1}` is
-  accepted, and only the last value is kept: `{"a":1}`. That's how most JSON
-  parsers treat it, Oracle's own `IS JSON` included unless it's given
-  `WITH UNIQUE KEYS`. Duplicate keys are a known way to write a comment in
-  JSON. 23ai's JSON type refuses such a document with ORA-40473. The Mirror
-  keeps the last value on every path: a literal, a bind and `JSON('...')`.
+- **JSON duplicate keys.** A document with a repeated key, such as
+  `{"a": 1, "a": 2}`, is accepted and the last value is kept: `{"a":2}`. That's
+  what Python's `json`, JavaScript's `JSON.parse` and PostgreSQL's `jsonb` do,
+  and Oracle's own `IS JSON` accepts such a document unless given
+  `WITH UNIQUE KEYS`. 23ai's JSON type refuses it with ORA-40473. JSON leaves
+  duplicates undefined, and some parsers keep the first value or refuse. An
+  application that checks a document before storing it should check it with a
+  parser that sees what the Mirror stores: in Python, `object_pairs_hook` sees
+  every pair. The Mirror keeps the last value on every path: a literal, a bind,
+  any other text value stored into a JSON column, and `JSON('...')`.
   `IS JSON WITH UNIQUE KEYS` still answers as Oracle's does
   ([#2421](https://github.com/seerdb/seerdb/issues/2421)).
 - **JSON key order.** JSON objects are unordered, and two documents that differ
@@ -583,6 +587,10 @@ Some features are better with a superuser and degrade without one:
   superuser. Without them, comparison still works by instant.
 - **Storing a `BOOLEAN` into a `NUMBER` column.** That needs a cast between
   built-in types, which needs a superuser. Without it, the assignment is refused.
+- **Storing text into a JSON column,** other than a plain literal or bind: a
+  `VARCHAR2` or `CLOB` column, a concatenation, `TO_CHAR(...)`, a literal in an
+  `INSERT ... SELECT`. Like the `BOOLEAN` case, that needs casts between
+  built-in types, so a superuser. Without them, such an assignment is refused.
 
 Prefer the restricted role and accept these.
 

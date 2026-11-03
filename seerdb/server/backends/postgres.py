@@ -1268,13 +1268,36 @@ _HELPER_FUNCTIONS_DDL = (
         # Oracle's SQL/JSON over jsonb (#1707), the values JSON has no type for
         # in their extended form (#1706). JSON(text [EXTENDED]) parses text,
         # extended names and all.
+        # The text goes through jsonb's input function itself: `$1::jsonb`
+        # would take the cast below, which calls this function.
         'CREATE OR REPLACE FUNCTION sys.ora_json(text) RETURNS jsonb '
-        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb $$;'
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_in($1::cstring) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json(character) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_json($1::text) $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json(jsonb) RETURNS jsonb '
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+        # A text value stored into a JSON column (#2441): 23ai converts a
+        # VARCHAR2, a CLOB or any text expression, where PostgreSQL converts only
+        # an untyped literal, through jsonb's input, and refused the rest. These
+        # are assignment casts through JSON(text), so a duplicate key keeps its
+        # last value here as everywhere else (#2421). A CLOB is a domain over
+        # text, which the text cast covers; a literal in a select list is a
+        # character. Creating a cast between built-in types needs a superuser;
+        # without one such a value is refused, as before.
+        + ''.join(
+            'DO $$ BEGIN '
+            f'CREATE CAST ({source} AS jsonb) WITH FUNCTION sys.ora_json({argument}) '
+            'AS ASSIGNMENT; '
+            'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+            for source, argument in (
+                ('text', 'text'),
+                ('character varying', 'text'),
+                ('character', 'character'),
+            )
+        )
         # JSON_SCALAR(x): x as a JSON scalar, in its extended form where JSON
         # has no type for it.
-        'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(anyelement) RETURNS jsonb '
+        + 'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(anyelement) RETURNS jsonb '
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT to_jsonb($1) $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(timestamp) RETURNS jsonb '
         "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('$oracleTimestamp', "
@@ -12816,6 +12839,11 @@ _INVALID_NUMBER = re.compile(
 )
 # What a number's text may hold, the rest being what 23ai's ORA-01722 names.
 _NUMBER_CHARACTERS = frozenset('0123456789.+-eE')
+# Text PostgreSQL could not read as a JSON document, stored into a JSON column
+# or given to JSON(): 23ai's ORA-40441, where the SQLSTATE alone reads as an
+# invalid number (#2441).
+_INVALID_JSON = re.compile(r'invalid input syntax for type json\b')
+_ORA_JSON_SYNTAX_ERROR = 40441
 
 
 class _InvalidNumber(BackendError):
@@ -12934,6 +12962,10 @@ def _backend_error(
             quoted = original.find("'" + value.replace("'", "''") + "'")
             offset = quoted if quoted >= 0 else None
         return _InvalidNumber(value, offset)
+    if code == ORA_INVALID_NUMBER and _INVALID_JSON.match(_primary_message(exc)):
+        return BackendError(
+            'JSON syntax error', ora_code=_ORA_JSON_SYNTAX_ERROR, error_offset=offset
+        )
     missing = _MISSING_RELATION.match(_primary_message(exc))
     if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and missing is not None:
         return _ObjectMissing(missing.group(1), offset)
