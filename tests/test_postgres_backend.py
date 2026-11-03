@@ -3123,6 +3123,42 @@ def test_translate_plsql_block_wraps_anonymous_declare_block() -> None:
     assert _translate_plsql_block('BEGIN') == 'BEGIN'
 
 
+def test_sqlcode_and_sqlerrm_read_the_handlers_error() -> None:
+    # PL/pgSQL has neither (#2429). They read the error PL/pgSQL's SQLSTATE and
+    # SQLERRM hold in a handler; the block declares a no-error pair of those
+    # names, which a handler's own shadow, so outside one they read no error.
+    from seerdb.server.backends.postgres import _translate_routine_ddl
+
+    out = _translate_plsql_block(
+        'DECLARE c NUMBER; m VARCHAR2(100); BEGIN m := SQLERRM(-1403); NULL; '
+        'EXCEPTION WHEN OTHERS THEN c := SQLCODE; m := sqlerrm; '
+        "INSERT INTO t VALUES ('SQLCODE'); END;"
+    )
+    assert out.startswith(
+        "DO $$ DECLARE sqlstate text := '00000'; sqlerrm text := ''; "
+        ' c numeric; m varchar(100); BEGIN '
+    )
+    assert 'm := sys.ora_sqlerrm_of(-1403)' in out
+    assert 'c := sys.ora_sqlcode(sqlstate, sqlerrm);' in out
+    assert 'm := sys.ora_sqlerrm(sqlstate, sqlerrm);' in out
+    assert "VALUES ('SQLCODE')" in out  # a literal is text
+    # A block with no DECLARE gains one; a routine's body is read the same way.
+    bare = 'BEGIN NULL; EXCEPTION WHEN OTHERS THEN x(SQLCODE); END;'
+    assert _translate_plsql_block(bare) == (
+        "DO $$ DECLARE sqlstate text := '00000'; sqlerrm text := ''; BEGIN NULL; "
+        'EXCEPTION WHEN OTHERS THEN x(sys.ora_sqlcode(sqlstate, sqlerrm)); END $$'
+    )
+    routine = _translate_routine_ddl(
+        'CREATE OR REPLACE PROCEDURE p IS BEGIN x(SQLCODE); END p;', frozenset()
+    )
+    assert (
+        "$$ DECLARE sqlstate text := '00000'; sqlerrm text := ''; "
+        'BEGIN x(sys.ora_sqlcode(sqlstate, sqlerrm));'
+    ) in routine
+    # One that names neither is as before.
+    assert 'sqlstate' not in _translate_plsql_block('BEGIN NULL; END;')
+
+
 def test_translate_plsql_block_hoists_local_functions() -> None:
     # Each local function becomes a pg_temp function ahead of the DO block, and a
     # call to one -- from the block or another local function -- is qualified
@@ -7178,6 +7214,106 @@ def test_a_session_that_refuses_implicit_results_raises_ora_29481() -> None:
             'EXCEPTION WHEN OTHERS THEN n := 1; END;'
         )
         assert caught.implicit_results == []
+    finally:
+        backend.rollback()
+        backend.close()
+
+
+def test_sqlcode_and_sqlerrm_are_23ais() -> None:
+    # In a handler, SQLCODE and SQLERRM are the caught error's, as 23ai gives
+    # them (#2429): NO_DATA_FOUND's SQLCODE is +100; outside a handler, no
+    # error; a nested handler's error is its own, and the outer one's again
+    # after it. A stored procedure's handler reads them the same way.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+
+    def caught(raiser: str, reader: str = 'c := SQLCODE; m := SQLERRM;') -> tuple:
+        backend.execute(
+            'DECLARE x NUMBER; c NUMBER; m VARCHAR2(400); BEGIN '
+            f'BEGIN {raiser}; EXCEPTION WHEN OTHERS THEN {reader} END; '
+            'INSERT INTO t_2429 VALUES (c, m); END;'
+        )
+        (row,) = backend.execute('SELECT c, m FROM t_2429').rows
+        backend.execute('DELETE FROM t_2429')
+        return tuple(row)
+
+    try:
+        backend.execute('DROP TABLE IF EXISTS t_2429')
+        backend.execute('CREATE TABLE t_2429 (c NUMBER, m VARCHAR2(400))')
+        assert caught("RAISE_APPLICATION_ERROR(-20001, 'boom')") == (
+            -20001,
+            'ORA-20001: boom',
+        )
+        assert caught('SELECT 1 INTO x FROM t_2429') == (
+            100,
+            'ORA-01403: no data found',
+        )
+        assert caught('x := 1 / 0') == (-1476, 'ORA-01476: divisor is equal to zero')
+        assert caught('SELECT 1 INTO x FROM dual CONNECT BY LEVEL <= 2')[0] == -1422
+        assert caught('NULL', 'NULL; END; c := SQLCODE; m := SQLERRM; BEGIN NULL;') == (
+            0,
+            'ORA-0000: normal, successful completion',
+        )
+        assert caught(
+            'NULL', 'NULL; END; c := 0; m := SQLERRM(-1403); BEGIN NULL;'
+        ) == (
+            0,
+            'ORA-01403: no data found',
+        )
+        nested = (
+            'BEGIN RAISE NO_DATA_FOUND; EXCEPTION WHEN OTHERS THEN NULL; END; '
+            'c := SQLCODE; m := SQLERRM;'
+        )
+        assert caught("RAISE_APPLICATION_ERROR(-20002, 'outer')", nested) == (
+            -20002,
+            'ORA-20002: outer',
+        )
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE p_2429 IS c NUMBER; m VARCHAR2(400); BEGIN '
+            'c := 1 / 0; EXCEPTION WHEN OTHERS THEN c := SQLCODE; m := SQLERRM; '
+            'INSERT INTO t_2429 VALUES (c, m); END;'
+        )
+        backend.execute('BEGIN p_2429; END;')
+        assert [tuple(r) for r in backend.execute('SELECT c, m FROM t_2429').rows] == [
+            (-1476, 'ORA-01476: divisor is equal to zero')
+        ]
+    finally:
+        backend.rollback()
+        backend.execute('DROP PROCEDURE IF EXISTS p_2429')
+        backend.execute('DROP TABLE IF EXISTS t_2429')
+        backend.close()
+
+
+def test_sqlcode_is_the_code_the_client_is_told() -> None:
+    # SQLCODE in a handler and the error the client gets uncaught agree: the
+    # SQL function follows _ora_code_for, from the same tables (#2429).
+    from types import SimpleNamespace
+
+    from seerdb.server.backends.postgres import _ora_code_for
+
+    cases = [
+        ('22012', 'division by zero'),
+        ('23505', 'duplicate key value violates unique constraint "k"'),
+        ('42P01', 'relation "x" does not exist'),
+        ('42501', 'permission denied for schema s'),
+        ('42501', 'permission denied for table t'),
+        ('42601', 'INSERT has more expressions than target columns'),
+        ('22003', 'numeric field overflow'),
+        ('22003', 'integer out of range'),
+        ('P0001', 'ORA-20123: mine'),
+        ('P0003', 'query returned more than one row'),
+        ('XX000', 'something else'),
+    ]
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        for state, message in cases:
+            exc = SimpleNamespace(
+                sqlstate=state, diag=SimpleNamespace(message_primary=message)
+            )
+            (row,) = backend.execute(
+                f"SELECT sys.ora_sqlcode('{state}', '{message.replace(chr(39), chr(39) * 2)}') "
+                'FROM dual'
+            ).rows
+            assert row[0] == -_ora_code_for(exc), (state, message)
     finally:
         backend.rollback()
         backend.close()
