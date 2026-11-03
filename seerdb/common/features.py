@@ -87,6 +87,11 @@ class Features:
     # banner_full is 18c's, so the line is drawn at a client of 18.1 or later;
     # no client between 11.2 and 23.26 has been tried.
     oci_full_release: bool = True
+    # The field version the client itself speaks, which the verdicts above
+    # follow: the session's for a thin client, the one its capability block
+    # names for sqlplus. None when not known. A passthrough logs in upstream
+    # at it, so its upstream answers the client as it would directly (#2430).
+    client_field_version: int | None = None
 
 
 def session_features(
@@ -121,12 +126,14 @@ def session_features(
             json=json,
             vector=vector,
             implicit_results=implicit_results,
+            client_field_version=client,
         )
     return Features(
         boolean=boolean,
         json=json,
         vector=vector,
         implicit_results=implicit_results,
+        client_field_version=client,
         oci_lob_12c=lob_12c,
         oci_tstz_local=client_field_version is None
         or client_field_version >= FIELD_VERSION_12_1,

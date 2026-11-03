@@ -37,7 +37,9 @@ from seerdb.common.dbobject import (
 from seerdb.common.sqltext import is_plsql
 from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_MAX,
     TNS_TYPE_ADT,
     TNS_TYPE_BFILE,
     TNS_TYPE_BLOB,
@@ -170,6 +172,13 @@ def _carries_bc_dates(method: Callable[..., _T]) -> Callable[..., _T]:
 # The most DBMS_LOB.SUBSTR returns from a BFILE in one call, a RAW (#1672).
 _BFILE_READ_CHUNK = 32767
 
+# The lowest field version an upstream session opens at (#2430). A session opens
+# at its client's version, so the upstream answers that client as it would
+# directly: it maps the 23ai types and refuses implicit results below 12.1. 23ai
+# serves no client below 11.2, so a 10.2-band client is relayed at 11.2's forms
+# instead, as the Mirror over PostgreSQL gives that band.
+_UPSTREAM_FLOOR_FIELD_VERSION = FIELD_VERSION_11_2
+
 
 class OraclePassthroughBackend:
     """Relays statements to a real Oracle at ``(host, port, service)``."""
@@ -287,6 +296,13 @@ class OraclePassthroughBackend:
             # The edition is chosen at LOGIN; deferring this connect until after
             # the AUTH is what makes it reachable at all.
             extra['edition'] = edition
+        spoken = (attrs or {}).get('field_version')
+        if spoken:
+            # Log in at the client's own version, so the upstream answers it as
+            # it would answer it directly (#2430), never below the floor.
+            extra['field_version'] = min(
+                max(int(spoken), _UPSTREAM_FLOOR_FIELD_VERSION), FIELD_VERSION_MAX
+            )
         # autocommit=False so the client drives the upstream transaction through
         # the Mirror: an explicit commit / rollback reaches the backend, and an
         # autocommit client still commits because the Mirror calls backend.commit()

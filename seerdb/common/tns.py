@@ -3081,6 +3081,12 @@ def _carried_cell(value: object, col: ColumnMeta) -> tuple[object, ColumnMeta]:
     # (#2418). NULL stays NULL.
     carried = _carried(col)
     if carried is col:
+        if col.is_oson and _SESSION_FEATURES.get().json is Carry.MAPPED:
+            # A BLOB with the OSON flag, to a client below native JSON: 23ai
+            # serves a FORMAT OSON column and the BLOB it maps a JSON column to
+            # alike, as a locator read over TTI_LOBOPS. A passthrough relays the
+            # latter as its upstream sent it (#2430).
+            return (value, replace(col, is_json=False, is_oson=False))
         return (value, col)
     if carried.data_type == TNS_TYPE_NUMBER:
         return (None if value is None else int(bool(value)), carried)

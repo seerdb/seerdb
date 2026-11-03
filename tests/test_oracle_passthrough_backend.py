@@ -12,10 +12,13 @@ emitted — the behaviour these tests pin without needing a database.
 
 from __future__ import annotations
 
+import pytest
+
 import seerdb
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_MAX,
 )
 from seerdb.server.backend import BindVar
 from seerdb.server.backends.passthrough import (
@@ -34,6 +37,32 @@ def test_a_release_packs_by_its_own_layout():
     assert _packed_release('18.4.0.0.0') == 0x12040000
     assert _packed_release('23.26.2.0.0') == 0x171A2000
     assert _packed_release('23.0.0.0.0') == 0x17000000
+
+
+@pytest.mark.parametrize(
+    ('spoken', 'upstream'),
+    [
+        ('4', FIELD_VERSION_11_2),  # 10.2: 23ai serves none, so 11.2's forms
+        ('6', FIELD_VERSION_11_2),
+        ('7', FIELD_VERSION_12_1),
+        ('27', FIELD_VERSION_MAX),  # sqlplus 23.26, above what seerdb speaks
+        (None, None),  # not known: the client's default
+    ],
+)
+def test_the_upstream_session_opens_at_the_clients_version(
+    monkeypatch: pytest.MonkeyPatch, spoken: str | None, upstream: int | None
+) -> None:
+    # The upstream answers the client as it would directly: it maps the 23ai
+    # types and refuses implicit results below 12.1. A client below 11.2 is
+    # relayed at 11.2, which 23ai serves (#2430).
+    opened: dict = {}
+    monkeypatch.setattr(seerdb, 'connect', lambda **kwargs: opened.update(kwargs))
+    backend = OraclePassthroughBackend(
+        host='db', port=1521, service='S', credentials={'PYO': 'pyo123'}
+    )
+    backend.authenticate('PYO')
+    backend.open_session({} if spoken is None else {'field_version': spoken})
+    assert opened.get('field_version') == upstream
 
 
 def test_a_character_bind_is_declared_with_its_buffer():
