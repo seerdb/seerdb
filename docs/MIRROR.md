@@ -1201,7 +1201,13 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   `TO_NUMBER` in a PL/SQL assignment is -1722 here, -6502 on Oracle.
   `SQLERRM(n)` knows only the messages the Mirror itself uses.
 - **Exceptions a block declares itself** (`e EXCEPTION`, `RAISE e`,
-  `PRAGMA EXCEPTION_INIT`) aren't supported yet
+  `WHEN e`) work as on Oracle, a package's among them. Each is a PostgreSQL
+  error code of its own, `U` and four letters or digits, taken from a hash of
+  where it's declared. In principle two exceptions could hash to the same code
+  and catch each other. `PRAGMA EXCEPTION_INIT` works for an Oracle error
+  PostgreSQL raises under one error code of its own, such as -1476
+  (`ZERO_DIVIDE`). It's refused for one that shares a code or has none, and,
+  for now, for the application range -20000 to -20999
   ([#2444](https://github.com/seerdb/seerdb/issues/2444)).
 - **Object types** have no methods. A collection computed in a query fetches as
   a plain array.

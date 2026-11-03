@@ -3123,6 +3123,50 @@ def test_translate_plsql_block_wraps_anonymous_declare_block() -> None:
     assert _translate_plsql_block('BEGIN') == 'BEGIN'
 
 
+def test_a_blocks_own_exceptions_are_sqlstates_of_their_own() -> None:
+    # PL/pgSQL has no exception declarations (#2444). Each becomes a SQLSTATE
+    # of its own, U and four: RAISE e raises it and WHEN e catches it. A
+    # nested block's own `e` is another exception; Oracle's predefined names
+    # are PostgreSQL's conditions; a CASE in a handler is left alone.
+    from seerdb.server.backends.postgres import UnsupportedFeature
+
+    out = _translate_plsql_block(
+        'DECLARE e EXCEPTION; BEGIN DECLARE e EXCEPTION; BEGIN RAISE e; END; '
+        'RAISE e; EXCEPTION WHEN e OR zero_divide THEN '
+        "x := CASE WHEN 1 = 1 THEN 'y' END; WHEN value_error THEN NULL; END;"
+    )
+    states = re.findall(r"ERRCODE = '(U[0-9A-Z]{4})'", out)
+    assert len(states) == 2 and states[0] != states[1]
+    assert f"WHEN SQLSTATE '{states[1]}' OR division_by_zero THEN" in out
+    assert "CASE WHEN 1 = 1 THEN 'y' END" in out
+    assert (
+        'WHEN invalid_text_representation OR string_data_right_truncation '
+        'OR numeric_value_out_of_range THEN'
+    ) in out
+    assert 'EXCEPTION;' not in out
+    # EXCEPTION_INIT binds the name to Oracle's error, by its one SQLSTATE.
+    bound = _translate_plsql_block(
+        'DECLARE e EXCEPTION; PRAGMA EXCEPTION_INIT(e, -1476); BEGIN RAISE e; '
+        'EXCEPTION WHEN e THEN NULL; END;'
+    )
+    assert "RAISE EXCEPTION USING ERRCODE = '22012'" in bound
+    assert "WHEN SQLSTATE '22012' THEN" in bound
+    assert 'PRAGMA' not in bound
+    # A code with no one SQLSTATE, or an application error's, is refused.
+    for code in ('-942', '-20001'):
+        with pytest.raises(UnsupportedFeature, match='EXCEPTION_INIT'):
+            _translate_plsql_block(
+                f'DECLARE e EXCEPTION; PRAGMA EXCEPTION_INIT(e, {code}); '
+                'BEGIN NULL; END;'
+            )
+    # A package's exception has one code wherever it is named.
+    named = _translate_plsql_block(
+        'BEGIN RAISE pk.e; EXCEPTION WHEN PK.E THEN NULL; END;'
+    )
+    (raised,) = re.findall(r"ERRCODE = '(U[0-9A-Z]{4})'", named)
+    assert f"WHEN SQLSTATE '{raised}' THEN" in named
+
+
 def test_sqlcode_and_sqlerrm_read_the_handlers_error() -> None:
     # PL/pgSQL has neither (#2429). They read the error PL/pgSQL's SQLSTATE and
     # SQLERRM hold in a handler; the block declares a no-error pair of those
@@ -7322,6 +7366,99 @@ def test_sqlcode_and_sqlerrm_are_23ais() -> None:
         backend.rollback()
         backend.execute('DROP PROCEDURE IF EXISTS p_2429')
         backend.execute('DROP TABLE IF EXISTS t_2429')
+        backend.close()
+
+
+def test_a_blocks_own_exceptions_behave_as_23ais() -> None:
+    # Measured on 23ai (#2444): caught by name and by OTHERS, with SQLCODE 1
+    # and SQLERRM 'User-Defined Exception'; ORA-06510 uncaught; another
+    # exception, or a nested block's own of the same name, not caught by it;
+    # EXCEPTION_INIT's name catching Oracle's error; a package's exception
+    # caught from another unit; a procedure's own one ORA-06510 to its caller.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+
+    def caught(block: str) -> str:
+        backend.execute(block)
+        (row,) = backend.execute('SELECT m FROM t_2444').rows
+        backend.execute('DELETE FROM t_2444')
+        return row[0]
+
+    try:
+        backend.execute('DROP TABLE IF EXISTS t_2444')
+        backend.execute('CREATE TABLE t_2444 (m VARCHAR2(100))')
+        assert (
+            caught(
+                'DECLARE e EXCEPTION; BEGIN RAISE e; '
+                "EXCEPTION WHEN e THEN INSERT INTO t_2444 VALUES ('e'); END;"
+            )
+            == 'e'
+        )
+        assert (
+            caught(
+                'DECLARE e EXCEPTION; c NUMBER; m VARCHAR2(60); BEGIN RAISE e; '
+                'EXCEPTION WHEN OTHERS THEN c := SQLCODE; m := SQLERRM; '
+                "INSERT INTO t_2444 VALUES (c || ' ' || m); END;"
+            )
+            == '1 User-Defined Exception'
+        )
+        with pytest.raises(BackendError) as raised:
+            backend.execute('DECLARE e EXCEPTION; BEGIN RAISE e; END;')
+        assert raised.value.ora_code == 6510
+        assert 'unhandled user-defined exception' in str(raised.value)
+        assert (
+            caught(
+                'DECLARE e1 EXCEPTION; e2 EXCEPTION; BEGIN BEGIN RAISE e2; '
+                "EXCEPTION WHEN e1 THEN INSERT INTO t_2444 VALUES ('e1'); END; "
+                "EXCEPTION WHEN e2 THEN INSERT INTO t_2444 VALUES ('e2'); END;"
+            )
+            == 'e2'
+        )
+        assert (
+            caught(
+                'DECLARE e EXCEPTION; BEGIN DECLARE e EXCEPTION; BEGIN RAISE e; '
+                "END; EXCEPTION WHEN e THEN INSERT INTO t_2444 VALUES ('outer e'); "
+                "WHEN OTHERS THEN INSERT INTO t_2444 VALUES ('others'); END;"
+            )
+            == 'others'
+        )
+        assert (
+            caught(
+                'DECLARE e EXCEPTION; PRAGMA EXCEPTION_INIT(e, -1476); c NUMBER; '
+                'x NUMBER; BEGIN x := 1 / 0; EXCEPTION WHEN e THEN c := SQLCODE; '
+                "INSERT INTO t_2444 VALUES ('e ' || c); END;"
+            )
+            == 'e -1476'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE pk_2444 AS e EXCEPTION; PROCEDURE r; END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY pk_2444 AS '
+            'PROCEDURE r IS BEGIN RAISE e; END; END;'
+        )
+        assert (
+            caught(
+                'BEGIN pk_2444.r; EXCEPTION WHEN pk_2444.e THEN '
+                "INSERT INTO t_2444 VALUES ('pk e'); END;"
+            )
+            == 'pk e'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE p_2444 IS e EXCEPTION; BEGIN RAISE e; END;'
+        )
+        with pytest.raises(BackendError) as raised:
+            backend.execute('BEGIN p_2444; END;')
+        assert raised.value.ora_code == 6510
+    finally:
+        backend.rollback()
+        for drop in ('DROP PROCEDURE p_2444', 'DROP PACKAGE pk_2444'):
+            try:
+                backend.execute(drop)
+            except BackendError:
+                backend.rollback()  # never created: the test failed before it
+        backend.execute('DROP TABLE IF EXISTS t_2444')
         backend.close()
 
 
