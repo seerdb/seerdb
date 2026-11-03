@@ -1206,8 +1206,8 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   where it's declared. In principle two exceptions could hash to the same code
   and catch each other. `PRAGMA EXCEPTION_INIT` works for an Oracle error
   PostgreSQL raises under one error code of its own, such as -1476
-  (`ZERO_DIVIDE`). It's refused for one that shares a code or has none, and,
-  for now, for the application range -20000 to -20999
+  (`ZERO_DIVIDE`), and for the application range -20000 to -20999. It's
+  refused for an error that shares a code or has none
   ([#2444](https://github.com/seerdb/seerdb/issues/2444)).
 - **Object types** have no methods. A collection computed in a query fetches as
   a plain array.
