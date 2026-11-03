@@ -657,6 +657,10 @@ def handle_login(
         if offset < 0:
             raise InterfaceError('fast-auth bundle carried no OSESSKEY')
         osesskey = after_pro[offset:]
+        # Every 23ai feature is native at a fast-auth version; the table also
+        # records that version, for a backend that opens its own session at it
+        # (#2430).
+        _SESSION_FEATURES.set(session_features(field_version))
     else:
         # Legacy: answer the packet just read -- a thin client's DTY request, or
         # sqlplus's PRO request -- then, for sqlplus, its data-type round (a
@@ -1025,6 +1029,13 @@ def _open_backend_session(
     # (#1409).
     if service_name:
         connect_attrs.setdefault('service_name', service_name)
+    # The field version the client itself speaks, for a backend that opens a
+    # session of its own at it: a passthrough's upstream then answers this
+    # client as it would answer it directly (#2430). A string, as every
+    # connect attribute is.
+    spoken = _SESSION_FEATURES.get().client_field_version
+    if spoken is not None:
+        connect_attrs.setdefault('field_version', str(spoken))
     open_session = getattr(backend, 'open_session', None)
     if open_session is None:
         return

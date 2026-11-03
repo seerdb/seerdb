@@ -582,6 +582,46 @@ def test_a_json_column_reaches_an_older_client_as_23ai_sends_it() -> None:
     assert _at_11_2(_lob_queue, [col], [(None,)]) == []
 
 
+def test_an_oson_blob_reaches_an_older_client_as_a_locator() -> None:
+    # A passthrough relays a JSON column to an 11.2 client as its upstream,
+    # logged in at 11.2, sent it: a BLOB of the text, flagged JSON and OSON
+    # (#2430). It goes on as 23ai sent it, with the flags in the describe and
+    # the value as a locator. Inline as an OSON column's image, the client
+    # could not read the reply. 23ai serves a FORMAT OSON BLOB column to that
+    # client the same way, a locator read over TTI_LOBOPS, measured.
+    from seerdb.common.tns import (
+        ColumnMeta,
+        _decode_dcb_column,
+        _encode_dcb_column,
+        _lob_queue,
+        _thin_column_value,
+        decode_packet,
+    )
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB
+
+    col = ColumnMeta(
+        name=b'D',
+        data_type=TNS_TYPE_BLOB,
+        data_length=4000,
+        max_size=0,
+        charset=0,
+        csfrm=0,
+        is_json=True,
+        is_oson=True,
+    )
+    live = _at_11_2(decode_packet, _JSON_DESCRIBE_AT_11_2, (None, None, []), 6)
+    (served, _) = _at_11_2(_decode_dcb_column, _at_11_2(_encode_dcb_column, col, 1))
+    fields = ('data_type', 'data_length', 'charset', 'csfrm', 'is_json', 'is_oson')
+    assert [served[f] for f in fields] == [live[3][1][0][f] for f in fields]
+    assert b'{"a":1}' not in _at_11_2(_thin_column_value, b'{"a":1}', col)
+    [(content, is_clob, _)] = _at_11_2(_lob_queue, [col], [(b'{"a":1}',)])
+    assert (content, is_clob) == (b'{"a":1}', False)
+    # To a client that reads native JSON, an OSON column still rides inline,
+    # as python-oracledb reads it (#826).
+    assert b'{"a":1}' in _thin_column_value(b'{"a":1}', col)
+    assert _lob_queue([col], [(b'{"a":1}',)]) == []
+
+
 # 23ai's replies for `select to_vector('[1,2,3]') from dual` to the thin client
 # at field version 6 (11.2): the describe, and the LOB read bringing the text,
 # UTF-16 as a CLOB's is. Captured live (#2418).

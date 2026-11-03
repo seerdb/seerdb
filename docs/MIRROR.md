@@ -165,9 +165,13 @@ A client whose protocol predates a type gets the form 23ai sends that client
   `SYS.DBMS_SQL` on 23ai don't follow it. Over PostgreSQL, catching any
   exception also undoes what the block did before it
   ([#2428](https://github.com/seerdb/seerdb/issues/2428)).
-- **Passthrough:** these forms apply to the Mirror over PostgreSQL. A
-  passthrough forwards what its upstream sends, and its upstream session runs
-  at the Mirror's own version
+- **Passthrough:** a passthrough opens each upstream session at its own
+  client's version, so the upstream answers that client as it would directly.
+  It maps the 23ai types and refuses implicit results below 12.1 with its own
+  ORA-29481. The one exception is a client below 11.2, which 23ai doesn't
+  serve: its session goes upstream at 11.2 instead. For that band the
+  passthrough works as a protocol proxy, and the client gets the 11.2 forms,
+  as it does over PostgreSQL
   ([#2430](https://github.com/seerdb/seerdb/issues/2430)).
 
 ### SQL and PL/SQL over PostgreSQL

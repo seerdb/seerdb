@@ -379,6 +379,52 @@ def test_a_fast_auth_client_below_the_mirrors_version_is_served_at_its_own(
     assert result.get('error') is None, result.get('error')
 
 
+@pytest.mark.parametrize('version', [6, 7, 20])  # 11.2, 12.1, fast-auth 23ai
+def test_the_backend_session_opens_at_the_clients_version(version: int) -> None:
+    # A backend that opens a session of its own is told the version the client
+    # speaks, through the legacy login and the fast-auth one alike, so a
+    # passthrough's upstream answers the client as it would directly (#2430).
+    from seerdb.common.tns_consts import FIELD_VERSION_23_4
+
+    opened: dict = {}
+
+    class _OpeningBackend(_DualBackend):
+        def open_session(self, attrs: dict | None = None) -> None:
+            opened.update(attrs or {})
+
+    def run(listen: socket.socket) -> None:
+        conn, _ = listen.accept()
+        try:
+            serve_session(
+                PacketStream(conn), _OpeningBackend(), field_version=FIELD_VERSION_23_4
+            )
+        finally:
+            conn.close()
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    server = threading.Thread(target=run, args=(listen,), daemon=True)
+    server.start()
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=listen.getsockname()[1],
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+        field_version=version,
+    )
+    try:
+        assert conn.field_version == version
+    finally:
+        conn.close()
+        server.join(timeout=5)
+        listen.close()
+    assert opened['field_version'] == str(version)
+
+
 class _ImplicitResultsBackend(_DualBackend):
     """Records whether the login asked it to refuse implicit results."""
 

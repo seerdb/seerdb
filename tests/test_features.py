@@ -121,3 +121,23 @@ def test_a_sqlplus_reads_the_forms_its_own_version_names(
 ) -> None:
     table = session_features(FIELD_VERSION_11_2, oci=True, client_field_version=client)
     assert (table.oci_tstz_local, table.oci_full_release) == (tstz_local, full_release)
+
+
+@pytest.mark.parametrize(
+    ('field_version', 'oci', 'client', 'recorded'),
+    [
+        (FIELD_VERSION_11_2, False, None, FIELD_VERSION_11_2),
+        (FIELD_VERSION_23_4, False, None, FIELD_VERSION_23_4),
+        (FIELD_VERSION_18_1_EXT_1, True, FIELD_VERSION_11_2, FIELD_VERSION_11_2),
+        (FIELD_VERSION_18_1_EXT_1, True, 27, 27),  # sqlplus 23.26
+        (FIELD_VERSION_18_1_EXT_1, True, None, None),
+    ],
+    ids=['thin 11.2', 'thin 23ai', 'sqlplus 11.2', 'sqlplus 23.26', 'unread block'],
+)
+def test_the_table_records_the_version_the_client_speaks(
+    field_version: int, oci: bool, client: int | None, recorded: int | None
+) -> None:
+    # The version its verdicts follow, which a passthrough logs in upstream at
+    # (#2430): the session's for a thin client, its own block's for sqlplus.
+    table = session_features(field_version, oci=oci, client_field_version=client)
+    assert table.client_field_version == recorded
