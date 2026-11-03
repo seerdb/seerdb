@@ -144,6 +144,11 @@ A client whose protocol predates a type gets the form 23ai sends that client
 - **sqlplus:** sqlplus 11.2 shows such a column exactly as it does against
   23ai. `DESCRIBE` still names a `BOOLEAN` column `BOOLEAN`. sqlplus 10.2
   can't display a `BLOB` at all, and the JSON column is no exception.
+- **sqlplus 23.26 and the native types:** sqlplus 23.26 reads a JSON column as
+  21c serves it, with the image in the row, not read as a LOB. 21c logs
+  sqlplus 23.26 in as the Mirror does, which 23ai doesn't. No Oracle release
+  before 23ai has `VECTOR`, so at that dialect it has no reference. It goes
+  out in JSON's form, which is the Mirror's choice.
 - **JSON text:** it is compact, and numbers are plain decimals (`1.0` is `1`).
   The keys come in the order the backend keeps them. Over PostgreSQL that is
   `jsonb`'s sorted order, not the document's

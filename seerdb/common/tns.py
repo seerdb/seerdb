@@ -11164,6 +11164,23 @@ def oci_is_xmltype(col: ColumnMeta) -> bool:
     )
 
 
+# The uds flags an OCI describe carries, measured: 0x05000000 for a native
+# JSON column (21c to sqlplus 23.26) and for a CLOB flagged JSON (23ai's VECTOR
+# to sqlplus 11.2), 0x0D000000 for a BLOB flagged JSON and OSON (23ai's JSON to
+# sqlplus 11.2); zero otherwise (#2420).
+_OCI_UDS_JSON = 0x05000000
+_OCI_UDS_OSON = 0x08000000
+
+
+def _oci_uds_flags(col: ColumnMeta) -> int:
+    flags = 0
+    if col.data_type == TNS_TYPE_JSON or col.is_json:
+        flags |= _OCI_UDS_JSON
+    if col.is_oson and col.data_type != TNS_TYPE_JSON:
+        flags |= _OCI_UDS_OSON
+    return flags
+
+
 def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes:
     # A describe column as sqlplus reads it (_DCB_COLUMN). SYS.XMLTYPE is the
     # one typed column (#2050): an opaque type, with the type's id, version,
@@ -11223,7 +11240,7 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
             'type_name_length': len(col.type_name) if xmltype else 0,
             'type_name': col.type_name,
             'has_uds': field_version >= FIELD_VERSION_11_2,
-            'uds_flags': 0,
+            'uds_flags': _oci_uds_flags(col),
             'reserved': 0,
         }
     )
@@ -12502,6 +12519,47 @@ def _oci_lob_byte_size(value: object, is_clob: bool) -> int:
     return len(str(value))
 
 
+# A native JSON or VECTOR value's cell as sqlplus reads it (#2420), measured
+# against 21c, which logs sqlplus 23.26 in the classic way, as the Mirror does:
+# the 12c LOB cell -- the locator's length, the image's size and a chunk size
+# -- with the whole image prefetched between them and the locator, so the
+# client issues no TTI_LOBOPS read, and a zero byte after the locator. The
+# image is framed as the dialect frames a value: 21c, at its higher field
+# version, chunks it with ub4 lengths; at the version the Mirror speaks,
+# sqlplus reads only the one-byte chunks, and fails ORA-03106 on ub4 ones.
+# 21c reports a chunk size of 32600 for an image of up to 7968 bytes, which it
+# keeps in the row, and 8060 for a larger one.
+_OCI_PREFETCH_INLINE_MAX = 7968
+_OCI_PREFETCH_INLINE_CHUNK_SIZE = 32600
+_OCI_PREFETCH_CHUNK_SIZE = 8060
+# The 40-byte locator 21c sends with a prefetched image: this head, the
+# image's size as a big-endian ub4 at offset 15, then zeros.
+_OCI_PREFETCH_LOCATOR_HEAD = bytes.fromhex('280026000461080000000100000000')
+_OCI_PREFETCH_LOCATOR_LEN = 40
+_OCI_PREFETCH_VALUE = wire_schema.compile_encoder((('value', 'image'),), _OCI)
+
+
+def _oci_prefetched_lob_cell(image: bytes | None) -> bytes:
+    # NULL is the locator's length at zero, as for any LOB cell.
+    if image is None:
+        return bytes(4)
+    size = len(image)
+    chunk_size = (
+        _OCI_PREFETCH_INLINE_CHUNK_SIZE
+        if size <= _OCI_PREFETCH_INLINE_MAX
+        else _OCI_PREFETCH_CHUNK_SIZE
+    )
+    locator = (_OCI_PREFETCH_LOCATOR_HEAD + struct.pack('>I', size)).ljust(
+        _OCI_PREFETCH_LOCATOR_LEN, b'\x00'
+    )
+    return (
+        struct.pack('<IQI', _OCI_PREFETCH_LOCATOR_LEN, size, chunk_size)
+        + _OCI_PREFETCH_VALUE({'image': image})
+        + locator
+        + b'\x00'
+    )
+
+
 def encode_lob_locator_oci(
     value: object,
     is_clob: bool,
@@ -12575,13 +12633,11 @@ def encode_lob_read_response_oci(
 
 
 def oci_lob_contents(
-    columns: list[ColumnMeta], rows: list[tuple], *, for_oci: bool = False
+    columns: list[ColumnMeta], rows: list[tuple]
 ) -> list[tuple[bytes, bool]]:
     """The (wire-content, is_clob) of each non-NULL LOB cell, row-major (#405).
     See :func:`_lob_queue`."""
-    return [
-        (content, is_clob) for content, is_clob, _ in _lob_queue(columns, rows, for_oci)
-    ]
+    return [(content, is_clob) for content, is_clob, _ in _lob_queue(columns, rows)]
 
 
 def oci_lob_reads(
@@ -12590,11 +12646,11 @@ def oci_lob_reads(
     """The OCI (sqlplus) read queue: each non-NULL LOB cell's (wire-content,
     is_clob, national), row-major. An NCLOB's read reply echoes a national-form
     locator, as its row did (#1369)."""
-    return _lob_queue(columns, rows, True)
+    return _lob_queue(columns, rows)
 
 
 def _lob_queue(
-    columns: list[ColumnMeta], rows: list[tuple], for_oci: bool
+    columns: list[ColumnMeta], rows: list[tuple]
 ) -> list[tuple[bytes, bool, bool]]:
     """The (wire-content, is_clob, national) of each non-NULL LOB cell, row-major.
 
@@ -12604,16 +12660,16 @@ def _lob_queue(
     each); BLOB content is raw bytes (counts bytes). The session slices this per
     the offset/amount each read requests.
 
-    ``for_oci`` picks the caller's path. The OCI (sqlplus) path reads every
-    LOB-class column over TTI_LOBOPS and passes True. The thin path does not: it
-    carries a JSON or VECTOR image in the row itself (see
-    :func:`encode_prefetched_lob_value_thin`), so those columns draw no read, and
-    queueing them would shift every later LOB's position (#826/#887)."""
+    A JSON or VECTOR image rides in the row itself on both paths -- inline on
+    the thin one (:func:`encode_prefetched_lob_value_thin`), prefetched in its
+    LOB cell on the OCI one (:func:`_oci_prefetched_lob_cell`) -- so those
+    columns draw no read, and queueing them would shift every later LOB's
+    position (#826/#887/#2420)."""
     return [
         cell
         for row in rows
         for value, col in zip(row, columns)
-        if (cell := _lob_cell(value, col, for_oci)) is not None
+        if (cell := _lob_cell(value, col)) is not None
     ]
 
 
@@ -12625,16 +12681,12 @@ def oci_lob_row_cells(
     return {
         index: cell
         for index, (value, col) in enumerate(zip(row, columns))
-        if (cell := _lob_cell(value, col, True)) is not None
+        if (cell := _lob_cell(value, col)) is not None
     }
 
 
-def _lob_cell(
-    value: Any, col: ColumnMeta, for_oci: bool
-) -> tuple[bytes, bool, bool] | None:
+def _lob_cell(value: Any, col: ColumnMeta) -> tuple[bytes, bool, bool] | None:
     # One cell's (wire-content, is_clob, national), or None when it draws no read.
-    from seerdb.common.oson import encode_oson
-
     (value, col) = _carried_cell(value, col)
     if col.data_type not in _LOB_CONTENT_TYPES or value is None:
         return None
@@ -12650,8 +12702,9 @@ def _lob_cell(
         # an entry here would shift every later LOB's position (#826) --
         # the same reason the inline VECTOR case below skips.
         return None
-    if not for_oci and col.data_type in (TNS_TYPE_JSON, TNS_TYPE_VECTOR):
-        # The thin path carries a JSON or VECTOR image in the row itself,
+    if col.data_type in (TNS_TYPE_JSON, TNS_TYPE_VECTOR):
+        # A native JSON or VECTOR image rides in the row itself -- inline on
+        # the thin path, prefetched in its LOB cell on the OCI path (#2420) --
         # so it queues no content: a client that already has the value
         # issues no TTI_LOBOPS for it, and an entry here would shift every
         # later LOB's position in the queue (#887/#826).
@@ -12659,19 +12712,6 @@ def _lob_cell(
     if col.data_type == TNS_TYPE_CLOB:
         national = col.csfrm == _CSFRM_NCHAR
         return (str(value).encode('utf-16-be'), True, national)
-    if col.data_type == TNS_TYPE_JSON:
-        # A native JSON column reads back as a LOB whose content is the
-        # value's OSON image; the client decodes it as JSON (#30/#50).
-        # allow_wide so a > 255-key or > 64 KiB document re-encodes for
-        # the client's decoder (the LOB read framing carries any size).
-        return (encode_oson(value, allow_wide=True), False, False)
-    if col.data_type == TNS_TYPE_VECTOR:
-        # A native VECTOR column reads back as a LOB whose content is the
-        # value's binary image, re-encoded with the column's element
-        # format so INT8 / BINARY stay integral and FLOAT64 keeps its
-        # precision (#55).
-        vector = encode_vector(_vector_as(value, col.vector_format))
-        return (vector, False, False)
     return (bytes(value), False, False)
 
 
@@ -12683,6 +12723,18 @@ def _encode_oci_value(value: object, col: ColumnMeta, slot: int | None = None) -
     # later over TTI_LOBOPS, #405); a LONG / LONG RAW column streams inline via the
     # chunked form (#407); everything else is the ordinary inline DALC value.
     (value, col) = _carried_cell(value, col)
+    if col.data_type == TNS_TYPE_JSON:
+        from seerdb.common.oson import encode_oson
+
+        image = None if value is None else encode_oson(value, allow_wide=True)
+        return _oci_prefetched_lob_cell(image)
+    if col.data_type == TNS_TYPE_VECTOR:
+        image = (
+            None
+            if value is None
+            else encode_vector(_vector_as(value, col.vector_format))
+        )
+        return _oci_prefetched_lob_cell(image)
     if col.data_type in _OCI_LOB_TYPES:
         return encode_lob_locator_oci(
             value, col.data_type == TNS_TYPE_CLOB, col.csfrm == _CSFRM_NCHAR, slot

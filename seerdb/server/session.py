@@ -86,6 +86,7 @@ from seerdb.common.tns import (
     RefCursorOutBind,
     ScalarOutBind,
     TempLobRef,
+    _carried,
     ddl_command_type,
     decode_bfile_locator,
     decode_dalc,
@@ -2419,8 +2420,14 @@ def _answer_query_oci(
     has_long = any(
         col.data_type in (TNS_TYPE_LONG, TNS_TYPE_LONGRAW) for col in result.columns
     )
+    # A LOB-class column as this client is sent it: a CLOB / BLOB, a native
+    # JSON / VECTOR (its image prefetched in a LOB cell), or one of those two
+    # mapped to a CLOB / BLOB for a client below them. A live server answers
+    # each with the describe alone and sends the row after the define (#2420).
     has_lob = any(
-        col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) for col in result.columns
+        _carried(col).data_type
+        in (TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_JSON, TNS_TYPE_VECTOR)
+        for col in result.columns
     )
     # An XMLTYPE column too: a live server answers its execute with the
     # describe alone, as for a LOB, and sends the row on the fetch, after
