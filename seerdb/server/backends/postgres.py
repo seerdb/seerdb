@@ -16183,7 +16183,9 @@ class PostgresBackend:
         # A call whose block returned cursors through DBMS_SQL.RETURN_RESULT
         # (#1617) answers with their rows as implicit results, in the order it
         # returned them, each portal fetched and closed -- before a COMMIT the
-        # block asked for, which would close them.
+        # block asked for, which would close them. Its columns are described
+        # from the statement the portal runs, as a REF CURSOR's are (#2071):
+        # without it a TO_CLOB item came back a VARCHAR2 (#2434).
         self._implicit_portals = []
         result = call()
         portals, self._implicit_portals = self._implicit_portals, []
@@ -16191,11 +16193,14 @@ class PostgresBackend:
             return result
         implicit = []
         for portal in portals:
+            opened = self._conn.execute(
+                'SELECT statement FROM pg_cursors WHERE name = %s', (portal,)
+            ).fetchone()
             name = sql.Identifier(portal)
             fetch = sql.SQL('FETCH ALL FROM {}').format(name)
             with self._conn.cursor() as cursor:
                 cursor.execute(fetch)
-                fetched = self._build_result(cursor)
+                fetched = self._build_result(cursor, opened[0] if opened else '')
                 cursor.execute(sql.SQL('CLOSE {}').format(name))
             implicit.append((fetched.columns, fetched.rows))
         return replace(result, implicit_results=implicit)
