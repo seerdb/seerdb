@@ -239,14 +239,30 @@ AUTH_STATUS_NONE = 0xFCFF
 # The auth-service status the server returns in the classic sqlplus / thick-OCI
 # (deadbeef) null-negotiation reply, in place of the thin AUTH_STATUS_NONE.
 AUTH_STATUS_DEADBEEF = 0xFBFF
+# The status a server answers with when it selected an offered method (#2378),
+# and the Kerberos one: offered as its number and name, as sqlplus offers it.
+AUTH_STATUS_SELECTED = 0xFAFF
+AUTH_KERBEROS5 = 1
+AUTH_KERBEROS5_NAME = b'KERBEROS5'
+# A Kerberos address's type in the AP-REQ round: Kerberos's own numbers
+# (RFC 4120), an IPv4 address 2 and an IPv6 one 24.
+KRB5_ADDRESS_INET = 2
+KRB5_ADDRESS_INET6 = 24
 
 
-def auth_service() -> bytes:
-    """The minimal authentication service — no NTS/Kerberos method offered."""
-    return encode_service(
-        SERVICE_AUTH,
-        [sp_version(), sp_ub2(AUTH_MARKER), sp_status(AUTH_STATUS_NONE)],
-    )
+def auth_service(kerberos: bool = False) -> bytes:
+    """The authentication service: no method offered, or with ``kerberos``
+    the KERBEROS5 method (#2378)."""
+    SubPackets = [sp_version(), sp_ub2(AUTH_MARKER), sp_status(AUTH_STATUS_NONE)]
+    if kerberos:
+        SubPackets += [sp_ub1(AUTH_KERBEROS5), sp_string(AUTH_KERBEROS5_NAME)]
+    return encode_service(SERVICE_AUTH, SubPackets)
+
+
+def auth_round(SubPackets: list[bytes]) -> bytes:
+    """One round of an authentication method's own exchange: a container with
+    the authentication service alone (#2378)."""
+    return encode_ano([encode_service(SERVICE_AUTH, SubPackets)])
 
 
 def dh_public_key_round(PublicKey: bytes) -> bytes:

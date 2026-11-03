@@ -8112,7 +8112,6 @@ def encode_dictionary_token_auth(Dictionary: dict) -> bytes:
     the standard session-context pairs. The wire shape matches the ordinary AUTH
     header with the user fields zeroed.
     """
-    Tseq = Dictionary['seq']
     Role = Dictionary['env'].get('role', 0)
     Prelim = Dictionary['env'].get('prelim', 0)
     # NoNewPass (0x1) only — no UserAndPass (0x100), since there is no password.
@@ -8133,11 +8132,27 @@ def encode_dictionary_token_auth(Dictionary: dict) -> bytes:
             Pairs.append(encode_kv(b'AUTH_SIGNATURE', Signature.encode('utf-8')))
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
+    return _userless_auth(Dictionary, Mode, Pairs)
+
+
+def encode_dictionary_external_auth(Dictionary: dict) -> bytes:
+    """Build the AUTH message of a login the server authenticated already
+    (#2378): Kerberos, in the ANO exchange before it. As token auth's, it has
+    no username and no password, with logon mode ``NoNewPass`` (0x1), and only
+    the standard session-context pairs: the server knows the user from the
+    ticket."""
+    Role = Dictionary['env'].get('role', 0)
+    Prelim = Dictionary['env'].get('prelim', 0)
+    Mode = encode_sb4((Role * 32) | (Prelim * 128) | 1)
+    return _userless_auth(Dictionary, Mode, [])
+
+
+def _userless_auth(Dictionary: dict, Mode: bytes, Pairs: list[bytes]) -> bytes:
+    # A TTI_AUTH message with no user: `Pairs` before the session-context pairs.
     SessionKvs = _auth_session_kvs(Dictionary)  # charset .. connect-string
     NumPairs = len(Pairs) + _auth_session_kv_count(Dictionary)
-
     # No user: the has-user pointer byte is 0 and the user length is 0.
-    HeaderBytes = bytes([TTI_FUN, TTI_AUTH, Tseq, 0]) + encode_sb4(0)
+    HeaderBytes = bytes([TTI_FUN, TTI_AUTH, Dictionary['seq'], 0]) + encode_sb4(0)
     return (
         HeaderBytes
         + Mode
@@ -16557,11 +16572,14 @@ def encode_fast_auth(Pro: bytes, Dty: bytes, Sess: bytes) -> bytes:
     )
 
 
-def find_fast_auth_rpa(Body: bytes) -> int:
+def find_fast_auth_rpa(Body: bytes, authenticated: bool = False) -> int:
     """Return the offset of the auth-challenge TTI_RPA inside a bundled fast-auth
     response (PRO response + DTY response + RPA). The DTY datatype table contains
     0x08 bytes, so a naive token scan mis-hits; instead accept the first TTI_RPA
-    whose decode yields the OSESSKEY challenge (a non-empty session key)."""
+    whose decode yields the OSESSKEY challenge (a non-empty session key). With
+    ``authenticated``, a login the server authenticated already (Kerberos,
+    #2378), accept the one that decodes as the authentication result instead:
+    that bundle carries no OSESSKEY, and its reply no challenge."""
     for Off in range(len(Body)):
         if Body[Off] != TTI_RPA:
             continue
@@ -16569,7 +16587,9 @@ def find_fast_auth_rpa(Body: bytes) -> int:
             Result = decode_token_rpa(Body[Off + 1 :], ())
         except Exception:
             continue
-        if Result[0] == TTI_SESS and Result[1]:
+        if authenticated and Result[0] == TTI_AUTH:
+            return Off
+        if not authenticated and Result[0] == TTI_SESS and Result[1]:
             return Off
     return -1
 
