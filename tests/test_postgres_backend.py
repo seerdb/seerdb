@@ -3152,13 +3152,25 @@ def test_a_blocks_own_exceptions_are_sqlstates_of_their_own() -> None:
     assert "RAISE EXCEPTION USING ERRCODE = '22012'" in bound
     assert "WHEN SQLSTATE '22012' THEN" in bound
     assert 'PRAGMA' not in bound
-    # A code with no one SQLSTATE, or an application error's, is refused.
-    for code in ('-942', '-20001'):
-        with pytest.raises(UnsupportedFeature, match='EXCEPTION_INIT'):
-            _translate_plsql_block(
-                f'DECLARE e EXCEPTION; PRAGMA EXCEPTION_INIT(e, {code}); '
-                'BEGIN NULL; END;'
-            )
+    # A code with no one SQLSTATE is refused.
+    with pytest.raises(UnsupportedFeature, match='EXCEPTION_INIT'):
+        _translate_plsql_block(
+            'DECLARE e EXCEPTION; PRAGMA EXCEPTION_INIT(e, -942); BEGIN NULL; END;'
+        )
+    # Application errors are all P0001: their handlers merge into one, which
+    # tells them apart by code, the section's OTHERS body its ELSE.
+    merged = _translate_plsql_block(
+        'DECLARE e1 EXCEPTION; PRAGMA EXCEPTION_INIT(e1, -20001); '
+        'e2 EXCEPTION; PRAGMA EXCEPTION_INIT(e2, -20002); BEGIN RAISE e2; '
+        'EXCEPTION WHEN e1 THEN a; WHEN zero_divide OR e2 THEN b; '
+        'WHEN OTHERS THEN c; END;'
+    )
+    assert "RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'ORA-20002: '" in merged
+    assert (
+        "WHEN SQLSTATE 'P0001' THEN IF sys.ora_sqlcode(sqlstate, sqlerrm) = -20001 "
+        'THEN a; ELSIF sys.ora_sqlcode(sqlstate, sqlerrm) = -20002 THEN b; '
+        'ELSE c; END IF; WHEN division_by_zero THEN b; WHEN OTHERS THEN c;'
+    ) in merged
     # A package's exception has one code wherever it is named.
     named = _translate_plsql_block(
         'BEGIN RAISE pk.e; EXCEPTION WHEN PK.E THEN NULL; END;'
@@ -7430,6 +7442,50 @@ def test_a_blocks_own_exceptions_behave_as_23ais() -> None:
                 "INSERT INTO t_2444 VALUES ('e ' || c); END;"
             )
             == 'e -1476'
+        )
+        # In the application range: each name its own code, any other code
+        # to OTHERS, or past the section when it has none.
+        app = (
+            'DECLARE e1 EXCEPTION; PRAGMA EXCEPTION_INIT(e1, -20001); '
+            'e2 EXCEPTION; PRAGMA EXCEPTION_INIT(e2, -20002); c NUMBER; '
+            'm VARCHAR2(60); BEGIN '
+        )
+        seen = "c := SQLCODE; m := SQLERRM; INSERT INTO t_2444 VALUES ('{} ' || c || ' ' || m);"
+        assert (
+            caught(
+                app + "RAISE_APPLICATION_ERROR(-20002, 'two'); EXCEPTION "
+                'WHEN e1 THEN '
+                + seen.format('e1')
+                + ' WHEN e2 THEN '
+                + seen.format('e2')
+                + ' END;'
+            )
+            == 'e2 -20002 ORA-20002: two'
+        )
+        assert (
+            caught(
+                app + "RAISE_APPLICATION_ERROR(-20003, 'three'); EXCEPTION "
+                'WHEN e1 THEN '
+                + seen.format('e1')
+                + ' WHEN OTHERS THEN '
+                + seen.format('others')
+                + ' END;'
+            )
+            == 'others -20003 ORA-20003: three'
+        )
+        assert (
+            caught(
+                app + "BEGIN RAISE_APPLICATION_ERROR(-20003, 'three'); EXCEPTION "
+                'WHEN e1 THEN ' + seen.format('e1') + ' END; EXCEPTION WHEN OTHERS '
+                'THEN ' + seen.format('outer') + ' END;'
+            )
+            == 'outer -20003 ORA-20003: three'
+        )
+        assert (
+            caught(
+                app + 'RAISE e2; EXCEPTION WHEN e2 THEN ' + seen.format('e2') + ' END;'
+            )
+            == 'e2 -20002 ORA-20002: '
         )
         backend.execute(
             'CREATE OR REPLACE PACKAGE pk_2444 AS e EXCEPTION; PROCEDURE r; END;'

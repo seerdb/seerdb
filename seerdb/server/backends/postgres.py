@@ -10597,7 +10597,9 @@ _NO_ERROR_DECLARATIONS = "sqlstate text := '00000'; sqlerrm text := ''; "
 def _with_plsql_errors(block: str) -> str:
     # A PL/pgSQL body with PL/SQL's own exceptions (#2444), then its SQLCODE
     # and SQLERRM (#2429), as PL/pgSQL takes them.
-    return _with_error_functions(_with_user_exceptions(block))
+    return _with_error_functions(
+        _merged_application_handlers(_with_user_exceptions(block))
+    )
 
 
 def _with_error_functions(block: str) -> str:
@@ -10710,23 +10712,29 @@ def _states_by_ora_code() -> dict[int, str | None]:
     return states
 
 
-def _initialised_state(name: str, code: int) -> str:
-    # The SQLSTATE an EXCEPTION_INIT binds `name` to, or refused at compile.
+class _Declared(NamedTuple):
+    # A declared exception: the SQLSTATE it is raised and caught as, and the
+    # Oracle error EXCEPTION_INIT bound it to, None for a user-defined one.
+    state: str
+    ora: int | None
+
+
+def _initialised_state(name: str, code: int) -> _Declared:
+    # What an EXCEPTION_INIT binds `name` to, or refused at compile. An
+    # application error is P0001, as RAISE_APPLICATION_ERROR raises it, told
+    # apart by its code in the handler (_merged_application_handlers).
     ora = abs(code)
     if code == 100:
         ora = ORA_NO_DATA_FOUND
     if 20000 <= ora <= 20999:
-        raise UnsupportedFeature(
-            f'PRAGMA EXCEPTION_INIT({name}, {code}) for an application error is '
-            'not supported yet (#2444)'
-        )
+        return _Declared('P0001', ora)
     state = _states_by_ora_code().get(ora)
     if state is None:
         raise UnsupportedFeature(
             f'PRAGMA EXCEPTION_INIT({name}, {code}): no PostgreSQL error is '
             f'ORA-{ora:05d} alone'
         )
-    return state
+    return _Declared(state, ora)
 
 
 class _ExceptionFrame:
@@ -10736,7 +10744,7 @@ class _ExceptionFrame:
         self.kind = kind
         self.declaring = declaring
         self.handlers = False
-        self.exceptions: dict[str, tuple[str, bool]] = {}
+        self.exceptions: dict[str, _Declared] = {}
 
 
 def _with_user_exceptions(block: str) -> str:
@@ -10755,20 +10763,20 @@ def _with_user_exceptions(block: str) -> str:
     frames: list[_ExceptionFrame] = []
     seed = hashlib.sha1(masked.encode()).hexdigest()
 
-    def resolve(name: str) -> tuple[str, bool] | tuple[str, ...] | None:
+    def resolve(name: str) -> _Declared | tuple[str, ...] | None:
         # A name's SQLSTATE and whether it is Oracle's error, or PostgreSQL's
         # conditions for a predefined one; None for a name this does not know.
         key = name.upper()
         if '.' in key:
             parts = name.split('.')
-            return (_package_exception_state(parts[-2], parts[-1]), False)
+            return _Declared(_package_exception_state(parts[-2], parts[-1]), None)
         for frame in reversed(frames):
             if key in frame.exceptions:
                 return frame.exceptions[key]
         if key in _PREDEFINED_EXCEPTIONS:
             return _PREDEFINED_EXCEPTIONS[key]
         if package is not None and key not in _UNMAPPED_EXCEPTIONS:
-            return (_package_exception_state(package, name), False)
+            return _Declared(_package_exception_state(package, name), None)
         return None
 
     def name_at(index: int) -> tuple[str, int, int]:
@@ -10821,9 +10829,8 @@ def _with_user_exceptions(block: str) -> str:
         ):
             # `name EXCEPTION;` in a block's declarations.
             (name, name_start, _name_end) = words[i - 1]
-            top.exceptions[name] = (
-                _user_exception_state(f'{seed}:{name_start}:{name}'),
-                False,
+            top.exceptions[name] = _Declared(
+                _user_exception_state(f'{seed}:{name_start}:{name}'), None
             )
             edits.append((name_start, declared.end(), ''))
         elif word == 'PRAGMA' and top is not None and top.declaring:
@@ -10831,7 +10838,7 @@ def _with_user_exceptions(block: str) -> str:
             if init is not None:
                 name = init.group(1).upper()
                 code = int(init.group(2).replace(' ', ''))
-                top.exceptions[name] = (_initialised_state(name, code), True)
+                top.exceptions[name] = _initialised_state(name, code)
                 edits.append((start, init.end(), ''))
         elif word == 'EXCEPTION' and top is not None and top.kind == 'block':
             if i == 0 or words[i - 1][0] != 'RAISE':
@@ -10868,25 +10875,136 @@ def _with_user_exceptions(block: str) -> str:
     return _unmask_quoted(masked, contents)
 
 
-def _condition_of(found: tuple) -> str:
-    # A handler's condition for a resolved exception.
-    if len(found) == 2 and isinstance(found[1], bool):
-        return f"SQLSTATE '{found[0]}'"
-    return ' OR '.join(found)
+def _is_application(found: _Declared) -> bool:
+    return found.ora is not None and 20000 <= found.ora <= 20999
 
 
-def _raise_of(found: tuple) -> str:
-    # The RAISE of a resolved exception, its message the one the client gets.
-    if len(found) == 2 and isinstance(found[1], bool):
-        (state, oracle) = found
-        message = _USER_EXCEPTION_MESSAGE
-        if oracle:
-            code = _SQLSTATE_TO_ORA.get(state)
-            message = _ORA_MESSAGE.get(code, message) if code else message
-        return (
-            f"RAISE EXCEPTION USING ERRCODE = '{state}', MESSAGE = {_sql_text(message)}"
+def _condition_of(found: _Declared | tuple[str, ...]) -> str:
+    # A handler's condition for a resolved exception. An application error's
+    # is marked with its code, for _merged_application_handlers to sort out.
+    if not isinstance(found, _Declared):
+        return ' OR '.join(found)
+    if _is_application(found):
+        return f"{_APPLICATION_MARK}{found.ora}*/ SQLSTATE 'P0001'"
+    return f"SQLSTATE '{found.state}'"
+
+
+def _raise_of(found: _Declared | tuple[str, ...]) -> str:
+    # The RAISE of a resolved exception, its message the one the client gets:
+    # an application error's is its code with no text, as on Oracle.
+    if not isinstance(found, _Declared):
+        return f'RAISE {found[0]}'
+    message = _USER_EXCEPTION_MESSAGE
+    if _is_application(found):
+        message = f'ORA-{found.ora:05d}: '
+    elif found.ora is not None:
+        message = _ORA_MESSAGE.get(found.ora, message)
+    return f"RAISE EXCEPTION USING ERRCODE = '{found.state}', MESSAGE = {_sql_text(message)}"
+
+
+# The mark on an application error's handler condition, before its code.
+_APPLICATION_MARK = '/*seerdb application error '
+
+
+def _merged_application_handlers(block: str) -> str:
+    """`block` with each exception section that names an application error
+    (#2444) handling all of them in one handler, as PL/pgSQL can only catch
+    them as P0001: WHEN SQLSTATE 'P0001' THEN IF SQLCODE = -20001 THEN ...
+    ELSIF ... ELSE, the section's WHEN OTHERS body, or RAISE when it has none.
+    Its other conditions keep their handlers, in their order, after it. A
+    section is merged at a time, innermost first, until none is left."""
+    while _APPLICATION_MARK in block:
+        (masked, contents) = _mask_quoted(block)
+        section = _application_section(masked)
+        if section is None:
+            return block  # a mark outside any handler: leave the text be
+        (first, end, branches) = section
+        dispatched: list[str] = []
+        others = None
+        rest: list[str] = []
+        for conditions, body in branches:
+            kept = []
+            for condition in conditions:
+                if condition.startswith(_APPLICATION_MARK):
+                    code = condition[len(_APPLICATION_MARK) :].split('*/', 1)[0]
+                    dispatched.append(f'SQLCODE = -{code} THEN {body}')
+                else:
+                    kept.append(condition)
+            if [c.upper() for c in kept] == ['OTHERS']:
+                others = body
+            if kept:
+                rest.append(f'WHEN {" OR ".join(kept)} THEN {body}')
+        merged = (
+            "WHEN SQLSTATE 'P0001' THEN IF "
+            + ' ELSIF '.join(dispatched)
+            + f' ELSE {others if others is not None else "RAISE;"} END IF; '
+            + ' '.join(rest)
         )
-    return f'RAISE {found[0]}'
+        block = _unmask_quoted(f'{masked[:first]}{merged} {masked[end:]}', contents)
+    return block
+
+
+def _application_section(
+    masked: str,
+) -> tuple[int, int, list[tuple[list[str], str]]] | None:
+    # The innermost exception section whose own conditions carry the mark:
+    # where its first WHEN starts and its END, and its branches, each its
+    # conditions and its body.
+    words = list(_words(masked))
+    frames: list[list[Any]] = []  # [kind, handlers, WHEN starts]
+    after_end = False
+    for i, (word, start, end) in enumerate(words):
+        following = words[i + 1] if i + 1 < len(words) else None
+        if after_end and word in ('IF', 'LOOP', 'CASE'):
+            if word == 'CASE' and frames and frames[-1][0] == 'case':
+                frames.pop()
+            after_end = False
+            continue
+        after_end = False
+        top = frames[-1] if frames else None
+        if word == 'DECLARE':
+            frames.append(['declare', False, []])
+        elif word == 'BEGIN':
+            if top is not None and top[0] == 'declare':
+                top[0] = 'block'
+            else:
+                frames.append(['block', False, []])
+        elif word == 'CASE':
+            frames.append(['case', False, []])
+        elif word == 'EXCEPTION' and top is not None and top[0] == 'block':
+            if i == 0 or words[i - 1][0] != 'RAISE':
+                top[1] = True
+        elif word == 'WHEN' and top is not None and top[0] == 'block' and top[1]:
+            top[2].append(start)
+        elif word == 'END':
+            after_end = following is not None and not masked[end : following[1]].strip()
+            if (
+                after_end
+                and following is not None
+                and following[0] in ('IF', 'LOOP', 'CASE')
+            ):
+                continue
+            if not frames:
+                continue
+            (kind, _handlers, whens) = frames.pop()
+            if kind != 'block' or not whens:
+                continue
+            branches = []
+            for k, when in enumerate(whens):
+                stop = whens[k + 1] if k + 1 < len(whens) else start
+                text = masked[when + len('WHEN') : stop]
+                then = re.search(r'(?i)\bTHEN\b', text)
+                if then is None:
+                    return None
+                conditions = [
+                    c.strip() for c in re.split(r'(?i)\s+OR\s+', text[: then.start()])
+                ]
+                branches.append((conditions, text[then.end() :].strip()))
+            if any(
+                c.startswith(_APPLICATION_MARK) for conds, _b in branches for c in conds
+            ):
+                return (whens[0], start, branches)
+    return None
 
 
 def _nested_declarations(body: str) -> str:
