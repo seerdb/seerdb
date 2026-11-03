@@ -7555,6 +7555,30 @@ A relaying server gets these from its backend however that backend surfaces them
 cursor, so it is probed for rather than assumed: a statement that returned
 nothing must not fail because the cursor has no `nextset`.
 
+### 23.2 The OCI form (#2431)
+
+sqlplus 23.26 gets the same block from a 21c, which logs it in the classic way
+(captured with one result, two, and a block with an OUT bind as well). The
+fields are at OCI's fixed widths. Each result carries one more zero byte, at the
+place where a REF CURSOR OUT value has its lead byte (0x4c). The describe body
+and its trailer follow, as that value carries them:
+
+```
+ub1  0x1b                            (TTI_IRD)
+ub4  num_results                     (little-endian)
+per result:
+    ub1 0                            (preamble length, as thin)
+    ub1 0
+    describe body + trailer          (as in a REF CURSOR OUT value)
+    ub4 cursor_id                    (little-endian; no return code)
+```
+
+The block goes between the block's OUT values, if any, and its status, as in
+thin. sqlplus then prints `ResultSet #n` and re-executes each cursor id with no
+SQL (`035e … 40`, the cursor id, room for 15 rows). That is the same call it
+sends to print a REF CURSOR, and it is answered the same way: the rows, then
+ORA-01403 at the end.
+
 ## 24. XMLType (#124)
 
 An XMLType column is **TNS type 109 with no user object type** — the same row

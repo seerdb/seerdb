@@ -1496,7 +1496,9 @@ _CREATE_TEMP_RESPONSE: wire_schema.Schema = (
 # count, then per result a preamble the client skips, the column describe body,
 # and the server cursor id. The describe body is pre-encoded
 # (`_encode_describe_body`), so it rides as a `raw` field and the schema encodes
-# only.
+# only. OCI puts a zero byte before the describe, where a REF CURSOR OUT value
+# has its lead byte, then the describe and trailer as that value carries them
+# (21c to sqlplus 23.26, with one result and with two, #2431).
 _IMPLICIT_RESULTS: wire_schema.Schema = (
     ('const', bytes([TTI_IRD])),
     ('n4', 'count'),
@@ -1506,6 +1508,7 @@ _IMPLICIT_RESULTS: wire_schema.Schema = (
         'count',
         (
             ('value', 'preamble'),
+            ('only', 'oci', (('u8', 'lead'),)),
             ('raw', 'describe'),
             ('n4', 'cursor_id'),
         ),
@@ -2689,6 +2692,7 @@ _SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
 _ROWCOUNTS_BLOCK_THIN = wire_schema.compile_encoder(_ROWCOUNTS_BLOCK, _THIN)
 _CREATE_TEMP_RESPONSE_THIN = wire_schema.compile_encoder(_CREATE_TEMP_RESPONSE, _THIN)
 _IMPLICIT_RESULTS_THIN = wire_schema.compile_encoder(_IMPLICIT_RESULTS, _THIN)
+_IMPLICIT_RESULTS_OCI = wire_schema.compile_encoder(_IMPLICIT_RESULTS, _OCI)
 _SESSION_STATE_RESPONSE_THIN = wire_schema.compile_encoder(
     _SESSION_STATE_RESPONSE, _THIN
 )
@@ -3472,6 +3476,30 @@ def encode_implicit_results(results: list[tuple[list[ColumnMeta], int]]) -> byte
                 {
                     'preamble': b'',  # the length-prefixed preamble the client skips
                     'describe': _encode_describe_body(columns),
+                    'cursor_id': cursor_id,
+                }
+                for columns, cursor_id in results
+            ],
+        }
+    )
+
+
+def encode_implicit_results_oci(results: list[tuple[list[ColumnMeta], int]]) -> bytes:
+    """The OCI form of :func:`encode_implicit_results`, for sqlplus (#2431).
+
+    A live 21c sends it to sqlplus 23.26 between a block's OUT values, if any,
+    and its status. sqlplus then re-executes each cursor id to fetch its rows,
+    as it fetches a REF CURSOR's, so the caller must have parked them first.
+    """
+    return _IMPLICIT_RESULTS_OCI(
+        {
+            'count': len(results),
+            'results': [
+                {
+                    'preamble': b'',
+                    'lead': 0,
+                    'describe': _oci_describe_body(columns)
+                    + _describe_trailer(oci=True),
                     'cursor_id': cursor_id,
                 }
                 for columns, cursor_id in results
@@ -12328,6 +12356,7 @@ def encode_out_bind_response_oci(
     types: list[tuple[int, bytes]] | None = None,
     inputs: list[bool] | None = None,
     forms: list[int] | None = None,
+    implicit_results: bytes = b'',
 ) -> bytes:
     """OCI reply returning a PL/SQL block's OUT bind values (``EXEC :v := ...``).
 
@@ -12341,6 +12370,9 @@ def encode_out_bind_response_oci(
     which the marker before the values reports. A :class:`RefCursorOutBind`
     value is a cursor the block opened, its rows parked under its id (#2014).
     ``forms`` is each bind's character set form, as its descriptor declared it.
+    ``implicit_results`` is the block's TTI_IRD block, if it also called
+    ``DBMS_SQL.RETURN_RESULT`` (encode_implicit_results_oci). It goes between the
+    values and the status, as a live 21c sends it (#2431).
     """
     types = types or [(0, b'')] * len(values)
     inputs = inputs or [False] * len(values)
@@ -12350,7 +12382,9 @@ def encode_out_bind_response_oci(
         for given in inputs
     )
     rxd = _oci_outbind_rxd(values, types, forms)
-    return header + define_markers + rxd + _oci_outbind_tail(sequence)
+    return (
+        header + define_markers + rxd + implicit_results + _oci_outbind_tail(sequence)
+    )
 
 
 def _oci_outbind_rxd(
