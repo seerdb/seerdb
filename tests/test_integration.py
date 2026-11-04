@@ -4050,7 +4050,6 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute('BEGIN :value := 2.9; END;', [got])
         self.assertEqual(float(got.getvalue()), 2.9)
 
-    @_requires(_postgres_cannot('run a PL/SQL block'))
     def test_select_into_with_no_rows_raises(self):
         # ORA-01403 is the end-of-fetch sentinel a query's last FETCH ends on,
         # AND the error a PL/SQL `SELECT ... INTO` raises when it matches
@@ -4106,7 +4105,6 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE 1 = 0')
         self.assertIsNone(self.cur.fetchone())
 
-    @_requires(_postgres_cannot('run a PL/SQL block'))
     def test_select_into_that_finds_a_row_is_unaffected(self):
         # The block still works when it does find its row -- the guard must not
         # turn a success into an error either.
@@ -4884,7 +4882,6 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute("BEGIN :v := N'nat \u00fcn\u00ee \u4e2d'; END;", [Var])
         self.assertEqual(Var.getvalue(), 'nat ünî 中')
 
-    @_requires(_postgres_cannot('run PL/SQL'))
     @_requires(_ASSOC_ARRAY_BIND)
     def test_national_array_bind_round_trip(self):
         # PL/SQL-bound: an associative array lives in a PL/SQL PACKAGE (#1127).
@@ -5766,7 +5763,6 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
             Conn.close()
 
 
-@_requires(_postgres_cannot("know a block's bind directions"))
 @_requires(_BLOCK_IOV)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class BindDirectionIntegration(_IntegrationBase):
@@ -5776,6 +5772,9 @@ class BindDirectionIntegration(_IntegrationBase):
     # one that cannot reports every bind OUT, which is the documented
     # fallback rather than a gap (#1064).
 
+    @_requires(
+        _postgres_cannot("report a block's bind directions as Oracle does (#2453)")
+    )
     def test_a_block_reports_its_bind_directions(self):
         # The wire carries no direction on the way in, so the reply is the only
         # place this can be learned. The Mirror's passthrough forwards these so
@@ -7156,7 +7155,6 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.cur.execute('BEGIN :d := NULL; END;', [Var])
         self.assertIsNone(Var.getvalue())
 
-    @_requires(_postgres_cannot('run PL/SQL'))
     def test_inout_clob_var_small(self):
         # PL/SQL-bound: DBMS_LOB.WRITEAPPEND is a PL/SQL procedure with an IN OUT LOB (#1127).
         # Under the 32767-byte promotion threshold, so the bind stays a Var.
@@ -7165,7 +7163,6 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.cur.execute("BEGIN DBMS_LOB.WRITEAPPEND(:d, 3, 'END'); END;", [Var])
         self.assertEqual(Var.getvalue().read(), 'smallEND')
 
-    @_requires(_postgres_cannot('run PL/SQL'))
     def test_inout_clob_var_over_the_promotion_threshold(self):
         # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
         # Over it, so the Var is promoted to a temp-LOB marker on the way out
@@ -7187,7 +7184,6 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(len(Value), 50005)
         self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
 
-    @_requires(_postgres_cannot('run PL/SQL'))
     def test_inout_blob_var_over_the_promotion_threshold(self):
         # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
         Var = self.cur.var(seerdb.DB_TYPE_BLOB)
@@ -8534,7 +8530,6 @@ class GettypeCurrentSchemaIntegration(_IntegrationBase):
             self.cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = {self.owner}')
 
 
-@_requires(_postgres_cannot('create a PL/SQL package'))
 @_requires(_PACKAGE_TYPE_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class PlsqlTypeIntegration(_IntegrationBase):
@@ -8696,7 +8691,6 @@ class PlsqlTypeIntegration(_IntegrationBase):
         self.assertEqual(int(Total), 10)
 
 
-@_requires(_postgres_cannot('create a PL/SQL package'))
 @_requires(_REFCURSOR_IN_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class RefCursorInBindIntegration(_IntegrationBase):
@@ -8751,6 +8745,7 @@ class RefCursorInBindIntegration(_IntegrationBase):
         rc.execute("SELECT level, 'String ' || level FROM dual CONNECT BY level <= 5")
         return rc
 
+    @_requires(_postgres_cannot('fetch in a block from a REF CURSOR bound IN (#2452)'))
     def test_the_block_fetches_from_the_bound_cursor(self):
         # The proof that the id reached the server and named a usable cursor:
         # the block read a row off it and wrote the row down. Row 1 was consumed
@@ -8793,7 +8788,9 @@ class RefCursorInBindIntegration(_IntegrationBase):
                 pass
 
 
-@_requires(_postgres_cannot('create a PL/SQL package'))
+@_requires(
+    _postgres_cannot('bind an object or collection OUT through a package (#2451)')
+)
 @_requires(_OBJECT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectOutBindIntegration(_IntegrationBase):
@@ -10392,7 +10389,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
-    @_requires(_postgres_cannot('run a PL/SQL block'))
     async def test_select_into_with_no_rows_raises(self):
         # Async twin of the ORA-01403 tests (#1039).
         Table = 'PYO_ASYNC_NODATA'
@@ -11654,7 +11650,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
-    @_requires(_postgres_cannot('run PL/SQL'), _PACKAGE_TYPE_BIND)
+    @_requires(_PACKAGE_TYPE_BIND)
     async def test_gettype_resolves_a_package_level_type(self):
         # PL/SQL-bound: a package-level type lives in a PL/SQL PACKAGE (#1127).
         # Async twin of PlsqlTypeIntegration (#1030).
@@ -11854,7 +11850,10 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         except seerdb.DatabaseError:
                             pass  # a CREATE above failed, so nothing to drop
 
-    @_requires(_postgres_cannot('run PL/SQL'), _OBJECT_BIND)
+    @_requires(
+        _postgres_cannot('bind an object or collection OUT through a package (#2451)'),
+        _OBJECT_BIND,
+    )
     async def test_a_bare_object_out_bind_takes_its_value(self):
         # PL/SQL-bound: the object OUT bind is filled by a PL/SQL PACKAGE (#1127).
         # Async twin of ObjectOutBindIntegration (#1029): an object handed to
@@ -11956,7 +11955,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
-    @_requires(_postgres_cannot('run PL/SQL'), _LOB_VAR_BIND)
+    @_requires(_LOB_VAR_BIND)
     async def test_inout_clob_var(self):
         # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
         # The async twin of LOBOutBindIntegration (#978): a LOB OUT bind's value
