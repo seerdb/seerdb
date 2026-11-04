@@ -113,6 +113,7 @@ from seerdb.common.tns import (
     recording_session_keywords,
     return_bind_types,
     set_decode_dml_rowcounts,
+    set_decode_field_versions,
     set_decode_prev_row,
     set_decode_return_binds,
     split_connect,
@@ -855,6 +856,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         """Async port of `OracleConnect._next_data_packet` (#45): receive the
         next DATA packet, answering a server break with a single reset and
         draining the rest (the server's terminal reset) silently."""
+        set_decode_field_versions(self.field_version, self._server_field_version())
         while True:
             Received = await self.recv(Acc, Data)
             if Received is False:

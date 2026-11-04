@@ -58,6 +58,7 @@ from seerdb.common.tns import (
     _DTY_8I,
     assemble_packet,
     decode_8i_server_version,
+    decode_error_reply,
     decode_packet,
     decode_token_pro,
     decode_token_rpa,
@@ -81,6 +82,7 @@ from seerdb.common.tns import (
     recording_session_keywords,
     return_bind_types,
     set_decode_dml_rowcounts,
+    set_decode_field_versions,
     set_decode_prev_row,
     set_decode_return_binds,
     split_connect,
@@ -260,21 +262,10 @@ Xid = collections.namedtuple(
 
 
 def _tpc_error_info(Packet: bytes) -> tuple[int, str | None]:
-    # The ORA code and message of a TPC reply that failed (#1755). It comes as
-    # a TTI_OER, after any server piggyback, not as the RPA return params. The
-    # message is the embedded "ORA-NNNNN:" text, as an AQ error's is: the
-    # decoder's message slot reads past a leading piggyback wrong.
-    from seerdb.common.tns import decode_packet
-
-    Match = _AQ_ORA_RE.search(bytes(Packet))
-    if Match:
-        return (int(Match.group(1)), Match.group(2).rstrip().decode('utf-8', 'replace'))
-    try:
-        Result = decode_packet(Packet, (None, None, []))
-        Code = Result[1] if isinstance(Result, tuple) and len(Result) > 1 else 0
-    except Exception:
-        Code = 0
-    return (Code or 0, None)
+    # The ORA code and message of a TPC reply that failed (#1755): a TTI_OER,
+    # after any server piggyback, not the RPA return params. Read by the codec,
+    # which now walks a leading SYNC piggyback, so the message is whole (#2474).
+    return decode_error_reply(Packet)
 
 
 def _raise_tpc_error(Packet: bytes) -> None:
@@ -336,8 +327,6 @@ def _decode_aq_enq(Packet: bytes) -> bytes:
 
 import re as _re
 
-_AQ_ORA_RE = _re.compile(rb'ORA-(\d{5}):\s*([^\x00\n]*)')
-
 # A TNS_REFUSE body is an ASCII descriptor like
 # ``(DESCRIPTION=(TMP=)(VSNNUM=0)(ERR=12514)(ERROR_STACK=(ERROR=(CODE=12514)...))``.
 # Both ERR= and CODE= carry the listener's refusal reason (e.g. 12514 — the
@@ -357,14 +346,10 @@ def _parse_refuse_code(Packet: bytes) -> int | None:
     return None
 
 
-def _aq_error_info(Packet: bytes):
-    # Pull the ORA code + message out of an AQ error (TTI_OER) response. The OER
-    # token layout varies a little across tiers, so the embedded "ORA-NNNNN:"
-    # text is the reliable source.
-    Match = _AQ_ORA_RE.search(bytes(Packet))
-    if Match:
-        return (int(Match.group(1)), Match.group(2).rstrip().decode('utf-8', 'replace'))
-    return (0, None)
+def _aq_error_info(Packet: bytes) -> tuple[int, str | None]:
+    # The ORA code and message of an AQ error (TTI_OER) reply, read by the codec
+    # as every other error is, its whole message included (#2474).
+    return decode_error_reply(Packet)
 
 
 def _aq_oer_code(Packet: bytes) -> int:
@@ -4232,6 +4217,9 @@ class OracleConnect(_ConnectionLogic):
         # every marker storms the line and discards real data. self._in_break
         # latches across recv() calls so we send at most one reset per break
         # episode, and is cleared when a real DATA packet arrives.
+        # Whatever decodes this reply without its own versions reads it at
+        # this session's (#2474).
+        set_decode_field_versions(self.field_version, self._server_field_version())
         while True:
             Received = self.recv(Acc, Data)
             if Received is False:

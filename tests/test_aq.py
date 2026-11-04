@@ -10,7 +10,11 @@ import unittest
 
 from seerdb.client.aq import DeqOptions, EnqOptions, MessageProperties, Queue
 from seerdb.client.connection import _aq_error_info, _decode_aq_deq, _decode_aq_enq
-from seerdb.common.tns import encode_aq_enq
+from seerdb.common.tns import (
+    _DECODE_FIELD_VERSION,
+    _DECODE_SERVER_FIELD_VERSION,
+    encode_aq_enq,
+)
 from seerdb.common.tns_consts import (
     TNS_AQ_DEQ_REMOVE,
     TNS_FUNC_AQ_ENQ,
@@ -102,9 +106,23 @@ class TestDecode(unittest.TestCase):
         self.assertEqual(_decode_aq_enq(pkt), bytes(range(16)))
 
     def test_error_extraction(self):
-        # an OER carrying ORA-24010 is parsed to (code, message)
-        oer = b'\x04\x01\x01' + b'\x00' * 8 + b'ORA-24010: QUEUE FOO does not exist\n'
-        self.assertEqual(_aq_error_info(oer), (24010, 'QUEUE FOO does not exist'))
+        # The code and the whole message, prefix included, as every other error
+        # carries them (#2474), from 23ai's reply to an enqueue on a queue that
+        # doesn't exist, captured at field version 24 (the server's is 27).
+        oer = bytes.fromhex(
+            '04010102224e00025dca000000000300000000000000000000000007000000000000'
+            '025dca00010300364f52412d32343031303a2051554555452050594f2e50594f5f4e'
+            '4f5f535543485f515545554520646f6573206e6f742065786973740a1d'
+        )
+        tokens = (_DECODE_FIELD_VERSION.set(24), _DECODE_SERVER_FIELD_VERSION.set(27))
+        try:
+            self.assertEqual(
+                _aq_error_info(oer),
+                (24010, 'ORA-24010: QUEUE PYO.PYO_NO_SUCH_QUEUE does not exist'),
+            )
+        finally:
+            _DECODE_FIELD_VERSION.reset(tokens[0])
+            _DECODE_SERVER_FIELD_VERSION.reset(tokens[1])
 
 
 if __name__ == '__main__':

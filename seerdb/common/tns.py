@@ -871,6 +871,34 @@ FLUSH_OUT_BINDS = (False, 'fob')
 MAX_FLUSH_OUT_BINDS = 4
 
 
+def set_decode_field_versions(FieldVersion: int, ServerFieldVersion: int) -> None:
+    """The field versions a decode reads at when it isn't given its own: a
+    connection sets them as it reads a reply, so a decode of that reply made
+    without them (an error helper's) reads it at this session's (#2474)."""
+    _DECODE_FIELD_VERSION.set(FieldVersion)
+    _DECODE_SERVER_FIELD_VERSION.set(ServerFieldVersion)
+
+
+def decode_error_reply(Packet: bytes) -> tuple[int, str | None]:
+    """The ORA code and message of a reply that ends in an OER, after any
+    server piggyback: a TPC, sessionless-transaction or AQ call that failed
+    (#2474). The message is the server's whole text, ``ORA-NNNNN:`` and all,
+    as every other error carries it. ``(0, None)`` when the reply reads as no
+    error."""
+    try:
+        Result = decode_packet(Packet, (None, None, []))
+    except (Truncated, IndexError, ValueError, KeyError, TypeError):
+        # Not a reply that decodes to a status: no error to report from it,
+        # and the caller says the response was unexpected.
+        return (0, None)
+    if not isinstance(Result, tuple) or len(Result) < 6:
+        return (0, None)
+    (Code, Message) = (Result[1], Result[5])
+    if not isinstance(Code, int):
+        return (0, None)
+    return (Code, Message if isinstance(Message, str) else None)
+
+
 def decode_packet(
     Data: bytes,
     Acc: tuple,

@@ -130,17 +130,59 @@ _RESUME_UNKNOWN_REPLY = bytes.fromhex(
 )
 
 
+# 23ai's reply to a rollback of an XID that never existed, captured at field
+# version 24 (#2474): ORA-24756, whose message runs over two lines.
+_ROLLBACK_UNKNOWN_REPLY = bytes.fromhex(
+    '04010102fd4d000260b40000000000000000000000000000000000070000000000000260b400'
+    '0000724f52412d32343735363a207472616e73616374696f6e2077697468206964656e746966'
+    '696572206774693a20307830303030303030312e373336353635373236343632324436453635'
+    '3736363537323244373736313733206269643a20307833310a20646f6573206e6f7420657869'
+    '73740a1d'
+)
+
+
 class TestReplyErrors(unittest.TestCase):
     # A TPC reply that failed is raised, not discarded (#1755): the server's
-    # ORA code and message, from a reply that opens with a piggyback.
+    # ORA code and its whole message (#2474), read by the codec at the field
+    # version of the session the reply was captured in, as a connection sets it.
+    def setUp(self):
+        from seerdb.common.tns import (
+            _DECODE_FIELD_VERSION,
+            _DECODE_SERVER_FIELD_VERSION,
+        )
+
+        self._tokens = (
+            (_DECODE_FIELD_VERSION, _DECODE_FIELD_VERSION.set(24)),
+            (_DECODE_SERVER_FIELD_VERSION, _DECODE_SERVER_FIELD_VERSION.set(24)),
+        )
+
+    def tearDown(self):
+        for var, token in self._tokens:
+            var.reset(token)
+
     def test_failed_resume_raises_its_ora_error(self):
+        # A reply that opens with a SYNC piggyback.
         from seerdb.client.connection import _check_tpc_reply
         from seerdb.common.exceptions import DatabaseError
 
         with self.assertRaises(DatabaseError) as ctx:
             _check_tpc_reply(_RESUME_UNKNOWN_REPLY)
         self.assertEqual(ctx.exception.code, 26218)
-        self.assertIn('does not exist', str(ctx.exception))
+        self.assertEqual(
+            str(ctx.exception),
+            'ORA-26218: sessionless transaction with GTRID 736C362D6E6F7065 '
+            'does not exist.',
+        )
+
+    def test_a_message_over_two_lines_is_kept_whole(self):
+        from seerdb.client.connection import _check_tpc_reply
+        from seerdb.common.exceptions import DatabaseError
+
+        with self.assertRaises(DatabaseError) as ctx:
+            _check_tpc_reply(_ROLLBACK_UNKNOWN_REPLY)
+        self.assertEqual(ctx.exception.code, 24756)
+        self.assertTrue(str(ctx.exception).startswith('ORA-24756: transaction'))
+        self.assertTrue(str(ctx.exception).endswith('bid: 0x31\n does not exist'))
 
     def test_return_params_pass(self):
         from seerdb.client.connection import _check_tpc_reply
