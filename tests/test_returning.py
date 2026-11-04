@@ -576,6 +576,7 @@ class TestFlushOutBindsAcknowledged(unittest.TestCase):
             self._packets = list(packets)
             self.sent = []
             self._session_keywords = {}
+            self._call_status = []
 
         def _absorb_session_keywords(self):
             pass

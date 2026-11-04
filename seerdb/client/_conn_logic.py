@@ -47,6 +47,7 @@ from seerdb.common.tns_consts import (
     CCAP_FIELD_VERSION,
     CCAP_TTC4,
     CCAP_TTC4_EXPLICIT_BOUNDARY,
+    CONN_STATE_AUTHENTICATED,
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
@@ -55,10 +56,17 @@ from seerdb.common.tns_consts import (
     ORA_TOO_MANY_ROWS,
     RCAP_TTC,
     RCAP_TTC_SESSION_STATE_OPS,
+    TNS_EOCS_FLAGS_TXN_IN_PROGRESS,
     TNS_KEYWORD_NUM_TXN_PRIORITY,
     TNS_SESSION_STATE_REQUEST_BEGIN,
     DictionaryType,
 )
+
+# Errors after which the server has ended the session (#2456): it was killed
+# (ORA-00028), is not logged on (ORA-01012), the instance is going down
+# (ORA-01089, ORA-01092), the idle limit passed (ORA-02396), or the connection
+# is lost (ORA-03113, ORA-03114, ORA-03135).
+_SESSION_ENDED = frozenset({28, 1012, 1089, 1092, 2396, 3113, 3114, 3135})
 
 if TYPE_CHECKING:
     from seerdb.client.connection import Xid
@@ -122,8 +130,13 @@ class _ConnectionLogic:
     _cursor_cache: dict[tuple[str, bytes], int]
     _cursor_cache_max: int
     server_version: int
+    max_identifier_length: int | None
+    instance_name: str | None
+    _call_status: list[int]
 
     if TYPE_CHECKING:
+
+        def _socket_open(self) -> bool: ...
 
         def _next_seq(self) -> int: ...
 
@@ -411,6 +424,41 @@ class _ConnectionLogic:
         if self._server_compile_caps and not self._supports_txn_priority():
             return ''
         return self._txn_priority_requested
+
+    def _absorb_identity(self, Identity: dict) -> None:
+        # What the login reply says about the server (#2456): the longest
+        # identifier it takes (None where it doesn't say, as before 12.2) and
+        # its instance's name.
+        self.max_identifier_length = Identity.get('max_identifier_length')
+        self.instance_name = Identity.get('instance_name')
+
+    @property
+    def transaction_in_progress(self) -> bool:
+        """Whether the session has a transaction open, as the server said in
+        its last reply (the TXN_IN_PROGRESS bit of the call status, #2456).
+        Not available before Oracle 10g, whose replies seerdb doesn't read it
+        from."""
+        if self.field_version < FIELD_VERSION_10_2:
+            raise NotSupportedError(
+                'transaction_in_progress is not available before Oracle 10g'
+            )
+        return bool(
+            self._call_status and self._call_status[0] & TNS_EOCS_FLAGS_TXN_IN_PROGRESS
+        )
+
+    def is_healthy(self) -> bool:
+        """Whether the connection is usable, without a round trip (#2456).
+
+        False once it is closed, its socket has failed or the server closed
+        it, or the server's last reply ended the session (a killed session,
+        an instance shutting down, a lost connection). A session ended
+        server-side without a word, by a firewall or a kill not yet reported,
+        only shows on the next call: use ``ping()`` to find out for sure."""
+        if self.conn_state != CONN_STATE_AUTHENTICATED:
+            return False
+        if self._call_status[1:2] and self._call_status[1] in _SESSION_ENDED:
+            return False
+        return self._socket_open()
 
     def _absorb_session_keywords(self) -> None:
         # Take the session state the last reply reported (#1776).

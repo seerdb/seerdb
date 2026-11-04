@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from seerdb.common.dbobject import DbObjectType
 
 import logging
+import select
 import socket
 import ssl
 import struct
@@ -1228,6 +1229,13 @@ class OracleConnect(_ConnectionLogic):
         # SYS_CONTEXT('USERENV', 'DB_UNIQUE_NAME'), from the login reply; None
         # before 10g, whose reply does not carry it (#1774).
         self.db_unique_name: str | None = None
+        # From the login reply too (#2456): the longest identifier the server
+        # takes (None before 12.2, which doesn't say) and the instance's name.
+        self.max_identifier_length: int | None = None
+        self.instance_name: str | None = None
+        # The last reply's call status and error code, recorded as it decodes
+        # (#2456): transaction_in_progress and is_healthy read them.
+        self._call_status: list[int] = []
         # Negotiated TTC field version. Starts at the client's advertised max
         # (the field_version arg; 21.1 by default) and is lowered to the
         # server's during the PRO handshake — min(client, server), see
@@ -1997,7 +2005,7 @@ class OracleConnect(_ConnectionLogic):
             return done.value
 
     def _handle_rpa(self, Data: bytes) -> int | None:
-        with recording_session_keywords(self._session_keywords):
+        with recording_session_keywords(self._session_keywords, self._call_status):
             Result = decode_token_rpa(Data, ())
         self._absorb_session_keywords()
         if Result[0] == TTI_SESS:
@@ -2026,8 +2034,9 @@ class OracleConnect(_ConnectionLogic):
             self.send(TNS_DATA, Data)
             return self.handle_login()
         elif Result[0] == TTI_AUTH:
-            # Auth result: (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName)
-            (_, Resp, Ver, SessId, SerialNum, DbUniqueName) = Result
+            # Auth result: (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName,
+            # Identity)
+            (_, Resp, Ver, SessId, SerialNum, DbUniqueName, Identity) = Result
             logger.debug('handle_login: auth result Ver=%s SessId=%s', Ver, SessId)
             if self._token_auth:
                 # Token auth (#125): the server grants the session with no
@@ -2037,6 +2046,7 @@ class OracleConnect(_ConnectionLogic):
                 self.session_id = SessId
                 self.serial_num = SerialNum
                 self.db_unique_name = DbUniqueName
+                self._absorb_identity(Identity)
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 logger.debug('handle_login: authenticated (token)')
                 return 0
@@ -2046,6 +2056,7 @@ class OracleConnect(_ConnectionLogic):
                 self.session_id = SessId
                 self.serial_num = SerialNum
                 self.db_unique_name = DbUniqueName
+                self._absorb_identity(Identity)
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 logger.debug('handle_login: authenticated')
                 # Negotiation cache (#438): record the fast-auth field version so
@@ -3457,7 +3468,9 @@ class OracleConnect(_ConnectionLogic):
             Kept = len(Rows) if Rows is not None else 0
             while True:
                 try:
-                    with recording_session_keywords(self._session_keywords):
+                    with recording_session_keywords(
+                        self._session_keywords, self._call_status
+                    ):
                         Result = decode_packet(
                             Packet,
                             Acc,
@@ -4224,6 +4237,25 @@ class OracleConnect(_ConnectionLogic):
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+
+    def _socket_open(self) -> bool:
+        # Whether the server has left the socket open, without reading from it
+        # (#2456): a zero-wait select, and on a readable socket a one-byte peek,
+        # which reads b'' once the server has closed it. A TLS or WebSocket
+        # stream can't be peeked under its framing, so there a readable socket
+        # counts as open.
+        Sock = self.sock
+        if Sock is None:
+            return False
+        try:
+            (Readable, _, _) = select.select([Sock], [], [], 0)
+            if not Readable:
+                return True
+            return Sock.recv(1, socket.MSG_PEEK) != b''
+        except (ValueError, NotImplementedError, AttributeError, TypeError):
+            return True  # a stream that can't be peeked: readable is open
+        except OSError:
+            return False
 
     def disconnect(self) -> None:
         if self.sock:
