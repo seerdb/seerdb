@@ -13,8 +13,9 @@ for tests/test_schema_round_trip.py to re-encode. Most are the captures the
 tests hold; some are what seerdb's own client sends the Mirror in a test.
 
 Left out, and counted in the file's header: what a fuzz test feeds a
-decoder, and what a test feeds one to show it does not raise on rubbish --
-random bytes, not messages.
+decoder, what a test feeds one to show it does not raise on rubbish, and the
+cut-short prefixes and arbitrary bytes the resumable AUTH walk is checked on --
+bytes, not messages.
 """
 
 import json
@@ -26,8 +27,10 @@ from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORPUS = os.path.join(ROOT, 'tests', 'schema_corpus.txt')
-# A test whose input is random bytes, by name.
-_NOT_MESSAGES = ('test_fuzz', 'rubbish')
+# A test whose input is random bytes, by name, or cut-short and arbitrary
+# bytes: the resumable AUTH walk is fed every prefix of a message and pairs of
+# arbitrary bytes, to agree with a whole walk on each (GHSA-vxvf-jx7x-rcx8).
+_NOT_MESSAGES = ('test_fuzz', 'rubbish', 'test_the_auth_walk_')
 
 _PLUGIN = """
 import json, os, re
@@ -122,7 +125,7 @@ def main() -> None:
     kept = []
     for r in _record():
         if any(word in r['test'] for word in _NOT_MESSAGES):
-            dropped['random bytes from a fuzz or rubbish test'] += 1
+            dropped['random or cut-short bytes, not messages'] += 1
         else:
             kept.append(r)
     kept.sort(key=lambda r: (r['schema'], r['codec'], r['fv'], r['consumed']))
