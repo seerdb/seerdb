@@ -442,6 +442,17 @@ class _ConnectionLogic:
         if Idle is not None:
             Sock.setsockopt(socket.IPPROTO_TCP, Idle, self.expire_time * 60)
 
+    def tpc_forget(self, xid: Xid) -> None:
+        """Not supported: python-oracledb's thin mode refuses it too (DPY-3001,
+        thick mode only), so there is no thin form to follow (#2457). A server
+        sent the forget operation the way the other state changes go refuses it
+        as a malformed packet (ORA-03137). Forget a heuristically completed
+        branch with DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY instead."""
+        raise NotSupportedError(
+            'tpc_forget is not supported: python-oracledb supports it only in '
+            'thick mode, and the thin protocol form is not known'
+        )
+
     def _absorb_identity(self, Identity: dict) -> None:
         # What the login reply says about the server (#2456): the longest
         # identifier it takes (None where it doesn't say, as before 12.2) and

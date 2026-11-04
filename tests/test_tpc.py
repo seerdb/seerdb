@@ -73,3 +73,78 @@ class TestDecode(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class _FakeCursor:
+    # What tpc_recover reads, without a server: the SQL it ran, and the rows
+    # DBA_PENDING_TRANSACTIONS would give.
+    def __init__(self, rows):
+        self.rows = rows
+        self.sql = None
+        self.closed = False
+
+    def execute(self, sql):
+        self.sql = sql
+
+    def fetchall(self):
+        return self.rows
+
+    def close(self):
+        self.closed = True
+
+
+class _AsyncFakeCursor(_FakeCursor):
+    async def execute(self, sql):
+        self.sql = sql
+
+    async def fetchall(self):
+        return self.rows
+
+    async def close(self):
+        self.closed = True
+
+
+_PENDING = [(4242, b'seerdb-a', b'1'), (4242, b'seerdb-b', b'2')]
+
+
+class TestRecoverAndForget(unittest.TestCase):
+    # tpc_recover and tpc_forget (#2457), sync and async.
+
+    def _conn(self, cls):
+        return cls(host='db', port=1521, service_name='S')
+
+    def test_recover_reads_the_pending_branches_as_xids(self):
+        from seerdb.client.connection import OracleConnect
+
+        conn = self._conn(OracleConnect)
+        cursor = _FakeCursor(_PENDING)
+        conn.cursor = lambda: cursor
+        self.assertEqual(conn.tpc_recover(), [Xid(*row) for row in _PENDING])
+        self.assertEqual(
+            cursor.sql,
+            'SELECT formatid, globalid, branchid FROM dba_pending_transactions',
+        )
+        self.assertTrue(cursor.closed)
+
+    def test_async_recover_reads_them_too(self):
+        import asyncio
+
+        from seerdb.client.aconnection import AsyncOracleConnect
+
+        conn = self._conn(AsyncOracleConnect)
+        cursor = _AsyncFakeCursor(_PENDING)
+        conn.cursor = lambda: cursor
+        self.assertEqual(
+            asyncio.run(conn.tpc_recover()), [Xid(*row) for row in _PENDING]
+        )
+        self.assertTrue(cursor.closed)
+
+    def test_forget_is_refused_as_python_oracledb_thin_refuses_it(self):
+        from seerdb.client.aconnection import AsyncOracleConnect
+        from seerdb.client.connection import OracleConnect
+        from seerdb.common.exceptions import NotSupportedError
+
+        for cls in (OracleConnect, AsyncOracleConnect):
+            with self.subTest(cls=cls.__name__):
+                with self.assertRaisesRegex(NotSupportedError, 'thick mode'):
+                    self._conn(cls).tpc_forget(Xid(1, b'g', b'b'))

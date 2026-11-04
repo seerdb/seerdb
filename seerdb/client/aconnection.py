@@ -49,6 +49,7 @@ from seerdb.client.connection import (
     _PROXY_REPLY_LIMIT,
     _REDIRECT_CONNECT_ATTEMPTS,
     _REDIRECT_CONNECT_DELAY,
+    _TPC_RECOVER_SQL,
     Xid,
     _abandoned_call_message,
     _check_tpc_reply,
@@ -2719,6 +2720,15 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._transaction_context = None
         if Result != TNS_TPC_TXN_STATE_ABORTED:
             raise DatabaseError(f'unexpected TPC rollback state {Result}')
+
+    async def tpc_recover(self) -> list[Xid]:
+        """Async port of `OracleConnect.tpc_recover` (#2457)."""
+        Cursor = self.cursor()
+        try:
+            await Cursor.execute(_TPC_RECOVER_SQL)
+            return [Xid(*Row) for Row in await Cursor.fetchall()]
+        finally:
+            await Cursor.close()
 
     # --- Sessionless transactions (#133, 23ai), async port ---
 

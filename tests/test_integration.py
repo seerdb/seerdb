@@ -5771,6 +5771,158 @@ class PingKilledSessionIntegration(_ThrottleRetry, unittest.TestCase):
                 pass
 
 
+# Two-phase commit (#131, #2457): a 12.1+ server, and no Mirror, which doesn't
+# serve XA (docs/MIRROR.md, "Not served").
+_TPC = _Need(
+    'two-phase commit needs a 12.1+ server, and the Mirror does not serve XA',
+    min_fv=FIELD_VERSION_12_1,
+    not_mirror=('*',),
+)
+_TPC_FORMAT = 0x5EED
+
+
+def _tpc_xid(tag: str) -> seerdb.Xid:
+    # An XID of this run alone, so two runs on one bed never share a branch.
+    return seerdb.Xid(_TPC_FORMAT, f'seerdb-{tag}-{os.getpid()}'.encode(), b'1')
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class TpcIntegration(_ThrottleRetry, unittest.TestCase):
+    """Two-phase commit, end to end (#131, #2457). Each test settles every
+    branch it prepares, so nothing is left in doubt on the bed.
+
+    A session that prepared a branch stays open until the branch is settled:
+    a second or two after it closes, the database's recovery process takes the
+    branch over, and from then on it can only be forced (ORA-24756 to a commit
+    or rollback by XID), measured on 23ai. Keeping it open is also how XA runs:
+    one session prepares, the coordinator settles."""
+
+    TABLE = 'PYO_TPC_BRANCHES'
+
+    def _connect(self):
+        return seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            **_FV_KW,
+        )
+
+    def setUp(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        self.xids: list = []
+        self.preparers: list = []
+        with self._connect() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(f'DROP TABLE {self.TABLE}')
+            except DatabaseError:
+                pass  # not left over from an earlier run
+            cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+
+    def tearDown(self):
+        # A branch a failed test left prepared is rolled back by its XID while
+        # the session that prepared it is still open, then the sessions close.
+        from seerdb.common.exceptions import Error
+
+        with self._connect() as conn:
+            for xid in self.xids:
+                try:
+                    conn.tpc_rollback(xid)
+                except Error:
+                    pass  # settled already, as a passing test leaves it
+            for preparer in self.preparers:
+                preparer.close()
+            conn.cursor().execute(f'DROP TABLE {self.TABLE}')
+
+    def _rows(self) -> list:
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute(f'SELECT n FROM {self.TABLE} ORDER BY n')
+            return [n for (n,) in cur.fetchall()]
+
+    def _prepare(self, conn, tag: str, n: int) -> seerdb.Xid:
+        xid = _tpc_xid(tag)
+        self.xids.append(xid)
+        conn.tpc_begin(xid)
+        conn.cursor().execute(f'INSERT INTO {self.TABLE} VALUES ({n})')
+        conn.tpc_end(xid)
+        self.assertTrue(conn.tpc_prepare(xid))
+        return xid
+
+    @_requires(_TPC)
+    def test_a_branch_prepares_and_commits(self):
+        with self._connect() as conn:
+            xid = self._prepare(conn, 'whole', 1)
+            conn.tpc_commit(xid)
+        self.assertEqual(self._rows(), [1])
+
+    @_requires(_TPC)
+    def test_a_branch_prepares_and_rolls_back(self):
+        with self._connect() as conn:
+            xid = self._prepare(conn, 'undo', 1)
+            conn.tpc_rollback(xid)
+        self.assertEqual(self._rows(), [])
+
+    @_requires(_TPC)
+    def test_a_read_only_branch_needs_no_commit(self):
+        with self._connect() as conn:
+            xid = _tpc_xid('readonly')
+            conn.tpc_begin(xid)
+            conn.cursor().execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+            conn.tpc_end(xid)
+            self.assertFalse(conn.tpc_prepare(xid))
+
+    @_requires(_TPC)
+    def test_a_one_phase_commit_needs_no_prepare(self):
+        with self._connect() as conn:
+            xid = _tpc_xid('onephase')
+            self.xids.append(xid)
+            conn.tpc_begin(xid)
+            conn.cursor().execute(f'INSERT INTO {self.TABLE} VALUES (7)')
+            conn.tpc_end(xid)
+            conn.tpc_commit(xid, one_phase=True)
+        self.assertEqual(self._rows(), [7])
+
+    @_requires(_TPC)
+    def test_branches_left_in_doubt_are_recovered_and_settled_elsewhere(self):
+        # tpc_recover lists the prepared branches other sessions hold, and
+        # this one commits or rolls each back by its XID (#2457).
+        from seerdb.common.exceptions import DatabaseError
+
+        for tag, n in (('keep', 1), ('drop', 2)):
+            conn = self._connect()
+            self.preparers.append(conn)
+            self._prepare(conn, tag, n)
+        (keep, drop) = self.xids
+        with self._connect() as conn:
+            try:
+                recovered = conn.tpc_recover()
+            except DatabaseError as exc:
+                if exc.code != 942:
+                    raise
+                self.skipTest(
+                    'the test user cannot read DBA_PENDING_TRANSACTIONS '
+                    '(tools/test_bed_setup.sql grants it)'
+                )
+            self.assertIn(keep, recovered)
+            self.assertIn(drop, recovered)
+            conn.tpc_commit(keep)
+            conn.tpc_rollback(drop)
+            left = conn.tpc_recover()
+        self.assertNotIn(keep, left)
+        self.assertNotIn(drop, left)
+        self.assertEqual(self._rows(), [1])
+
+    @_requires(_TPC)
+    def test_tpc_forget_is_refused_as_python_oracledb_thin_refuses_it(self):
+        with self._connect() as conn:
+            with self.assertRaises(seerdb.NotSupportedError):
+                conn.tpc_forget(_tpc_xid('forget'))
+
+
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
     """A proxy login, ``user[proxy]`` (#126), keeps its proxy end to end (#1093).
@@ -10826,6 +10978,58 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     else None
                 )
                 self.assertEqual(await Cur.fetchall(), [(driver,)])
+
+    @_requires(_TPC)
+    async def test_branches_left_in_doubt_are_recovered_and_settled_elsewhere(self):
+        # Async twin of TpcIntegration's (#2457): begin, end, prepare,
+        # recover, commit and roll back, each awaited. The preparing sessions
+        # stay open until their branches are settled, as there.
+        from seerdb.common.exceptions import DatabaseError, Error
+
+        table = 'PYO_ATPC_BRANCHES'
+        Kwargs = self._kwargs()
+        Kwargs['autocommit'] = False
+        (keep, drop) = (_tpc_xid('akeep'), _tpc_xid('adrop'))
+        Preparers = []
+        async with await seerdb.connect_async(**Kwargs) as Conn:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {table}')
+            except DatabaseError:
+                pass  # not left over from an earlier run
+            await Cur.execute(f'CREATE TABLE {table} (n NUMBER)')
+        Settler = await seerdb.connect_async(**Kwargs)
+        try:
+            for xid, n in ((keep, 1), (drop, 2)):
+                Conn = await seerdb.connect_async(**Kwargs)
+                Preparers.append(Conn)
+                await Conn.tpc_begin(xid)
+                await Conn.cursor().execute(f'INSERT INTO {table} VALUES ({n})')
+                await Conn.tpc_end(xid)
+                self.assertTrue(await Conn.tpc_prepare(xid))
+            try:
+                recovered = await Settler.tpc_recover()
+            except DatabaseError as exc:
+                if exc.code != 942:
+                    raise
+                self.skipTest('the test user cannot read DBA_PENDING_TRANSACTIONS')
+            self.assertIn(keep, recovered)
+            self.assertIn(drop, recovered)
+            await Settler.tpc_commit(keep)
+            await Settler.tpc_rollback(drop)
+            Cur = Settler.cursor()
+            await Cur.execute(f'SELECT n FROM {table}')
+            self.assertEqual(await Cur.fetchall(), [(1,)])
+        finally:
+            for xid in (keep, drop):
+                try:
+                    await Settler.tpc_rollback(xid)
+                except Error:
+                    pass  # settled already, as a passing test leaves it
+            for Conn in Preparers:
+                await Conn.close()
+            await Settler.cursor().execute(f'DROP TABLE {table}')
+            await Settler.close()
 
     async def test_transaction_in_progress_follows_the_server(self):
         # Async twin of CursorIntegration's (#2456).
