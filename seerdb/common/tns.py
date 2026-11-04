@@ -676,14 +676,29 @@ _DECODE_SESSION_KEYWORDS: contextvars.ContextVar[dict[int, str | None] | None] =
 )
 
 
+# The call status and error code of the last OER or status a connection decoded
+# (#2456): the status's TXN_IN_PROGRESS bit is the server saying whether the
+# session holds an open transaction, and the code tells a session the server
+# ended. Recorded the same way as the keywords above, into a two-item list of
+# the connection's own, and only walked when no connection is recording.
+_DECODE_CALL_STATUS: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    'decode_call_status', default=None
+)
+
+
 @contextlib.contextmanager
-def recording_session_keywords(Sink: dict[int, str | None]) -> Iterator[None]:
+def recording_session_keywords(
+    Sink: dict[int, str | None], CallStatus: list[int] | None = None
+) -> Iterator[None]:
     """Record the keyword-value pairs the replies decoded inside the block report
-    into ``Sink``, keyword -> text value (#1776)."""
+    into ``Sink``, keyword -> text value (#1776), and the last reply's call
+    status and error code into ``CallStatus`` when given (#2456)."""
     Token = _DECODE_SESSION_KEYWORDS.set(Sink)
+    StatusToken = _DECODE_CALL_STATUS.set(CallStatus)
     try:
         yield
     finally:
+        _DECODE_CALL_STATUS.reset(StatusToken)
         _DECODE_SESSION_KEYWORDS.reset(Token)
 
 
@@ -914,6 +929,16 @@ def decode_packet(
         case t if t == TTI_SVR_PIGGYBACK:
             return decode_token_server_piggyback(Data, Acc)
         case t if t == TTI_STA:  # tran
+            # A commit's or rollback's whole reply: its call status says
+            # whether a transaction is still open (#2456).
+            StatusSink = _DECODE_CALL_STATUS.get()
+            if StatusSink is not None:
+                try:
+                    (Status, _) = _STA_FROM_THIN(Data)
+                except (IndexError, Truncated):
+                    pass  # a short status leaves the last one recorded
+                else:
+                    StatusSink[:] = [Status['call_status'], 0]
             return (True, Acc)
         case t if t == TTI_END_OF_RESPONSE:
             # End-of-response marker (#155/#132): on an EOR-negotiated 23ai
@@ -2304,6 +2329,8 @@ _O8I_STATUS: wire_schema.Schema = (
     ('when', 'code', (('chr', 'message'),)),
 )
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+# A commit's or rollback's whole thin reply, read for its call status (#2456).
+_STA_FROM_THIN = wire_schema.compile_decoder(_STA, _THIN)
 # The experimental 9i OALL8 describe (#792, #798): the OCI describe column
 # (_DCB_COLUMN) without the byte 10g+ OCI has before each column and the one
 # after it, behind the maximum row size, the column count and one byte (0x4b);
@@ -6527,6 +6554,12 @@ def encode_result(
     ]
     if modern:
         pairs.append((b'AUTH_MAX_OPEN_CURSORS', str(_AUTH_MAX_OPEN_CURSORS).encode()))
+    # A session at field version 12.2 or later is told how long an identifier
+    # may be: 128 on every bed that sends it (18c, 21c, 23ai). A 23ai sends it
+    # to a 12.2 session but not to a 12.1 one, and 10g and 11g never do, so a
+    # client's max_identifier_length reads None there (#2456).
+    if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2:
+        pairs.append((b'AUTH_MAX_IDEN_LENGTH', b'128'))
     # The session's names, each sent only when the server knows it. A client
     # reads these ONLY from here, so leaving them out is what left
     # `connection.instance_name` and friends None (#826). The domain always
@@ -6897,6 +6930,9 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
     # succeeded, only this bit says anything is wrong (#993, #2262). The rowid is
     # the row a DML touched, in the physical-rowid layout a ROWID column uses.
     CallStatus = Head['call_status']
+    StatusSink = _DECODE_CALL_STATUS.get()
+    if StatusSink is not None:
+        StatusSink[:] = [CallStatus, Head['code']]
     RowCount = Head['rows']
     ErrCode = Head['code']
     CursorId = Head['cursor']
@@ -7140,7 +7176,15 @@ def decode_token_rpa(Data: bytes, Acc: tuple) -> tuple:
         # piggyback: the transaction priority the session starts at (#1776).
         if Rest1[:2] == bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC]):
             _decode_sync_pairs(Rest1[2:])
-        return (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName)
+        # The longest identifier the server takes (128 from 12.2, unsent
+        # before) and the instance's name, for the connection's attributes
+        # (#2456).
+        Instance = dict(KVs).get(b'AUTH_INSTANCENAME')
+        Identity = {
+            'max_identifier_length': _auth_int(dict(KVs).get(b'AUTH_MAX_IDEN_LENGTH')),
+            'instance_name': bytes(Instance).decode('utf-8') if Instance else None,
+        }
+        return (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName, Identity)
     else:
         # The 256-bit scheme carries the server's PBKDF2 iteration counts; the
         # client must derive the key with these, not hardcoded defaults (#309).

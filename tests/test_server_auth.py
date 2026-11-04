@@ -37,6 +37,7 @@ from seerdb.common.tns import (
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_12_2,
     TTI_AUTH,
     TTI_OER,
     TTI_RPA,
@@ -112,7 +113,7 @@ def test_encode_challenge_decodes_as_a_sess_challenge() -> None:
 
 def test_encode_result_decodes_as_an_auth_result() -> None:
     payload = encode_result(bytes(24), session_id=59, db_name='FREE')
-    kind, resp, version, session_id, serial_num, unique = decode_token_rpa(
+    kind, resp, version, session_id, serial_num, unique, _identity = decode_token_rpa(
         payload[1:], ()
     )
     assert kind == TTI_AUTH
@@ -134,6 +135,36 @@ def test_a_21c_result_also_sends_the_real_unique_name() -> None:
     assert b'AUTH_SC_REAL_DBUNIQUE_NAME' not in older
     assert decode_token_rpa(modern[1:], ())[5] == 'FREE'
     assert decode_token_rpa(older[1:], ())[5] == 'FREE'
+
+
+def _encoded_at(field_version: int, encode):
+    # The codec writes at its default field version unless told otherwise.
+    from seerdb.common import tns
+
+    token = tns._ENCODE_FIELD_VERSION.set(field_version)
+    try:
+        return encode()
+    finally:
+        tns._ENCODE_FIELD_VERSION.reset(token)
+
+
+def test_a_12_2_result_says_how_long_an_identifier_may_be() -> None:
+    # A session at field version 12.2 or later gets AUTH_MAX_IDEN_LENGTH, 128
+    # as 18c, 21c and 23ai send it; a 12.1 session gets none, as from a live
+    # 23ai, and the client reads None (#2456).
+    modern = _encoded_at(FIELD_VERSION_12_2, lambda: encode_result(bytes(24)))
+    older = _encoded_at(FIELD_VERSION_12_1, lambda: encode_result(bytes(24)))
+    assert decode_token_rpa(modern[1:], ())[6]['max_identifier_length'] == 128
+    assert decode_token_rpa(older[1:], ())[6]['max_identifier_length'] is None
+
+
+def test_an_auth_result_names_the_instance() -> None:
+    # AUTH_INSTANCENAME, which every server from 10g on sends (#2456).
+    named = encode_result(bytes(24), instance_name='FREE')
+    assert decode_token_rpa(named[1:], ())[6]['instance_name'] == 'FREE'
+    assert (
+        decode_token_rpa(encode_result(bytes(24))[1:], ())[6]['instance_name'] is None
+    )
 
 
 def test_an_auth_result_prefers_the_real_unique_name() -> None:
@@ -478,7 +509,7 @@ def test_full_auth_roundtrip_through_seerdb_client_encoders() -> None:
     assert not verify_password(server_conn, auth_password, b'wrongpass')
 
     # The result the server sends back, validated by the client's own check.
-    _, resp, _, _, _, _ = decode_token_rpa(encode_result(server_conn)[1:], ())
+    _, resp, _, _, _, _, _ = decode_token_rpa(encode_result(server_conn)[1:], ())
     assert validate(unhexlify(resp), client_conn)
 
 

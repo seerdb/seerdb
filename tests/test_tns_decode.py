@@ -3769,7 +3769,16 @@ class TestTnsCommandDecoders(unittest.TestCase):
         DbUniqueName = 'XE'
         self.assertEqual(
             decode_token_rpa(Data, None),
-            (TTI_AUTH, Resp, Ver, SessId, SerialNum, DbUniqueName),
+            (
+                TTI_AUTH,
+                Resp,
+                Ver,
+                SessId,
+                SerialNum,
+                DbUniqueName,
+                # 11g sends its instance's name but no identifier limit (#2456).
+                {'max_identifier_length': None, 'instance_name': 'XE'},
+            ),
         )
 
 

@@ -22,6 +22,7 @@ from seerdb.client.pipeline import (
     create_pipeline,
 )
 from seerdb.client.pool import Pool
+from seerdb.client.sqlnames import enquote_literal, enquote_name, is_simple_sql_name
 from seerdb.common.datatypes import (
     BINARY,
     CURSOR,
@@ -195,6 +196,9 @@ __all__ = [
     'DbObjectType',
     'DbRef',
     'Xid',
+    'enquote_literal',
+    'enquote_name',
+    'is_simple_sql_name',
     'Queue',
     'MessageProperties',
     'EnqOptions',

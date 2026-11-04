@@ -3293,6 +3293,75 @@ class CursorIntegration(_IntegrationBase):
         finally:
             self.cur.execute(f'DROP TABLE {table}')
 
+    def test_transaction_in_progress_follows_the_server(self):
+        # The TXN_IN_PROGRESS bit of each reply's call status (#2456): a DML
+        # sets it, and a commit's or a rollback's bare status reply clears it.
+        # Before 10g seerdb doesn't read it, and says so.
+        from seerdb.common.exceptions import DatabaseError
+
+        with seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            **_FV_KW,
+        ) as conn:
+            if conn.field_version < FIELD_VERSION_10_2:
+                with self.assertRaises(seerdb.NotSupportedError):
+                    conn.transaction_in_progress
+                return
+            cur = conn.cursor()
+            table = 'PYO_TXN_IN_PROGRESS'
+            try:
+                cur.execute(f'DROP TABLE {table}')
+            except DatabaseError:
+                pass  # not left over from an earlier run
+            cur.execute(f'CREATE TABLE {table} (n NUMBER)')
+            try:
+                self.assertFalse(conn.transaction_in_progress)
+                cur.execute(f'INSERT INTO {table} VALUES (1)')
+                self.assertTrue(conn.transaction_in_progress)
+                conn.commit()
+                self.assertFalse(conn.transaction_in_progress)
+                cur.execute(f'UPDATE {table} SET n = 2')
+                self.assertTrue(conn.transaction_in_progress)
+                conn.rollback()
+                self.assertFalse(conn.transaction_in_progress)
+                cur.execute(f'SELECT n FROM {table}')
+                self.assertEqual(cur.fetchall(), [(1,)])
+                self.assertFalse(conn.transaction_in_progress)
+            finally:
+                cur.execute(f'DROP TABLE {table}')
+
+    def test_the_login_reply_names_the_instance_and_identifier_limit(self):
+        # From the login reply alone (#2456): the instance's name, as SQL
+        # reports it, and the longest identifier, which 12.2 and later send
+        # (128) to a session at field version 12.2 or later, and nothing before.
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            self.cur.execute("SELECT sys_context('userenv', 'instance_name') FROM dual")
+        except DatabaseError as exc:
+            if exc.code != 2003:
+                raise
+            self.assertIsNone(self.conn.instance_name)
+        else:
+            self.assertEqual(self.conn.instance_name, self.cur.fetchone()[0])
+        # The server tells a session at field version 12.2 or later; a 23ai
+        # tells a 12.1 session nothing.
+        if self.conn.field_version >= FIELD_VERSION_12_2:
+            self.assertEqual(self.conn.max_identifier_length, 128)
+        else:
+            self.assertIsNone(self.conn.max_identifier_length)
+
+    def test_is_healthy_needs_no_round_trip(self):
+        # True on an open connection, False once closed (#2456).
+        with _connect_with() as conn:
+            self.assertTrue(conn.is_healthy())
+            conn.close()
+            self.assertFalse(conn.is_healthy())
+
     def test_db_unique_name_is_the_one_sql_reports(self):
         # Read from the login reply alone, as python-oracledb 26 reads it, and
         # equal to what SQL reports (#1774). Before 10g USERENV has no
@@ -5604,6 +5673,31 @@ def _kill_session(sid) -> None:
 )
 class PingKilledSessionIntegration(_ThrottleRetry, unittest.TestCase):
     """A ping on a session the server killed raises, as the server says (#1095)."""
+
+    @_requires(_PING_ROUND_TRIP)
+    def test_a_killed_session_turns_unhealthy_once_the_server_says_so(self):
+        # A kill reaches the client on its next call, as ORA-00028; until then
+        # is_healthy can't know, and after it says False (#2456).
+        conn = seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            **_FV_KW,
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT SYS_CONTEXT('userenv', 'sid') FROM dual")
+            _kill_session(int(cur.fetchone()[0]))
+            with self.assertRaises(seerdb.DatabaseError):
+                cur.execute('SELECT 1 FROM dual')
+            self.assertFalse(conn.is_healthy())
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - the session is gone
+                pass
 
     @_requires(_PING_ROUND_TRIP)
     def test_ping_raises_on_a_killed_session(self):
@@ -10682,6 +10776,47 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 )
                 self.assertEqual(await Cur.fetchall(), [(driver,)])
 
+    async def test_transaction_in_progress_follows_the_server(self):
+        # Async twin of CursorIntegration's (#2456).
+        from seerdb.common.exceptions import DatabaseError
+
+        Kwargs = self._kwargs()
+        Kwargs['autocommit'] = False
+        async with await seerdb.connect_async(**Kwargs) as Conn:
+            if Conn.field_version < FIELD_VERSION_10_2:
+                with self.assertRaises(seerdb.NotSupportedError):
+                    Conn.transaction_in_progress
+                return
+            table = 'PYO_ATXN_IN_PROGRESS'
+            async with Conn.cursor() as Cur:
+                try:
+                    await Cur.execute(f'DROP TABLE {table}')
+                except DatabaseError:
+                    pass  # not left over from an earlier run
+                await Cur.execute(f'CREATE TABLE {table} (n NUMBER)')
+                try:
+                    await Cur.execute(f'INSERT INTO {table} VALUES (1)')
+                    self.assertTrue(Conn.transaction_in_progress)
+                    await Conn.commit()
+                    self.assertFalse(Conn.transaction_in_progress)
+                    await Cur.execute(f'DELETE FROM {table}')
+                    self.assertTrue(Conn.transaction_in_progress)
+                    await Conn.rollback()
+                    self.assertFalse(Conn.transaction_in_progress)
+                finally:
+                    await Cur.execute(f'DROP TABLE {table}')
+
+    async def test_is_healthy_needs_no_round_trip(self):
+        # Async twin of CursorIntegration's (#2456).
+        Conn = await seerdb.connect_async(**self._kwargs())
+        self.assertTrue(Conn.is_healthy())
+        self.assertEqual(
+            Conn.max_identifier_length,
+            128 if Conn.field_version >= FIELD_VERSION_12_2 else None,
+        )
+        await Conn.close()
+        self.assertFalse(Conn.is_healthy())
+
     async def test_a_descriptor_over_230_bytes_connects(self):
         # Async twin of CursorIntegration's.
         async with await seerdb.connect_async(
@@ -13835,9 +13970,13 @@ class PreSha2VerifierLoginIntegration(_ThrottleRetry, unittest.TestCase):
         captured = {}
         original = _cm.decode_token_rpa
 
+        from seerdb.common.tns_consts import TTI_SESS
+
         def spy(data, acc):
             result = original(data, acc)
-            if isinstance(result, tuple) and len(result) == 7:  # SESS challenge
+            # The challenge, by its type: the auth result is a 7-tuple too
+            # since it carries the login identity (#2456).
+            if isinstance(result, tuple) and result and result[0] == TTI_SESS:
                 captured['sess'] = result
             return result
 

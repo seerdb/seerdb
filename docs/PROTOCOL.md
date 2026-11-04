@@ -1276,6 +1276,7 @@ If successful, the server returns TTI_RPA with:
 | `AUTH_SESSION_ID`       | Session identifier                 |
 | `AUTH_SERIAL_NUM`       | Session serial number              |
 | `AUTH_MAX_OPEN_CURSORS` | Session's max open cursors (12.1+) |
+| `AUTH_MAX_IDEN_LENGTH`  | Longest identifier, `128` (12.2+)  |
 | `AUTH_INSTANCENAME`     | Instance name                      |
 | `AUTH_SC_DBUNIQUE_NAME` | Database unique name               |
 | `AUTH_SC_REAL_DBUNIQUE_NAME` | Database unique name (21c+)   |
@@ -1290,6 +1291,17 @@ however correct the session otherwise is — `sys_context('userenv', 'sid')` wil
 happily return the right value in the same breath. Measured on a live 23ai:
 `AUTH_INSTANCENAME` `FREE`, `AUTH_SC_DBUNIQUE_NAME` `FREE`,
 `AUTH_SC_SERVICE_NAME` `freepdb1` (lower case, unlike the others).
+
+`AUTH_MAX_IDEN_LENGTH` is the longest identifier the server takes, a client's
+`max_identifier_length` (#2456). It depends on the **negotiated field version**,
+not the server's release. Measured on 2026-11-04:
+- 23ai sends `128` to a session at field version 8 (12.2) or later, and nothing to
+  one at 7 (12.1);
+- 18c and 21c send `128`;
+- 10g and 11g never send it.
+
+Where it isn't sent, the attribute is `None` rather than a value the client
+assumes. The Mirror sends it to a session at field version 12.2 or later.
 
 The unique name is `sys_context('userenv', 'db_unique_name')`, and it comes in
 two keys (#1774). 21c and 23ai send both `AUTH_SC_DBUNIQUE_NAME` and
@@ -1574,6 +1586,17 @@ while a transaction is in progress (`TXN_IN_PROGRESS`), `5` right after a
 PL/SQL execute. seerdb once fetched only on `call_status == 1`, which worked
 solely because autocommit on was the default; with autocommit off a LOB
 SELECT of an uncommitted row returned no rows at all (#712).
+
+**Client side: `transaction_in_progress` (#2456).** The connection keeps the
+`call_status` of the last reply it decoded and reports its `TXN_IN_PROGRESS` bit.
+That reply is either an OER or, for a bare commit or rollback, the `TTI_STA`
+that is the whole reply (`17 <ub4 call_status> <ub2 sequence>`). Measured on 10g,
+11g and 23ai: an INSERT or UPDATE sets the bit, and the commit's or rollback's
+status clears it. The last reply's error code is kept too: after ORA-00028,
+ORA-01012, ORA-01089, ORA-01092, ORA-02396, ORA-03113, ORA-03114 or ORA-03135 the
+session is gone, and `is_healthy()` says False without a round trip. seerdb
+doesn't read the bit from the 8i and 9i replies, so there the attribute is
+refused rather than guessed.
 
 **Server side: the transaction bit is not optional (#889).** A client reads
 `TXN_IN_PROGRESS` (`0x02`) to decide whether releasing a connection to a pool,

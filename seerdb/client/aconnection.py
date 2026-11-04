@@ -418,6 +418,13 @@ class AsyncOracleConnect(_ConnectionLogic):
         # SYS_CONTEXT('USERENV', 'DB_UNIQUE_NAME'), from the login reply; None
         # before 10g, whose reply does not carry it (#1774).
         self.db_unique_name: str | None = None
+        # From the login reply too (#2456): the longest identifier the server
+        # takes (None before 12.2, which doesn't say) and the instance's name.
+        self.max_identifier_length: int | None = None
+        self.instance_name: str | None = None
+        # The last reply's call status and error code, recorded as it decodes
+        # (#2456): transaction_in_progress and is_healthy read them.
+        self._call_status: list[int] = []
         # Negotiated TTC field version; see OracleConnect for the full note.
         self.field_version = field_version
         self._field_version_requested = field_version  # for the nego-cache retry
@@ -1228,7 +1235,7 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def _handle_rpa(self, Data: bytes) -> int | None:
         from seerdb.common.tns_consts import TTI_AUTH
 
-        with recording_session_keywords(self._session_keywords):
+        with recording_session_keywords(self._session_keywords, self._call_status):
             Result = decode_token_rpa(Data, ())
         self._absorb_session_keywords()
         if Result[0] == TTI_SESS:
@@ -1259,13 +1266,14 @@ class AsyncOracleConnect(_ConnectionLogic):
             return await self.handle_login()
         elif Result[0] == TTI_AUTH:
             # Second RPA: auth result.
-            (_, Resp, Ver, SessId, SerialNum, DbUniqueName) = Result
+            (_, Resp, Ver, SessId, SerialNum, DbUniqueName, Identity) = Result
             if self._token_auth:
                 # Token auth (#125): no server proof / ConnKey; accept directly.
                 self.server_version = Ver
                 self.session_id = SessId
                 self.serial_num = SerialNum
                 self.db_unique_name = DbUniqueName
+                self._absorb_identity(Identity)
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 return 0
             assert self.conn_key is not None
@@ -1274,6 +1282,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 self.session_id = SessId
                 self.serial_num = SerialNum
                 self.db_unique_name = DbUniqueName
+                self._absorb_identity(Identity)
                 self.conn_state = CONN_STATE_AUTHENTICATED
                 if (
                     self.negotiation_cache
@@ -1319,7 +1328,9 @@ class AsyncOracleConnect(_ConnectionLogic):
             Kept = len(Rows) if Rows is not None else 0
             while True:
                 try:
-                    with recording_session_keywords(self._session_keywords):
+                    with recording_session_keywords(
+                        self._session_keywords, self._call_status
+                    ):
                         Result = decode_packet(
                             Packet,
                             Acc,
@@ -3078,6 +3089,14 @@ class AsyncOracleConnect(_ConnectionLogic):
             # is out of sync, we still want to release the local socket below.
             pass
         await self.disconnect()
+
+    def _socket_open(self) -> bool:
+        # Whether the server has left the stream open, without reading from it
+        # (#2456): the reader has seen no end of file, and the transport is not
+        # closing.
+        if self._writer is None or self._reader is None:
+            return False
+        return not (self._reader.at_eof() or self._writer.is_closing())
 
     async def disconnect(self) -> None:
         if self._writer is not None:

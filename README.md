@@ -305,12 +305,13 @@ exercise.
 | **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+) | ✅ |
 | **Arrow / DataFrame fetch** — `cursor.fetch_df_all` / `fetch_df_batches` (pyarrow `Table` / record batches) | ✅ |
 | **SODA** — document store over `DBMS_SODA`: collections, documents, query-by-example (with streaming), insert / read / upsert / update / delete / bulk, indexing + data guide (18c+) | ✅ |
-| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects; `dsn` as an Easy Connect string, a connect descriptor (with address failover) or a `tnsnames.ora` alias, IPv6, TCPS through an HTTPS proxy; `ws://` / `wss://` to a Mirror's WebSocket listener (a seerdb extension, the `ws` extra) | ✅ |
+| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, `is_healthy()` with no round trip, `transaction_in_progress` (10g+), `max_identifier_length` and `instance_name` from the login reply, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects; `dsn` as an Easy Connect string, a connect descriptor (with address failover) or a `tnsnames.ora` alias, IPv6, TCPS through an HTTPS proxy; `ws://` / `wss://` to a Mirror's WebSocket listener (a seerdb extension, the `ws` extra) | ✅ |
 | **Authentication** — O3LOGON (8i / 9i) and O5LOGON (10g+, 128 / 192 / 256-bit); token-based auth — OAuth2 (bare JWT) and OCI IAM (signed) for Autonomous Database | ✅ |
 | **Native network encryption** — Advanced Networking (ANO): AES-CBC encryption + SHA-2 data-integrity negotiated at connect, for a server with `SQLNET.ENCRYPTION_SERVER` / `CRYPTO_CHECKSUM_SERVER` set | ✅ |
 | **Advanced Queuing (AQ)** — enqueue / dequeue over `DBMS_AQ`, including JSON payloads | ✅ |
 | **Implicit result sets** — `DBMS_SQL.RETURN_RESULT` (`getimplicitresults`) | ✅ |
 | **Two-phase commit / XA** — `tpc_begin` / `tpc_prepare` / `tpc_commit` / `tpc_rollback` with an `Xid` | ✅ |
+| **Dynamic SQL helpers** — `enquote_literal`, `enquote_name`, `is_simple_sql_name`, as in python-oracledb 4.0 | ✅ |
 | **Request pipelining** — `create_pipeline()` batches operations into one round trip (23ai) | ✅ |
 | **Async** — full `asyncio` API (connection, cursor, pool) at parity with the sync API | ✅ |
 | **Character sets** — AL32UTF8 and others; national-charset (`DB_TYPE_NVARCHAR` / `NCHAR`) binds | ✅ |
