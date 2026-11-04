@@ -8685,6 +8685,12 @@ thin protocol does not have.
 
 ## 38. Continuous Query Notification is not on the thin wire (#129)
 
+> **Superseded.** python-oracledb 4.0.0 (May 2026) added CQN and AQ
+> notifications to its thin mode, so the finding below no longer holds for
+> current servers and clients. It is kept as the 2026-08 record until the
+> thin form is measured and documented here (#2460). Until then seerdb still
+> raises `NotSupportedError` from `subscribe()`.
+
 Continuous Query Notification (CQN) registers a **server-initiated
 subscription**: the client asks the database to watch a query / set of objects
 and, when they change, the *server opens a callback connection back to the
