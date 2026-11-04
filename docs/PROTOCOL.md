@@ -362,6 +362,12 @@ CONNECT packet itself is sent in the legacy 16-bit-length envelope regardless.
 
 When SSL/TLS is used, `PROTOCOL=TCPS`.
 
+Two optional parts go where python-oracledb 26.1 writes them (#2456):
+- `(EXPIRE_TIME=<minutes>)` opens the DESCRIPTION, when `expire_time` is above 0. The client also turns TCP keepalive on, with the first probe after that many minutes of quiet.
+- `(INSTANCE_NAME=<instance>)` follows the service name, before `(SERVER=...)`.
+
+The listener acts on the instance name. Measured on 9i, 10g, 11g and 23ai (2026-11-04): the instance it serves connects, and one it doesn't know is refused with ORA-12521, *connection refused by the listener*. The Mirror doesn't check it yet (#2471).
+
 **A descriptor over 230 bytes** does not ride in the CONNECT (#1768). A server
 reads at most 230 bytes of connect data from the CONNECT packet. Given more, it
 waits for data that never comes and the connect hangs. The limit was measured on

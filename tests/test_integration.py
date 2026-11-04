@@ -3355,6 +3355,53 @@ class CursorIntegration(_IntegrationBase):
         else:
             self.assertIsNone(self.conn.max_identifier_length)
 
+    @_requires(_mirror_lacks('a listener refusing an unknown instance (#2471)'))
+    def test_an_unknown_instance_name_is_refused(self):
+        # A listener refuses (INSTANCE_NAME=...) naming an instance it doesn't
+        # know, with ORA-12521: measured on 9i, 10g, 11g and 23ai (#2456).
+        from seerdb.common.exceptions import DatabaseError
+
+        with self.assertRaises(DatabaseError) as raised:
+            _connect_with(instance_name='SEERDB_NO_SUCH_INSTANCE')
+        self.assertEqual(raised.exception.code, 12521)
+
+    def test_instance_name_reaches_that_instance(self):
+        # (INSTANCE_NAME=...) in CONNECT_DATA (#2456): the listener hands the
+        # session to the instance named.
+        from seerdb.common.exceptions import DatabaseError
+
+        with _connect_with() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT sys_context('userenv', 'instance_name') FROM dual")
+            except DatabaseError as exc:
+                if exc.code != 2003:
+                    raise
+                self.skipTest('USERENV names no instance before 10g')
+            (instance,) = cur.fetchone()
+        with _connect_with(instance_name=instance) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT sys_context('userenv', 'instance_name') FROM dual")
+            self.assertEqual(cur.fetchone(), (instance,))
+
+    def test_expire_time_turns_keepalive_on(self):
+        # expire_time (#2456): TCP keepalive on the socket, after that many
+        # minutes of quiet, and (EXPIRE_TIME=n) in the descriptor, which the
+        # server takes.
+        import socket
+
+        with _connect_with(expire_time=2) as conn:
+            sock = conn.sock
+            self.assertEqual(sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 1)
+            idle = getattr(socket, 'TCP_KEEPIDLE', None)
+            if idle is not None:
+                self.assertEqual(sock.getsockopt(socket.IPPROTO_TCP, idle), 120)
+            conn.cursor().execute('SELECT 1 FROM dual')
+        with _connect_with() as conn:
+            self.assertEqual(
+                conn.sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 0
+            )
+
     def test_is_healthy_needs_no_round_trip(self):
         # True on an open connection, False once closed (#2456).
         with _connect_with() as conn:

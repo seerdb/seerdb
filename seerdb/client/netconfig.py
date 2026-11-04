@@ -208,6 +208,10 @@ class DescriptorTarget:
     # The HTTPS proxy a TCPS address is reached through (#1993).
     https_proxy: str = ''
     https_proxy_port: int = 0
+    # The instance CONNECT_DATA names, and the DESCRIPTION's keepalive
+    # interval in minutes (#2456).
+    instance_name: str = ''
+    expire_time: int = 0
 
 
 @dataclass(frozen=True)
@@ -222,6 +226,7 @@ class Address:
     server_type: str | None = None
     https_proxy: str = ''
     https_proxy_port: int = 0
+    instance_name: str = ''
 
 
 @dataclass(frozen=True)
@@ -269,6 +274,7 @@ _DESCRIPTION_KEYS = _ROUTE_KEYS | {
     'address',
     'address_list',
     'connect_data',
+    'expire_time',
     'retry_count',
     'retry_delay',
 }
@@ -276,7 +282,9 @@ _ADDRESS_LIST_KEYS = _ROUTE_KEYS | {'address'}
 _ADDRESS_KEYS = frozenset(
     {'protocol', 'host', 'port', 'https_proxy', 'https_proxy_port'}
 )
-_CONNECT_DATA_KEYS = frozenset({'service_name', 'sid', 'cid', 'server'})
+_CONNECT_DATA_KEYS = frozenset(
+    {'service_name', 'sid', 'cid', 'server', 'instance_name'}
+)
 _DEFAULT_PORT = 1521
 
 
@@ -390,7 +398,7 @@ def proxy_address(proxy: Node | None, port: Node | None) -> tuple[str, int]:
 def _connect_data(description: list[tuple[str, Node]]) -> Address:
     # The description's CONNECT_DATA, as an Address its addresses fill in.
     connect_data = [v for k, v in description if k == 'connect_data']
-    service_name = sid = ''
+    service_name = sid = instance_name = ''
     server_type = None
     if connect_data:
         data = _branch(connect_data[0], 'connect_data')
@@ -399,12 +407,16 @@ def _connect_data(description: list[tuple[str, Node]]) -> Address:
         service_name = found if isinstance(found, str) else ''
         found = _find_first(data, 'sid')
         sid = found if isinstance(found, str) else ''
+        found = _find_first(data, 'instance_name')
+        instance_name = found if isinstance(found, str) else ''
         found = _find_first(data, 'server')
         if found is not None:
             if not isinstance(found, str):
                 raise NetConfigError('SERVER in CONNECT_DATA must be a word')
             server_type = server_type_value(found)
-    return Address('', 0, 'tcp', service_name, sid, server_type)
+    return Address(
+        '', 0, 'tcp', service_name, sid, server_type, instance_name=instance_name
+    )
 
 
 def descriptor_target(name: str, value: Node) -> DescriptorTarget:
@@ -426,6 +438,7 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
             f'a connect descriptor opens with DESCRIPTION, not {name.upper()}'
         )
     addresses: list[Address] = []
+    expire_time: int | None = None
     for node in descriptions:
         description = _branch(node, 'description')
         _refuse_unread(description, _DESCRIPTION_KEYS, 'DESCRIPTION parameter')
@@ -439,6 +452,13 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
                     options.retry_count = int(number)
                 elif key == 'retry_delay' and options.retry_delay is None:
                     options.retry_delay = number
+            elif key == 'expire_time' and expire_time is None:
+                # Minutes between keepalive probes; the first description's
+                # holds for the connection (#2456).
+                number = _number(child, key)
+                if not number >= 0:
+                    raise NetConfigError(f'EXPIRE_TIME={child!r} is not a number')
+                expire_time = int(number)
         data = _connect_data(description)
         for key, child in description:
             if key == 'address':
@@ -472,6 +492,8 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         route,
         first.https_proxy,
         first.https_proxy_port,
+        first.instance_name,
+        expire_time or 0,
     )
 
 

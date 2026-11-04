@@ -214,6 +214,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         server_type: str | None = None,
         https_proxy: str | None = None,
         https_proxy_port: int = 0,
+        instance_name: str | None = None,
+        expire_time: int = 0,
         wallet_location: str | None = None,
         wallet_password: str | None = None,
         config_dir: str | None = None,
@@ -262,6 +264,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                 None,
                 https_proxy,
                 https_proxy_port,
+                instance_name=instance_name or '',
+                expire_time=expire_time,
             )
             (
                 host,
@@ -280,6 +284,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                 https_proxy,
                 https_proxy_port,
                 protocol,
+                instance_name,
+                expire_time,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # The transport in force (#1988); a route address can repoint it.
         self.protocol = protocol
@@ -302,6 +308,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         # dedicated / shared / pooled, written into (SERVER=...); pooled also asks
         # for DRCP, as in python-oracledb (#1977).
         self.server_type = server_type_value(server_type)
+        # The instance to reach, written into CONNECT_DATA, and the minutes
+        # between TCP keepalive probes, 0 for none (#2456). The instance the
+        # server reports at login is `instance_name`, set from its reply.
+        self._instance_name_requested = instance_name or ''
+        self.expire_time = expire_time
         self.password = password
         self.sid = sid
         self.service_name = service_name
@@ -517,6 +528,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             Sock.setblocking(False)
             try:
                 await Loop.sock_connect(Sock, Sockaddr)
+                self._apply_keepalive(Sock)
                 return Sock
             except OSError as E:
                 Sock.close()
@@ -659,6 +671,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         (self.service_name, self.sid) = (address.service_name, address.sid)
         if address.server_type is not None:
             self.server_type = address.server_type
+        if address.instance_name:
+            self._instance_name_requested = address.instance_name
         if address.https_proxy:
             (self.https_proxy, self.https_proxy_port) = (
                 address.https_proxy,

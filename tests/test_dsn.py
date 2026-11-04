@@ -122,7 +122,6 @@ class Parameters(unittest.TestCase):
 
     def test_the_rest_are_refused_by_name(self):
         for name in (
-            'expire_time',
             'connect_timeout',
             'wallet_location',
             'frobnicate',

@@ -8,7 +8,7 @@
 connects. Without a wallet seerdb used to drop the argument and dial
 ``localhost:1521``. This module reads the string the way python-oracledb does:
 
-    [user[/password]@][//]host[:port][/service_name]
+    [user[/password]@][//]host[:port][/service_name[:server_type][/instance_name]]
 
 or a connect descriptor with one address,
 ``[user[/password]@](DESCRIPTION=(ADDRESS=...)(CONNECT_DATA=...))``
@@ -22,7 +22,9 @@ it, as it does in python-oracledb. A bare word is a tnsnames alias, read from
 yet -- ``?`` parameters, or a descriptor parameter seerdb does not act on --
 raises NotSupportedError naming it, rather than being ignored. A ``tcps://``
 prefix, or PROTOCOL=TCPS in a descriptor, turns TLS on, and a ``:server_type``
-suffix or (SERVER=...) in CONNECT_DATA sets the server type (#1977).
+suffix or (SERVER=...) in CONNECT_DATA sets the server type (#1977). A third
+segment or (INSTANCE_NAME=...) names the instance, and ``?expire_time=`` or
+(EXPIRE_TIME=...) turns TCP keepalive on (#2456).
 """
 
 from __future__ import annotations
@@ -61,6 +63,8 @@ class DsnTarget:
     route: Route | None = None
     https_proxy: str = ''
     https_proxy_port: int = 0
+    instance_name: str = ''
+    expire_time: int = 0
 
 
 @dataclass(frozen=True)
@@ -86,6 +90,10 @@ class ConnectArguments:
     # extension 'ws' / 'wss' (#1988). Trailing with a default so a plain
     # ConnectArguments(...) positional build need not pass it.
     protocol: str = 'tcp'
+    # The instance to reach (INSTANCE_NAME in CONNECT_DATA) and the minutes
+    # between keepalive probes, 0 for none (#2456).
+    instance_name: str = ''
+    expire_time: int = 0
 
     def as_tuple(self) -> tuple:
         # In field order, for a constructor to unpack into its own arguments.
@@ -140,6 +148,8 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             route=found.route,
             https_proxy=found.https_proxy,
             https_proxy_port=found.https_proxy_port,
+            instance_name=found.instance_name,
+            expire_time=found.expire_time,
         )
     protocol = 'tcp'
     scheme, separator, after = text.partition('://')
@@ -185,6 +195,8 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             route=found.route,
             https_proxy=found.https_proxy,
             https_proxy_port=found.https_proxy_port,
+            instance_name=found.instance_name,
+            expire_time=found.expire_time,
         )
     port = _DEFAULT_PORT
     if rest.startswith(':'):
@@ -193,16 +205,33 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             raise ProgrammingError(f'dsn {dsn!r}: the port is not a number')
         port = int(digits)
         rest = slash + after
-    service_name = ''
+    service_name = instance_name = ''
     server_type = None
     if rest.startswith('/'):
-        (service_name, colon, kind) = rest[1:].partition(':')
+        # /service_name[:server_type][/instance_name], as python-oracledb
+        # reads it (#2456).
+        (service, slash, instance_name) = rest[1:].partition('/')
+        if slash and (not instance_name or '/' in instance_name):
+            raise ProgrammingError(
+                f'dsn {dsn!r} is not [//]host[:port][/service_name[:server_type]'
+                '[/instance_name]]'
+            )
+        (service_name, colon, kind) = service.partition(':')
         if colon:
             server_type = server_type_value(kind)
     elif rest:
         raise ProgrammingError(f'dsn {dsn!r} is not [//]host[:port][/service_name]')
     return DsnTarget(
-        host, port, service_name, user, password, '', protocol, server_type, parameters
+        host,
+        port,
+        service_name,
+        user,
+        password,
+        '',
+        protocol,
+        server_type,
+        parameters,
+        instance_name=instance_name,
     )
 
 
@@ -236,6 +265,7 @@ def _apply_parameters(
             'retry_delay',
             'https_proxy',
             'https_proxy_port',
+            'expire_time',
         }
     )
     if unread:
@@ -257,6 +287,12 @@ def _apply_parameters(
                 f'dsn {dsn!r}: pool_purity={parameters["pool_purity"]!r}'
             )
         args = replace(args, purity=purity)
+    if 'expire_time' in parameters:
+        if not parameters['expire_time'].isdigit():
+            raise ProgrammingError(
+                f'dsn {dsn!r}: expire_time={parameters["expire_time"]!r} is not a number'
+            )
+        args = replace(args, expire_time=int(parameters['expire_time']))
     if 'transport_connect_timeout' in parameters:
         args = replace(
             args, timeout=_timeout_ms(dsn, parameters['transport_connect_timeout'])
@@ -291,6 +327,7 @@ def _apply_parameters(
             args.server_type,
             args.https_proxy or '',
             args.https_proxy_port,
+            args.instance_name,
         )
         args = replace(
             args,
@@ -321,6 +358,10 @@ def resolve_dsn_arguments(
     # leave args.ssl as given -- _open_transport branches on the protocol.
     if info.server_type is not None:
         args = replace(args, server_type=info.server_type)
+    if info.instance_name:
+        args = replace(args, instance_name=info.instance_name)
+    if info.expire_time:
+        args = replace(args, expire_time=info.expire_time)
     if info.service_name:
         args = replace(args, service_name=info.service_name, sid='')
     elif info.sid:
