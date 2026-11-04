@@ -18,6 +18,7 @@ revoke select on sys.v_$sesstat from &test_user;
 revoke select on sys.v_$statname from &test_user;
 revoke select on sys.v_$parameter from &test_user;
 revoke select on sys.v_$database from &test_user;
+revoke select on sys.dba_pending_transactions from &test_user;
 drop directory seerdb_bfile_dir;
 drop user seerdb_proxy_target cascade;
 drop user seerdb_admin cascade;

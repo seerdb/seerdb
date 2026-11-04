@@ -287,6 +287,11 @@ def _raise_tpc_error(Packet: bytes) -> None:
     raise DatabaseError(f'unexpected TPC response 0x{Packet[:1].hex()}')
 
 
+# What tpc_recover reads (#2457): the in-doubt branches' identifiers, as
+# python-oracledb reads them.
+_TPC_RECOVER_SQL = 'SELECT formatid, globalid, branchid FROM dba_pending_transactions'
+
+
 def _check_tpc_reply(Packet: bytes) -> bytes:
     # Every TPC reply, before its caller reads it (#1755): one that does not
     # open with the RPA return params and carries an ORA code is a failure the
@@ -3733,6 +3738,17 @@ class OracleConnect(_ConnectionLogic):
         self._transaction_context = None
         if Result != TNS_TPC_TXN_STATE_ABORTED:
             raise DatabaseError(f'unexpected TPC rollback state {Result}')
+
+    def tpc_recover(self) -> list[Xid]:
+        """The branches waiting in doubt, from DBA_PENDING_TRANSACTIONS, ready
+        for tpc_commit or tpc_rollback (#2457). Needs SELECT on that view, as
+        in python-oracledb."""
+        Cursor = self.cursor()
+        try:
+            Cursor.execute(_TPC_RECOVER_SQL)
+            return [Xid(*Row) for Row in Cursor.fetchall()]
+        finally:
+            Cursor.close()
 
     # --- Sessionless transactions (#133, 23ai) ---
 

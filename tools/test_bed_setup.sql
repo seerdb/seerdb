@@ -33,6 +33,8 @@ grant select on sys.v_$sesstat to &test_user;
 grant select on sys.v_$statname to &test_user;
 grant select on sys.v_$parameter to &test_user;
 grant select on sys.v_$database to &test_user;
+-- tpc_recover reads the in-doubt branches here (#2457).
+grant select on sys.dba_pending_transactions to &test_user;
 grant create view to &test_user;
 grant create procedure to &test_user;
 grant execute on sys.dbms_lob to &test_user;

@@ -7838,6 +7838,25 @@ field version < 12.1 (before any wire activity — the connection stays usable).
 Verified on 21c/23ai (two-phase commit, one-phase commit, rollback, read-only
 prepare), sync + async.
 
+**Recovering in-doubt branches (#2457).**
+- **`tpc_recover`** isn't a wire message. It is a query on
+  `DBA_PENDING_TRANSACTIONS` (`formatid, globalid, branchid`), as python-oracledb
+  documents it, and it needs SELECT on that view. A second session then settles
+  each branch with `tpc_commit` / `tpc_rollback` by XID, no context needed.
+- **Settling by XID works only while the branch is unclaimed.** Measured on 23ai,
+  2026-11-04:
+  - while the session that prepared the branch stays open, a rollback by XID from
+    another session succeeds at any delay tried (0 to 10 s);
+  - once that session closes, it succeeds for about a second. After 2 s it is
+    refused with ORA-24756, "transaction ... does not exist", from python-oracledb
+    too: the database's recovery process has taken the branch, now listed in
+    `DBA_2PC_PENDING`, and only `COMMIT FORCE` / `ROLLBACK FORCE` settle it.
+- **`tpc_forget`** is refused. python-oracledb 26.1 refuses it in thin mode
+  (DPY-3001, thick mode only). The change-state message with op `FORGET` (4) and
+  state 0 is refused by 23ai as malformed (ORA-03137, `[kpotxen: bad args] [0] [4]
+  [0]`). With no thin reference, seerdb raises NotSupportedError. A heuristically
+  completed branch is cleared with `DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY`.
+
 ## 29. Advanced Queuing (#128)
 
 Enqueue/dequeue via `connection.queue(name[, payload_type])` →
