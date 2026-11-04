@@ -3313,8 +3313,8 @@ class CursorIntegration(_IntegrationBase):
     def test_v_session_shows_the_identity_the_client_declared(self):
         # v$session and v$session_connect_info show this session as its login
         # declared it (#1212); the terminal is left out, since a login in the
-        # pre-12c shape declares none. Reading them needs a privilege the suite's user
-        # has on no Oracle bed (ORA-00942), so there it skips.
+        # pre-12c shape declares none. Reading them needs SELECT on v$session
+        # (tools/test_bed_setup.sql grants it); without it the test skips.
         from seerdb.common.exceptions import DatabaseError
 
         with _connect_with(
@@ -3338,6 +3338,8 @@ class CursorIntegration(_IntegrationBase):
                 cur.fetchall(),
                 [('pyo-program', 'pyo-machine', 'pyo-osuser')],
             )
+            if int(conn.version.split('.')[0]) < 11:
+                return  # v$session_connect_info has no CLIENT_DRIVER before 11g
             cur.execute(
                 'SELECT DISTINCT client_driver FROM v$session_connect_info '
                 "WHERE sid = sys_context('userenv', 'sid')"
@@ -10671,6 +10673,8 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     await Cur.fetchall(),
                     [('pyo-program', 'pyo-machine', 'pyo-osuser')],
                 )
+                if int(Conn.version.split('.')[0]) < 11:
+                    return  # no CLIENT_DRIVER column before 11g
                 await Cur.execute(
                     'SELECT DISTINCT client_driver FROM v$session_connect_info '
                     "WHERE sid = sys_context('userenv', 'sid')"

@@ -262,6 +262,19 @@ jobs:
           else:
               raise SystemExit(f'11g XE did not come back: {last}')
           PY
+      # Grants, a BFILE directory and a proxy target for the tests that
+      # otherwise skip on configuration alone (#2455). The admin tests use
+      # SYSTEM, set below, so no admin account is made here.
+      - name: Set the test bed up
+        run: |
+          docker cp tools/test_bed_setup.sql ${{ job.services.oracle.id }}:/tmp/seerdb_bed_setup.sql
+          if [ "${{ matrix.db.service }}" = XE ]; then
+            PDB=''
+          else
+            PDB='alter session set container = ${{ matrix.db.service }};'
+          fi
+          printf '%s\n@/tmp/seerdb_bed_setup.sql pyo\n' "$PDB" |
+            docker exec -i ${{ job.services.oracle.id }} sqlplus -s / as sysdba
       - name: Run integration suite against ${{ matrix.db.name }}
         env:
           SEERDB_TEST_USER: pyo
@@ -275,6 +288,9 @@ jobs:
           # ORACLE_PASSWORD. Harmless on 11g (that test skips on a pre-12c server).
           SEERDB_TEST_ADMIN_USER: system
           SEERDB_TEST_ADMIN_PASSWORD: oracle
+          # Made by tools/test_bed_setup.sql in the step above (#2455).
+          SEERDB_TEST_BFILE_DIR: SEERDB_BFILE_DIR
+          SEERDB_TEST_PROXY_USER: seerdb_proxy_target
           # Pace logins under XE's logon-storm throttle (ORA-01013), and retry a
           # whole test that still trips it.
           SEERDB_TEST_CONNECT_DELAY: "0.25"
