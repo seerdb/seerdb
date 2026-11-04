@@ -21,6 +21,7 @@ the pure methods here.
 
 from __future__ import annotations
 
+import socket
 from typing import TYPE_CHECKING, TypeGuard
 
 from seerdb.client.dialect import Dialect, Fv2Dialect, Fv2Oall8Dialect, O8iDialect
@@ -91,6 +92,8 @@ class _ConnectionLogic:
     cclass: str | None
     purity: int
     server_type: str | None
+    _instance_name_requested: str
+    expire_time: int
     socket_options: object
     conn_state: int
     timeout: int
@@ -425,6 +428,20 @@ class _ConnectionLogic:
             return ''
         return self._txn_priority_requested
 
+    def _apply_keepalive(self, Sock: socket.socket) -> None:
+        # expire_time (#2456): TCP keepalive, the first probe after that many
+        # minutes of quiet, as python-oracledb enables it; the probes' spacing
+        # and count stay the system's. A platform without the idle option still
+        # gets keepalive at its own default.
+        if self.expire_time <= 0:
+            return
+        Sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        Idle = getattr(socket, 'TCP_KEEPIDLE', None) or getattr(
+            socket, 'TCP_KEEPALIVE', None
+        )
+        if Idle is not None:
+            Sock.setsockopt(socket.IPPROTO_TCP, Idle, self.expire_time * 60)
+
     def _absorb_identity(self, Identity: dict) -> None:
         # What the login reply says about the server (#2456): the longest
         # identifier it takes (None where it doesn't say, as before 12.2) and
@@ -666,6 +683,8 @@ class _ConnectionLogic:
                 'cclass': self.cclass,
                 'purity': self.purity,
                 'server_type': self.server_type,
+                'instance_name': self._instance_name_requested,
+                'expire_time': self.expire_time,
                 'password': self.password,
                 'sid': self.sid,
                 'service_name': self.service_name,

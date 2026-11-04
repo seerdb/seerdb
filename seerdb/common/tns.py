@@ -8832,10 +8832,23 @@ def encode_dictionary_description(Dictionary: dict) -> bytes:
     # connection class or a purity requests no pooled server by itself (#1990).
     ServerType = Dictionary['env'].get('server_type')
     Drcp = b'(SERVER=' + ServerType.encode('ascii') + b')' if ServerType else b''
+    # The instance to reach, after the service as the reference client writes
+    # it, and the keepalive interval opening the DESCRIPTION (#2456).
+    Instance = Dictionary['env'].get('instance_name') or ''
+    InstancePart = (
+        b'(INSTANCE_NAME=' + Instance.encode('utf-8') + b')' if Instance else b''
+    )
+    Expire = int(Dictionary['env'].get('expire_time') or 0)
+    ExpirePart = (
+        b'(EXPIRE_TIME=' + str(Expire).encode('ascii') + b')' if Expire > 0 else b''
+    )
     return (
-        b'(DESCRIPTION=(CONNECT_DATA=('
+        b'(DESCRIPTION='
+        + ExpirePart
+        + b'(CONNECT_DATA=('
         + Sn
         + b')'
+        + InstancePart
         + Drcp
         + b'(CID=(PROGRAM='
         + AppName

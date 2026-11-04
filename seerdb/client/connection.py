@@ -993,6 +993,8 @@ class OracleConnect(_ConnectionLogic):
         server_type: str | None = None,
         https_proxy: str | None = None,
         https_proxy_port: int = 0,
+        instance_name: str | None = None,
+        expire_time: int = 0,
         wallet_location: str | None = None,
         wallet_password: str | None = None,
         config_dir: str | None = None,
@@ -1039,6 +1041,8 @@ class OracleConnect(_ConnectionLogic):
                 None,
                 https_proxy,
                 https_proxy_port,
+                instance_name=instance_name or '',
+                expire_time=expire_time,
             )
             (
                 host,
@@ -1057,6 +1061,8 @@ class OracleConnect(_ConnectionLogic):
                 https_proxy,
                 https_proxy_port,
                 protocol,
+                instance_name,
+                expire_time,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # field_version is the highest TTC field version seerdb advertises;
         # the server negotiates it down (min(client, server)). The default is the
@@ -1079,6 +1085,11 @@ class OracleConnect(_ConnectionLogic):
         # dedicated / shared / pooled, written into (SERVER=...); pooled also asks
         # for DRCP, as in python-oracledb (#1977).
         self.server_type = server_type_value(server_type)
+        # The instance to reach, written into CONNECT_DATA, and the minutes
+        # between TCP keepalive probes, 0 for none (#2456). The instance the
+        # server reports at login is `instance_name`, set from its reply.
+        self._instance_name_requested = instance_name or ''
+        self.expire_time = expire_time
         self.password = password
         self.sid = sid
         self.service_name = service_name
@@ -1354,6 +1365,7 @@ class OracleConnect(_ConnectionLogic):
             self._apply_socket_timeout()
             try:
                 sock.connect(Sockaddr)
+                self._apply_keepalive(sock)
                 return sock
             except OSError as e:
                 sock.close()
@@ -1505,6 +1517,8 @@ class OracleConnect(_ConnectionLogic):
         (self.service_name, self.sid) = (address.service_name, address.sid)
         if address.server_type is not None:
             self.server_type = address.server_type
+        if address.instance_name:
+            self._instance_name_requested = address.instance_name
         if address.https_proxy:
             (self.https_proxy, self.https_proxy_port) = (
                 address.https_proxy,
