@@ -40,6 +40,7 @@ from seerdb.common.tns import (
     max_string_size,
 )
 from seerdb.common.tns_consts import (
+    AL32UTF8_CHARSET,
     APP_CONTEXT_KEY_MAX_LEN,
     APP_CONTEXT_VALUE_MAX_LEN,
     CCAP_FEATURE_BACKPORT2,
@@ -60,6 +61,7 @@ from seerdb.common.tns_consts import (
     TNS_EOCS_FLAGS_TXN_IN_PROGRESS,
     TNS_KEYWORD_NUM_TXN_PRIORITY,
     TNS_SESSION_STATE_REQUEST_BEGIN,
+    TNS_VERSION_11_2,
     DictionaryType,
 )
 
@@ -178,7 +180,9 @@ class _ConnectionLogic:
         and the next call drew ORA-01012 (9i) or an AssertionError (8i)."""
         from seerdb.common.tns import decode_8i_terminal_error, decode_fv2_oer_error
 
-        if getattr(self, '_o3_oall8', False):
+        if getattr(self, '_o3_oall8', False) or getattr(self, '_native11', False):
+            # The native form's refusal, 9.2's or 11g's (#2466): an OCI OER
+            # with the ORA message as text.
             return self._oall8_login_error(Packet)
         if isinstance(self._dialect, O8iDialect):
             return decode_8i_terminal_error(Packet)
@@ -244,6 +248,64 @@ class _ConnectionLogic:
             PwdField,
             self._auth_info_pairs() + [(b'AUTH_ACL', b'8000')],
         )
+
+    # --- The 11g native login, for a pooled 11g session (#2466) -----------
+    # 11g's DRCP serves a pooled session only to a client speaking the native
+    # form (seerdb.common.tns, "The 11g native login"). The converted form logs
+    # in but crashes the pooled server process on its second call, so a pooled
+    # login to an 11g server speaks the native form throughout, and every call
+    # not built in that form yet is refused before it is sent (_native11_refuse).
+
+    def _native11_choose(self, AcceptVersion: int) -> None:
+        # Decided at the ACCEPT, before the PRO, whose banner already differs:
+        # a pooled login to a server answering 11g's protocol version. The
+        # native form is the client machine's own, which seerdb takes to be
+        # little-endian; refuse rather than send a big-endian one.
+        import sys
+
+        self._native11 = (
+            self.server_type == 'pooled' and AcceptVersion == TNS_VERSION_11_2
+        )
+        if self._native11 and sys.byteorder != 'little':
+            raise NotSupportedError(
+                'a pooled connection to Oracle 11g needs a little-endian client'
+            )
+
+    def _native11_dty(self) -> bytes:
+        from seerdb.common.tns import CharsetDict, encode_dty_oci11
+
+        return encode_dty_oci11(CharsetDict.get(self.charset, AL32UTF8_CHARSET))
+
+    def _native11_osesskey(self) -> bytes:
+        from seerdb.common.tns import encode_osesskey_oci11
+
+        return encode_osesskey_oci11(
+            self._next_seq(),
+            self.user.encode('utf-8'),
+            self._o7_logon_mode(),
+            self._o7_session_pairs(),
+        )
+
+    def _native11_auth(self, Auth: dict) -> tuple[bytes, bytes]:
+        # The second phase: the O5LOGON proof and the DRCP pairs, as the
+        # converted AUTH sends them below 12.1. Returns (message, ConnKey).
+        from seerdb.common.tns import encode_auth_oci11
+
+        return encode_auth_oci11(self._make_dict(DictionaryType.auth, auth=Auth), [])
+
+    def _native11_refuse(self) -> None:
+        # Called by send() for every DATA packet: once a native session has
+        # logged in, only what is built in the native form may go out. The
+        # converted form would reach the pooled server, which aborts on it.
+        if (
+            getattr(self, '_native11', False)
+            and self.conn_state == CONN_STATE_AUTHENTICATED
+            and not getattr(self, '_native11_sending', False)
+        ):
+            raise NotSupportedError(
+                'a pooled connection to Oracle 11g supports only logging in and '
+                'closing so far'
+            )
 
     def _o7_logon_mode(self) -> int:
         # The logon mode a 9i OSESSKEY carries (#2342), as 10g+'s: the role's
@@ -727,6 +789,8 @@ class _ConnectionLogic:
             'seq': self._next_seq(),
             'field_version': self.field_version,
             'oall8': getattr(self, '_oall8', False),
+            # The native 11g login (#2466) sends the OCI banner in its PRO.
+            'oci_banner': getattr(self, '_native11', False),
             'max_string_size': max_string_size(self._server_runtime_caps),
             'supports_eor': self._supports_eor,
             # The priority the login's ALTER SESSION asks for (#1776).

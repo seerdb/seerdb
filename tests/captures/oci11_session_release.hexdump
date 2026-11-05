@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# sqlplus 11.2's session release as it exits the pooled session (#2466):
+# TNS_FUNC_SESSION_RELEASE, the sequence, the tag pointer (absent), the tag's
+# length 0 and mode 3.
+# Captured 2026-11-05 through tools/capture_proxy.py: sqlplus 11.2 (instant
+# client 11.2, x86-64 Linux) logging in to Oracle 11g XE 11.2.0.2 with
+# SERVER=POOLED, the DRCP pool started. The TTC payload, without the packet's
+# header, as `hexdump -C` output; the offset column and the |ascii| gutter are
+# ignored by tests.replay.parse_hexdump.
+00000000  03 a3 1c 00 00 00 00 00  00 00 00 00 00 00 00 03  |................|
+00000010  00 00 00                                          |...|
+00000013

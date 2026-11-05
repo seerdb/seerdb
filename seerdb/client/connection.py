@@ -63,6 +63,7 @@ from seerdb.common.tns import (
     decode_packet,
     decode_token_pro,
     decode_token_rpa,
+    decode_token_rpa_oci,
     encode_aq_array,
     encode_aq_deq,
     encode_aq_enq,
@@ -73,6 +74,7 @@ from seerdb.common.tns import (
     encode_packet,
     encode_pipeline_begin,
     encode_pipeline_end,
+    encode_session_release_oci,
     encode_tpc_change_state,
     encode_tpc_switch,
     ends_response,
@@ -1231,6 +1233,9 @@ class OracleConnect(_ConnectionLogic):
         self.negotiation_cache = negotiation_cache
         # Experimental 9i OALL8 opt-in (#716); ignored on non-9i tiers.
         self._oall8 = oall8
+        # A pooled 11g session speaks the native form (#2466); set at the ACCEPT.
+        self._native11 = False
+        self._native11_sending = False
         self._used_nego_cache = False
         self._skip_nego_cache = False  # forced true on the invalidate-and-retry
         self.server_version = 0
@@ -1577,6 +1582,8 @@ class OracleConnect(_ConnectionLogic):
         self.conn_key = None
         self._o3_phase = 0
         self._o3_oall8 = False
+        self._native11 = False
+        self._native11_sending = False
         self._open_transport()
         self.handle_login()
 
@@ -1660,6 +1667,8 @@ class OracleConnect(_ConnectionLogic):
                     # urgent byte (it interrupts a compute-bound server faster);
                     # otherwise we use the in-band INTERRUPT marker.
                     self._supports_oob = bool(Opts & TNS_GSO_CAN_RECV_ATTENTION)
+                    # A pooled login to 11g speaks the native form (#2466).
+                    self._native11_choose(Ver)
                     self.conn_state = CONN_STATE_CONNECTED
                     logger.debug(
                         'handle_login: Ver=%s, Opts=%s, Sdu=%s', Ver, Opts, Sdu
@@ -1708,7 +1717,10 @@ class OracleConnect(_ConnectionLogic):
                                 # the bundle. Only reached when the caller opts in
                                 # with field_version >= 23.1 EXT 1 (default stays 21.1).
                                 return self._fast_auth_login()
-                            if isinstance(self._dialect, O8iDialect):
+                            if self._native11:
+                                # The native data-type request, no table (#2466).
+                                Data = self._native11_dty()
+                            elif isinstance(self._dialect, O8iDialect):
                                 # 8i has no Unicode charset and predates ~37 data
                                 # types, so it needs its own shorter DTY — the
                                 # modern one draws ORA-03120 (§ _DTY_8I).
@@ -1720,7 +1732,11 @@ class OracleConnect(_ConnectionLogic):
                             self.send(TNS_DATA, Data)
                         case p if p == TTI_DTY:
                             logger.debug('handle_login: recv DTY')
-                            if isinstance(self._dialect, O8iDialect):
+                            if self._native11:
+                                # The native OSESSKEY (#2466); its reply is read
+                                # by _handle_rpa, as the converted one is.
+                                self.send(TNS_DATA, self._native11_osesskey())
+                            elif isinstance(self._dialect, O8iDialect):
                                 # Oracle 8i: O3LOGON via the OSESSKEY envelope.
                                 self._o3_phase = 1
                                 self._send_8i_osesskey()
@@ -1826,7 +1842,7 @@ class OracleConnect(_ConnectionLogic):
                             )
                             from seerdb.common.tns import decode_packet
 
-                            if getattr(self, '_o3_phase', 0):
+                            if getattr(self, '_o3_phase', 0) or self._native11:
                                 # An 8i or 9i login, refused at either phase: its
                                 # tier's status, not the 10g+ one (#2340), the
                                 # native OALL8 one's included (#798).
@@ -2021,7 +2037,11 @@ class OracleConnect(_ConnectionLogic):
 
     def _handle_rpa(self, Data: bytes) -> int | None:
         with recording_session_keywords(self._session_keywords, self._call_status):
-            Result = decode_token_rpa(Data, ())
+            if self._native11:
+                # The native login's replies, the same pairs at OCI's widths.
+                Result = decode_token_rpa_oci(bytes([TTI_RPA]) + Data)
+            else:
+                Result = decode_token_rpa(Data, ())
         self._absorb_session_keywords()
         if Result[0] == TTI_SESS:
             # Auth challenge: (TTI_SESS, SessKey, Salt, DerivedSalt, Vgen, Sder, Vfr)
@@ -2042,9 +2062,12 @@ class OracleConnect(_ConnectionLogic):
                 # a pre-SHA-2 account on a modern server (#311).
                 'verifier_type': VerifierType,
             }
-            (Data, ConnKey) = encode_dictionary_auth(
-                self._make_dict(DictionaryType.auth, auth=Auth)
-            )
+            if self._native11:
+                (Data, ConnKey) = self._native11_auth(Auth)
+            else:
+                (Data, ConnKey) = encode_dictionary_auth(
+                    self._make_dict(DictionaryType.auth, auth=Auth)
+                )
             self.conn_key = ConnKey
             self.send(TNS_DATA, Data)
             return self.handle_login()
@@ -3428,7 +3451,22 @@ class OracleConnect(_ConnectionLogic):
         if self.conn_state == CONN_STATE_DISCONNECTED:
             return
         try:
-            if self.conn_state == CONN_STATE_AUTHENTICATED:
+            if self.conn_state == CONN_STATE_AUTHENTICATED and self._native11:
+                # A pooled 11g session (#2466) ends as sqlplus ends it: the
+                # native session release, which the server answers with a bare
+                # status, then the EOF packet. No statement can have run, so
+                # there is nothing to roll back.
+                self._native11_sending = True
+                try:
+                    self.send(TNS_DATA, encode_session_release_oci(self._next_seq()))
+                finally:
+                    self._native11_sending = False
+                self._next_data_packet()
+                if self.sock is not None:
+                    self._write(
+                        struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                    )
+            elif self.conn_state == CONN_STATE_AUTHENTICATED:
                 if not self.autocommit:
                     self.rollback()
                 # Any server cursors still queued for close (#191) are freed by
@@ -3516,6 +3554,8 @@ class OracleConnect(_ConnectionLogic):
         # Python's default recursion limit on payloads big enough to
         # cross more than a few SDU boundaries (test_basic crashed with
         # RecursionError on the auth handshake).
+        if Type == TNS_DATA:
+            self._native11_refuse()  # a pooled 11g session's calls (#2466)
         while Data is not None:
             if Type == TNS_DATA and self._ano is not None and self._ano.active:
                 (Packet, Rest) = self._encode_ano_packet(Data)

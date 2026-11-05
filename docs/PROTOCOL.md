@@ -921,6 +921,38 @@ changes in separate sessions, the whole reply is invariant: unlike the
 query-path OERs, offset 5 and its offset-49 echo are not a live sequence here but
 constants, so the Mirror emits it verbatim.
 
+#### 4.1.4 DRCP on 11g needs the native form (client side, #2466)
+
+11g's connection pool serves a pooled session (`SERVER=POOLED`) only to a client
+speaking the native form above. Measured on 11g XE 11.2.0.2, its pool started,
+against sqlplus 11.2:
+
+- **The login asks for DRCP with one bit**, `0x10` in compile capability 31
+  (`OCI2`; python-oracledb's `TNS_CCAP_DRCP`). Without it the second AUTH phase
+  is refused with ORA-56606 (*DRCP: Client version does not support the
+  feature*), whatever the session pairs say. seerdb's converted 11.2 vector has
+  `0x0c` there, and its 12c+ vector has `0x10`.
+- **The converted form logs in with that bit and then crashes the pool.** The
+  first call's reply opens with a server-side piggyback, `SESS_RET` (opcode 4),
+  which below 12.1 is one `ub2` only. The next call, whatever it is, aborts the
+  pooled server process with `ORA-00600 [kpplsPreProcessState:1] [21]
+  [<function>]`. A native client gets no `SESS_RET`, and its calls run.
+- **What sets the native form apart is the whole of it**, not one field.
+  Replaying sqlplus's own session with seerdb's values put back one at a time
+  (the CONNECT, each capability byte, each `OCI2` bit, the AUTH's pairs) never
+  brings the `SESS_RET` back.
+
+So a pooled login to an 11g server (an ACCEPT at version 314) speaks the native
+form throughout: the OCI banner in the PRO (§19.18), the data-type request with no
+table and sqlplus 11.2's capability vectors (§4.2.1), and the OSESSKEY and AUTH at
+OCI's widths (§4.1.2), every length declared at three bytes a character, as
+sqlplus 11.2 declares them. The O5LOGON values and the DRCP pairs
+(`AUTH_KPPL_CONN_CLASS`, `AUTH_KPPL_PURITY`) are the converted AUTH's. It ends
+as sqlplus ends it: `TNS_FUNC_SESSION_RELEASE` (163) with an absent tag pointer, a
+zero tag length and mode 3, which the server answers with a bare `TTI_STA`, then
+the EOF packet. The native form is the client machine's own, and seerdb assumes
+both ends are little-endian; a big-endian client is refused.
+
 ### 4.2 Data Type Negotiation (TTI_DTY)
 
 TTI_DTY (message type `2`, `TNS_MSG_TYPE_DATA_TYPES`) advertises the client's

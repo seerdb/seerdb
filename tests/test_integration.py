@@ -227,6 +227,13 @@ def _8i_skip_reason(test_method_name: str) -> str | None:
 _TARGET_IS_8I: bool | None = None
 
 
+def _pooled_11g(conn) -> bool:
+    # A pooled session on 11g, which seerdb serves in the native form (#2466).
+    # Step one of that work builds the login and the close; a statement is
+    # refused before it is sent.
+    return conn.server_type == 'pooled' and conn.server_version >> 24 == 11
+
+
 def _conn_is_8i(conn) -> bool:
     # 8i is now identified by its dialect object, not a flag (#369).
     from seerdb.client.dialect import O8iDialect
@@ -3542,6 +3549,10 @@ class CursorIntegration(_IntegrationBase):
                     raise
                 with conn:
                     cur = conn.cursor()
+                    if _pooled_11g(conn):
+                        with self.assertRaises(seerdb.NotSupportedError):
+                            cur.execute('SELECT 1 FROM dual')
+                        continue
                     cur.execute('SELECT 1 FROM dual')
                     self.assertEqual(cur.fetchone(), (1,))
 
@@ -3631,6 +3642,10 @@ class CursorIntegration(_IntegrationBase):
             with pool.acquire() as conn:
                 self.assertTrue(conn.cclass.startswith('SEERDB:'))
                 cur = conn.cursor()
+                if _pooled_11g(conn):
+                    with self.assertRaises(seerdb.NotSupportedError):
+                        cur.execute('SELECT 1 FROM dual')
+                    return
                 cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(cur.fetchone(), (1,))
         finally:
@@ -11451,6 +11466,10 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     raise
                 async with Conn:
                     async with Conn.cursor() as Cur:
+                        if _pooled_11g(Conn):
+                            with self.assertRaises(seerdb.NotSupportedError):
+                                await Cur.execute('SELECT 1 FROM dual')
+                            continue
                         await Cur.execute('SELECT 1 FROM dual')
                         self.assertEqual(await Cur.fetchone(), (1,))
 
@@ -11527,6 +11546,10 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             async with Pool.acquire() as Conn:
                 self.assertTrue(Conn.cclass.startswith('SEERDB:'))
                 async with Conn.cursor() as Cur:
+                    if _pooled_11g(Conn):
+                        with self.assertRaises(seerdb.NotSupportedError):
+                            await Cur.execute('SELECT 1 FROM dual')
+                        return
                     await Cur.execute('SELECT 1 FROM dual')
                     self.assertEqual(await Cur.fetchone(), (1,))
         finally:
