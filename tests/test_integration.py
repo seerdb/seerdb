@@ -227,13 +227,6 @@ def _8i_skip_reason(test_method_name: str) -> str | None:
 _TARGET_IS_8I: bool | None = None
 
 
-def _pooled_11g(conn) -> bool:
-    # A pooled session on 11g, which seerdb serves in the native form (#2466).
-    # Step one of that work builds the login and the close; a statement is
-    # refused before it is sent.
-    return conn.server_type == 'pooled' and conn.server_version >> 24 == 11
-
-
 def _conn_is_8i(conn) -> bool:
     # 8i is now identified by its dialect object, not a flag (#369).
     from seerdb.client.dialect import O8iDialect
@@ -534,6 +527,10 @@ _FV_KW: dict[str, Any] = {'field_version': _FIELD_VERSION} if _FIELD_VERSION els
 # only, every other server ignores the option.
 if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
     _FV_KW['oall8'] = True
+# Run the suite over pooled sessions, as DRCP serves them (#2466): on 11g that
+# is the native form. The server's pool must be started.
+if os.environ.get('SEERDB_TEST_SERVER_TYPE'):
+    _FV_KW['server_type'] = os.environ['SEERDB_TEST_SERVER_TYPE']
 
 _SKIP_REASON = (
     'integration tests require a real DB connection; '
@@ -3540,8 +3537,7 @@ class CursorIntegration(_IntegrationBase):
                         host=_HOST,
                         port=_PORT,
                         service_name=_SERVICE,
-                        server_type=kind,
-                        **_FV_KW,
+                        **{**_FV_KW, 'server_type': kind},
                     )
                 except seerdb.DatabaseError as e:
                     if kind == 'pooled' and getattr(e, 'code', None) == 12520:
@@ -3549,10 +3545,6 @@ class CursorIntegration(_IntegrationBase):
                     raise
                 with conn:
                     cur = conn.cursor()
-                    if _pooled_11g(conn):
-                        with self.assertRaises(seerdb.NotSupportedError):
-                            cur.execute('SELECT 1 FROM dual')
-                        continue
                     cur.execute('SELECT 1 FROM dual')
                     self.assertEqual(cur.fetchone(), (1,))
 
@@ -3629,10 +3621,9 @@ class CursorIntegration(_IntegrationBase):
                 host=_HOST,
                 port=_PORT,
                 service_name=_SERVICE,
-                server_type='pooled',
                 min=1,
                 max=2,
-                **_FV_KW,
+                **{**_FV_KW, 'server_type': 'pooled'},
             )
         except seerdb.DatabaseError as e:
             if getattr(e, 'code', None) == 12520:
@@ -3642,10 +3633,6 @@ class CursorIntegration(_IntegrationBase):
             with pool.acquire() as conn:
                 self.assertTrue(conn.cclass.startswith('SEERDB:'))
                 cur = conn.cursor()
-                if _pooled_11g(conn):
-                    with self.assertRaises(seerdb.NotSupportedError):
-                        cur.execute('SELECT 1 FROM dual')
-                    return
                 cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(cur.fetchone(), (1,))
         finally:
@@ -8706,8 +8693,8 @@ class PoolIntegration(_ThrottleRetry, unittest.TestCase):
             password=_PASSWORD,
             service_name=_SERVICE,
             autocommit=True,
-            **_FV_KW,
-            **extra,
+            # What the test asks for over the suite's settings (#2466).
+            **{**_FV_KW, **extra},
         )
 
     def test_pre_warms_to_min_and_runs_query(self):
@@ -10784,8 +10771,8 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             password=_PASSWORD,
             service_name=_SERVICE,
             autocommit=True,
-            **_FV_KW,
-            **extra,
+            # What the test asks for over the suite's settings (#2466).
+            **{**_FV_KW, **extra},
         )
 
     async def asyncSetUp(self):
@@ -11466,10 +11453,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     raise
                 async with Conn:
                     async with Conn.cursor() as Cur:
-                        if _pooled_11g(Conn):
-                            with self.assertRaises(seerdb.NotSupportedError):
-                                await Cur.execute('SELECT 1 FROM dual')
-                            continue
                         await Cur.execute('SELECT 1 FROM dual')
                         self.assertEqual(await Cur.fetchone(), (1,))
 
@@ -11546,10 +11529,6 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             async with Pool.acquire() as Conn:
                 self.assertTrue(Conn.cclass.startswith('SEERDB:'))
                 async with Conn.cursor() as Cur:
-                    if _pooled_11g(Conn):
-                        with self.assertRaises(seerdb.NotSupportedError):
-                            await Cur.execute('SELECT 1 FROM dual')
-                        return
                     await Cur.execute('SELECT 1 FROM dual')
                     self.assertEqual(await Cur.fetchone(), (1,))
         finally:
@@ -14018,8 +13997,8 @@ class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
             password=_PASSWORD,
             service_name=_SERVICE,
             autocommit=True,
-            **_FV_KW,
-            **extra,
+            # What the test asks for over the suite's settings (#2466).
+            **{**_FV_KW, **extra},
         )
 
     async def test_pre_warms_to_min_and_runs_query(self):

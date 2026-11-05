@@ -32,6 +32,7 @@ from seerdb.common.sqltext import is_reusable_dml
 from seerdb.common.tns import (
     FV2_BIND_IN,
     FV2_BIND_OUT,
+    O8I_STMT_SELECT,
     O8I_STMT_TXN,
     decode_8i_block_cursor,
     decode_8i_block_out,
@@ -71,6 +72,10 @@ from seerdb.common.tns import (
     decode_fv2_version,
     decode_fv2_warn_flags,
     decode_o8i_bfile_getlen,
+    decode_oci11_describe,
+    decode_oci11_piggybacks,
+    decode_oci11_rows,
+    decode_oci11_status,
     decode_ub4,
     encode_8i_close_cursors,
     encode_8i_lob_read,
@@ -101,6 +106,9 @@ from seerdb.common.tns import (
     encode_o8i_bfile_close,
     encode_o8i_bfile_getlen,
     encode_o8i_bfile_open,
+    encode_oci11_close_cursors,
+    encode_oci11_execute,
+    encode_oci11_fetch,
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
@@ -108,6 +116,7 @@ from seerdb.common.tns import (
     o8i_stmt_type,
     o8i_terminal_complete,
     o9i_oall8_terminal_complete,
+    oci11_stmt_type,
 )
 from seerdb.common.tns_consts import (
     ISO_LATIN_1_CHARSET,
@@ -115,7 +124,12 @@ from seerdb.common.tns_consts import (
     TNS_LOB_OP_FILE_CLOSE,
     TNS_LOB_OP_FILE_OPEN,
     TNS_LOB_OP_GET_LENGTH,
+    TNS_TYPE_ADT,
     TNS_TYPE_BFILE,
+    TNS_TYPE_BLOB,
+    TNS_TYPE_CLOB,
+    TNS_TYPE_LONG,
+    TNS_TYPE_LONGRAW,
     TNS_TYPE_REFCURSOR,
     TTI_LOB,
     TTI_OER,
@@ -1461,3 +1475,219 @@ class Fv2Oall8Dialect(Oall8Dialect):
             record = {'out_positions': [], 'out_values': [], 'directions': directions}
             return (0, 0, 0, (None, None), [record], None, None, [], None)
         return (0, 0, 0, (None, None), [], None, None, [], None)
+
+
+# The column types a pooled 11g session reads so far (#2466): their cells are
+# the scalar values the native 9i row decoder reads. LOB, LONG, REF CURSOR and
+# object columns come back in forms not measured against 11g yet.
+_OCI11_UNREAD_TYPES = {
+    TNS_TYPE_BLOB: 'BLOB',
+    TNS_TYPE_CLOB: 'CLOB or NCLOB',
+    TNS_TYPE_BFILE: 'BFILE',
+    TNS_TYPE_LONG: 'LONG',
+    TNS_TYPE_LONGRAW: 'LONG RAW',
+    TNS_TYPE_REFCURSOR: 'cursor',
+    TNS_TYPE_ADT: 'object or collection',
+}
+
+
+def _oci11_unsupported(what: str):
+    from seerdb.common.exceptions import NotSupportedError
+
+    return NotSupportedError(
+        f'{what} is not supported on a pooled Oracle 11g connection yet'
+    )
+
+
+class Oci11Dialect(Oall8Dialect):
+    """A pooled Oracle 11g session, in the native form (#2466).
+
+    11g's DRCP serves a pooled session only to a client in OCI's native form,
+    so once the native login has run, every call is sqlplus 11.2's: the execute
+    and the fetch at OCI's widths, COMMIT and ROLLBACK as statements, cursors
+    closed in front of the next call. The call sequences are the native
+    dialects' (Oall8Dialect); the hooks below are 11g's (encode_oci11_* /
+    decode_oci11_*, measured against sqlplus 11.2 through 11g XE's pool). The
+    rows are the native 9i form's, which 11g's are.
+
+    Served: queries over scalar columns, DML, DDL, COMMIT and ROLLBACK. Not yet,
+    and refused before anything is sent: binds, PL/SQL blocks, array DML, and
+    LOB, LONG, REF CURSOR and object columns (refused at the describe)."""
+
+    _wire = '11g native'
+
+    def __init__(
+        self,
+        next_seq: Callable[[], int],
+        on_session: Callable[[int, int], None] | None = None,
+        on_call_status: Callable[[int], None] | None = None,
+    ) -> None:
+        super().__init__(next_seq)
+        # The rows an execute asks for with it, the cursor's arraysize.
+        self._rows = 1
+        # Told the pooled session's id and serial when the server hands it over
+        # (its session return), which are not the login's.
+        self._on_session = on_session
+        # Told each reply's call status, the OER's first byte (its
+        # TXN_IN_PROGRESS bit 0x02 says a transaction is open).
+        self._on_call_status = on_call_status
+
+    def _session_return(self, reply: bytes) -> bytes:
+        # The reply without the piggybacks ahead of it, the session return
+        # among them reported.
+        (ret, rest) = decode_oci11_piggybacks(reply)
+        if ret is not None and self._on_session is not None:
+            self._on_session(ret['session_id'], ret['serial'])
+        return rest
+
+    def capabilities(self) -> frozenset[str]:
+        return frozenset({CAP_QUERY, CAP_DML, CAP_OWN_TXN})
+
+    # --- the 11g hooks for the shared call sequences in Oall8Dialect
+
+    def _sql_text(self, sql: str) -> bytes:
+        return encode_9i_sql_text(sql)  # UTF-8, the session's charset
+
+    def _close_frames(self, cursors: list[int]) -> bytes:
+        return encode_oci11_close_cursors(self._next_seq(), cursors)
+
+    def _status(self, reply: bytes) -> dict:
+        status = decode_oci11_status(self._session_return(reply))
+        if self._on_call_status is not None:
+            self._on_call_status(status['status'])
+        return status
+
+    def _cursor_id(self, reply: bytes) -> int:
+        return self._status(reply).get('cursor', 0)
+
+    def _terminal_error(self, reply: bytes) -> tuple[int, str | None]:
+        status = self._status(reply)
+        return (status.get('error_code', 0), status.get('message'))
+
+    def _error_offset(self, reply: bytes) -> int:
+        return self._status(reply).get('error_pos', 0)
+
+    def _fetch_ended(self, terminal: bytes) -> bool:
+        # ORA-01403 ends the fetch; any other error is raised.
+        (err_code, message) = self._terminal_error(terminal)
+        if err_code == ORA_NO_DATA_FOUND:
+            return True
+        _raise_ora(err_code, message)
+        return False
+
+    def _terminal_complete(self, terminal: bytes) -> bool:
+        from seerdb.common.exceptions import Truncated
+
+        try:
+            decode_oci11_status(terminal)
+        except Truncated:
+            return False
+        return True
+
+    def _dml_response(self, reply: bytes) -> tuple[int, int, str | None]:
+        # A DML's affected rows ride the OER where a fetch's row count does.
+        status = self._status(reply)
+        return (
+            status.get('row_kind', 0),
+            status.get('error_code', 0),
+            status.get('message'),
+        )
+
+    def _decode_describe(self, buf: bytes) -> tuple[list, bytes]:
+        # A query that fails as the session's first call has its error behind
+        # the session return, where the shared sequence looks for a describe.
+        reply = self._session_return(buf)
+        if reply[:1] == bytes([TTI_OER]):
+            self._finished(self._cursor_id(reply))
+            (err_code, message) = self._terminal_error(reply)
+            from seerdb.common.exceptions import DatabaseError, from_ora_code
+
+            if not err_code:
+                raise DatabaseError('Oracle 11g rejected the query (no ORA code)')
+            exc = from_ora_code(err_code)(
+                message or f'ORA-{err_code:05d}', code=err_code
+            )
+            exc.offset = self._error_offset(reply)
+            raise exc
+        (columns, rest) = decode_oci11_describe(reply)
+        for col in columns:
+            if col['data_type'] in _OCI11_UNREAD_TYPES:
+                name = _OCI11_UNREAD_TYPES[col['data_type']]
+                raise _oci11_unsupported(f'a {name} column')
+        return (columns, rest)
+
+    def _decode_rows(self, buf: bytes, columns: list, last_row: list | None) -> tuple:
+        return decode_oci11_rows(buf, columns, last_row)
+
+    def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
+        if bind:
+            raise _oci11_unsupported('a bind')
+        return encode_oci11_execute(
+            self._next_seq(), sql_text, O8I_STMT_SELECT, self._rows
+        )
+
+    def _encode_fetch(self, cursor: int, count: int, long_size: int) -> bytes:
+        return encode_oci11_fetch(self._next_seq(), cursor, count)
+
+    def _encode_dml(
+        self, sql_text: bytes, stmt_type: int, bind: list | None = None
+    ) -> bytes:
+        if bind:
+            raise _oci11_unsupported('a bind')
+        if stmt_type == O8I_STMT_TXN:
+            # COMMIT and ROLLBACK, which 8i's table types as 0, have their own.
+            stmt_type = oci11_stmt_type(
+                sql_text.decode('utf-8', 'replace').strip().upper()
+            )
+        return encode_oci11_execute(self._next_seq(), sql_text, stmt_type)
+
+    # --- the calls
+
+    def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
+        # The execute brings the first `fetch` rows, as a fetch does.
+        if bind:
+            raise _oci11_unsupported('a bind')
+        self._rows = fetch or 15
+        return (yield from super().execute_query(sql, bind, fetch))
+
+    def execute_dml(
+        self,
+        sql: str,
+        bind: list | None = None,
+        batch: list | None = None,
+        batcherrors: bool = False,
+        cache: dict | None = None,
+    ):
+        # INSERT / UPDATE / DELETE, DDL and transaction statements. The error
+        # comes back in the result, as the other dialects return it, so the
+        # cursor reports what the statement did.
+        if bind:
+            raise _oci11_unsupported('a bind')
+        assert not batch
+        stmt_type = oci11_stmt_type(sql.strip().upper())
+        yield Send(self._closing() + self._encode_dml(self._sql_text(sql), stmt_type))
+        buf = yield from self._recv_terminal('DML')
+        status = self._status(buf)
+        self._finished(status.get('cursor', 0))
+        err_code = status.get('error_code', 0)
+        return (
+            0,
+            err_code,
+            0,
+            (0 if err_code else status.get('row_kind', 0), None),
+            [],
+            status.get('message'),
+            status.get('rowid'),  # the touched row, cursor.lastrowid
+            [],
+            None,
+            status.get('error_pos', 0) if err_code else 0,
+            status.get('warn_flags', 0),
+        )
+
+    def execute_block(self, sql: str, bind: list | None = None):
+        raise _oci11_unsupported('a PL/SQL block')
+        yield  # unreachable -- makes this a generator, as the protocol has it
+
+    def bfile_read(self, locator: bytes):
+        raise _oci11_unsupported('reading a BFILE')
+        yield  # unreachable -- makes this a generator, as the protocol has it

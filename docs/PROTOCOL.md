@@ -953,6 +953,54 @@ zero tag length and mode 3, which the server answers with a bare `TTI_STA`, then
 the EOF packet. The native form is the client machine's own, and seerdb assumes
 both ends are little-endian; a big-endian client is refused.
 
+**The calls**, measured against sqlplus 11.2 through the pool: a query, its
+fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
+
+- **The execute** is OALL8's head (`_ALL8_HEAD`) in OCI's wide form, the SQL's
+  length declared at three bytes a character; then two indicators and 32 zero
+  bytes, the SQL, and the al8i4 array of 13 ub4s carrying 8i's meanings: `[0]` 1,
+  `[1]` the execute flag (0 for a query, whose rows come with the execute), `[7]`
+  the statement type (1 query, 2 update, 3 delete, 4 insert, 5 create, 6 drop,
+  17 rollback, 21 commit). The options are thin's bits, with `NOT_PLSQL`
+  (`0x8000`) on every statement but `COMMIT` and `ROLLBACK`: `0x8061` for a
+  query, `0x8021` for DML and DDL, `0x21` for those two. sqlplus sends `COMMIT`
+  and `ROLLBACK` as statements, and so does seerdb on these sessions. sqlplus
+  leaves its own address in one pointer field (offset 131) where seerdb sends the
+  indicator. The fetch (`_FETCH`) and the close of finished cursors, piggybacked
+  in front of the next call (`_CLOSE_CURSORS`), are the shared schemas at OCI's
+  widths.
+- **A query's reply** is the describe (`_DCB_COLUMN` at OCI's widths, the uds
+  flags included), its trailer, the row header and the rows, then the status. A
+  fetch's reply is the rows and the status. ORA-01403 in the OER ends the rows.
+- **Rows come in two forms.** Plain rows are the native 9.2 form's (repeated
+  columns behind `TTI_BVC`). When the row header's byte 2 has `0x08` (`0x1a`,
+  against `0x22` for an execute's plain rows and `0x02` for a fetch's), each row
+  is `TTI_RXD` and one value, chunked past 252 bytes, holding the row as a data
+  block stores it: a flag byte (`0x2c`, a whole row), a lock byte, the cell
+  count, and the cells (a ub1 length, `0xFF` for NULL, `0xFE` and a
+  little-endian ub2 past 250 bytes). Trailing NULL columns are left out. 11g
+  sends them for some queries over tables, sqlplus's and seerdb's alike.
+- **The status** is the return parameters, thin's RPA at OCI's widths (a count
+  of ub4 values, 6, the third the statement's cursor; the transaction id; the
+  session's changed settings as keyword pairs, which an `ALTER SESSION` returns
+  with its NLS values; the registration), then the OER (§36). With no pairs the
+  RPA is the 35 bytes the Mirror sends (and reads as `_OCI_STATUS_FRAME`). The
+  OER's first byte is the call status, its `TXN_IN_PROGRESS` bit `0x02` set
+  after a DML; its row count is the rows so far on a fetch and the rows changed
+  on a DML; an error's message follows it. Behind the OER of an INSERT, UPDATE,
+  DELETE or MERGE that succeeded comes the touched row's rowid as the 9.2 form's
+  UROWID cell (a ub2 size and the bytes): 13 bytes for a heap table's, a logical
+  rowid for an index-organized table's.
+- **The statement's cursor** is in the OER at offset 18 (a ub2), where the
+  Mirror writes a category that sqlplus does not read, and in the RPA. The next
+  close names it.
+- **Server piggybacks** come ahead of the first reply and of the OER: the session
+  return (`SESS_RET`, opcode 4), python-oracledb's 12c+ layout at OCI's widths,
+  carrying the pooled session's own SID and serial (not the login's), and the
+  pooled server's OS process id (`OS_PID_MTS`, opcode 2: a ub2, then the id as a
+  value). The session return in the converted form (§4.1.4's first point) is the
+  one-`ub2` layout; in the native form it is this one.
+
 ### 4.2 Data Type Negotiation (TTI_DTY)
 
 TTI_DTY (message type `2`, `TNS_MSG_TYPE_DATA_TYPES`) advertises the client's

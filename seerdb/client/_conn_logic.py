@@ -24,7 +24,13 @@ from __future__ import annotations
 import socket
 from typing import TYPE_CHECKING, TypeGuard
 
-from seerdb.client.dialect import Dialect, Fv2Dialect, Fv2Oall8Dialect, O8iDialect
+from seerdb.client.dialect import (
+    Dialect,
+    Fv2Dialect,
+    Fv2Oall8Dialect,
+    O8iDialect,
+    Oci11Dialect,
+)
 from seerdb.client.enums import TransactionPriority
 from seerdb.common.end_user_sec import EndUserSecurityContext
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
@@ -94,6 +100,8 @@ class _ConnectionLogic:
     cclass: str | None
     purity: int
     server_type: str | None
+    session_id: int | None
+    serial_num: int | None
     _instance_name_requested: str
     expire_time: int
     socket_options: object
@@ -293,9 +301,20 @@ class _ConnectionLogic:
 
         return encode_auth_oci11(self._make_dict(DictionaryType.auth, auth=Auth), [])
 
+    def _native11_session(self, SessionId: int, Serial: int) -> None:
+        # The pooled session the server handed over: its own SID and SERIAL#,
+        # as python-oracledb takes them from the session return.
+        self.session_id = SessionId
+        self.serial_num = Serial
+
+    def _native11_call_status(self, Status: int) -> None:
+        # A pooled 11g reply's call status, which transaction_in_progress reads.
+        self._call_status[:] = [Status]
+
     def _native11_refuse(self) -> None:
         # Called by send() for every DATA packet: once a native session has
-        # logged in, only what is built in the native form may go out. The
+        # logged in, only what is built in the native form may go out -- the
+        # dialect's calls (_drive marks them) and the session release. The
         # converted form would reach the pooled server, which aborts on it.
         if (
             getattr(self, '_native11', False)
@@ -303,8 +322,7 @@ class _ConnectionLogic:
             and not getattr(self, '_native11_sending', False)
         ):
             raise NotSupportedError(
-                'a pooled connection to Oracle 11g supports only logging in and '
-                'closing so far'
+                'this call is not supported on a pooled Oracle 11g connection yet'
             )
 
     def _o7_logon_mode(self) -> int:
@@ -654,6 +672,13 @@ class _ConnectionLogic:
         # would silently never take effect (#1775).
         if self.field_version < FIELD_VERSION_10_2:
             raise NotSupportedError('application context requires Oracle 10g or later')
+        # A pooled 11g session's calls carry no piggyback in front of them yet:
+        # set, the context would never reach the server (#2466).
+        if getattr(self, '_native11', False):
+            raise NotSupportedError(
+                'application context is not supported on a pooled Oracle 11g '
+                'connection yet'
+            )
 
     def set_app_context(self, namespace: str, **values: str) -> None:
         """Set attributes of an application context namespace (#1775), as
@@ -875,6 +900,11 @@ class _ConnectionLogic:
         # modern (10g->23ai) keeps _dialect None and takes the TTI_ALL8 path.
         if is_8i:
             self._dialect = O8iDialect(self._next_seq)
+        elif getattr(self, '_native11', False):
+            # A pooled 11g session speaks the native form throughout (#2466).
+            self._dialect = Oci11Dialect(
+                self._next_seq, self._native11_session, self._native11_call_status
+            )
         elif self.field_version < FIELD_VERSION_10_2:
             # The 9i OALL8 opt-in (#716) speaks the native 64-bit request form;
             # the default 9i path speaks the compact TTI_ALL7.
@@ -1044,8 +1074,10 @@ def _pre10_tier_name_for(Dialect) -> str:
     Both tiers negotiate TTC field version 2, so the version alone cannot tell
     them apart and a hard-coded "Oracle 9i" in a message is wrong half the time.
     """
-    from seerdb.client.dialect import O8iDialect
+    from seerdb.client.dialect import O8iDialect, Oci11Dialect
 
+    if isinstance(Dialect, Oci11Dialect):
+        return '11g (a pooled connection)'
     return '8i' if isinstance(Dialect, O8iDialect) else '9i'
 
 

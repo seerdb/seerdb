@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# sqlplus 11.2's fetch of 5 more rows from cursor 1 (#2466).
+# Captured 2026-11-05 through tools/capture_proxy.py: sqlplus 11.2 (instant
+# client 11.2, x86-64 Linux) running statements on Oracle 11g XE 11.2.0.2 with
+# SERVER=POOLED, the DRCP pool started. The TTC payload, without the packet's
+# header, as `hexdump -C` output; the offset column and the |ascii| gutter are
+# ignored by tests.replay.parse_hexdump.
+00000000  03 05 18 01 00 00 00 05  00 00 00                 |...........|
+0000000b

@@ -2028,7 +2028,12 @@ class OracleConnect(_ConnectionLogic):
                 if intent is RECV:
                     to_send = self._next_data_packet()
                 elif isinstance(intent, Send):
-                    self.send(TNS_DATA, intent.data)
+                    # The dialect's own call: a pooled 11g session sends it (#2466).
+                    self._native11_sending = True
+                    try:
+                        self.send(TNS_DATA, intent.data)
+                    finally:
+                        self._native11_sending = False
                     to_send = None
                 else:  # pragma: no cover - defensive
                     raise TypeError(f'unknown dialect intent: {intent!r}')
@@ -3454,8 +3459,9 @@ class OracleConnect(_ConnectionLogic):
             if self.conn_state == CONN_STATE_AUTHENTICATED and self._native11:
                 # A pooled 11g session (#2466) ends as sqlplus ends it: the
                 # native session release, which the server answers with a bare
-                # status, then the EOF packet. No statement can have run, so
-                # there is nothing to roll back.
+                # status, then the EOF packet; rolled back first, as every close.
+                if not self.autocommit:
+                    self.rollback()
                 self._native11_sending = True
                 try:
                     self.send(TNS_DATA, encode_session_release_oci(self._next_seq()))
