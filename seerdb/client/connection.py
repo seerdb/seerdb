@@ -29,6 +29,7 @@ from seerdb.client._conn_logic import (
     returning_block_request,
     returning_block_result,
 )
+from seerdb.client.defaults import defaults
 from seerdb.client.dialect import (
     CAP_OWN_TXN,
     Dialect,
@@ -973,7 +974,7 @@ class OracleConnect(_ConnectionLogic):
         machine: str | None = None,
         terminal: str | None = None,
         osuser: str | None = None,
-        fetch_lobs: bool = True,
+        fetch_lobs: bool | None = None,
         driver_name: str | None = None,
         edition: str | None = None,
         transaction_priority: str | TransactionPriority | None = None,
@@ -999,6 +1000,9 @@ class OracleConnect(_ConnectionLogic):
         # Sharding keys are an OCI-only routing capability (#164); accept the
         # oracledb-compatible parameters but reject them with NotSupportedError.
         _reject_sharding(shardingkey, supershardingkey)
+        # seerdb.defaults stands in for what is not passed (#2458).
+        if config_dir is None:
+            config_dir = defaults.config_dir
         # Without a wallet, dsn names the address -- an Easy Connect string, a
         # descriptor or a tnsnames alias -- and wins over host / port /
         # service_name passed beside it, as in python-oracledb (#1972, #1976).
@@ -1109,19 +1113,25 @@ class OracleConnect(_ConnectionLogic):
         # Session identity the server records in v$session (#826). Named as
         # python-oracledb names them; each defaults to what this process is
         # (program falls back to app_name, osuser to the database user).
-        self.program = program
-        self.machine = machine
-        self.terminal = terminal
-        self.osuser = osuser
+        self.program = program if program is not None else defaults.program
+        self.machine = machine if machine is not None else defaults.machine
+        self.terminal = terminal if terminal is not None else defaults.terminal
+        self.osuser = osuser if osuser is not None else defaults.osuser
         # Whether a fetched CLOB / BLOB comes back as a LOB object (the default,
         # matching python-oracledb) or is materialised into str / bytes. The LOB
         # object is what makes size() / read(offset, amount) / write() / trim()
         # reachable at all; set False for the value-only behaviour (#964).
-        self.fetch_lobs = fetch_lobs
+        self.fetch_lobs = (
+            defaults.fetch_lobs if fetch_lobs is None else bool(fetch_lobs)
+        )
+        # The output type handler every cursor without its own uses (#2458).
+        self.outputtypehandler = None
         # What this session reports as its client_driver. python-oracledb lets an
         # application set it so it can identify itself in
         # v$session_connect_info; unset, seerdb reports its own banner (#826).
-        self.driver_name = driver_name
+        self.driver_name = (
+            driver_name if driver_name is not None else defaults.driver_name
+        )
         # The edition this session runs in. A LOGIN-time choice: it rides in the
         # AUTH, not in a later ALTER SESSION (#826).
         self.edition = edition
@@ -1257,7 +1267,7 @@ class OracleConnect(_ConnectionLogic):
         # exec_oac_signature). Capped to keep memory predictable; LRU eviction
         # via insertion order (Python's regular dict).
         self._cursor_cache: dict[tuple[str, bytes], int] = {}
-        self._cursor_cache_max = 32
+        self._cursor_cache_max = max(0, int(defaults.stmtcachesize))
         # Server cursors awaiting close (#191). On 12c+ the cache is off so every
         # execute opens a fresh server cursor; once a call is fully drained that
         # cursor is dead weight, and never closing them trips ORA-01000. We batch

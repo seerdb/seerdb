@@ -13,6 +13,7 @@ from seerdb.client.apool import AsyncPool
 from seerdb.client.aq import DeqOptions, EnqOptions, MessageProperties, Queue
 from seerdb.client.connection import OracleConnect, Xid
 from seerdb.client.cursor import FetchInfo
+from seerdb.client.defaults import Defaults, defaults
 from seerdb.client.enums import TransactionPriority
 from seerdb.client.pipeline import (
     Pipeline,
@@ -191,6 +192,8 @@ __all__ = [
     'JSON',
     'SparseVector',
     'FetchInfo',
+    'Defaults',
+    'defaults',
     'Var',
     'DbObject',
     'DbObjectType',

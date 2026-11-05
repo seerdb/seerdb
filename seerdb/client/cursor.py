@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
+from seerdb.client.typehandlers import apply_fetch_plan, lob_columns
 from seerdb.common.datatypes import (
     _DATE_TNS_TYPES,
     _NUMBER_TNS_TYPES,
@@ -111,8 +112,11 @@ class Cursor(_CursorLogic):
         self._scroll_active = False
         self._scroll_cursor_id = 0
 
-    def execute(self, operation: str, parameters=None) -> 'Cursor':
+    def execute(
+        self, operation: str, parameters=None, *, fetch_decimals: bool | None = None
+    ) -> 'Cursor':
         self._check_open()
+        self._fetch_decimals_for(fetch_decimals)
         # Re-executing frees any cursor left open by a prior scrollable SELECT.
         self._release_scroll_cursor()
         Bind = _bind_temp_lobs(_resolve_parameters(operation, parameters))
@@ -398,6 +402,7 @@ class Cursor(_CursorLogic):
             self._lastrowid = None
             self._description = [_column_description(C) for C in ColMeta]
             self._annotations = [_col_annotations(C) for C in ColMeta]
+            self._plan_fetch()
             self._rows = [
                 _resolve_nested_cursors(
                     self._connection,
@@ -437,6 +442,7 @@ class Cursor(_CursorLogic):
             self._lastrowid = _touched_rowid(LastRowid, ServerRowCount)
             self._description = None
             self._annotations = None
+            self._fetch_plan = None
             self._rows = []
             self._rowcount = ServerRowCount if isinstance(ServerRowCount, int) else -1
 
@@ -568,6 +574,16 @@ class Cursor(_CursorLogic):
         self._row_index += 1
         if self._scroll_active:
             self._scroll_consumed = self._scroll_buf_min + self._row_index - 1
+        if self._fetch_plan is not None:
+            # The output type handler's conversions (#2458), before the
+            # rowfactory sees the row, as python-oracledb applies them.
+            from seerdb.common.lob import LOB
+
+            Row = list(Row)
+            for I in lob_columns(self._fetch_plan):
+                if isinstance(Row[I], LOB):
+                    Row[I] = Row[I].read()
+            Row = apply_fetch_plan(self._fetch_plan, Row)
         if self._rowfactory is not None:
             return self._rowfactory(*Row)
         return tuple(Row)
@@ -637,6 +653,7 @@ class Cursor(_CursorLogic):
         Rows = self._connection.fetch_all_rows(CursorId, RowFormat)
         self._description = [_column_description(C) for C in RowFormat]
         self._annotations = [_col_annotations(C) for C in RowFormat]
+        self._plan_fetch()
         self._rows = [
             _resolve_nested_cursors(
                 self._connection,
@@ -1147,6 +1164,9 @@ def _build_refcursor_cursor(Connection, Rows, Marker) -> 'Cursor':
     Nested = Cursor(Connection)
     Nested._description = [_column_description(C) for C in Marker['row_format']]
     Nested._annotations = [_col_annotations(C) for C in Marker['row_format']]
+    # The connection's output type handler applies to it, as it applies to any
+    # cursor without one of its own (#2458).
+    Nested._plan_fetch()
     # Recursive: a nested cursor may itself select a CURSOR(...) column, so its
     # rows get the same resolution the outer ones did (#826).
     Nested._rows = [
@@ -1591,6 +1611,7 @@ def _column_description(Col: dict) -> 'FetchInfo':
         domain_schema=_text(Col.get('domain_schema')),
         domain_name=_text(Col.get('domain_name')),
         annotations=_col_annotations(Col),
+        max_size=DeclaredSize,
     )
 
 
@@ -1645,8 +1666,12 @@ class FetchInfo(tuple):
         domain_schema=None,
         domain_name=None,
         annotations=None,
+        max_size=0,
     ):
         self = super().__new__(cls, fields)
+        # The declared size, which the older six-argument output type handler
+        # form is passed (#2458).
+        self._max_size = max_size
         self.vector_flags = vector_flags
         # A VECTOR column that allows ANY number of dimensions says so with a
         # flag, not with a count -- the count alongside it is 0 and means
@@ -1675,3 +1700,39 @@ class FetchInfo(tuple):
         self.domain_name = domain_name
         self.annotations = annotations
         return self
+
+    # The 7-tuple's fields by name, as python-oracledb's FetchInfo has them; an
+    # output type handler reads them (#2458).
+    @property
+    def name(self) -> str:
+        return self[0]
+
+    @property
+    def type_code(self) -> object:
+        return self[1]
+
+    @property
+    def type(self) -> object:
+        """The column's type. python-oracledb returns the object type for an
+        object column; seerdb returns its type code, as `type_code` does."""
+        return self[1]
+
+    @property
+    def display_size(self) -> int | None:
+        return self[2]
+
+    @property
+    def internal_size(self) -> int | None:
+        return self[3]
+
+    @property
+    def precision(self) -> int | None:
+        return self[4]
+
+    @property
+    def scale(self) -> int | None:
+        return self[5]
+
+    @property
+    def null_ok(self) -> bool:
+        return self[6]

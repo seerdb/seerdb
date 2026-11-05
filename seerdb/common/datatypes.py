@@ -7,8 +7,10 @@
 # circular dependency.
 
 import datetime
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from seerdb.common.tns_consts import (
     TNS_TYPE_ADT,
@@ -312,6 +314,9 @@ class Var:
         'num_elements',
         '_iteration_values',
         '_pytype',
+        'inconverter',
+        'outconverter',
+        'convert_nulls',
     )
 
     def __init__(
@@ -320,6 +325,9 @@ class Var:
         size: int | None = None,
         is_array: bool = False,
         num_elements: int = 0,
+        inconverter: Callable[[Any], Any] | None = None,
+        outconverter: Callable[[Any], Any] | None = None,
+        convert_nulls: bool = False,
     ):
         self.dbtype = _resolve_dbtype(typ)
         # The Python type the caller asked for, when they asked with one. Three
@@ -339,8 +347,21 @@ class Var:
         # statement has a RETURNING ... INTO clause (#687). `getvalue(pos)`
         # reads it; a single execute leaves it None and reads `_value`.
         self._iteration_values: list | None = None
+        # python-oracledb's converters (#2458). `inconverter` is applied to a
+        # value set on this variable; `outconverter` to each value a fetch into
+        # it returns -- not to NULL unless `convert_nulls`.
+        self.inconverter = inconverter
+        self.outconverter = outconverter
+        self.convert_nulls = convert_nulls
+
+    @property
+    def type(self) -> object:
+        """The variable's database type (python-oracledb's ``Var.type``)."""
+        return self.dbtype
 
     def setvalue(self, pos: int, value: object) -> None:
+        if self.inconverter is not None:
+            value = self.inconverter(value)
         self._value = value
         self.has_value = True
 

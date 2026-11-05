@@ -25,6 +25,7 @@ from seerdb.client.cursor import (
     _with_object_bind_lobs,
     cursor,
 )
+from seerdb.client.typehandlers import apply_fetch_plan, lob_columns
 from seerdb.common.datatypes import TempLob, Var
 from seerdb.common.exceptions import (
     DatabaseError,
@@ -85,8 +86,11 @@ class AsyncCursor(_CursorLogic):
         self._scroll_active = False
         self._scroll_cursor_id = 0
 
-    async def execute(self, operation: str, parameters=None) -> 'AsyncCursor':
+    async def execute(
+        self, operation: str, parameters=None, *, fetch_decimals: bool | None = None
+    ) -> 'AsyncCursor':
         self._check_open()
+        self._fetch_decimals_for(fetch_decimals)
         self._release_scroll_cursor()  # free any prior scrollable cursor (#181)
         Bind = _bind_temp_lobs(_resolve_parameters(operation, parameters))
         Bind = self._resolve_cursor_binds(Bind)
@@ -342,6 +346,7 @@ class AsyncCursor(_CursorLogic):
             self._lastrowid = None
             self._description = [_column_description(C) for C in ColMeta]
             self._annotations = [_col_annotations(C) for C in ColMeta]
+            self._plan_fetch()
             self._rows = await self._resolve_rows(Rows)
             self._rowcount = len(self._rows)
             if (
@@ -363,6 +368,7 @@ class AsyncCursor(_CursorLogic):
             self._lastrowid = _touched_rowid(LastRowid, ServerRowCount)
             self._description = None
             self._annotations = None
+            self._fetch_plan = None
             self._rows = []
             self._rowcount = ServerRowCount if isinstance(ServerRowCount, int) else -1
 
@@ -465,6 +471,7 @@ class AsyncCursor(_CursorLogic):
         Rows = await self._connection.fetch_all_rows(CursorId, RowFormat)
         self._description = [_column_description(C) for C in RowFormat]
         self._annotations = [_col_annotations(C) for C in RowFormat]
+        self._plan_fetch()
         self._rows = await self._resolve_rows(Rows)
         self._rowcount = len(self._rows)
         self._row_index = 0
@@ -478,6 +485,7 @@ class AsyncCursor(_CursorLogic):
         Nested = AsyncCursor(self._connection)
         Nested._description = [_column_description(C) for C in Marker['row_format']]
         Nested._annotations = [_col_annotations(C) for C in Marker['row_format']]
+        Nested._plan_fetch()  # the connection's handler applies (#2458)
         Resolved = await Nested._resolve_rows(Rows)
         Nested._rows = Resolved
         Nested._rowcount = len(Resolved)
@@ -586,6 +594,16 @@ class AsyncCursor(_CursorLogic):
         self._row_index += 1
         if self._scroll_active:
             self._scroll_consumed = self._scroll_buf_min + self._row_index - 1
+        if self._fetch_plan is not None:
+            # The output type handler's conversions (#2458); see Cursor.fetchone.
+            from seerdb.common.lob import LOB
+
+            Row = list(Row)
+            for I in lob_columns(self._fetch_plan):
+                Cell = Row[I]
+                if isinstance(Cell, LOB):
+                    Row[I] = await Cell.aread()
+            Row = apply_fetch_plan(self._fetch_plan, Row)
         if self._rowfactory is not None:
             return self._rowfactory(*Row)
         return tuple(Row)
