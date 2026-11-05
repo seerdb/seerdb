@@ -242,6 +242,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_END_USER_SECURITY_CTX,
     TNS_FUNC_PIPELINE_BEGIN,
     TNS_FUNC_PIPELINE_END,
+    TNS_FUNC_SESSION_RELEASE,
     TNS_FUNC_SESSION_STATE,
     TNS_FUNC_SET_END_TO_END_ATTR,
     TNS_FUNC_TPC_TXN_CHANGE_STATE,
@@ -7175,6 +7176,13 @@ def decode_token_rpa(Data: bytes, Acc: tuple) -> tuple:
     (Num, Rest0) = decode_ub4(Data)
     Flags: dict = {}
     (KVs, Rest1) = decode_kv(Rest0, Num, [], Flags)
+    return _login_reply(KVs, Flags, Rest1)
+
+
+def _login_reply(KVs: list, Flags: dict, Rest1: bytes) -> tuple:
+    # A login reply's pairs, read: the challenge, as (TTI_SESS, ...), or the
+    # result, as (TTI_AUTH, ...). Shared by the thin reply and the native one
+    # (decode_token_rpa_oci), whose pairs are the same at other widths.
     SessKey = dict(KVs).get(b'AUTH_SESSKEY')
     Salt = dict(KVs).get(b'AUTH_VFR_DATA')
     DerivedSalt = dict(KVs).get(b'AUTH_PBKDF2_CSK_SALT')
@@ -8033,6 +8041,19 @@ def _encode_at_negotiated_version(Dictionary: dict) -> None:
         _ENCODE_FIELD_VERSION.set(Dictionary['field_version'])
 
 
+def _drcp_auth_values(Env: dict) -> tuple[str | None, int]:
+    # DRCP (#130): a connection class and a session purity go out as given:
+    # cclass -> AUTH_KPPL_CONN_CLASS, purity -> AUTH_KPPL_PURITY. Only
+    # server_type='pooled' asks for a pooled server, and then a purity left at
+    # its default is NEW. A class alone labels the session and requests nothing,
+    # as in python-oracledb (#1990, #1977). Returns (class, purity), 0 for none.
+    CClass = Env.get('cclass')
+    Purity = Env.get('purity', 0) or 0
+    if Env.get('server_type') == 'pooled' and Purity == 0:
+        Purity = 1  # PURITY_NEW
+    return (CClass, Purity)
+
+
 def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
     _encode_at_negotiated_version(Dictionary)
     Tseq = Dictionary['seq']
@@ -8073,16 +8094,7 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
     )
     ProxyInd = 1 if ProxyUser else 0
 
-    # DRCP (#130): a connection class and a session purity go out as given:
-    # cclass -> AUTH_KPPL_CONN_CLASS, purity -> AUTH_KPPL_PURITY. Only
-    # server_type='pooled' asks for a pooled server, and then a purity left at
-    # its default is NEW. A class alone labels the session and requests nothing,
-    # as in python-oracledb (#1990, #1977).
-    CClass = Dictionary['env'].get('cclass')
-    Purity = Dictionary['env'].get('purity', 0) or 0
-    Pooled = Dictionary['env'].get('server_type') == 'pooled'
-    if Pooled and Purity == 0:
-        Purity = 1  # PURITY_NEW
+    (CClass, Purity) = _drcp_auth_values(Dictionary['env'])
     CClassKv = (
         encode_kv(b'AUTH_KPPL_CONN_CLASS', CClass.encode('utf-8')) if CClass else b''
     )
@@ -16621,7 +16633,8 @@ def encode_dictionary_pro(Dictionary: dict) -> bytes:
     # keep the live machine/os. Measured gate: this is the SOLE reason native
     # OALL8 login stalled; connect-packet shape, ANO content and DTY charset were
     # each proven not to matter.
-    if Dictionary.get('oall8'):
+    # The native 11g login of a pooled session (#2466) sends the same banner.
+    if Dictionary.get('oall8') or Dictionary.get('oci_banner'):
         Banner = f'{platform.machine()}/{platform.system()} 2.4.xx'.encode(
             'ascii', 'replace'
         )
@@ -17006,6 +17019,175 @@ def parse_oall8_auth_sesskey(Packet: bytes) -> bytes:
     After = Packet[Idx + len(b'AUTH_SESSKEY') :]
     ValLen = After[4]  # ub1 chunk length; the ub4le repeat precedes it in [0:4]
     return unhexlify(After[5 : 5 + ValLen])
+
+
+# --- The 11g native login, for a pooled 11g session (#2466) ------------------
+# 11g's DRCP serves a pooled session only to a client speaking the native form,
+# as OCI does: the OCI banner in the PRO, a data-type request with no type table,
+# and from then on every message at OCI's fixed little-endian widths. A client in
+# the converted form logs in once it asks for DRCP (OCI2's 0x10), but the pooled
+# server process then aborts on its second call with ORA-00600
+# [kpplsPreProcessState:1]. Client and server are taken to be little-endian
+# x86-64 peers, as sqlplus 11.2 and 11g on Linux are; the client refuses
+# otherwise.
+#
+# The capability vectors are sqlplus 11.2's, measured against 11g XE 11.2.0.2, so
+# the server talks to this client exactly as to sqlplus 11.2, the client the
+# Mirror's OCI codec was built against. OCI2 (index 31) is 0xBF: 0x10 asks for
+# DRCP (TNS_CCAP_DRCP), the rest are OCI's own. Field version 6 (11.2) at index 7.
+_OCI11_COMPILE_CAPS = bytes.fromhex(
+    '060101010f010106010101010101017fff030a030701017f017fff01090101bf01050600010704'
+)
+_OCI11_RUNTIME_CAPS = bytes.fromhex('02010000180003')
+# What follows the capabilities in sqlplus 11.2's request: the client's time-zone
+# block (11 bytes, its h/m/s at 4..6 biased by 60: UTC here), the timezone-file
+# version as a big-endian ub4 (14, instant client 11.2's), and the national
+# charset as a little-endian ub2 (AL16UTF16).
+_OCI11_DTY_TRAILER = (
+    bytes.fromhex('800000003c3c3c80000000')
+    + struct.pack('>I', 14)
+    + struct.pack('<H', AL16UTF16_CHARSET)
+)
+
+
+def encode_dty_oci11(Charset: int = AL32UTF8_CHARSET) -> bytes:
+    """The data-type request of the 11g native login (#2466): the charset twice,
+    flag 2 (no type table), sqlplus 11.2's capability vectors and its trailer.
+    The server answers with a short TTI_DTY, the reply
+    ``build_oci_dty_reply`` makes on the Mirror's side."""
+    Cs = struct.pack('<H', Charset)
+    return (
+        bytes([TTI_DTY])
+        + Cs
+        + Cs
+        + bytes([2])
+        + bytes([len(_OCI11_COMPILE_CAPS)])
+        + _OCI11_COMPILE_CAPS
+        + bytes([len(_OCI11_RUNTIME_CAPS)])
+        + _OCI11_RUNTIME_CAPS
+        + _OCI11_DTY_TRAILER
+    )
+
+
+def _auth_call_oci(
+    Subtype: int,
+    Seq: int,
+    User: bytes,
+    Mode: int,
+    Pairs: list[tuple[bytes, bytes, int]],
+) -> bytes:
+    # An OCI OSESSKEY or AUTH as sqlplus 11.2 sends it (_AUTH_HEAD and its pairs
+    # at OCI's widths). It declares every length -- the user's, each key's and
+    # each value's -- at three bytes a character, its buffers' size, where 9.2
+    # declares the bytes themselves (_oall8_auth).
+    return _AUTH_OCI(
+        {
+            'subtype': Subtype,
+            'seq': Seq,
+            'pointer_1': True,
+            'user_length': 3 * len(User),
+            'mode': Mode,
+            'pointer_2': True,
+            'pair_count': len(Pairs),
+            'pointer_3': True,
+            'pointer_4': True,
+            'user_prefixed': True,
+            'user_raw': False,
+            'user': User,
+            'pairs': [
+                {
+                    'key_length': 3 * len(Key),
+                    'key': Key,
+                    'value_length': 3 * len(Value),
+                    'value': Value,
+                    'flags': Flags,
+                }
+                for (Key, Value, Flags) in Pairs
+            ],
+        }
+    )
+
+
+def encode_osesskey_oci11(
+    Seq: int, User: bytes, Mode: int, Pairs: list[tuple[bytes, bytes]]
+) -> bytes:
+    """The 11g native login's first phase (#2466): an OSESSKEY asking for the
+    session key, with the session's pairs (program, machine, pid, osuser)."""
+    return _auth_call_oci(TTI_SESS, Seq, User, Mode, [(K, V, 0) for K, V in Pairs])
+
+
+def encode_auth_oci11(
+    Dictionary: dict, Pairs: list[tuple[bytes, bytes]]
+) -> tuple[bytes, bytes]:
+    """The 11g native login's second phase (#2466): the O5LOGON proof
+    (AUTH_SESSKEY, AUTH_PASSWORD) and the DRCP pairs, as the converted AUTH
+    carries them, then ``Pairs``. Returns the message and the ConnKey the
+    server's proof is checked with."""
+    Auth = Dictionary['auth']
+    Env = Dictionary['env']
+    User = Env['user'].encode('utf-8')
+    (AuthPass, AuthSess, _, _, ConnKey) = o5logon(
+        Auth['sess'],
+        Auth['salt'],
+        Auth['derived_salt'],
+        User,
+        Env['password'].encode('utf-8'),
+        Auth.get('vgen_count'),
+        Auth.get('sder_count'),
+        Auth.get('verifier_type'),
+    )
+    Out: list[tuple[bytes, bytes, int]] = [
+        (b'AUTH_SESSKEY', AuthSess.hex().upper().encode('ascii'), 1),
+        (b'AUTH_PASSWORD', AuthPass.hex().upper().encode('ascii'), 0),
+    ]
+    (CClass, Purity) = _drcp_auth_values(Env)
+    if CClass:
+        Out.append((b'AUTH_KPPL_CONN_CLASS', CClass.encode('utf-8'), 0))
+    if Purity:
+        Out.append((b'AUTH_KPPL_PURITY', str(Purity).encode('ascii'), 1))
+    Out += [(K, V, 0) for K, V in Pairs]
+    Mode = (Env.get('role', 0) * 32) | (Env.get('prelim', 0) * 128) | 1 | 256
+    return (_auth_call_oci(TTI_AUTH, Dictionary['seq'], User, Mode, Out), ConnKey)
+
+
+_AUTH_REPLY_FROM_OCI = wire_schema.compile_decoder(_PRE10_AUTH_REPLY, _OCI)
+
+
+def decode_token_rpa_oci(Payload: bytes) -> tuple:
+    """A native login reply (#2466), the RPA and its pairs at OCI's widths, read
+    as ``decode_token_rpa`` reads the thin one: the challenge as (TTI_SESS, ...)
+    and the result as (TTI_AUTH, ...). ``Payload`` starts at the RPA token."""
+    (Reply, Rest) = _AUTH_REPLY_FROM_OCI(Payload)
+    KVs = [
+        (bytes(P.get('key', b'')), bytes(P.get('value', b''))) for P in Reply['pairs']
+    ]
+    Flags = {bytes(P.get('key', b'')): P['flags'] for P in Reply['pairs']}
+    return _login_reply(KVs, Flags, Rest)
+
+
+# The session release (TNS_FUNC_SESSION_RELEASE), sqlplus 11.2's at OCI's widths:
+# the tag pointer, absent, the tag's length and the release mode. sqlplus sends
+# mode 3 when it exits a pooled session, which ends it; the server answers with
+# a bare TTI_STA.
+_SESSION_RELEASE: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TNS_FUNC_SESSION_RELEASE])),
+    ('u8', 'seq'),
+    ('ptr', 'tag_pointer'),
+    ('n4', 'tag_length'),
+    ('n4', 'mode'),
+)
+_SESSION_RELEASE_OCI = wire_schema.compile_encoder(_SESSION_RELEASE, _OCI)
+SESSION_RELEASE_MODE_EXIT = 3
+
+
+def encode_session_release_oci(
+    Seq: int, Mode: int = SESSION_RELEASE_MODE_EXIT
+) -> bytes:
+    """Release a pooled 11g session in the native form (#2466), as sqlplus 11.2
+    does when it closes the connection."""
+    return _SESSION_RELEASE_OCI(
+        {'seq': Seq, 'tag_pointer': False, 'tag_length': 0, 'mode': Mode}
+    )
 
 
 def encode_dictionary_spfp(Dictionary: dict) -> bytes:
