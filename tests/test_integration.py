@@ -6566,6 +6566,121 @@ class CursorCacheIntegration(_IntegrationBase):
         self.assertNotIn(Earliest, CachedSql)
 
 
+def _clob_as_text(cursor, metadata):
+    # An output type handler fetching the CLOB / BLOB columns as their content
+    # (#2458), as python-oracledb's documentation writes one.
+    if metadata.type_code is seerdb.DB_TYPE_CLOB:
+        return cursor.var(seerdb.DB_TYPE_LONG, arraysize=cursor.arraysize)
+    if metadata.type_code is seerdb.DB_TYPE_BLOB:
+        return cursor.var(seerdb.DB_TYPE_LONG_RAW, arraysize=cursor.arraysize)
+    return None
+
+
+def _number_as_text(cursor, metadata):
+    if metadata.type_code is seerdb.DB_TYPE_NUMBER:
+        return cursor.var(str, arraysize=cursor.arraysize)
+    return None
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class TypeHandlerIntegration(_IntegrationBase):
+    """Output type handlers and fetch_decimals on a live server (#2458)."""
+
+    _WHEN = datetime.datetime(2026, 11, 4)
+
+    def _fill(self):
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (id NUMBER, n NUMBER, c CLOB, b BLOB, d DATE)'
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES '
+            "(1, 1.5, 'lob text', HEXTORAW('0102'), "
+            "TO_DATE('2026-11-04', 'YYYY-MM-DD'))"
+        )
+        self.cur.execute(f'INSERT INTO {self.TABLE} (id) VALUES (2)')
+
+    def test_a_number_fetched_as_text(self):
+        self.cur.outputtypehandler = _number_as_text
+        self.cur.execute('SELECT 1.5, 4371, -0.0000001 FROM dual')
+        self.assertEqual(self.cur.fetchone(), ('1.5', '4371', '-0.0000001'))
+        # The description still says what the column is.
+        self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
+
+    def test_lobs_as_content_then_as_lobs_on_the_same_statement(self):
+        # The statement is cached after the first run, so the second and third
+        # reuse it with a different handler -- the sequence python-oracledb
+        # misreads. A DATE beside the LOBs is where a misread shows.
+        from seerdb.common.lob import LOB
+
+        self._fill()
+        Sql = f'SELECT c, b, d FROM {self.TABLE} WHERE id = 1'
+        # 8i reads every LOB's content as it fetches, LOB objects or not.
+        KeepsLobs = not _conn_is_8i(self.conn)
+        for Handler in (None, _clob_as_text, None):
+            with self.subTest(handler=Handler):
+                Cur = self.conn.cursor()
+                Cur.outputtypehandler = Handler
+                Cur.execute(Sql)
+                (C, B, D) = Cur.fetchone()
+                if Handler is None and KeepsLobs:
+                    self.assertIsInstance(C, LOB)
+                    self.assertIsInstance(B, LOB)
+                    (C, B) = (C.read(), B.read())
+                self.assertEqual((C, B, D), ('lob text', b'\x01\x02', self._WHEN))
+
+    def test_the_connection_handler_serves_cursors_without_one(self):
+        self.conn.outputtypehandler = _number_as_text
+        Cur = self.conn.cursor()
+        self.assertEqual(Cur.execute('SELECT 7 FROM dual').fetchone(), ('7',))
+        # A cursor's own handler wins, even one that leaves the column alone.
+        Cur = self.conn.cursor()
+        Cur.outputtypehandler = lambda cursor, metadata: None
+        self.assertEqual(Cur.execute('SELECT 7 FROM dual').fetchone(), (7,))
+
+    def test_outconverter_and_convert_nulls(self):
+        self._fill()
+        Sql = f'SELECT n FROM {self.TABLE} ORDER BY id'
+
+        def Converting(nulls):
+            def Handler(cursor, metadata):
+                return cursor.var(
+                    str,
+                    arraysize=cursor.arraysize,
+                    outconverter=lambda v: f'<{v}>',
+                    convert_nulls=nulls,
+                )
+
+            return Handler
+
+        self.cur.outputtypehandler = Converting(False)
+        self.assertEqual(self.cur.execute(Sql).fetchall(), [('<1.5>',), (None,)])
+        self.cur.outputtypehandler = Converting(True)
+        self.assertEqual(self.cur.execute(Sql).fetchall(), [('<1.5>',), ('<None>',)])
+
+    def test_fetch_decimals(self):
+        Sql = "SELECT 4371, 1.5, CAST(NULL AS NUMBER), 'x' FROM dual"
+        self.cur.execute(Sql, fetch_decimals=True)
+        self.assertEqual(
+            self.cur.fetchone(), (Decimal(4371), Decimal('1.5'), None, 'x')
+        )
+        self.assertEqual(self.cur.execute(Sql).fetchone()[0], 4371)
+        Saved = seerdb.defaults.fetch_decimals
+        seerdb.defaults.fetch_decimals = True
+        try:
+            self.assertIsInstance(self.cur.execute(Sql).fetchone()[0], Decimal)
+        finally:
+            seerdb.defaults.fetch_decimals = Saved
+
+    def test_a_refused_conversion_fails_the_execute(self):
+        self.cur.outputtypehandler = lambda cursor, metadata: cursor.var(bytes)
+        with self.assertRaises(seerdb.DatabaseError):
+            self.cur.execute('SELECT 1 FROM dual')
+        self.assertIsNone(self.cur.description)
+        # The connection is fine afterwards.
+        self.cur.outputtypehandler = None
+        self.assertEqual(self.cur.execute('SELECT 1 FROM dual').fetchone(), (1,))
+
+
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ParseIntegration(_IntegrationBase):
     """`cursor.parse()` (#1018): parse the statement, never run it.
@@ -10529,6 +10644,35 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_output_type_handlers_and_fetch_decimals(self):
+        # Async twin of TypeHandlerIntegration (#2458): the LOB is read with an
+        # awaited read, on a statement the plain run before it cached.
+        from seerdb.common.lob import LOB
+
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Sql = "SELECT TO_CLOB('lob text'), 1.5 FROM dual"
+            if Conn.field_version < FIELD_VERSION_10_2:
+                Sql = "SELECT 'lob text', 1.5 FROM dual"
+            for Handler in (None, _clob_as_text, None):
+                Cur = Conn.cursor()
+                Cur.outputtypehandler = Handler
+                await Cur.execute(Sql)
+                (Text, Number) = await Cur.fetchone()
+                if isinstance(Text, LOB):
+                    self.assertIsNone(Handler)
+                    Text = await Text.aread()
+                self.assertEqual((Text, Number), ('lob text', Decimal('1.5')))
+            Conn.outputtypehandler = _number_as_text
+            Cur = Conn.cursor()
+            await Cur.execute('SELECT 7 FROM dual')
+            self.assertEqual(await Cur.fetchone(), ('7',))
+            Conn.outputtypehandler = None
+            await Cur.execute('SELECT 7 FROM dual', fetch_decimals=True)
+            self.assertEqual(await Cur.fetchone(), (Decimal(7),))
+        finally:
+            await Conn.close()
 
     async def test_lob_reads_around_the_length_markers_come_back_whole(self):
         # Async twin of LOBReadLengthIntegration (#1970).

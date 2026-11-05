@@ -17,8 +17,11 @@ read and write.
 
 from __future__ import annotations
 
+from seerdb.client.defaults import defaults
+from seerdb.client.typehandlers import build_fetch_plan
 from seerdb.common.datatypes import Var
 from seerdb.common.exceptions import (
+    NotSupportedError,
     ProgrammingError,
     from_ora_code,
 )
@@ -116,6 +119,40 @@ class _CursorLogic:
         # Bind types declared by setinputsizes for the next execute (#696), as
         # (positional, by name). Cleared once that execute has used them.
         self._inputsizes: tuple[tuple, dict] = ((), {})
+        # seerdb.defaults, read as the cursor is opened (#2458).
+        self.arraysize = defaults.arraysize
+        self.prefetchrows = defaults.prefetchrows
+        # The output type handler (#2458); None defers to the connection's.
+        self.outputtypehandler = None
+        # The per-column plan the handler and fetch_decimals made for the
+        # current result set, applied as each row is fetched; None when no
+        # column needs one. fetch_decimals as the last execute had it.
+        self._fetch_plan: list | None = None
+        self._fetch_decimals: bool = defaults.fetch_decimals
+
+    def _plan_fetch(self) -> None:
+        # Called wherever a new result set is described (#2458). A handler that
+        # raises, or a conversion that is refused, leaves no result set behind:
+        # the statement failed as far as the caller is concerned.
+        if self._description is None:
+            self._fetch_plan = None
+            return
+        try:
+            self._fetch_plan = build_fetch_plan(
+                self, self._description, self._fetch_decimals
+            )
+        except BaseException:
+            self._fetch_plan = None
+            self._description = None
+            self._annotations = None
+            self._rows = []
+            raise
+
+    def _fetch_decimals_for(self, fetch_decimals: bool | None) -> None:
+        # An execute's fetch_decimals, else seerdb.defaults'.
+        self._fetch_decimals = (
+            defaults.fetch_decimals if fetch_decimals is None else bool(fetch_decimals)
+        )
 
     @property
     def scrollable(self) -> bool:
@@ -184,15 +221,52 @@ class _CursorLogic:
         multi-row/zero-row change). PEP 249 optional attribute."""
         return self._lastrowid
 
-    def var(self, typ, size=None) -> Var:
+    def var(
+        self,
+        typ,
+        size=None,
+        arraysize: int = 1,
+        inconverter=None,
+        outconverter=None,
+        typename: str | None = None,
+        encoding_errors: str | None = None,
+        bypass_decode: bool = False,
+        convert_nulls: bool = False,
+    ) -> Var:
         """Create a bind variable that can receive an OUT / IN OUT value.
 
         `typ` is a Python type (`int`, `str`, `bytes`, `datetime`, ...) or an
         `seerdb` type constant (`seerdb.NUMBER`, `seerdb.STRING`,
         `seerdb.DB_TYPE_*`). Pass the returned `Var` in a `callproc` /
-        `execute` parameter list and read the result with `getvalue()`.
+        `execute` parameter list and read the result with `getvalue()`, or
+        return it from an `outputtypehandler` to say what a fetched column
+        becomes (#2458).
+
+        The rest are python-oracledb's: `arraysize` (reported as
+        `num_elements`), `inconverter` (applied to a value set on it),
+        `outconverter` (applied to each value fetched into it, and to NULL too
+        with `convert_nulls`). `typename`, `encoding_errors` and
+        `bypass_decode` are refused, not ignored, since seerdb doesn't act on
+        them.
         """
-        return Var(typ, size)
+        if typename is not None:
+            raise NotSupportedError(
+                'var(typename=...) is not supported; pass the type from '
+                'connection.gettype() as typ'
+            )
+        if encoding_errors is not None or bypass_decode:
+            raise NotSupportedError(
+                'var(encoding_errors=..., bypass_decode=...) is not supported'
+            )
+        V = Var(
+            typ,
+            size,
+            num_elements=max(int(arraysize), 1),
+            inconverter=inconverter,
+            outconverter=outconverter,
+            convert_nulls=convert_nulls,
+        )
+        return V
 
     def getbatcherrors(self) -> list:
         """Errors collected by the most recent ``executemany(batcherrors=True)``.

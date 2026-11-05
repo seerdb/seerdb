@@ -185,6 +185,22 @@ What works:
   BLOB columns materialise to `str` / `bytes` of any size, with
   `EMPTY_CLOB()` / `EMPTY_BLOB()` as `""` / `b""`. The default is `True`,
   matching python-oracledb
+- Output type handlers: `outputtypehandler` on the connection or the cursor
+  (the cursor's wins), called once per column with its `FetchInfo` (or with
+  the older six arguments), returning `None` or a `cursor.var()`. The variable's
+  type converts the column — a NUMBER to `str` / `float` / `Decimal`, a DATE
+  to `str`, a CLOB to `str`, a BLOB to `bytes` and so on, refusing the
+  conversions python-oracledb refuses — and its `outconverter` is applied to
+  each value (to NULL too with `convert_nulls=True`). `cursor.var()` takes
+  `arraysize`, `inconverter`, `outconverter` and `convert_nulls`. The
+  conversions are made client-side, on the value as fetched. Sync and async
+- `fetch_decimals`: `execute(..., fetch_decimals=True)` or
+  `seerdb.defaults.fetch_decimals = True` fetches every NUMBER as
+  `decimal.Decimal`, whole values included
+- `seerdb.defaults`: `arraysize`, `prefetchrows`, `fetch_lobs`,
+  `fetch_decimals`, `stmtcachesize`, `config_dir` and the session identity
+  (`program`, `machine`, `osuser`, `terminal`, `driver_name`), the values a
+  connection or cursor starts from when none is passed, as in python-oracledb
 - BFILE read: SELECT of a `BFILENAME(...)` / BFILE column round-trips
   the external file contents as `bytes`, read natively over
   `TTI_LOBOPS` (`FILE_OPEN` → `READ` → `FILE_CLOSE`). The only
@@ -385,11 +401,22 @@ position return `None` instead of forcing a try/except. (A target before the
 first row still raises `IndexError`, and the buffered non-scrollable path raises
 for out-of-range in either direction, matching PEP 249 / oracledb.)
 
-**LOB** columns are fetched as their **content directly** — a `CLOB` / `NCLOB`
-comes back as `str`, a `BLOB` as `bytes` — rather than as a `LOB` object you have
-to `.read()` (oracledb's default). Simplest for typical values; note the whole
-LOB is materialised in memory. (Oracle's `'' == NULL` rule still applies, so an
-empty-string / empty-bytes bind stores — and reads back — as `None`.)
+A **NUMBER** is fetched as an `int` when it is whole and a `decimal.Decimal`
+otherwise, never as python-oracledb's `float`, so no digit is lost on the way.
+`fetch_decimals=True` makes every NUMBER a `Decimal`, as it does there. An output
+type handler converts the value seerdb fetched, so the same holds through one: a
+`cursor.var(int)` or `cursor.var(seerdb.NUMBER)` keeps a fractional NUMBER a
+`Decimal`, and a `cursor.var(Decimal)` gives a `Decimal` for a BINARY_DOUBLE or a
+string column too, where python-oracledb hands back a `float`. A `TIMESTAMP WITH
+TIME ZONE` fetched as `str` keeps its offset, as seerdb's datetime for it does.
+
+A **CLOB / BLOB** an output type handler wants as `str` / `bytes` is read
+through the LOB it arrives as, where python-oracledb has the server redefine the
+column and send it inline. The values are the same; it costs a read per LOB. A
+JSON or VECTOR column can't be converted by a handler yet.
+
+(Oracle's `'' == NULL` rule applies to LOBs as to strings, so an empty-string /
+empty-bytes bind stores — and reads back — as `None`.)
 
 ## Requirements
 
