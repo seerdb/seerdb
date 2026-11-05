@@ -548,6 +548,8 @@ class AsyncCursor(_CursorLogic):
             self._rowcount = 0
             self._row_index = 0
             return self
+        if len(Rows) > 1 and is_plsql(operation):
+            return await self._executemany_block(operation, Rows)
         return await self._run(
             operation,
             Rows[0],
@@ -555,6 +557,20 @@ class AsyncCursor(_CursorLogic):
             BatchErrors=batcherrors,
             ArrayDmlRowCounts=arraydmlrowcounts,
         )
+
+    async def _executemany_block(self, operation: str, Rows: list) -> 'AsyncCursor':
+        # A PL/SQL block's rows, one execute each (#2479); see
+        # Cursor._executemany_block.
+        Sizes = self._inputsizes
+        for Offset, Row in enumerate(Rows):
+            self._inputsizes = Sizes
+            try:
+                await self._run(operation, Row)
+            except DatabaseError as Exc:
+                self._inputsizes = ((), {})
+                Exc.offset = Offset
+                raise
+        return self
 
     # --- Server-side scroll window helpers (#181), see seerdb.client.cursor.Cursor ---
 

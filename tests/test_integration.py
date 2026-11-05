@@ -6713,6 +6713,62 @@ class VarValueIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class PlsqlExecutemanyIntegration(_IntegrationBase):
+    """executemany() of a PL/SQL block with binds (#2479): sent as one array
+    execute it was refused, ORA-03146 and a killed session on 23ai, a dropped
+    connection on 11g."""
+
+    def _fill(self, Rows):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(20))')
+        self.cur.executemany(
+            f'BEGIN INSERT INTO {self.TABLE} VALUES (:1, :2); END;', Rows
+        )
+
+    def test_every_row_runs(self):
+        Rows = [(1, 'one'), (2, 'two'), (3, None)]
+        self._fill(Rows)
+        self.cur.execute(f'SELECT n, s FROM {self.TABLE} ORDER BY n')
+        self.assertEqual(self.cur.fetchall(), Rows)
+        # The connection is fine afterwards.
+        self.assertEqual(self.cur.execute('SELECT 1 FROM dual').fetchone(), (1,))
+
+    def test_named_binds(self):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, s VARCHAR2(20))')
+        self.cur.executemany(
+            f'BEGIN INSERT INTO {self.TABLE} VALUES (:n, :s); END;',
+            [{'n': 1, 's': 'a'}, {'n': 2, 's': 'b'}],
+        )
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (2,))
+
+    def test_a_failing_row_is_named_and_the_rows_before_it_ran(self):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        Sql = (
+            f'BEGIN IF :1 = 2 THEN '
+            "RAISE_APPLICATION_ERROR(-20001, 'row two'); END IF; "
+            f'INSERT INTO {self.TABLE} VALUES (:1); END;'
+        )
+        with self.assertRaises(seerdb.DatabaseError) as Raised:
+            self.cur.executemany(Sql, [(1,), (2,), (3,)])
+        self.assertEqual(Raised.exception.code, 20001)
+        self.assertEqual(Raised.exception.offset, 1)
+        self.cur.execute(f'SELECT n FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
+    def test_setinputsizes_types_every_row(self):
+        # Every row's NULL is a NUMBER, so the comparison with a NUMBER column
+        # is accepted for each of them, not only for the first.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        self.cur.setinputsizes(int)
+        self.cur.executemany(
+            f'BEGIN INSERT INTO {self.TABLE} VALUES (NVL(:1, 0) + 1); END;',
+            [(None,), (None,), (None,)],
+        )
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE} WHERE n = 1')
+        self.assertEqual(self.cur.fetchone(), (3,))
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ParseIntegration(_IntegrationBase):
     """`cursor.parse()` (#1018): parse the statement, never run it.
 
@@ -10675,6 +10731,28 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
+
+    async def test_executemany_of_a_plsql_block(self):
+        # Async twin of PlsqlExecutemanyIntegration (#2479).
+        Table = 'PYO_ASYNC_BLOCK_MANY'
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            try:
+                await Cur.execute(f'DROP TABLE {Table}')
+            except seerdb.DatabaseError:
+                pass  # not there on a first run
+            await Cur.execute(f'CREATE TABLE {Table} (n NUMBER)')
+            try:
+                await Cur.executemany(
+                    f'BEGIN INSERT INTO {Table} VALUES (:1); END;', [(1,), (2,), (3,)]
+                )
+                await Cur.execute(f'SELECT n FROM {Table} ORDER BY n')
+                self.assertEqual(await Cur.fetchall(), [(1,), (2,), (3,)])
+            finally:
+                await Cur.execute(f'DROP TABLE {Table}')
+        finally:
+            await Conn.close()
 
     async def test_output_type_handlers_and_fetch_decimals(self):
         # Async twin of TypeHandlerIntegration (#2458): the LOB is read with an

@@ -526,6 +526,8 @@ class Cursor(_CursorLogic):
             self._rowcount = 0
             self._row_index = 0
             return self
+        if len(Rows) > 1 and is_plsql(operation):
+            return self._executemany_block(operation, Rows)
         return self._run(
             operation,
             Rows[0],
@@ -533,6 +535,26 @@ class Cursor(_CursorLogic):
             BatchErrors=batcherrors,
             ArrayDmlRowCounts=arraydmlrowcounts,
         )
+
+    def _executemany_block(self, operation: str, Rows: list) -> 'Cursor':
+        # A PL/SQL block's rows, one execute each (#2479). Sent as one array
+        # execute on a freshly parsed cursor, the server refuses them --
+        # ORA-03146 on 23ai and the session killed after it, the connection
+        # dropped on 11g -- since nothing has told it the binds' directions yet.
+        # python-oracledb runs the first row alone and the rest as one array
+        # re-execute; one execute per row is the same result in more round
+        # trips. A pending setinputsizes types every row, and an error carries
+        # its row's index as `offset`, as python-oracledb reports it.
+        Sizes = self._inputsizes
+        for Offset, Row in enumerate(Rows):
+            self._inputsizes = Sizes
+            try:
+                self._run(operation, Row)
+            except DatabaseError as Exc:
+                self._inputsizes = ((), {})
+                Exc.offset = Offset
+                raise
+        return self
 
     # --- Server-side scroll window helpers (#181) ---
 
