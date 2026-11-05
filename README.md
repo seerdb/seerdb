@@ -501,9 +501,12 @@ it; a proxy beside a plain TCP address is not used. A `:server_type` suffix (`db
 descriptor sets `server_type`, which `connect()` also takes: `dedicated`,
 `shared` or `pooled`, the last asking for DRCP (`cclass` and `purity` only label
 the session, as in python-oracledb). Oracle 11g's pool serves only clients in
-OCI's native form, which seerdb speaks for a pooled 11g connection; so far it
-logs in and closes there, and refuses anything else with `NotSupportedError`
-(#2466). A
+OCI's native form, which seerdb speaks for a pooled 11g connection. There it
+runs queries, DML, DDL, `commit` and `rollback` so far (with `lastrowid`
+and `transaction_in_progress`, and no statement cache); binds, PL/SQL blocks,
+array DML, LOB, LONG, cursor and object columns, application contexts,
+`ping()` and `changepassword()` are refused with `NotSupportedError` until they
+are built (#2466). A
 descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is
 refused with `NotSupportedError` for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`
 (`cclass`), `pool_purity` (`new` / `self`), `transport_connect_timeout`

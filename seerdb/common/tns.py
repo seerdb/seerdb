@@ -9906,12 +9906,17 @@ _OCI_OER: wire_schema.Schema = (
     ('n4', 'row_kind'),
     ('n4', 'error_code'),
     ('pad', 2),
-    ('u8', 'category'),  # 2 row/value-producing, 1 DDL, 0 none
+    # 2 row/value-producing, 1 DDL, 0 none, as the Mirror writes it. Live 11g
+    # sends the statement's cursor here (a ub2 with the pad after it; measured
+    # through the pool, #2466), which sqlplus doesn't read from the Mirror.
+    ('u8', 'category'),
     ('pad', 1),
     ('u8', 'error_pos'),  # the column sqlplus draws its caret under
     ('pad', 1),
     ('u8', 'command_type'),  # the V$SQL command type
-    ('pad', 4),
+    # Zero from the Mirror; live 11g sends a non-zero byte here (offset 24) on a
+    # reply of row images (measured through the pool, #2466). Nothing reads it.
+    ('n4', 'unpinned_23'),
     ('u8', 'warn_flags'),  # 0x21: a PL/SQL object compiled with errors
     ('bytes', 'rowid', 13),  # a DML's touched row
     ('pad', 8),
@@ -9968,6 +9973,7 @@ def _oci_oer(fields: dict, *, wide: bool | None = None) -> bytes:
         wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
     return _OCI_OER_OCI(
         {
+            'unpinned_23': 0,
             **fields,
             'ext_error_code': fields['error_code'],
             'oci_12c': wide,
@@ -17188,6 +17194,323 @@ def encode_session_release_oci(
     return _SESSION_RELEASE_OCI(
         {'seq': Seq, 'tag_pointer': False, 'tag_length': 0, 'mode': Mode}
     )
+
+
+# --- The 11g native calls, for a pooled 11g session (#2466) -------------------
+# What a pooled 11g session sends once logged in, as sqlplus 11.2 sends it, and
+# how it reads 11g's replies. Measured against sqlplus 11.2 through 11g XE's
+# pool: a query, a fetch, DDL, DML, COMMIT and ROLLBACK (which sqlplus sends as
+# statements), and a failing statement.
+#
+# The execute is OALL8's head (_ALL8_HEAD) in OCI's wide form, its SQL's length
+# declared at three bytes a character; then two indicators and 32 zero bytes,
+# the SQL, and the al8i4 array of 13 ub4s, which carries what 8i's does: [0] 1,
+# [1] the execute flag (0 for a query, whose rows come with the execute), [7]
+# the statement type. The options are thin's bits, NOT_PLSQL on every statement
+# but COMMIT and ROLLBACK.
+# sqlplus 11.2 sends the wide preamble, its lengths 8 bytes (_OCI_ALL8_WIDE).
+_ALL8_HEAD_OCI_WIDE = wire_schema.compile_encoder(_ALL8_HEAD, _OCI_WIDE)
+_FETCH_OCI = wire_schema.compile_encoder(_FETCH, _OCI)
+_CLOSE_CURSORS_OCI = wire_schema.compile_encoder(_CLOSE_CURSORS, _OCI)
+_DESCRIBE_TRAILER_FROM_OCI = wire_schema.compile_decoder(_DESCRIBE_TRAILER, _OCI)
+_OCI11_EXEC_MIDDLE = oci.OCI_INDICATOR + oci.OCI_INDICATOR + bytes(32)
+# The statement types sqlplus 11.2 sends that 8i's table lacks: 8i sends COMMIT
+# and ROLLBACK as type 0.
+OCI11_STMT_ROLLBACK = 17
+OCI11_STMT_COMMIT = 21
+_OCI11_STMT_TYPES = {'COMMIT': OCI11_STMT_COMMIT, 'ROLLBACK': OCI11_STMT_ROLLBACK}
+_OCI11_EXEC_NOT_PLSQL = 0x8000
+
+
+def oci11_stmt_type(Head: str) -> int:
+    """The statement type a pooled 11g session's execute names (al8i4[7]), from
+    the upper-cased, stripped statement: 8i's, and COMMIT / ROLLBACK's own."""
+    Word = Head.split(None, 1)[0] if Head else ''
+    return _OCI11_STMT_TYPES.get(Word, o8i_stmt_type(Head))
+
+
+def encode_oci11_execute(Seq: int, Sql: bytes, StmtType: int, Rows: int = 1) -> bytes:
+    """A pooled 11g session's execute (#2466): parse and execute ``Sql``, and for
+    a query fetch up to ``Rows`` rows with it."""
+    Query = StmtType == O8I_STMT_SELECT
+    Options = TNS_EXEC_OPTION_PARSE | TNS_EXEC_OPTION_EXECUTE
+    if Query:
+        Options |= TNS_EXEC_OPTION_FETCH
+    if StmtType not in (OCI11_STMT_COMMIT, OCI11_STMT_ROLLBACK):
+        Options |= _OCI11_EXEC_NOT_PLSQL
+    Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+    try:
+        Head = _ALL8_HEAD_OCI_WIDE(
+            {
+                'seq': Seq,
+                'token_number': None,
+                'options': Options,
+                'cursor': 0,
+                'sql_present': True,
+                'sql_length': 3 * len(Sql),
+                'al8i4_present': True,
+                'al8i4_length': 13,
+                'al8o4': True,
+                'al8o4l': True,
+                'prefetch_size': 0,
+                'prefetch_rows': Rows,
+                'max_long': 0,
+                'binds_present': False,
+                'bind_count': 0,
+                'al8app': False,
+                'al8txn': True,
+                'al8txl': False,
+                'al8kv': True,
+                'al8kvl': True,
+                'defines_present': True,
+                'define_count': 0,
+            }
+        )
+        Al8i4 = [1, 0 if Query else 1, 0, 0, 0, 0, 0, StmtType, 0, 0, 0, 0, 0]
+        return (
+            Head
+            + _OCI11_EXEC_MIDDLE
+            + _OCI.chr(Sql)
+            + b''.join(_OCI.n4(V) for V in Al8i4)
+        )
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
+
+
+def encode_oci11_fetch(Seq: int, Cursor: int, Rows: int) -> bytes:
+    """A pooled 11g session's fetch of ``Rows`` more rows from ``Cursor``."""
+    return _FETCH_OCI(
+        {'seq': Seq, 'token_number': None, 'cursor': Cursor, 'rows': Rows}
+    )
+
+
+def encode_oci11_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
+    """The close of finished cursors, piggybacked ahead of the next call, as
+    sqlplus 11.2 closes them."""
+    return _CLOSE_CURSORS_OCI(
+        {
+            'seq': Seq,
+            'token_number': None,
+            'cursors_present': True,
+            'count': len(Cursors),
+            'cursors': [{'cursor': C} for C in Cursors],
+        }
+    )
+
+
+# The session return a pooled server sends ahead of the first reply once it
+# has the session (TNS_SERVER_PIGGYBACK_SESS_RET), python-oracledb's layout at
+# OCI's widths: a ub2, a ub1, the session state's pair count, the flags, and the
+# pooled session's id and serial, which are not the login's (measured: 0 pairs,
+# flags 2). Pairs are not measured, so a reply carrying them is refused.
+_OCI11_SESS_RET: wire_schema.Schema = (
+    ('const', bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SESS_RET])),
+    ('n2', 'unpinned_2'),
+    ('u8', 'unpinned_4'),
+    ('n4', 'pair_count'),
+    ('n4', 'flags'),
+    ('n4', 'session_id'),
+    ('n2', 'serial'),
+)
+_OCI11_SESS_RET_FROM_OCI = wire_schema.compile_decoder(_OCI11_SESS_RET, _OCI)
+
+
+def decode_oci11_piggybacks(Data: bytes) -> tuple[dict | None, bytes]:
+    """The server-side piggybacks ahead of a pooled 11g reply or its OER, and
+    what follows them: the session return (the pooled session, returned) and
+    the pooled server's OS process id (OS_PID_MTS: a ub2, then the id as a
+    value), measured on 11g. Any other piggyback is refused rather than
+    guessed at."""
+    Session = None
+    Rest = Data
+    try:
+        while Rest[:1] == bytes([TTI_SVR_PIGGYBACK]):
+            Opcode = Rest[1]
+            if Opcode == TNS_SERVER_PIGGYBACK_SESS_RET:
+                (Session, Rest) = _OCI11_SESS_RET_FROM_OCI(Rest)
+                if Session['pair_count']:
+                    raise NotSupportedError(
+                        'a pooled 11g session returned session state, which '
+                        'seerdb does not read yet'
+                    )
+            elif Opcode == TNS_SERVER_PIGGYBACK_OS_PID_MTS:
+                (_, Rest) = _OCI.read_n2(Rest[2:])
+                (_, Rest) = _OCI.read_value(Rest)
+            else:
+                raise DataError(f'11g native reply: server piggyback {Opcode}')
+    except IndexError as Exc:
+        raise Truncated(f'11g piggyback: {Exc}') from Exc
+    return (Session, Rest)
+
+
+_OCI11_DESCRIBE_GIVEN = {'oci_12c': False, 'has_uds': True}
+
+
+def decode_oci11_describe(Data: bytes) -> tuple[list[dict], bytes]:
+    """11g's describe of a query in the native form (TTI_DCB) and its trailer,
+    as the 9i native dialect's columns, and the bytes after it: the row stream.
+    A describe that runs off the end raises Truncated, for the reader to read
+    on."""
+    (_, Data) = decode_oci11_piggybacks(Data)
+    if Data[:1] != bytes([TTI_DCB]):
+        raise DataError('not an 11g native describe')
+    try:
+        Body = Data[5 + int.from_bytes(Data[1:5], 'little') :]
+        Count = int.from_bytes(_oci_fixed(Body[4:8], 4, 'n4'), 'little')
+        Rest = Body[8:]
+        Columns = []
+        for _ in range(Count):
+            (Column, Rest) = _DCB_COLUMN_FROM_OCI(Rest, _OCI11_DESCRIBE_GIVEN)
+            Columns.append(Column)
+        (_, Rest) = _DESCRIBE_TRAILER_FROM_OCI(Rest, {'has_query_key': True})
+    except IndexError as Exc:
+        raise Truncated(f'11g native describe: {Exc}') from Exc
+    return (_o9i_oall8_columns(Columns), Rest)
+
+
+# A reply's rows as row images (#2466): when the row header's byte 2 has 0x08
+# (0x1a, against 0x22 for an execute's plain rows and 0x02 for a fetch's),
+# each row is TTI_RXD and one value, chunked past 252 bytes, holding the row as
+# a data block stores it: a flag byte (0x2c, a whole row: head, first and last
+# piece), a lock byte, the cell count, and the cells -- a ub1 length, 0xFF for
+# NULL, 0xFE and a little-endian ub2 past 250 bytes. Trailing NULL columns are
+# left out. Measured against sqlplus 11.2 through 11g XE's pool.
+_OCI11_RXH_ROW_IMAGE = 0x08
+_OCI11_ROW_WHOLE = 0x2C
+
+
+def _oci11_row_image(Image: bytes, Columns: list) -> list:
+    from seerdb.common.types import decode_value
+
+    if len(Image) < 3 or Image[0] & _OCI11_ROW_WHOLE != _OCI11_ROW_WHOLE:
+        raise DataError(f'11g row image: not a whole row ({bytes(Image[:3]).hex()})')
+    Count = Image[2]
+    if Count > len(Columns):
+        raise DataError(f'11g row image: {Count} cells for {len(Columns)} columns')
+    Row: list = []
+    At = 3
+    for Col in Columns[:Count]:
+        Length = Image[At]
+        At += 1
+        if Length == 0xFF:
+            Row.append(None)
+            continue
+        if Length == 0xFE:
+            Length = int.from_bytes(Image[At : At + 2], 'little')
+            At += 2
+        Raw = bytes(Image[At : At + Length])
+        if len(Raw) != Length:
+            raise DataError('11g row image: a cell runs past the row')
+        At += Length
+        Row.append(decode_value(Col, Raw))
+    if At != len(Image):
+        raise DataError('11g row image: bytes left after its cells')
+    return Row + [None] * (len(Columns) - Count)
+
+
+def decode_oci11_rows(
+    Data: bytes, Columns: list, PrevRow: list | None = None
+) -> tuple[list, bytes, list | None]:
+    """A pooled 11g reply's rows, to the status: (rows, terminal, last row), as
+    decode_9i_oall8_exec_response returns them. Plain rows are the native 9.2
+    form's and read by it; row images are read here. A stream cut short raises
+    Truncated for the reader to read on."""
+    if Data[:1] != bytes([TTI_RXH]) or len(Data) < 3:
+        return decode_9i_oall8_exec_response(Data, Columns, PrevRow)
+    if not Data[2] & _OCI11_RXH_ROW_IMAGE:
+        return decode_9i_oall8_exec_response(Data, Columns, PrevRow)
+    Rows: list = []
+    Last = PrevRow
+    try:
+        (_, Rest) = _OCI_RXH_FROM_OCI(Data)
+        while Rest[:1] == bytes([TTI_RXD]):
+            (Image, Rest) = _OCI.read_value(Rest[1:])
+            Last = _oci11_row_image(bytes(Image), Columns)
+            Rows.append(Last)
+    except IndexError as Exc:
+        raise Truncated(f'11g row images: {Exc}') from Exc
+    return (Rows, Rest, Last)
+
+
+# The return parameters ahead of an execute's OER: thin's RPA at OCI's widths --
+# a count of ub4 values (6: the third the statement's cursor), the transaction
+# id's length and bytes, the session's changed settings as keyword pairs (an
+# ALTER SESSION's NLS values: a key, a value and the keyword's number), and the
+# registration. 35 bytes with no pairs, which is all the Mirror sends (it reads
+# them as _OCI_STATUS_FRAME). Measured through the pool, #2466.
+_OCI11_RPA: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n2', 'value_count'),
+    ('each', 'values', 'value_count', (('n4', 'value'),)),
+    ('n2', 'txn_length'),
+    ('bytes', 'txn', 'txn_length'),
+    ('n2', 'pair_count'),
+    (
+        'each',
+        'pairs',
+        'pair_count',
+        (
+            ('n4', 'key_length'),
+            ('when', 'key_length', (('value', 'key'),)),
+            ('n4', 'value_length'),
+            ('when', 'value_length', (('value', 'value'),)),
+            ('n2', 'keyword'),
+        ),
+    ),
+    ('n4', 'registration'),
+)
+_OCI11_RPA_FROM_OCI = wire_schema.compile_decoder(_OCI11_RPA, _OCI)
+_OCI11_RPA_CURSOR = 2
+_OCI11_OER_GIVEN = {'oci_12c': False, 'oci_pre12c': True}
+# Behind the OER of an INSERT, UPDATE or DELETE that succeeded (told by the
+# command it ran, as a SELECT's status can look like a DML's) comes the touched
+# row's rowid, as the native 9.2 form's UROWID cell frames one (a ub2 size and
+# the bytes): 13 bytes for a heap table's, a logical one for an index-organized
+# table's. Measured through the pool, #2466.
+_OCI11_DML_COMMANDS = frozenset({2, 6, 7, 189})  # INSERT, UPDATE, DELETE, MERGE
+
+
+def decode_oci11_status(Data: bytes) -> dict:
+    """The status ending an 11g native reply: the return parameters
+    (_OCI11_RPA) an execute's carries, the OER, a DML's trailer, and the error's
+    text, with piggybacks ahead of each. Returns the OER's fields with ``cursor``
+    (the statement's cursor, measured where _OCI_OER says ``category``),
+    ``message``, ``keywords`` (the settings an ALTER SESSION changed) and
+    ``rowid`` (the row a DML touched). A status
+    cut short raises Truncated, for the reader to read on; anything else in its
+    place raises DataError, not a wait for bytes that will not come."""
+    (_, Rest) = decode_oci11_piggybacks(Data)
+    try:
+        Keywords: list = []
+        if Rest[:1] == bytes([TTI_RPA]):
+            (Rpa, Rest) = _OCI11_RPA_FROM_OCI(Rest)
+            Keywords = Rpa['pairs']
+            (_, Rest) = decode_oci11_piggybacks(Rest)
+        if not Rest:
+            raise Truncated('11g native status: no OER yet')
+        if Rest[0] != TTI_OER:
+            raise DataError(f'11g native status: token {Rest[0]} where the OER is')
+        (Oer, Rest) = _OCI_OER_FROM_OCI(Rest, _OCI11_OER_GIVEN)
+        Rowid = None
+        if Oer['command_type'] in _OCI11_DML_COMMANDS and not Oer['error_code']:
+            from seerdb.common.types import urowid_to_string
+
+            (Cell, Rest) = _O9I_UROWID_CELL_FROM_O9I(Rest)
+            if Cell['length']:
+                Rowid = urowid_to_string(bytes(Cell['urowid']))
+        Message = None
+        if Oer['error_code']:
+            (Text, Rest) = _OCI.read_value(Rest)
+            Message = bytes(Text).decode('utf-8', 'replace').rstrip('\n')
+    except IndexError as Exc:
+        raise Truncated(f'11g native status: {Exc}') from Exc
+    return {
+        **Oer,
+        'cursor': Oer['category'],
+        'message': Message,
+        'keywords': Keywords,
+        'rowid': Rowid,
+    }
 
 
 def encode_dictionary_spfp(Dictionary: dict) -> bytes:

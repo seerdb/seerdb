@@ -1271,7 +1271,12 @@ class AsyncOracleConnect(_ConnectionLogic):
                 if intent is RECV:
                     to_send = await self._next_data_packet()
                 elif isinstance(intent, Send):
-                    await self.send(TNS_DATA, intent.data)
+                    # The dialect's own call: a pooled 11g session sends it (#2466).
+                    self._native11_sending = True
+                    try:
+                        await self.send(TNS_DATA, intent.data)
+                    finally:
+                        self._native11_sending = False
                     to_send = None
                 else:  # pragma: no cover - defensive
                     raise TypeError(f'unknown dialect intent: {intent!r}')
@@ -3133,7 +3138,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             if self.conn_state == CONN_STATE_AUTHENTICATED and self._native11:
                 # A pooled 11g session (#2466) ends as sqlplus ends it: the
                 # native session release, answered with a bare status, then the
-                # EOF packet. Mirrors OracleConnect.close.
+                # EOF packet; rolled back first, as every close. Mirrors
+                # OracleConnect.close.
+                if not self.autocommit:
+                    await self.rollback()
                 self._native11_sending = True
                 try:
                     await self.send(

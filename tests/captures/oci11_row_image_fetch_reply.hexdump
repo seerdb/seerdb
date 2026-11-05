@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# 11g's reply to the fetch after it (#2466): the other two rows as row images
+# (3, NULL, NULL coming as one cell), then the OER with ORA-01403.
+# Captured 2026-11-05 through tools/capture_proxy.py: sqlplus 11.2 (instant
+# client 11.2, x86-64 Linux) running statements on Oracle 11g XE 11.2.0.2 with
+# SERVER=POOLED, the DRCP pool started. The TTC payload, without the packet's
+# header, as `hexdump -C` output; the offset column and the |ascii| gutter are
+# ignored by tests.replay.parse_hexdump.
+00000000  06 01 1a 13 03 00 00 00  00 00 05 00 00 00 00 00  |................|
+00000010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000020  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000030  00 00 07 0f 2c 01 03 02  c1 03 05 73 68 6f 72 74  |....,......short|
+00000040  02 7a 7a 07 06 2c 01 01  02 c1 04 04 02 00 00 00  |.zz..,..........|
+00000050  1c 00 01 03 00 00 00 7b  05 00 00 00 00 03 00 00  |.......{........|
+00000060  00 03 00 20 00 00 00 94  d8 01 00 04 00 00 00 8d  |... ............|
+00000070  24 00 00 02 00 00 00 00  00 00 00 00 1d 00 00 01  |$...............|
+00000080  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000090  00 00 00 20 f6 31 0a 00  00 00 00 00 00 00 00 00  |... .1..........|
+000000a0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000b0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000c0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000d0  00 00 00 19 4f 52 41 2d  30 31 34 30 33 3a 20 6e  |....ORA-01403: n|
+000000e0  6f 20 64 61 74 61 20 66  6f 75 6e 64 0a           |o data found.|
+000000ed
