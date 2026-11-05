@@ -363,5 +363,88 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(OracleConnect(program='mine').program, 'mine')
 
 
+class InputTypeHandlerTest(unittest.TestCase):
+    """The input side (#2458): what reaches the bind list."""
+
+    def _cursor(self, handler=None, conn_handler=None):
+        cur = _stub_cursor(
+            types.SimpleNamespace(sock=object(), inputtypehandler=conn_handler)
+        )
+        cur.inputtypehandler = handler
+        return cur
+
+    def test_no_handler_leaves_the_binds_alone(self):
+        Bind = [1, 'a']
+        self.assertEqual(self._cursor()._handled_binds(Bind, None), (Bind, None))
+
+    def test_called_for_each_value_that_is_not_a_var(self):
+        seen = []
+
+        def handler(cursor, value, num_elements):
+            seen.append((value, num_elements))
+
+        own = Var(int)
+        own.setvalue(0, 5)
+        self._cursor(handler)._handled_binds([1, own, None], None)
+        self.assertEqual(seen, [(1, 1), (None, 1)])
+
+    def test_a_returned_var_binds_the_value_through_its_inconverter(self):
+        def handler(cursor, value, num_elements):
+            if isinstance(value, int):
+                return cursor.var(str, inconverter=lambda v: f'<{v}>')
+            return None
+
+        (Bind, Batch) = self._cursor(handler)._handled_binds([42, 'x'], None)
+        self.assertIsInstance(Bind[0], Var)
+        self.assertEqual(Bind[0].getvalue(), '<42>')
+        self.assertEqual(Bind[1], 'x')
+        self.assertIsNone(Batch)
+
+    def test_a_batch_calls_it_once_per_position_with_the_row_count(self):
+        seen = []
+
+        def handler(cursor, value, num_elements):
+            seen.append((value, num_elements))
+            return cursor.var(str, arraysize=num_elements, inconverter=str)
+
+        (Bind, Batch) = self._cursor(handler)._handled_binds([1], [[2], [3]])
+        self.assertEqual(seen, [(1, 3)])
+        self.assertEqual(
+            [Bind[0].getvalue()] + [Row[0].getvalue() for Row in Batch], ['1', '2', '3']
+        )
+
+    def test_the_cursor_handler_wins_over_the_connection_handler(self):
+        def to_text(cursor, value, num_elements):
+            return cursor.var(str, inconverter=str)
+
+        cur = self._cursor(conn_handler=to_text)
+        self.assertIsInstance(cur._handled_binds([1], None)[0][0], Var)
+        cur.inputtypehandler = lambda cursor, value, num_elements: None
+        self.assertEqual(cur._handled_binds([1], None)[0], [1])
+
+    def test_a_handler_returning_something_else_is_refused(self):
+        cur = self._cursor(lambda cursor, value, num_elements: 5)
+        with self.assertRaises(seerdb.ProgrammingError):
+            cur._handled_binds([1], None)
+
+    def test_a_value_that_does_not_fit_the_returned_var_is_refused(self):
+        # python-oracledb's DPY-3013: a var(str) for an int, no inconverter.
+        cur = self._cursor(lambda cursor, value, num_elements: cursor.var(str))
+        with self.assertRaises(seerdb.NotSupportedError):
+            cur._handled_binds([1], None)
+
+    def test_a_declared_bind_is_not_offered_to_the_handler(self):
+        seen = []
+
+        def handler(cursor, value, num_elements):
+            seen.append(value)
+
+        cur = self._cursor(handler)
+        cur.setinputsizes(int)
+        Bind = cur._typed_binds('select :1, :2 from dual', [7, 8])
+        cur._handled_binds(Bind, None)
+        self.assertEqual(seen, [8])
+
+
 if __name__ == '__main__':
     unittest.main()

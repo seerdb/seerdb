@@ -194,6 +194,16 @@ What works:
   each value (to NULL too with `convert_nulls=True`). `cursor.var()` takes
   `arraysize`, `inconverter`, `outconverter` and `convert_nulls`. The
   conversions are made client-side, on the value as fetched. Sync and async
+- Input type handlers: `inputtypehandler` on the connection or the cursor
+  (the cursor's wins), called with `(cursor, value, num_elements)` for each
+  bind value that isn't already a variable or declared by `setinputsizes()`.
+  It returns `None` or a `cursor.var()`, which then binds that value: its
+  `inconverter` turns, say, an application object into a string, and the
+  result must fit the variable's type. An `executemany` calls it once per bind
+  position, with the first row's value and the row count, and every row goes
+  through the variable it returned. seerdb calls it at each execute, where
+  python-oracledb skips a re-execute of the same statement with values of the
+  same types. Sync and async
 - `fetch_decimals`: `execute(..., fetch_decimals=True)` or
   `seerdb.defaults.fetch_decimals = True` fetches every NUMBER as
   `decimal.Decimal`, whole values included
