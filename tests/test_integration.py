@@ -6682,6 +6682,37 @@ class TypeHandlerIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+class VarValueIntegration(_IntegrationBase):
+    """A Var's value must fit its type (#2477): one that doesn't used to reach
+    the server as the wrong type's bytes and come back as garbage."""
+
+    def test_a_value_that_does_not_fit_is_refused_before_the_server(self):
+        for Typ, Value in ((str, 12), (int, '12'), (seerdb.DB_TYPE_DATE, '12')):
+            with self.subTest(var=Typ, value=Value):
+                V = self.cur.var(Typ)
+                with self.assertRaises(seerdb.NotSupportedError):
+                    V.setvalue(0, Value)
+        # As a declared bind type too.
+        self.cur.setinputsizes(int)
+        with self.assertRaises(seerdb.NotSupportedError):
+            self.cur.execute('SELECT :1 FROM dual', ['12'])
+        self.assertEqual(self.cur.execute('SELECT 1 FROM dual').fetchone(), (1,))
+
+    def test_a_binary_double_takes_a_decimal(self):
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        if self.conn.field_version < FIELD_VERSION_10_2:
+            self.skipTest('BINARY_DOUBLE is 10g+')
+        for Value, Expected in ((Decimal('1.25'), 1.25), (True, 1.0), (12, 12.0)):
+            with self.subTest(value=Value):
+                V = self.cur.var(seerdb.DB_TYPE_BINARY_DOUBLE)
+                V.setvalue(0, Value)
+                self.assertEqual(
+                    self.cur.execute('SELECT :1 FROM dual', [V]).fetchone(), (Expected,)
+                )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
 class ParseIntegration(_IntegrationBase):
     """`cursor.parse()` (#1018): parse the statement, never run it.
 

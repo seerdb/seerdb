@@ -295,6 +295,58 @@ def _resolve_dbtype(typ: object):
     raise ValueError(f'unsupported var() type: {typ!r}')
 
 
+# What a variable of each type accepts as its value, as python-oracledb accepts
+# it (#2477). The value is encoded by its own Python type while the bind says
+# the variable's, so anything else reached the server as the wrong type's bytes
+# and came back as garbage, or as NULL. A type not listed keeps what it took
+# before: LOBs, objects, cursors, JSON, VECTOR, BOOLEAN, INTERVAL YEAR TO MONTH.
+_NUMERIC_VALUES = (int, float, Decimal)  # bool is an int
+_DATE_VALUES = (datetime.date,)  # a datetime is a date; a BcDate also goes
+_ACCEPTED_VALUES: dict[object, tuple[type, ...]] = {
+    DB_TYPE_VARCHAR: (str, bytes),
+    DB_TYPE_CHAR: (str, bytes),
+    DB_TYPE_NVARCHAR: (str, bytes),
+    DB_TYPE_NCHAR: (str, bytes),
+    DB_TYPE_LONG: (str, bytes),
+    DB_TYPE_NUMBER: _NUMERIC_VALUES,
+    DB_TYPE_BINARY_INTEGER: _NUMERIC_VALUES,
+    DB_TYPE_BINARY_FLOAT: _NUMERIC_VALUES,
+    DB_TYPE_BINARY_DOUBLE: _NUMERIC_VALUES,
+    DB_TYPE_RAW: (str, bytes, bytearray),
+    DB_TYPE_LONG_RAW: (str, bytes, bytearray),
+    DB_TYPE_DATE: _DATE_VALUES,
+    DB_TYPE_TIMESTAMP: _DATE_VALUES,
+    DB_TYPE_TIMESTAMP_TZ: _DATE_VALUES,
+    DB_TYPE_TIMESTAMP_LTZ: _DATE_VALUES,
+    DB_TYPE_INTERVAL_DS: (datetime.timedelta,),
+}
+_BINARY_FLOATS = (DB_TYPE_BINARY_FLOAT, DB_TYPE_BINARY_DOUBLE)
+
+
+def _checked_value(dbtype: object, value: object) -> object:
+    """`value` as a variable of `dbtype` binds it, or NotSupportedError."""
+    if value is None:
+        return value
+    Accepted = _ACCEPTED_VALUES.get(dbtype)
+    if Accepted is None:
+        return value
+    if not isinstance(value, Accepted) and not (
+        # seerdb's own date before year 1, which no datetime can hold.
+        Accepted is _DATE_VALUES and isinstance(value, BcDate)
+    ):
+        from seerdb.common.exceptions import NotSupportedError
+
+        raise NotSupportedError(
+            f'a value of type {type(value).__name__} cannot be set on a '
+            f'{dbtype} variable'
+        )
+    if dbtype in _BINARY_FLOATS and not isinstance(value, float):
+        # The binary encoders take a float; a Decimal or a bool reached the
+        # server as NULL (#2477).
+        return float(value)  # type: ignore[arg-type]
+    return value
+
+
 class Var:
     """A bind container that can receive an OUT / IN OUT value.
 
@@ -362,6 +414,13 @@ class Var:
     def setvalue(self, pos: int, value: object) -> None:
         if self.inconverter is not None:
             value = self.inconverter(value)
+        # A value the variable's type can't bind is refused here, as
+        # python-oracledb refuses it, rather than reaching the server as the
+        # wrong type's bytes (#2477). An array variable checks each element.
+        if self.is_array and isinstance(value, (list, tuple)):
+            value = [_checked_value(self.dbtype, Item) for Item in value]
+        else:
+            value = _checked_value(self.dbtype, value)
         self._value = value
         self.has_value = True
 
