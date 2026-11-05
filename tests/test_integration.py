@@ -6680,6 +6680,67 @@ class TypeHandlerIntegration(_IntegrationBase):
         self.cur.outputtypehandler = None
         self.assertEqual(self.cur.execute('SELECT 1 FROM dual').fetchone(), (1,))
 
+    # --- the input side ---
+
+    def test_an_input_handler_binds_a_python_object(self):
+        self.cur.inputtypehandler = _point_as_text
+        self.assertEqual(
+            self.cur.execute('SELECT :1 FROM dual', [_Point(1, 2)]).fetchone(), ('1,2',)
+        )
+        # The connection's serves a cursor without one.
+        self.conn.inputtypehandler = _point_as_text
+        Cur = self.conn.cursor()
+        self.assertEqual(
+            Cur.execute('SELECT :1 FROM dual', [_Point(3, 4)]).fetchone(), ('3,4',)
+        )
+
+    def test_an_input_handler_over_an_executemany(self):
+        Calls = []
+
+        def Handler(cursor, value, num_elements):
+            Calls.append(num_elements)
+            return _point_as_text(cursor, value, num_elements)
+
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, p VARCHAR2(20))')
+        self.cur.inputtypehandler = Handler
+        Rows = [(1, _Point(1, 2)), (2, _Point(3, 4)), (3, _Point(5, 6))]
+        self.cur.executemany(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', Rows)
+        # A PL/SQL block's rows run one at a time (#2479); the handler still
+        # sees the batch once per position.
+        self.cur.executemany(
+            f'BEGIN INSERT INTO {self.TABLE} VALUES (:1 + 10, :2); END;', Rows
+        )
+        self.assertEqual(Calls, [3, 3, 3, 3])
+        self.cur.execute(f'SELECT n, p FROM {self.TABLE} ORDER BY n')
+        self.assertEqual(
+            self.cur.fetchall(),
+            [(1, '1,2'), (2, '3,4'), (3, '5,6'), (11, '1,2'), (12, '3,4'), (13, '5,6')],
+        )
+
+    def test_a_value_the_handler_s_var_cannot_take_is_refused(self):
+        self.cur.inputtypehandler = lambda cursor, value, num_elements: cursor.var(str)
+        with self.assertRaises(seerdb.NotSupportedError):
+            self.cur.execute('SELECT :1 FROM dual', [12])
+        self.cur.inputtypehandler = None
+        self.assertEqual(
+            self.cur.execute('SELECT :1 FROM dual', [12]).fetchone(), (12,)
+        )
+
+
+class _Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+def _point_as_text(cursor, value, num_elements):
+    # An input type handler binding a Python object the driver can't (#2458).
+    if isinstance(value, _Point):
+        return cursor.var(
+            str, arraysize=num_elements, inconverter=lambda p: f'{p.x},{p.y}'
+        )
+    return None
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class VarValueIntegration(_IntegrationBase):
@@ -10780,6 +10841,14 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             Conn.outputtypehandler = None
             await Cur.execute('SELECT 7 FROM dual', fetch_decimals=True)
             self.assertEqual(await Cur.fetchone(), (Decimal(7),))
+            # The input side.
+            Conn.inputtypehandler = _point_as_text
+            Cur = Conn.cursor()
+            await Cur.execute('SELECT :1 FROM dual', [_Point(1, 2)])
+            self.assertEqual(await Cur.fetchone(), ('1,2',))
+            Cur.inputtypehandler = lambda cursor, value, num_elements: 5
+            with self.assertRaises(seerdb.ProgrammingError):
+                await Cur.execute('SELECT :1 FROM dual', [1])
         finally:
             await Conn.close()
 

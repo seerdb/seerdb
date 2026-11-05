@@ -356,8 +356,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.fetch_lobs = (
             defaults.fetch_lobs if fetch_lobs is None else bool(fetch_lobs)
         )
-        # The output type handler every cursor without its own uses (#2458).
+        # The type handlers every cursor without its own uses (#2458).
         self.outputtypehandler = None
+        self.inputtypehandler = None
         # What this session reports as its client_driver. python-oracledb lets an
         # application set it so it can identify itself in
         # v$session_connect_info; unset, seerdb reports its own banner (#826).

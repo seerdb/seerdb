@@ -262,7 +262,9 @@ class Cursor(_CursorLogic):
         Bind = self._typed_binds(operation, Bind)
         if Batch:
             Batch = [self._typed_binds(operation, Row) for Row in Batch]
-        else:
+        # Then the input type handler, for each bind still untyped (#2458).
+        (Bind, Batch) = self._handled_binds(Bind, Batch)
+        if not Batch:
             Bind = self._promote_lob_var_binds(Bind)
         self._inputsizes = ((), {})
         _check_object_bind_support(self._connection, Bind, Batch)
@@ -546,14 +548,23 @@ class Cursor(_CursorLogic):
         # trips. A pending setinputsizes types every row, and an error carries
         # its row's index as `offset`, as python-oracledb reports it.
         Sizes = self._inputsizes
-        for Offset, Row in enumerate(Rows):
-            self._inputsizes = Sizes
-            try:
-                self._run(operation, Row)
-            except DatabaseError as Exc:
-                self._inputsizes = ((), {})
-                Exc.offset = Offset
-                raise
+        # The input type handler sees the whole batch once, as it would for an
+        # array execute, so each row arrives already bound through its Var.
+        Typed = [self._typed_binds(operation, Row) for Row in Rows]
+        (First, Rest) = self._handled_binds(Typed[0], Typed[1:])
+        Rows = [First] + list(Rest or [])
+        self._binds_handled = True
+        try:
+            for Offset, Row in enumerate(Rows):
+                self._inputsizes = Sizes
+                try:
+                    self._run(operation, Row)
+                except DatabaseError as Exc:
+                    self._inputsizes = ((), {})
+                    Exc.offset = Offset
+                    raise
+        finally:
+            self._binds_handled = False
         return self
 
     # --- Server-side scroll window helpers (#181) ---

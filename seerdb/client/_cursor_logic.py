@@ -44,6 +44,18 @@ def _declared_bind(declared: object, value: object) -> Var:
     return variable
 
 
+def _bound_like(template: Var, value: object) -> Var:
+    # A further row's bind through the variable an input type handler returned
+    # for the first: the same type, size and inconverter (#2458).
+    variable = Var(
+        template._pytype or template.dbtype,
+        template.size,
+        inconverter=template.inconverter,
+    )
+    variable.setvalue(0, value)
+    return variable
+
+
 def _touched_rowid(rowid: str | None, rowcount: object) -> str | None:
     """The ``lastrowid`` a DML / DDL reply reports (#1078).
 
@@ -122,13 +134,56 @@ class _CursorLogic:
         # seerdb.defaults, read as the cursor is opened (#2458).
         self.arraysize = defaults.arraysize
         self.prefetchrows = defaults.prefetchrows
-        # The output type handler (#2458); None defers to the connection's.
+        # The type handlers (#2458); None defers to the connection's.
         self.outputtypehandler = None
+        self.inputtypehandler = None
+        # Set while a block's executemany runs its rows one by one (#2479), whose
+        # binds the handler has already seen as one batch.
+        self._binds_handled = False
         # The per-column plan the handler and fetch_decimals made for the
         # current result set, applied as each row is fetched; None when no
         # column needs one. fetch_decimals as the last execute had it.
         self._fetch_plan: list | None = None
         self._fetch_decimals: bool = defaults.fetch_decimals
+
+    def _handled_binds(
+        self, Bind: list, Batch: list | None
+    ) -> tuple[list, list | None]:
+        """Bind and Batch with the input type handler applied (#2458).
+
+        The handler, the cursor's else the connection's, is called once per bind
+        position that isn't already a Var -- one the caller made, or one
+        setinputsizes declared -- with the first row's value and the number of
+        rows, as python-oracledb calls it. A Var it returns binds that position
+        in every row: each row's value goes through its inconverter and must
+        then fit its type."""
+        if self._binds_handled:
+            # A block's executemany already ran the handler over its batch.
+            return Bind, Batch
+        Handler = self.inputtypehandler
+        if Handler is None:
+            Handler = getattr(self._connection, 'inputtypehandler', None)
+        if Handler is None or not Bind:
+            return Bind, Batch
+        Rows = [Bind] + list(Batch or [])
+        Out = [list(Row) for Row in Rows]
+        for Index, Value in enumerate(Bind):
+            if isinstance(Value, Var):
+                continue
+            Template = Handler(self, Value, len(Rows))
+            if Template is None:
+                continue
+            if not isinstance(Template, Var):
+                raise ProgrammingError(
+                    'an input type handler must return None or a variable from '
+                    f'cursor.var(), not {type(Template).__name__}'
+                )
+            Template.setvalue(0, Value)
+            Out[0][Index] = Template
+            for Row in Out[1:]:
+                if Index < len(Row) and not isinstance(Row[Index], Var):
+                    Row[Index] = _bound_like(Template, Row[Index])
+        return Out[0], (Out[1:] if Batch else Batch)
 
     def _plan_fetch(self) -> None:
         # Called wherever a new result set is described (#2458). A handler that
