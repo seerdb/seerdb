@@ -123,6 +123,7 @@ from seerdb.common.tns import (
     encode_oci11_lobop,
     encode_oci11_long_fetch,
     encode_oci11_ping,
+    encode_oci11_scroll_fetch,
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
@@ -135,6 +136,7 @@ from seerdb.common.tns import (
 from seerdb.common.tns_consts import (
     ISO_LATIN_1_CHARSET,
     ORA_NO_DATA_FOUND,
+    TNS_FETCH_ORIENTATION_LAST,
     TNS_LOB_OP_FILE_CLOSE,
     TNS_LOB_OP_FILE_OPEN,
     TNS_LOB_OP_GET_LENGTH,
@@ -247,6 +249,9 @@ CAP_TEMP_LOB = 'temp_lob'
 # its own form (#2466).
 CAP_PARSE = 'parse'
 CAP_PING = 'ping'
+# The dialect serves a server-side scrollable cursor -- its open and its
+# positioned fetches -- in its own form (#2466).
+CAP_SCROLL = 'scroll'
 
 
 # The cursor cache's cap, as on 10g+ (OracleConnect._cursor_cache_max).
@@ -1561,7 +1566,7 @@ class Oci11Dialect(Oall8Dialect):
     form's image. LONG and LONG RAW
     columns are read a row a fetch, each value whole; a cursor the server opened
     (a REF CURSOR OUT bind's, a CURSOR(...) column's) with sqlplus's fetch.
-    ping() and cursor.parse() are OCI's own calls."""
+    ping(), cursor.parse() and a scrollable cursor are OCI's own calls."""
 
     _wire = '11g native'
 
@@ -1605,6 +1610,7 @@ class Oci11Dialect(Oall8Dialect):
                 CAP_TEMP_LOB,
                 CAP_PARSE,
                 CAP_PING,
+                CAP_SCROLL,
             }
         )
 
@@ -1930,6 +1936,86 @@ class Oci11Dialect(Oall8Dialect):
                 continue
             _raise_ora(status.get('error_code', 0), status.get('message'))
             return (value, updated)
+
+    def execute_scrollable(self, sql: str, bind: list | None, prefetch: int):
+        # A query opened scrollable, as OCI 11.2's OCI_STMT_SCROLLABLE_READONLY
+        # execute opens one through the pool: the cursor stays open past its
+        # last row, its first `prefetch` rows come with the execute, and the
+        # rest by position (scroll_fetch). Returns the 9-tuple a query's
+        # execute does, the ORA code (1403 at the end) and the cursor's id in
+        # it, the row count the cursor's position; the cursor is not closed.
+        bind = bind or []
+        self._check_binds(bind)
+        yield Send(
+            self._closing()
+            + encode_oci11_execute(
+                self._next_seq(),
+                self._sql_text(sql),
+                O8I_STMT_SELECT,
+                max(prefetch, 1),
+                bind,
+                Scrollable=True,
+            )
+        )
+        received = yield RECV
+        if received is False:
+            raise Exception('Connection closed during an 11g scrollable open')
+        packet = self._session_return(received[1])
+        if packet[:1] != bytes([TTI_DCB]):
+            status = self._status(packet)
+            self._finished(status.get('cursor', 0))
+            _raise_ora(status.get('error_code', 0), status.get('message'))
+            raise Exception('An 11g scrollable open answered without a describe')
+        (columns, rest) = yield from self._recv_describe(packet)
+        (rows, terminal, _) = yield from self.recv_rows(rest, columns, None)
+        status = self._status(terminal)
+        code = status.get('error_code', 0)
+        if code not in (0, ORA_NO_DATA_FOUND):
+            self._finished(status.get('cursor', 0))
+            _raise_ora(code, status.get('message'))
+        return (
+            0,
+            code,
+            status.get('cursor', 0),
+            (status.get('row_kind'), columns),
+            rows,
+            None,
+            None,
+            [],
+            None,
+        )
+
+    def scroll_fetch(
+        self,
+        cursor: int,
+        orientation: int,
+        position: int,
+        columns: list,
+        fetch: int,
+        last_row: list | None,
+    ):
+        # Up to `fetch` rows of a scrollable cursor from `position` (1-based),
+        # or its last row, as OCI 11.2's OCIStmtFetch2 asks: every other
+        # orientation by the row it lands on, which the cursor has worked out.
+        # Returns (rows, at the end, the cursor's position after them); past
+        # the last row the rows are none.
+        yield Send(
+            self._closing()
+            + encode_oci11_scroll_fetch(
+                self._next_seq(),
+                cursor,
+                max(fetch, 1),
+                self._long_size(columns, fetch),
+                orientation == TNS_FETCH_ORIENTATION_LAST,
+                position,
+            )
+        )
+        (rows, terminal, _) = yield from self.recv_rows(b'', columns, last_row)
+        status = self._status(terminal)
+        code = status.get('error_code', 0)
+        if code not in (0, ORA_NO_DATA_FOUND):
+            _raise_ora(code, status.get('message'))
+        return (rows, code == ORA_NO_DATA_FOUND, status.get('row_kind'))
 
     def ping(self):
         # A round trip that runs nothing, as OCI 11.2's OCIPing makes one
