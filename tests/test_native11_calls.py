@@ -353,10 +353,122 @@ class Native11LobTest(_At11g):
             'hello clob',
         )
 
-    def test_the_other_lob_calls_are_refused(self):
+
+class Native11LobCallTest(_At11g):
+    """A LOB object's other calls, against an OCI 11.2 program's own."""
+
+    @staticmethod
+    def _locator(Captured):
+        # The locator the captured call was made on, as it was fetched.
+        from seerdb.common.tns import _LOBOPS_READ_FROM_OCI_WIDE
+
+        return bytes(_LOBOPS_READ_FROM_OCI_WIDE(Captured)[0]['locator'])
+
+    def test_the_calls_are_oci_11_2s(self):
+        from seerdb.common.tns import encode_oci11_lobop
+        from seerdb.common.tns_consts import (
+            TNS_LOB_OP_CLOSE,
+            TNS_LOB_OP_GET_LENGTH,
+            TNS_LOB_OP_IS_OPEN,
+            TNS_LOB_OP_OPEN,
+            TNS_LOB_OP_TRIM,
+            TNS_LOB_OP_WRITE,
+        )
+
+        for Name, Operation, Offset, Amount, Data in (
+            ('oci11_lobop_get_length.hexdump', TNS_LOB_OP_GET_LENGTH, 0, 0, None),
+            ('oci11_lobop_is_open.hexdump', TNS_LOB_OP_IS_OPEN, 0, 0, None),
+            ('oci11_lobop_open.hexdump', TNS_LOB_OP_OPEN, 0, 2, None),
+            (
+                'oci11_lobop_write.hexdump',
+                TNS_LOB_OP_WRITE,
+                1,
+                5,
+                'HELLO'.encode('utf-16-be'),
+            ),
+            ('oci11_lobop_close.hexdump', TNS_LOB_OP_CLOSE, 0, 0, None),
+            ('oci11_lobop_trim.hexdump', TNS_LOB_OP_TRIM, 0, 3, None),
+        ):
+            with self.subTest(Name):
+                Captured = _capture(Name)
+                self.assertEqual(
+                    encode_oci11_lobop(
+                        Captured[2],
+                        self._locator(Captured),
+                        Operation,
+                        Offset,
+                        Amount,
+                        Data,
+                    ),
+                    Captured,
+                )
+
+    def test_the_replies(self):
+        from seerdb.common.tns import decode_oci11_lobop
+        from seerdb.common.tns_consts import (
+            TNS_LOB_OP_CLOSE,
+            TNS_LOB_OP_GET_LENGTH,
+            TNS_LOB_OP_IS_OPEN,
+            TNS_LOB_OP_WRITE,
+        )
+
+        Sent = self._locator(_capture('oci11_lobop_write.hexdump'))
+        for Name, Operation, Value in (
+            ('oci11_lobop_get_length_reply.hexdump', TNS_LOB_OP_GET_LENGTH, 10),
+            ('oci11_lobop_is_open_reply.hexdump', TNS_LOB_OP_IS_OPEN, 1),
+            ('oci11_lobop_write_reply.hexdump', TNS_LOB_OP_WRITE, 5),
+            ('oci11_lobop_close_reply.hexdump', TNS_LOB_OP_CLOSE, None),
+        ):
+            with self.subTest(Name):
+                (Got, Locator, Rest) = decode_oci11_lobop(_capture(Name), Operation)
+                self.assertEqual(Got, Value)
+                self.assertEqual(len(Locator), len(Sent) - 2)
+                self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+        (_, Written, _) = decode_oci11_lobop(
+            _capture('oci11_lobop_write_reply.hexdump'), TNS_LOB_OP_WRITE
+        )
+        self.assertNotEqual(Written, Sent[2:])  # the write changed it
+
+    def test_the_dialect_returns_the_value_and_the_locator(self):
+        from seerdb.common.tns_consts import TNS_LOB_OP_GET_LENGTH
+
+        Locator = self._locator(_capture('oci11_lobop_get_length.hexdump'))
+        (Sends, Result) = _drive(
+            Oci11Dialect(lambda: 7).lob_operation(Locator, TNS_LOB_OP_GET_LENGTH),
+            [_capture('oci11_lobop_get_length_reply.hexdump')],
+        )
+        self.assertEqual(len(Sends), 1)
+        self.assertEqual(Result, (10, Locator[2:]))
+
+    def test_a_failed_call_raises(self):
+        from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
+
+        with self.assertRaises(DatabaseError) as Raised:
+            _drive(
+                Oci11Dialect(lambda: 7).lob_operation(
+                    b'\x00\x02ab', TNS_LOB_OP_WRITE, 1, 1, b'\x00x'
+                ),
+                [_capture('oci11_lobop_not_locked_reply.hexdump')],
+            )
+        self.assertEqual(Raised.exception.code, 22920)
+
+    def test_an_unmeasured_call_is_refused(self):
+        from seerdb.common.tns_consts import TNS_LOB_OP_FILE_OPEN
+
         Dialect = Oci11Dialect(lambda: 1)
         with self.assertRaises(NotSupportedError):
-            _drive(Dialect.lob_operation(b'x', 1), [])
+            _drive(Dialect.lob_operation(b'x', TNS_LOB_OP_FILE_OPEN), [])
+
+    def test_a_write_counts_utf_16_code_units(self):
+        # A character past the BMP is two of them; counted as one, the pooled
+        # server process died (ORA-03137).
+        from seerdb.client._conn_logic import fv2_lob_payload
+        from seerdb.common.tns_consts import AL16UTF16_CHARSET
+
+        self.assertEqual(
+            fv2_lob_payload('\U0001f600!', False, AL16UTF16_CHARSET),
+            ('\U0001f600!'.encode('utf-16-be'), 3),
+        )
 
 
 class Native11ReplyTest(_At11g):

@@ -1098,12 +1098,20 @@ def fv2_lob_payload(
     characters than the amount (ORA-22993, #2383)."""
     from typing import cast
 
+    from seerdb.common.tns_consts import AL16UTF16_CHARSET
     from seerdb.common.types import _CHARSET_PYTHON_NAME, fv2_lob_charset
 
     if is_blob:
         return (cast(bytes, Data), len(Data))
     Text = cast(str, Data)
-    return (Text.encode(_CHARSET_PYTHON_NAME[fv2_lob_charset(charset)]), len(Text))
+    Charset = fv2_lob_charset(charset)
+    Bytes = Text.encode(_CHARSET_PYTHON_NAME[Charset])
+    if Charset == AL16UTF16_CHARSET:
+        # UTF-16's characters are its code units: a character past the BMP is
+        # two of them. Counted as one, a pooled 11g server process read the
+        # rest of the data as a protocol error and died (ORA-03137, #2466).
+        return (Bytes, len(Bytes) // 2)
+    return (Bytes, len(Text))
 
 
 def pre10_dml_applied(Result: object, BatchErrors: bool) -> bool:

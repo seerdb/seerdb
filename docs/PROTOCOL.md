@@ -1028,6 +1028,26 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   CLOB's text comes as UTF-16, an NCLOB's too. sqlplus frees a temporary LOB
   after reading it (`FREE_TEMP`, `0x111`); seerdb leaves that to the session's
   end for now.
+- **A LOB object's other calls**, measured from an OCI 11.2 program
+  (`OCILobGetLength`, `OCILobWrite` and the rest) through the pool, are
+  `_LOBOPS_READ`'s fields too, each with the locator as fetched:
+  - GET_LENGTH (`0x1`) and GET_CHUNK_SIZE (`0x4000`) set the amount's pointer
+    and send 0;
+  - OPEN (`0x8000`) sends its mode in the amount, TRIM (`0x20`) the new length;
+  - WRITE (`0x40`) sends the source offset and the amount, then `TTI_LOB` and
+    the data as a value (`_OCI11_LOBOPS_WRITE`): ub1-length chunks of up to
+    255 bytes past 252;
+  - IS_OPEN (`0x11000`) sets the null-LOB pointer and no amount; CLOSE
+    (`0x10000`) sets neither.
+
+  The reply (`_OCI11_LOBOPS_REPLY`) is `TTI_RPA`, the locator as the server now
+  sees it (a ub2 length and the body; a WRITE or a TRIM changes it), the value
+  as a ub8 when the request carried an amount, or IS_OPEN's one byte, then the
+  status. A call that fails, such as a write on a row not locked (ORA-22920),
+  is answered with the status alone. A CLOB's text goes as UTF-16 big-endian,
+  as it comes, and its amount counts UTF-16 code units: a character past the
+  BMP is two. Counted as one, the server read the rest of the data as a
+  protocol error, `ORA-03137 [12333]`, and the pooled server process died.
 - **The statement's cursor** is in the OER at offset 18 (a ub2), where the
   Mirror writes a category that sqlplus does not read, and in the RPA. The next
   close names it.

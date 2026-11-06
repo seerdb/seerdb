@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 11.2's OCILobIsOpen on that CLOB once open (#2466): the null-LOB pointer
+# set, no amount.
+# Captured 2026-11-06 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux; OCILobGetLength, OCILobOpen and the
+# like, called through ctypes) on Oracle 11g XE 11.2.0.2 with SERVER=POOLED,
+# the DRCP pool started. The TTC payload, without the packet's header, as
+# `hexdump -C` output; the offset column and the |ascii| gutter are ignored by
+# tests.replay.parse_hexdump.
+00000000  03 60 1f fe ff ff ff ff  ff ff ff 56 00 00 00 00  |.`.........V....|
+00000010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000020  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000030  00 00 00 00 00 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000040  ff ff ff 00 10 01 00 00  00 00 00 00 00 00 00 00  |................|
+00000050  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000060  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000070  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000080  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000090  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000a0  00 00 00 00 54 00 01 02  0c 80 00 00 02 00 00 00  |....T...........|
+000000b0  01 00 00 00 57 62 e7 00  01 e7 d4 00 01 e7 d3 00  |....Wb..........|
+000000c0  02 00 02 03 69 00 01 00  68 00 65 00 6c 00 6c 00  |....i...h.e.l.l.|
+000000d0  6f 00 20 00 00 00 00 00  73 55 c5 00 00 00 04 00  |o. .....sU......|
+000000e0  0d 00 00 07 c6 00 c0 0c  3e 04 72 12 00 00 00 00  |........>.r.....|
+000000f0  01 e7 d3 01 00 01 53 00  00                       |......S..|
+000000f9
