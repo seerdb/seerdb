@@ -1104,8 +1104,24 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   120: a pointer and a count each, where the Mirror's schema had a pad) count
   the error codes (ub2s), the rows (ub4s) and the messages (a ub4 length, the
   text, 6 bytes), which follow the OER before ORA-24381's own message; byte 7 of
-  that OER is 0, where every other carries 1. An array DML with RETURNING is
-  refused, as on the native 9i path.
+  that OER is 0, where every other carries 1.
+- **A DML's RETURNING ... INTO**, an array DML's too, goes as OCI 11.2 sends one
+  through the pool, not as the PL/SQL block 8i and 9i take: the statement as it
+  is, with a block's options (`0x40429`: BIND, PLSQL_BIND and the block bit, no
+  NOT_PLSQL), `al8i4[1]` the iterations, each target's descriptor with flags 5
+  and its value the unset placeholder `fd 01` in every row. The reply is the
+  bind prompt, then per iteration `TTI_RXD` and, for each target in bind order,
+  a ub4 row count and that many rows: the value (an empty one for a NULL), a
+  ub2 indicator and a ub2 return code, 1405 for a NULL (indicator -1) and 1406
+  for a value cut to its declared size (the indicator its whole length).
+  An iteration that matched nothing has a count of 0. A statement that fails
+  breaks, then asks the client to flush out its binds: a bare `TTI_FOB`, or its
+  bind prompt alone, which OCI answers with a `TTI_FOB` of its own. Only then
+  does it break again and send the error. Unanswered, the server read the
+  next call as a protocol violation (`ORA-03137 [opiexe: protocol
+  violation]`) and the pooled server process died. A RETURNING into a CLOB or
+  BLOB still goes through the PL/SQL block, which serves it, as its native
+  form is not measured.
 - **A block's reply** opens with the bind prompt (`TTI_IOV`, the 9.2 form's: a
   50-byte head and one direction mask a bind, `0x10` OUT, `0x20` IN, `0x30` IN
   OUT), then, when the block writes binds, `TTI_RXD` and each OUT or IN OUT

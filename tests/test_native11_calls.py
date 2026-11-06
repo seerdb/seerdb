@@ -1119,6 +1119,113 @@ class Native11ScrollTest(_At11g):
         self.assertEqual(Past[:2], ([], True))
 
 
+class Native11ReturningTest(_At11g):
+    """A DML's RETURNING ... INTO, an array DML's too, against an OCI 11.2
+    program's own."""
+
+    _SQL = 'update pyo_drcp_ar set g = g + 10 where g = :1 returning id, s into :2, :3'
+
+    @staticmethod
+    def _binds(Message, Count):
+        # An execute's options, al8i4, descriptors and the values after them.
+        from seerdb.common.tns import (
+            _ALL8_HEAD_FROM_OCI_WIDE,
+            _OAC_FROM_OCI,
+            _OCI,
+            _oci_all8_head,
+        )
+
+        (Head, _) = _ALL8_HEAD_FROM_OCI_WIDE(Message)
+        (_, LengthAt, _) = _oci_all8_head(Message)
+        (_, Rest) = _OCI.read_chr(Message[LengthAt:])
+        Rest = bytes(Rest)
+        Al8i4 = Rest[:52]
+        Rest = Rest[52:]
+        Oacs = []
+        for _ in range(Count):
+            (Oac, Rest) = _OAC_FROM_OCI(Rest, {'oci_12c': False})
+            Oacs.append(Oac)
+        return (Head['options'], Al8i4, Oacs, bytes(Rest))
+
+    def test_the_execute_is_oci_11_2s(self):
+        # Its options, al8i4 and values are OCI's, and its targets' descriptors
+        # carry OCI's flags 5. (seerdb's IN descriptors carry sqlplus's flags,
+        # and a VARCHAR2's size three bytes a character, as everywhere else.)
+        from seerdb import DB_TYPE_NUMBER, DB_TYPE_VARCHAR
+        from seerdb.common.datatypes import Var
+
+        Captured = _capture('oci11_execute_array_returning.hexdump')
+        Out = [Var(DB_TYPE_NUMBER, 22), Var(DB_TYPE_VARCHAR, 10)]
+        Mine = encode_oci11_execute(
+            Captured[2],
+            self._SQL.encode(),
+            oci11_stmt_type(self._SQL.upper()),
+            1,
+            [1, *Out],
+            [[2, *Out], [7, *Out]],
+            Returning=frozenset({1, 2}),
+        )
+        (OurOptions, OurAl8i4, Ours, OurValues) = self._binds(Mine, 3)
+        (TheirOptions, TheirAl8i4, Theirs, TheirValues) = self._binds(Captured, 3)
+        self.assertEqual((OurOptions, OurAl8i4), (TheirOptions, TheirAl8i4))
+        self.assertEqual(OurValues, TheirValues)
+        self.assertEqual(
+            [(O['data_type'], O['flags']) for O in Ours[1:]],
+            [(T['data_type'], T['flags']) for T in Theirs[1:]],
+        )
+
+    def test_each_iteration_brings_its_rows(self):
+        from seerdb.common.tns import decode_oci11_returning
+
+        (Records, Rest, _) = decode_oci11_returning(
+            _capture('oci11_array_returning_reply.hexdump'), 3, [1, 2], 3
+        )
+        self.assertEqual(
+            [R['return_values'] for R in Records],
+            [
+                [
+                    [bytes.fromhex('c202'), bytes.fromhex('c20202')],
+                    [b'abcdef', None],
+                ],
+                [[bytes.fromhex('c203')], [b'x']],
+                [[], []],
+            ],
+        )
+        self.assertEqual(Records[0]['return_lengths'], [[0, 0], [0, -1]])
+        self.assertEqual(decode_oci11_status(Rest)['row_kind'], 3)
+
+    def test_a_cut_value_says_its_length(self):
+        from seerdb.common.tns import decode_oci11_returning
+
+        ((Record,), _, _) = decode_oci11_returning(
+            _capture('oci11_returning_cut_reply.hexdump'), 2, [1], 1
+        )
+        self.assertEqual(Record['return_values'], [[b'ab', None]])
+        self.assertEqual(Record['return_lengths'], [[6, -1]])
+
+    def test_a_failing_one_has_its_binds_flushed_first(self):
+        # Asked to flush out its binds, the dialect echoes TTI_FOB, then reads
+        # the error; unanswered, the server took the next call for a protocol
+        # violation and the pooled server process died.
+        from seerdb import DB_TYPE_NUMBER
+        from seerdb.common.datatypes import Var
+
+        (Sends, Result) = _drive(
+            Oci11Dialect(lambda: 7).execute_returning(
+                'insert into pyo_drcp_rf (v) values (:1) returning id into :2',
+                [1.5, Var(DB_TYPE_NUMBER, 22)],
+                None,
+                frozenset({1}),
+            ),
+            [
+                _capture('oci11_returning_flush_request.hexdump'),
+                _capture('oci11_returning_error_reply.hexdump'),
+            ],
+        )
+        self.assertEqual(Sends[1], bytes([0x13]))
+        self.assertEqual(Result[1], 1400)
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 

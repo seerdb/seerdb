@@ -9909,7 +9909,11 @@ _OCI_OER: wire_schema.Schema = (
     # 1 on a LOB / LONG-row status, 2 on a LONG; a DML carries its row count.
     ('n4', 'row_kind'),
     ('n4', 'error_code'),
-    ('pad', 2),
+    # Zero from the Mirror and in most of live 11g's statuses; the error code
+    # again, as a ub2, in the status that follows a failed DML RETURNING's
+    # flush of its out binds (ORA-01400, measured through the pool, #2466).
+    # Nothing reads it.
+    ('n2', 'unpinned_16'),
     # 2 row/value-producing, 1 DDL, 0 none, as the Mirror writes it. Live 11g
     # sends the statement's cursor here (a ub2 with the pad after it; measured
     # through the pool, #2466), which sqlplus doesn't read from the Mirror.
@@ -9990,6 +9994,7 @@ def _oci_oer(fields: dict, *, wide: bool | None = None) -> bytes:
     return _OCI_OER_OCI(
         {
             'unpinned_7': 1,
+            'unpinned_16': 0,
             'unpinned_23': 0,
             'batch_codes_present': False,
             'batch_code_count': 0,
@@ -15009,6 +15014,8 @@ _CHARACTER_BIND_TYPES = frozenset(
 )
 # sqlplus 11.2's bind flags, whatever the direction (#2466).
 _OCI11_BIND_FLAGS = 0x03
+# OCI 11.2's flags on a DML RETURNING target's descriptor (#2466).
+_OCI11_RETURN_BIND_FLAGS = 0x05
 
 
 _OCI11_LONG_BIND_TYPES = {
@@ -15073,7 +15080,7 @@ def _encode_oci11_bind_value(Value: object) -> bytes:
     return _encode_9i_bind_value(Value)
 
 
-def _encode_oci11_bind_oac(Value: object) -> bytes:
+def _encode_oci11_bind_oac(Value: object, Flags: int = _OCI11_BIND_FLAGS) -> bytes:
     # A pooled 11g session's bind descriptor (#2466): the native 9.2 form's type
     # and size, with sqlplus 11.2's flags, and a character bind's charset and
     # form declared -- the session's, or AL16UTF16 and form 2 for a national one.
@@ -15081,17 +15088,15 @@ def _encode_oci11_bind_oac(Value: object) -> bytes:
 
     if _is_oci11_cursor_var(Value):
         return _native_bind_oac(
-            TNS_TYPE_REFCURSOR, _OCI11_BIND_FLAGS, _OCI11_CURSOR_BIND_SIZE, 0, 0
+            TNS_TYPE_REFCURSOR, Flags, _OCI11_CURSOR_BIND_SIZE, 0, 0
         )
     Lob = _oci11_lob_bind(Value)
     if Lob is not None:
         if Lob[0]:
-            return _native_bind_oac(
-                TNS_TYPE_BLOB, _OCI11_BIND_FLAGS, _OCI11_LOB_BIND_SIZE, 0, 0
-            )
+            return _native_bind_oac(TNS_TYPE_BLOB, Flags, _OCI11_LOB_BIND_SIZE, 0, 0)
         return _native_bind_oac(
             TNS_TYPE_CLOB,
-            _OCI11_BIND_FLAGS,
+            Flags,
             _OCI11_LOB_BIND_SIZE,
             AL32UTF8_CHARSET,
             1,
@@ -15118,7 +15123,7 @@ def _encode_oci11_bind_oac(Value: object) -> bytes:
         (Charset, Csfrm) = (AL32UTF8_CHARSET, 1)
     else:
         (Charset, Csfrm) = (0, 0)
-    return _native_bind_oac(DType, _OCI11_BIND_FLAGS, Size, Charset, Csfrm)
+    return _native_bind_oac(DType, Flags, Size, Charset, Csfrm)
 
 
 def _is_national_var(Value: object) -> bool:
@@ -17428,6 +17433,7 @@ def encode_oci11_execute(
     BatchErrors: bool = False,
     ParseOnly: bool = False,
     Scrollable: bool = False,
+    Returning: frozenset[int] = frozenset(),
 ) -> bytes:
     """A pooled 11g session's execute (#2466): parse and execute ``Sql`` with
     ``Binds``, and for a query fetch up to ``Rows`` rows with it. The binds are
@@ -17444,7 +17450,13 @@ def encode_oci11_execute(
     ``Scrollable`` opens a query's cursor scrollable, as OCI 11.2's
     OCI_STMT_SCROLLABLE_READONLY execute does: al8i4[9] SCROLLABLE and
     NO_CANCEL_ON_EOF, so the cursor stays open past its last row, and the
-    fetch positioned at row one (_OCI11_SCROLL_AL8I4)."""
+    fetch positioned at row one (_OCI11_SCROLL_AL8I4).
+
+    ``Returning`` holds the positions of a DML's RETURNING ... INTO targets,
+    sent as OCI 11.2 sends them through the pool: the statement as it is, with
+    a block's options (BIND, PLSQL_BIND and the block bit, no NOT_PLSQL), each
+    target's descriptor with flags 5 and its value the unset placeholder in
+    every row, whatever the Var holds."""
     Binds = Binds or []
     # An executemany's rows: each its own TTI_RXD and values behind the one set
     # of descriptors, as the native 9.2 form sends them (_encode_9i_oall8),
@@ -17463,7 +17475,7 @@ def encode_oci11_execute(
         Options |= TNS_EXEC_OPTION_BIND
     if ParseOnly:
         pass
-    elif Block:
+    elif Block or Returning:
         Options |= _OCI11_EXEC_BLOCK | (_OCI11_EXEC_BLOCK_BINDS if Binds else 0)
     elif StmtType not in (OCI11_STMT_COMMIT, OCI11_STMT_ROLLBACK):
         Options |= _OCI11_EXEC_NOT_PLSQL
@@ -17508,17 +17520,28 @@ def encode_oci11_execute(
             + b''.join(_OCI.n4(V) for V in Al8i4)
         )
         if Binds:
-            Oacs = [_encode_oci11_bind_oac(V) for V in _oac_rep_row(BindRows)]
+            Oacs = [
+                _encode_oci11_bind_oac(
+                    V, _OCI11_RETURN_BIND_FLAGS if I in Returning else _OCI11_BIND_FLAGS
+                )
+                for (I, V) in enumerate(_oac_rep_row(BindRows))
+            ]
             Message += b''.join(Oacs)
             Long = [
                 not Block and int.from_bytes(Oac[5:9], 'little') > 4000 for Oac in Oacs
             ]
             for Row in BindRows:
                 Message += bytes([TTI_RXD])
-                for Value in [V for V, L in zip(Row, Long) if not L] + [
-                    V for V, L in zip(Row, Long) if L
+                Values = [
+                    _O8I_OUT_PLACEHOLDER
+                    if I in Returning
+                    else _encode_oci11_bind_value(V)
+                    for (I, V) in enumerate(Row)
+                ]
+                for Value in [V for V, L in zip(Values, Long) if not L] + [
+                    V for V, L in zip(Values, Long) if L
                 ]:
-                    Message += _encode_oci11_bind_value(Value)
+                    Message += Value
         return Message
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
@@ -18163,6 +18186,61 @@ def decode_oci11_block(
     except IndexError as Exc:
         raise Truncated(f'11g block reply: {Exc}') from Exc
     return (Directions, Values, Rest, Session)
+
+
+def decode_oci11_returning(
+    Data: bytes, NumBinds: int, Returning: list[int], Iterations: int
+) -> tuple[list, bytes, dict | None]:
+    """A pooled 11g DML RETURNING's reply (#2466), as OCI 11.2 reads one through
+    the pool: the bind prompt (a block's), then per iteration TTI_RXD and, for
+    each RETURNING target in bind order, a ub4 row count and that many rows --
+    each the value (an empty one for a NULL), a ub2 indicator and a ub2 return
+    code: 1405 a NULL (the indicator -1), 1406 a value cut to its declared
+    size (the indicator its whole length) -- then the status. Returns (one
+    {return_positions, return_values, return_lengths} record per iteration
+    answered, the status, the session return or None); a failed iteration ends
+    them, and the status says why. A reply cut short raises Truncated."""
+    Records: list = []
+    Directions = decode_9i_oall8_bind_directions(Data, NumBinds)
+    if Directions is None:
+        return (Records, Data, None)
+    (Session, Rest) = decode_oci11_piggybacks(Data[50 + NumBinds :])
+    try:
+        for _ in range(Iterations):
+            if Rest[:1] != bytes([TTI_RXD]):
+                break
+            Rest = Rest[1:]
+            Values: list = []
+            Lengths: list = []
+            for _ in Returning:
+                (Count, Rest) = _OCI.read_n4(Rest)
+                Got: list = []
+                Sizes: list = []
+                for _ in range(Count):
+                    (Value, Rest) = _OCI.read_value(Rest)
+                    (Indicator, Rest) = _OCI.read_n2(Rest)
+                    (Code, Rest) = _OCI.read_n2(Rest)
+                    if Code == _OCI11_RETURN_NULL:
+                        (Got, Sizes) = (Got + [None], Sizes + [-1])
+                    else:
+                        Got.append(bytes(Value))
+                        Sizes.append(Indicator if Code == _OCI11_RETURN_CUT else 0)
+                Values.append(Got)
+                Lengths.append(Sizes)
+            Records.append(
+                {
+                    'return_positions': list(Returning),
+                    'return_values': Values,
+                    'return_lengths': Lengths,
+                }
+            )
+    except IndexError as Exc:
+        raise Truncated(f'11g RETURNING reply: {Exc}') from Exc
+    return (Records, Rest, Session)
+
+
+_OCI11_RETURN_NULL = 1405  # ORA-01405, fetched column value is NULL
+_OCI11_RETURN_CUT = 1406  # ORA-01406, fetched column value was truncated
 
 
 # Behind the OER of an INSERT, UPDATE or DELETE that succeeded (told by the

@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# 11g's reply to it (#2466): the bind prompt (IN, OUT, OUT); then per iteration
+# TTI_RXD and, for each target, a ub4 row count and the rows, each the value, a
+# ub2 indicator and a ub2 return code: iteration 1 two rows (100, 'abcdef')
+# and (101, NULL -- an empty value, -1, 1405), iteration 2 one (200, 'x'),
+# iteration 3 none; then the status, three rows.
+# Captured 2026-11-06 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8; an array
+# OCIStmtExecute, the RETURNING targets bound OCI_DATA_AT_EXEC with
+# OCIBindDynamic, called through ctypes) on Oracle 11g XE 11.2.0.2 with
+# SERVER=POOLED, the DRCP pool started, on pyo_drcp_ar (id NUMBER, g NUMBER,
+# s VARCHAR2(10)) holding (100, 1, 'abcdef'), (101, 1, NULL), (200, 2, 'x').
+# The TTC payload, without the packet's header, as `hexdump -C` output; the
+# offset column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  0b 01 05 93 03 00 00 00  00 00 03 00 00 00 00 00  |................|
+00000010  00 00 f0 f0 23 1c ff 7f  00 00 00 00 e8 07 00 00  |....#...........|
+00000020  00 00 00 00 00 00 ee 7f  00 00 00 00 00 00 00 00  |................|
+00000030  00 00 20 10 10 07 02 00  00 00 02 c2 02 00 00 00  |.. .............|
+00000040  00 03 c2 02 02 00 00 00  00 02 00 00 00 06 61 62  |..............ab|
+00000050  63 64 65 66 00 00 00 00  00 ff ff 7d 05 07 01 00  |cdef.......}....|
+00000060  00 00 02 c2 03 00 00 00  00 01 00 00 00 01 78 00  |..............x.|
+00000070  00 00 00 07 00 00 00 00  00 00 00 00 08 06 00 91  |................|
+00000080  f3 79 00 00 00 00 00 03  00 00 00 01 00 00 00 00  |.y..............|
+00000090  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 04  |................|
+000000a0  02 00 00 00 10 00 01 03  00 00 00 00 00 00 00 00  |................|
+000000b0  00 03 00 07 00 06 00 00  00 00 00 26 13 02 00 04  |...........&....|
+000000c0  00 00 00 05 1a 00 00 02  00 00 00 00 00 00 00 00  |................|
+000000d0  10 00 00 03 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000e0  00 00 00 00 00 00 00 20  f6 31 0a 00 00 00 00 0d  |....... .1......|
+000000f0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000100  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000110  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000120  00 00 00 00 00 00 00 0d  00 0d 01 00 02 13 26 00  |..............&.|
+00000130  04 00 00 1a 05 00 02                              |.......|
+00000137
