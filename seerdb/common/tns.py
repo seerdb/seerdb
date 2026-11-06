@@ -15048,9 +15048,23 @@ def _oci11_lob_bind(Value: object) -> tuple[bool, bytes] | None:
     return None
 
 
+def _is_oci11_cursor_var(Value: object) -> bool:
+    from seerdb.common.datatypes import Var
+
+    return isinstance(Value, Var) and Value.dbtype.tns_type == TNS_TYPE_REFCURSOR
+
+
+# A REF CURSOR Var bound OUT on a pooled 11g session, as sqlplus 11.2 binds a
+# `variable rc refcursor` (#2466): the descriptor a REF CURSOR (102) of one
+# byte, the value a cursor id of 0, four bytes.
+_OCI11_CURSOR_BIND_SIZE = 1
+
+
 def _encode_oci11_bind_value(Value: object) -> bytes:
-    # A pooled 11g session's bind value: a LOB's locator, or the native 9.2
-    # form's value.
+    # A pooled 11g session's bind value: a REF CURSOR's, a LOB's locator, or
+    # the native 9.2 form's value.
+    if _is_oci11_cursor_var(Value):
+        return _OCI.value(bytes(4))
     Lob = _oci11_lob_bind(Value)
     if Lob is not None:
         return _OCI.n4(len(Lob[1])) + _OCI.value(Lob[1])
@@ -15063,6 +15077,10 @@ def _encode_oci11_bind_oac(Value: object) -> bytes:
     # form declared -- the session's, or AL16UTF16 and form 2 for a national one.
     from seerdb.common.datatypes import Var
 
+    if _is_oci11_cursor_var(Value):
+        return _native_bind_oac(
+            TNS_TYPE_REFCURSOR, _OCI11_BIND_FLAGS, _OCI11_CURSOR_BIND_SIZE, 0, 0
+        )
     Lob = _oci11_lob_bind(Value)
     if Lob is not None:
         if Lob[0]:
@@ -15462,7 +15480,7 @@ def _o9i_oall8_urowid_cell(Data: bytes) -> tuple[str | None, bytes]:
 
 
 def decode_9i_oall8_exec_response(
-    Data: bytes, Columns: list, PrevRow: list | None = None
+    Data: bytes, Columns: list, PrevRow: list | None = None, Oci11: bool = False
 ) -> tuple[list, bytes, list | None]:
     # Decode a 9i OALL8 execute / fetch row stream (RXH + RXD + inter-row BVC) up
     # to the status, mirroring decode_8i_exec_response but at the OCI fixed widths
@@ -15543,6 +15561,11 @@ def decode_9i_oall8_exec_response(
                         # cursor comes opened and described, as a REF CURSOR OUT
                         # bind's does -- (cursor id, columns), its rows for the
                         # dialect to fetch by that id.
+                        # 11g's describe is its own (_OCI11_CURSOR_CELL, #2466).
+                        if Oci11:
+                            (Opened, Rest) = _oci11_cursor_cell(Rest)
+                            Row.append(Opened)
+                            continue
                         (Cell, Rest) = _O9I_CURSOR_CELL_FROM_OCI(Rest, _DESCRIBE_GIVEN)
                         Row.append(
                             (Cell['cursor'], _o9i_oall8_columns(Cell['columns']))
@@ -17486,24 +17509,39 @@ def encode_oci11_fetch(Seq: int, Cursor: int, Rows: int) -> bytes:
     )
 
 
-# A query with a LONG or LONG RAW column fetches each row with an OALL8 that
-# carries the most of the value to read, as sqlplus 11.2 fetches one through
-# the pool (its `set long` in max_long): no SQL, the cursor, FETCH and the bit
-# 0x40000 in the options, al8i4[1] the one row and [7] SELECT. The query's own
-# execute, which asks for none of it (max_long 0), brings no rows.
+# A fetch that says how to fetch, as sqlplus 11.2 fetches through the pool: an
+# OALL8 with no SQL, the cursor, FETCH in the options, max_long the most of a
+# value to read, al8i4[1] the rows and [7] SELECT. sqlplus sends it for:
+# - a query with a LONG or LONG RAW column, each row, one at a time, max_long
+#   its `set long` and the bit 0x40000 in the options too. The query's own
+#   execute, which asks for none of the value (max_long 0), brings no rows.
+# - a cursor the server opened -- a REF CURSOR OUT bind's, a CURSOR(...)
+#   column's -- its first rows, max_long its widest column's buffer and one.
 _OCI11_LONG_FETCH_OPTIONS = TNS_EXEC_OPTION_FETCH | 0x40000
 
 
 def encode_oci11_long_fetch(Seq: int, Cursor: int, MaxLong: int) -> bytes:
     """A pooled 11g session's fetch of the next row from ``Cursor``, its LONG
     or LONG RAW value read up to ``MaxLong`` bytes."""
+    return _oci11_fetch_all8(Seq, Cursor, 1, MaxLong, _OCI11_LONG_FETCH_OPTIONS)
+
+
+def encode_oci11_cursor_fetch(Seq: int, Cursor: int, Rows: int, MaxLong: int) -> bytes:
+    """A pooled 11g session's fetch of up to ``Rows`` rows from a cursor the
+    server opened, each column's value up to ``MaxLong`` bytes."""
+    return _oci11_fetch_all8(Seq, Cursor, Rows, MaxLong, TNS_EXEC_OPTION_FETCH)
+
+
+def _oci11_fetch_all8(
+    Seq: int, Cursor: int, Rows: int, MaxLong: int, Options: int
+) -> bytes:
     Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
     try:
         Head = _ALL8_HEAD_OCI_WIDE(
             {
                 'seq': Seq,
                 'token_number': None,
-                'options': _OCI11_LONG_FETCH_OPTIONS,
+                'options': Options,
                 'cursor': Cursor,
                 'sql_present': False,
                 'sql_length': 0,
@@ -17527,7 +17565,7 @@ def encode_oci11_long_fetch(Seq: int, Cursor: int, MaxLong: int) -> bytes:
         )
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
-    Al8i4 = [0, 1, 0, 0, 0, 0, 0, O8I_STMT_SELECT] + [0] * 5
+    Al8i4 = [0, Rows, 0, 0, 0, 0, 0, O8I_STMT_SELECT] + [0] * 5
     return Head + _OCI11_EXEC_MIDDLE + b''.join(_OCI.n4(V) for V in Al8i4)
 
 
@@ -17591,6 +17629,53 @@ def decode_oci11_piggybacks(Data: bytes) -> tuple[dict | None, bytes]:
 
 
 _OCI11_DESCRIBE_GIVEN = {'oci_12c': False, 'has_uds': True}
+# A cursor the server opened, as 11g hands it to a pooled session (#2466): a
+# REF CURSOR OUT bind's value and a CURSOR(...) column's cell, measured against
+# sqlplus 11.2. A lead byte (0x4c, as the Mirror's _REFCURSOR_OUT has it), the
+# describe's body as a query's TTI_DCB carries it (decode_oci11_describe), and
+# the cursor's id; an OUT bind's then its indicator.
+_OCI11_CURSOR_CELL: wire_schema.Schema = (
+    ('u8', 'lead'),
+    ('n4', 'max_row_size'),
+    ('n4', 'count'),
+    ('each', 'columns', 'count', _DCB_COLUMN),
+    *_DESCRIBE_TRAILER,
+    ('n4', 'cursor'),
+)
+_OCI11_CURSOR_CELL_FROM_OCI = wire_schema.compile_decoder(_OCI11_CURSOR_CELL, _OCI)
+_OCI11_CURSOR_GIVEN = {**_OCI11_DESCRIBE_GIVEN, 'has_query_key': True}
+# A REF CURSOR the block left unopened, or closed, has no columns, and then the
+# byte the trailer opens with in OCI's form (date_lead) is not sent either: it
+# is the column array's own lead, as 9.2's describe has it (columns_lead).
+# Measured on `begin if 1 = 0 then open :1 for ... end if; end;` and on a
+# cursor opened and closed in the block.
+_OCI11_UNOPENED_CURSOR_CELL: wire_schema.Schema = (
+    ('u8', 'lead'),
+    ('n4', 'max_row_size'),
+    ('const', bytes(4)),  # no columns
+    ('n4', 'date_length'),
+    ('value', 'date'),
+    ('n4', 'dcbflag'),
+    ('n4', 'dcbmdbz'),
+    ('n4', 'dcbmnpr'),
+    ('n4', 'dcbmxpr'),
+    ('n4', 'query_key_length'),
+    ('n4', 'cursor'),
+)
+_OCI11_UNOPENED_CURSOR_CELL_FROM_OCI = wire_schema.compile_decoder(
+    _OCI11_UNOPENED_CURSOR_CELL, _OCI
+)
+
+
+def _oci11_cursor_cell(Data: bytes) -> tuple[tuple[int, list] | None, bytes]:
+    # ((the cursor's id, its columns), the bytes after it), its rows for the
+    # dialect to fetch by that id; None for one with no columns, which was
+    # never opened or is closed.
+    if Data[5:9] == bytes(4):
+        (_, Rest) = _OCI11_UNOPENED_CURSOR_CELL_FROM_OCI(Data)
+        return (None, bytes(Rest))
+    (Cell, Rest) = _OCI11_CURSOR_CELL_FROM_OCI(Data, _OCI11_CURSOR_GIVEN)
+    return ((Cell['cursor'], _o9i_oall8_columns(Cell['columns'])), bytes(Rest))
 
 
 def decode_oci11_describe(Data: bytes) -> tuple[list[dict], bytes]:
@@ -17663,9 +17748,9 @@ def decode_oci11_rows(
     form's and read by it; row images are read here. A stream cut short raises
     Truncated for the reader to read on."""
     if Data[:1] != bytes([TTI_RXH]) or len(Data) < 3:
-        return decode_9i_oall8_exec_response(Data, Columns, PrevRow)
+        return decode_9i_oall8_exec_response(Data, Columns, PrevRow, Oci11=True)
     if not Data[2] & _OCI11_RXH_ROW_IMAGE:
-        return decode_9i_oall8_exec_response(Data, Columns, PrevRow)
+        return decode_9i_oall8_exec_response(Data, Columns, PrevRow, Oci11=True)
     Rows: list = []
     Last = PrevRow
     try:
@@ -17938,7 +18023,10 @@ _OCI11_OER_GIVEN = {'oci_12c': False, 'oci_pre12c': True}
 
 
 def decode_oci11_block(
-    Data: bytes, NumBinds: int, Lobs: frozenset[int] = frozenset()
+    Data: bytes,
+    NumBinds: int,
+    Lobs: frozenset[int] = frozenset(),
+    Cursors: frozenset[int] = frozenset(),
 ) -> tuple[list[int] | None, list, bytes, dict | None]:
     """A pooled 11g block's reply (#2466): its bind prompt (TTI_IOV, the native
     9.2 form's: a 50-byte head, then one direction mask a bind, 0x10 OUT, 0x20
@@ -17948,7 +18036,10 @@ def decode_oci11_block(
     -- and the status. A session's first call has its session return between
     the prompt and the values. A LOB's value, at a position in ``Lobs``, is
     its locator as a bound one goes: a ub4 length and the locator as a value
-    (none for a NULL, its length 0), then the indicator. Returns (directions,
+    (none for a NULL, its length 0), then the indicator. A REF CURSOR's, at a
+    position in ``Cursors``, is the cursor the block opened
+    (_OCI11_CURSOR_CELL), then the indicator: (its id, its columns). Returns
+    (directions,
     the OUT values' bytes in bind order, None for a NULL, the status, the
     session return or None). A block that fails answers with the status alone:
     no directions. A reply cut short raises Truncated, for the reader to read
@@ -17963,6 +18054,11 @@ def decode_oci11_block(
             Rest = Rest[1:]
             for Position, Mask in enumerate(Directions):
                 if not Mask & FV2_BIND_OUT:
+                    continue
+                if Position in Cursors:
+                    (Opened, Rest) = _oci11_cursor_cell(bytes(Rest))
+                    (_, Rest) = _OCI.read_n2(Rest)  # its indicator
+                    Values.append(Opened)
                     continue
                 if Position in Lobs:
                     (Length, Rest) = _OCI.read_n4(Rest)

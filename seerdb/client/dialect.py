@@ -115,6 +115,7 @@ from seerdb.common.tns import (
     encode_o8i_bfile_open,
     encode_oci11_close_cursors,
     encode_oci11_create_temp,
+    encode_oci11_cursor_fetch,
     encode_oci11_execute,
     encode_oci11_fetch,
     encode_oci11_lob_read,
@@ -1501,7 +1502,6 @@ class Fv2Oall8Dialect(Oall8Dialect):
 # or LONG RAW bind is: OCI sends it as a VARCHAR or a RAW of its size.
 _OCI11_UNREAD_BINDS = {
     TNS_TYPE_BFILE: 'BFILE',
-    TNS_TYPE_REFCURSOR: 'cursor',
     TNS_TYPE_ADT: 'object or collection',
     TNS_TYPE_BLOB: 'BLOB',
     TNS_TYPE_CLOB: 'CLOB or NCLOB',
@@ -1509,7 +1509,6 @@ _OCI11_UNREAD_BINDS = {
 _OCI11_LOB_TYPES = frozenset({TNS_TYPE_CLOB, TNS_TYPE_BLOB})
 _OCI11_UNREAD_TYPES = {
     TNS_TYPE_BFILE: 'BFILE',
-    TNS_TYPE_REFCURSOR: 'cursor',
     TNS_TYPE_ADT: 'object or collection',
 }
 
@@ -1548,9 +1547,10 @@ class Oci11Dialect(Oall8Dialect):
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT. Not yet, and
     refused before anything is sent: an array DML's RETURNING, an array DML's
-    LOB Var, BFILE, REF CURSOR and object binds, and BFILE, REF CURSOR and
-    object columns (refused at the describe). LONG and LONG RAW columns are
-    read a row a fetch, each value whole."""
+    LOB Var, BFILE, a REF CURSOR bound IN or outside a block, and object binds,
+    and BFILE and object columns (refused at the describe). LONG and LONG RAW
+    columns are read a row a fetch, each value whole; a cursor the server opened
+    (a REF CURSOR OUT bind's, a CURSOR(...) column's) with sqlplus's fetch."""
 
     _wire = '11g native'
 
@@ -1569,6 +1569,9 @@ class Oci11Dialect(Oall8Dialect):
         # Told each reply's call status, the OER's first byte (its
         # TXN_IN_PROGRESS bit 0x02 says a transaction is open).
         self._on_call_status = on_call_status
+        # The cursors the server opened that are being read: their fetches say
+        # how wide the values are.
+        self._opened: set[int] = set()
 
     def _session_return(self, reply: bytes) -> bytes:
         # The reply without the piggybacks ahead of it, the session return
@@ -1599,10 +1602,17 @@ class Oci11Dialect(Oall8Dialect):
         # Var goes by a locator: an unset one (OUT) the empty one, one with a
         # value through a temporary LOB (the cursor's), so a LOB Var still
         # holding a value here -- an array DML's row -- is not served, nor an
-        # unset one outside a block, which has no OUT value to take.
-        from seerdb.common.datatypes import Var
+        # unset one outside a block, which has no OUT value to take. A REF
+        # CURSOR Var is served OUT, in a block; an open cursor bound IN is not.
+        from seerdb.common.datatypes import RefCursorBind, Var
 
         for value in bind or []:
+            if isinstance(value, RefCursorBind):
+                raise _oci11_unsupported('a REF CURSOR IN bind')
+            if isinstance(value, Var) and value.dbtype.tns_type == TNS_TYPE_REFCURSOR:
+                if not block:
+                    raise _oci11_unsupported('a REF CURSOR bind outside a block')
+                continue
             if not isinstance(value, Var) or (
                 block
                 and value.dbtype.tns_type in _OCI11_LOB_TYPES
@@ -1612,6 +1622,11 @@ class Oci11Dialect(Oall8Dialect):
             if value.dbtype.tns_type in _OCI11_UNREAD_BINDS:
                 name = _OCI11_UNREAD_BINDS[value.dbtype.tns_type]
                 raise _oci11_unsupported(f'a {name} bind')
+
+    @staticmethod
+    def _cursor_outs(bind: list) -> frozenset[int]:
+        # The positions whose OUT value is a cursor the block opened.
+        return frozenset(i for (i, value) in enumerate(bind) if _is_cursor_var(value))
 
     @staticmethod
     def _lob_outs(bind: list) -> frozenset[int]:
@@ -1734,7 +1749,25 @@ class Oci11Dialect(Oall8Dialect):
         # fetch.
         if long_size == _LONG_WHOLE:
             return encode_oci11_long_fetch(self._next_seq(), cursor, long_size)
+        if cursor in self._opened:
+            # A cursor the server opened -- a REF CURSOR's, a CURSOR(...)
+            # column's -- fetched as sqlplus 11.2 fetches one: the OALL8 that
+            # says how wide its values are (encode_oci11_cursor_fetch).
+            return encode_oci11_cursor_fetch(self._next_seq(), cursor, count, long_size)
         return encode_oci11_fetch(self._next_seq(), cursor, count)
+
+    def _long_size(self, columns: list, fetch: int) -> int:
+        # The widest column's buffer and one, as sqlplus 11.2 sends a cursor's
+        # fetch (the native 9.2 form's).
+        return max((col.get('data_length') or 0) for col in columns) + 1
+
+    def _read_cursor(self, cursor: int, columns: list):
+        # A cursor the server opened, read with its own fetch while it is.
+        self._opened.add(cursor)
+        try:
+            return (yield from super()._read_cursor(cursor, columns))
+        finally:
+            self._opened.discard(cursor)
 
     def _encode_dml(
         self, sql_text: bytes, stmt_type: int, bind: list | None = None
@@ -1933,9 +1966,10 @@ class Oci11Dialect(Oall8Dialect):
             self._closing() + self._encode_dml(self._sql_text(sql), stmt_type, bind)
         )
         lobs = self._lob_outs(bind)
-        buf = yield from self._recv_block(len(bind), lobs)
+        cursors = self._cursor_outs(bind)
+        buf = yield from self._recv_block(len(bind), lobs, cursors)
         (directions, out_values, rest, session) = decode_oci11_block(
-            buf, len(bind), lobs
+            buf, len(bind), lobs, cursors
         )
         if session is not None and self._on_session is not None:
             self._on_session(session['session_id'], session['serial'])
@@ -1949,6 +1983,14 @@ class Oci11Dialect(Oall8Dialect):
             self._lob_out_value(bind[pos], value) if pos in lobs else value
             for (pos, value) in zip(out_positions, out_values)
         ]
+        # A REF CURSOR the block opened comes back as its (id, columns): its rows
+        # are read now, by that id, and travel with the marker the cursor wraps,
+        # as on the native 9i dialect.
+        for i, pos in enumerate(out_positions):
+            if pos in cursors and isinstance(out_values[i], tuple):
+                (opened, columns) = out_values[i]
+                rows = yield from self._read_cursor(opened, columns)
+                out_values[i] = _cursor_marker(opened, columns, rows)
         record = {
             'out_positions': out_positions,
             'out_values': out_values,
@@ -1956,7 +1998,12 @@ class Oci11Dialect(Oall8Dialect):
         }
         return (0, 0, 0, (None, None), [record], None, None, [], None)
 
-    def _recv_block(self, num_binds: int, lobs: frozenset[int] = frozenset()):
+    def _recv_block(
+        self,
+        num_binds: int,
+        lobs: frozenset[int] = frozenset(),
+        cursors: frozenset[int] = frozenset(),
+    ):
         # A block's reply, read on across packets until it holds its prompt, its
         # OUT values and a whole status: a long OUT value spans packets.
         from seerdb.common.exceptions import Truncated
@@ -1968,7 +2015,7 @@ class Oci11Dialect(Oall8Dialect):
                 raise Exception('Connection closed during an 11g PL/SQL block')
             buf += received[1]
             try:
-                (_, _, rest, _) = decode_oci11_block(buf, num_binds, lobs)
+                (_, _, rest, _) = decode_oci11_block(buf, num_binds, lobs, cursors)
                 decode_oci11_status(self._session_return(rest))
             except Truncated:
                 continue
