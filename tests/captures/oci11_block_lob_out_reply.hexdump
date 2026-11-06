@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# 11g's reply to `begin :1 := to_blob(hextoraw('0102ff')); end;` with a BLOB
+# OUT bind and its indicator (#2466): the bind prompt, TTI_RXD, the value a ub4
+# 40 and the 40-byte locator as a value, then the indicator 0, then the status.
+# Captured 2026-11-06 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8;
+# OCILobCreateTemporary, OCIBindByPos and the like, called through ctypes) on
+# Oracle 11g XE 11.2.0.2 with SERVER=POOLED, the DRCP pool started. The TTC
+# payload, without the packet's header, as `hexdump -C` output; the offset
+# column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  0b 01 05 93 01 00 00 00  00 00 01 00 00 00 00 00  |................|
+00000010  00 00 10 53 4f a0 fd 7f  00 00 00 00 e8 07 00 00  |...SO...........|
+00000020  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000030  00 00 10 07 28 00 00 00  28 00 26 00 01 81 08 00  |....(...(.&.....|
+00000040  03 00 01 00 00 5b 04 06  00 00 00 00 01 00 00 00  |.....[..........|
+00000050  0a 00 00 00 01 00 00 00  00 c3 0b 98 51 b5 64 c0  |............Q.d.|
+00000060  7b 00 00 08 06 00 90 09  75 00 00 00 00 00 01 00  |{.......u.......|
+00000070  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000080  00 00 00 00 00 00 04 01  00 00 00 0a 00 01 01 00  |................|
+00000090  00 00 00 00 00 00 00 00  01 00 00 00 2f 00 00 00  |............/...|
+000000a0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000b0  00 00 00 00 00 00 00 0a  00 00 01 00 00 00 00 00  |................|
+000000c0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 20 f6  |.............. .|
+000000d0  31 0a 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |1...............|
+000000e0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000f0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000100  00 00 00 00 00 00 00 00  00 00 00 00 00 00        |..............|
+0000010e

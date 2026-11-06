@@ -32,6 +32,8 @@ from seerdb.common.sqltext import is_reusable_dml
 from seerdb.common.tns import (
     FV2_BIND_IN,
     FV2_BIND_OUT,
+    O8I_STMT_BEGIN,
+    O8I_STMT_DECLARE,
     O8I_STMT_SELECT,
     O8I_STMT_TXN,
     OCI11_LOB_CALLS,
@@ -1503,6 +1505,7 @@ _OCI11_UNREAD_BINDS = {
     TNS_TYPE_BLOB: 'BLOB',
     TNS_TYPE_CLOB: 'CLOB or NCLOB',
 }
+_OCI11_LOB_TYPES = frozenset({TNS_TYPE_CLOB, TNS_TYPE_BLOB})
 _OCI11_UNREAD_TYPES = {
     TNS_TYPE_BFILE: 'BFILE',
     TNS_TYPE_LONG: 'LONG',
@@ -1544,9 +1547,9 @@ class Oci11Dialect(Oall8Dialect):
     Served: queries over scalar, CLOB, NCLOB and BLOB columns, DML and array
     DML, DDL, COMMIT and ROLLBACK, and PL/SQL blocks, with scalar IN, OUT and
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
-    calls, temporary LOBs and LOBs bound IN. Not yet, and refused before
-    anything is sent: an array DML's RETURNING, LOB OUT binds, BFILE, REF
-    CURSOR and object binds, and BFILE, LONG, REF CURSOR and object columns (refused at
+    calls, temporary LOBs and LOB binds IN, OUT and IN OUT. Not yet, and
+    refused before anything is sent: an array DML's RETURNING, an array DML's
+    LOB Var, BFILE, REF CURSOR and object binds, and BFILE, LONG, REF CURSOR and object columns (refused at
     the describe)."""
 
     _wire = '11g native'
@@ -1590,15 +1593,57 @@ class Oci11Dialect(Oall8Dialect):
         )
 
     @staticmethod
-    def _check_binds(bind: list | None) -> None:
-        # The binds this session sends: scalar values and Vars. A LOB, BFILE,
-        # REF CURSOR or object Var travels in forms not measured against 11g.
+    def _check_binds(bind: list | None, block: bool = False) -> None:
+        # The binds this session sends: scalar values and Vars. A BFILE, REF
+        # CURSOR or object Var travels in forms not measured against 11g. A LOB
+        # Var goes by a locator: an unset one (OUT) the empty one, one with a
+        # value through a temporary LOB (the cursor's), so a LOB Var still
+        # holding a value here -- an array DML's row -- is not served, nor an
+        # unset one outside a block, which has no OUT value to take.
         from seerdb.common.datatypes import Var
 
         for value in bind or []:
-            if isinstance(value, Var) and value.dbtype.tns_type in _OCI11_UNREAD_BINDS:
+            if not isinstance(value, Var) or (
+                block
+                and value.dbtype.tns_type in _OCI11_LOB_TYPES
+                and not value.has_value
+            ):
+                continue
+            if value.dbtype.tns_type in _OCI11_UNREAD_BINDS:
                 name = _OCI11_UNREAD_BINDS[value.dbtype.tns_type]
                 raise _oci11_unsupported(f'a {name} bind')
+
+    @staticmethod
+    def _lob_outs(bind: list) -> frozenset[int]:
+        # The positions whose OUT value is a LOB's locator: a LOB Var, as itself
+        # or as the temporary LOB it went out as.
+        from seerdb.common.datatypes import TempLob, Var
+
+        return frozenset(
+            i
+            for (i, value) in enumerate(bind)
+            if isinstance(value, TempLob)
+            or (isinstance(value, Var) and value.dbtype.tns_type in _OCI11_LOB_TYPES)
+        )
+
+    @staticmethod
+    def _lob_out_value(value: object, locator: bytes | None):
+        # A returned locator as the LOB object the Var takes, its type and
+        # charset form the bind's.
+        from seerdb.common.datatypes import TempLob
+        from seerdb.common.lob import LOB
+
+        if locator is None:
+            return None
+        if isinstance(value, TempLob):
+            (data_type, csfrm) = (
+                TNS_TYPE_BLOB if value.is_blob else TNS_TYPE_CLOB,
+                value.csfrm,
+            )
+        else:
+            dbtype = getattr(value, 'dbtype')
+            (data_type, csfrm) = (dbtype.tns_type, getattr(dbtype, 'csfrm', 1))
+        return LOB(data_type, locator, csfrm=csfrm)
 
     # --- the 11g hooks for the shared call sequences in Oall8Dialect
 
@@ -1688,7 +1733,7 @@ class Oci11Dialect(Oall8Dialect):
     def _encode_dml(
         self, sql_text: bytes, stmt_type: int, bind: list | None = None
     ) -> bytes:
-        self._check_binds(bind)
+        self._check_binds(bind, block=stmt_type in (O8I_STMT_BEGIN, O8I_STMT_DECLARE))
         if stmt_type == O8I_STMT_TXN:
             # COMMIT and ROLLBACK, which 8i's table types as 0, have their own.
             stmt_type = oci11_stmt_type(
@@ -1876,13 +1921,16 @@ class Oci11Dialect(Oall8Dialect):
         # The values go back to the cursor by bind position, as on the native
         # 9i dialect; a block without OUT binds returns its status alone.
         bind = bind or []
-        self._check_binds(bind)
+        self._check_binds(bind, block=True)
         stmt_type = oci11_stmt_type(sql.strip().upper())
         yield Send(
             self._closing() + self._encode_dml(self._sql_text(sql), stmt_type, bind)
         )
-        buf = yield from self._recv_block(len(bind))
-        (directions, out_values, rest, session) = decode_oci11_block(buf, len(bind))
+        lobs = self._lob_outs(bind)
+        buf = yield from self._recv_block(len(bind), lobs)
+        (directions, out_values, rest, session) = decode_oci11_block(
+            buf, len(bind), lobs
+        )
         if session is not None and self._on_session is not None:
             self._on_session(session['session_id'], session['serial'])
         status = self._status(rest)
@@ -1891,6 +1939,10 @@ class Oci11Dialect(Oall8Dialect):
         if directions is None:
             return (0, 0, 0, (None, None), [], None, None, [], None)
         out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
+        out_values = [
+            self._lob_out_value(bind[pos], value) if pos in lobs else value
+            for (pos, value) in zip(out_positions, out_values)
+        ]
         record = {
             'out_positions': out_positions,
             'out_values': out_values,
@@ -1898,7 +1950,7 @@ class Oci11Dialect(Oall8Dialect):
         }
         return (0, 0, 0, (None, None), [record], None, None, [], None)
 
-    def _recv_block(self, num_binds: int):
+    def _recv_block(self, num_binds: int, lobs: frozenset[int] = frozenset()):
         # A block's reply, read on across packets until it holds its prompt, its
         # OUT values and a whole status: a long OUT value spans packets.
         from seerdb.common.exceptions import Truncated
@@ -1910,7 +1962,7 @@ class Oci11Dialect(Oall8Dialect):
                 raise Exception('Connection closed during an 11g PL/SQL block')
             buf += received[1]
             try:
-                (_, _, rest, _) = decode_oci11_block(buf, num_binds)
+                (_, _, rest, _) = decode_oci11_block(buf, num_binds, lobs)
                 decode_oci11_status(self._session_return(rest))
             except Truncated:
                 continue

@@ -651,6 +651,74 @@ class Native11TempLobTest(_At11g):
         self.assertFalse(temp_lobs_available(_Dedicated11g()))
 
 
+class Native11LobOutTest(_At11g):
+    """LOB OUT binds in a block, against an OCI 11.2 program's own."""
+
+    def test_an_unset_lob_var_sends_the_empty_locator(self):
+        from seerdb import DB_TYPE_CLOB
+        from seerdb.common.datatypes import Var
+
+        Captured = _capture('oci11_execute_lob_out.hexdump')
+        Mine = encode_oci11_execute(
+            Captured[2],
+            Native11BindRequestTest._sql_of(Captured),
+            8,
+            1,
+            [Var(DB_TYPE_CLOB)],
+        )
+        (Theirs, TheirValues) = Native11TempLobTest._binds(Captured, 1)
+        (Ours, OurValues) = Native11TempLobTest._binds(Mine, 1)
+        Fields = ('data_type', 'max_length', 'charset', 'csfrm')
+        self.assertEqual([Ours[0][F] for F in Fields], [Theirs[0][F] for F in Fields])
+        self.assertEqual(OurValues, TheirValues)
+
+    def test_the_values_carry_the_locators(self):
+        from seerdb.common.tns import decode_oci11_block
+
+        (_, Values, Rest, _) = decode_oci11_block(
+            _capture('oci11_block_lob_out_mixed_reply.hexdump'), 3, frozenset({1})
+        )
+        self.assertEqual(Values[0], bytes.fromhex('c12b'))  # 42
+        self.assertEqual(len(Values[1]), 40)
+        self.assertEqual(int.from_bytes(Values[1][:2], 'big'), 38)
+        self.assertEqual(Values[2], b'abc')
+        self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+        (_, Values, _, _) = decode_oci11_block(
+            _capture('oci11_block_lob_out_null_reply.hexdump'), 1, frozenset({0})
+        )
+        self.assertEqual(Values, [None])
+
+    def test_the_dialect_returns_a_lob_object(self):
+        from seerdb import DB_TYPE_BLOB, DB_TYPE_CLOB
+        from seerdb.common.datatypes import Var
+        from seerdb.common.lob import LOB
+
+        (_, Result) = _drive(
+            Oci11Dialect(lambda: 7).execute_block(
+                "begin :1 := to_blob(hextoraw('0102ff')); end;", [Var(DB_TYPE_BLOB)]
+            ),
+            [_capture('oci11_block_lob_out_reply.hexdump')],
+        )
+        (Value,) = Result[4][0]['out_values']
+        self.assertIsInstance(Value, LOB)
+        self.assertEqual((Value.data_type, len(Value.raw)), (113, 40))
+        (_, Result) = _drive(
+            Oci11Dialect(lambda: 7).execute_block(
+                'begin :1 := null; end;', [Var(DB_TYPE_CLOB)]
+            ),
+            [_capture('oci11_block_lob_out_null_reply.hexdump')],
+        )
+        self.assertEqual(Result[4][0]['out_values'], [None])
+
+    def test_an_unset_lob_var_outside_a_block_is_refused(self):
+        from seerdb import DB_TYPE_CLOB
+        from seerdb.common.datatypes import Var
+
+        with self.assertRaises(NotSupportedError):
+            Oci11Dialect._check_binds([Var(DB_TYPE_CLOB)])
+        Oci11Dialect._check_binds([Var(DB_TYPE_CLOB)], block=True)
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 

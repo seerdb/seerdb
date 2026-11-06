@@ -1005,6 +1005,15 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   as a value, its ub2 length in front, as a row's LOB cell carries it. A LOB
   Var's value and a value past 32,767 bytes into PL/SQL go through a temporary
   LOB, as on 12c+.
+- **A LOB bound OUT** sends the empty locator, a ub4 86 and 86 bytes (`00 54`
+  and zeros), as CREATE_TEMP does; IN OUT, its temporary LOB's. The block's
+  reply carries the new locator the same way, a ub4 length and the locator as
+  a value (a NULL: a length of 0 and nothing), then the indicator other OUT
+  values have. The descriptor's flag bit `0x01` asks for that indicator: OCI
+  sets it only when the program binds an indicator variable, and without it
+  the locator has none after it. seerdb sends sqlplus's flags (`0x03`), so it
+  always comes. A DML's RETURNING into a CLOB or BLOB goes the same way,
+  through the PL/SQL wrap.
 - **11g's own conversion corrupts some large text binds.** A CLOB bound from
   the 320,000-byte UTF-8 value `'中😀x' * 40000` is stored with the `中` at
   UTF-16 offset 8132, the LOB's chunk size, broken into two replacement
