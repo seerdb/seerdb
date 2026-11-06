@@ -267,6 +267,9 @@ class _Target(NamedTuple):
     # Whether the session makes a temporary LOB: 12c+, and a pooled 11g one in
     # the native form (#2466).
     temp_lobs: bool = False
+    # Whether a DML's RETURNING runs as a PL/SQL block, as below 10g and on a
+    # pooled 11g session, whose INTO targets take one row.
+    wrapped_returning: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -278,6 +281,7 @@ def _target_of(conn) -> _Target:
         conn.server_version >> 24,
         os.environ.get('SEERDB_TEST_MIRROR', ''),
         temp_lobs_available(conn),
+        getattr(conn, '_dialect', None) is not None,
     )
 
 
@@ -317,10 +321,14 @@ class _Need(NamedTuple):
     not_mirror: tuple[str, ...] = ()
     # Whether it needs a session that makes a temporary LOB.
     temp_lobs: bool = False
+    # Whether it needs RETURNING over several rows, which a wrapped one lacks.
+    rows_returning: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
         if self.temp_lobs and not target.temp_lobs:
+            return True
+        if self.rows_returning and target.wrapped_returning:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -451,8 +459,15 @@ _LOB_MODIFY = _Need(
 _FV = FIELD_VERSION_12_1
 _INVISIBLE_COLUMNS = _Need('INVISIBLE columns are 12.1+', min_fv=_FV)
 _REF_BIND = _Need('REF bind needs a 12.1+ server', min_fv=_FV)
+_ROWS_RETURNING = _Need(
+    'a RETURNING over several rows runs as a PL/SQL block below 10g and on a pooled '
+    '11g session, whose INTO targets take one row',
+    rows_returning=True,
+)
 _LOB_VAR_BIND = _Need(
-    'a LOB Var bind needs the 12.1+ OAC and temp-LOB path (#902)', min_fv=_FV
+    'a LOB Var bind needs the 12.1+ OAC and temp-LOB path (#902), or a pooled 11g '
+    'session',
+    temp_lobs=True,
 )
 _REFCURSOR_IN_BIND = _Need('a REF CURSOR IN bind needs the 12c+ bind OAC', min_fv=_FV)
 _VECTOR_BIND = _Need('a VECTOR bind needs a 12.1+ session (#1762)', min_fv=_FV)
@@ -9017,6 +9032,7 @@ class LOBReturningIntegration(_IntegrationBase):
         )
         self.assertEqual([V.read() for V in Var.getvalue()], [b'the returned blob'])
 
+    @_requires(_ROWS_RETURNING)
     def test_returning_several_lobs_from_one_update(self):
         # An UPDATE touching several rows returns one value per row, so the
         # reader has to walk the whole list in the LOB framing, not just the

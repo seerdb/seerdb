@@ -15025,9 +15025,22 @@ _OCI11_LOB_BIND_SIZE = 72
 
 def _oci11_lob_bind(Value: object) -> tuple[bool, bytes] | None:
     # (whether it is a BLOB, its locator with its ub2 length) for a LOB bound by
-    # its locator: a temporary one's marker or a LOB object. None otherwise.
+    # its locator: a temporary one's marker or a LOB object, or for an unset
+    # LOB Var (an OUT bind) the empty 86-byte locator OCI sends for one. None
+    # otherwise.
+    from seerdb.common.datatypes import Var
     from seerdb.common.lob import LOB
 
+    if (
+        isinstance(Value, Var)
+        and Value.dbtype.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
+        and not Value.has_value
+    ):
+        return (
+            Value.dbtype.tns_type == TNS_TYPE_BLOB,
+            (_OCI11_TEMP_LOCATOR_LENGTH - 2).to_bytes(2, 'big')
+            + bytes(_OCI11_TEMP_LOCATOR_LENGTH - 2),
+        )
     if isinstance(Value, TempLob):
         return (Value.is_blob, len(Value.locator).to_bytes(2, 'big') + Value.locator)
     if isinstance(Value, LOB) and Value.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
@@ -17880,7 +17893,7 @@ _OCI11_OER_GIVEN = {'oci_12c': False, 'oci_pre12c': True}
 
 
 def decode_oci11_block(
-    Data: bytes, NumBinds: int
+    Data: bytes, NumBinds: int, Lobs: frozenset[int] = frozenset()
 ) -> tuple[list[int] | None, list, bytes, dict | None]:
     """A pooled 11g block's reply (#2466): its bind prompt (TTI_IOV, the native
     9.2 form's: a 50-byte head, then one direction mask a bind, 0x10 OUT, 0x20
@@ -17888,10 +17901,13 @@ def decode_oci11_block(
     (a NULL an empty one, or 0xFF) and a ub2 indicator or return code (0;
     0xFFFF, or 3105 behind 0xFF, for a NULL), where 9.2 sends four bytes
     -- and the status. A session's first call has its session return between
-    the prompt and the values. Returns (directions, the OUT values' bytes in
-    bind order, None for a NULL, the status, the session return or None). A
-    block that fails answers with the status alone: no directions. A reply cut
-    short raises Truncated, for the reader to read on."""
+    the prompt and the values. A LOB's value, at a position in ``Lobs``, is
+    its locator as a bound one goes: a ub4 length and the locator as a value
+    (none for a NULL, its length 0), then the indicator. Returns (directions,
+    the OUT values' bytes in bind order, None for a NULL, the status, the
+    session return or None). A block that fails answers with the status alone:
+    no directions. A reply cut short raises Truncated, for the reader to read
+    on."""
     Directions = decode_9i_oall8_bind_directions(Data, NumBinds)
     if Directions is None:
         return (None, [], Data, None)
@@ -17900,10 +17916,13 @@ def decode_oci11_block(
     try:
         if Rest[:1] == bytes([TTI_RXD]):
             Rest = Rest[1:]
-            for Mask in Directions:
+            for Position, Mask in enumerate(Directions):
                 if not Mask & FV2_BIND_OUT:
                     continue
-                if Rest[:1] == b'\xff':
+                if Position in Lobs:
+                    (Length, Rest) = _OCI.read_n4(Rest)
+                    (Value, Rest) = _OCI.read_value(Rest) if Length else (b'', Rest)
+                elif Rest[:1] == b'\xff':
                     # A NULL as a row cell's (a RETURNING that matched no row:
                     # `ff 21 0c`), where a NULL assigned is an empty value.
                     (Value, Rest) = (b'', Rest[1:])
