@@ -978,6 +978,17 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   block carries `PLSQL_BIND` (`0x400`, with binds) and the block bit
   (`0x40000`) and no `NOT_PLSQL`, statement type 8 (`0x40021` without binds,
   `0x40429` with them).
+- **An array DML** (`executemany`) sends its rows in the one execute, each its
+  own `TTI_RXD` and values behind the one set of descriptors, `al8i4[1]` the
+  row count, as the native 9.2 form does; batch errors are asked for with
+  `BATCH_ERRORS` (`0x80000`). The OER's row count is the rows applied, a
+  failing batch's too, which is the row it stopped at. In batch-errors mode the
+  status is ORA-24381 and the OER's batch-error slots (at offsets 88, 104 and
+  120: a pointer and a count each, where the Mirror's schema had a pad) count
+  the error codes (ub2s), the rows (ub4s) and the messages (a ub4 length, the
+  text, 6 bytes), which follow the OER before ORA-24381's own message; byte 7 of
+  that OER is 0, where every other carries 1. An array DML with RETURNING is
+  refused, as on the native 9i path.
 - **A block's reply** opens with the bind prompt (`TTI_IOV`, the 9.2 form's: a
   50-byte head and one direction mask a bind, `0x10` OUT, `0x20` IN, `0x30` IN
   OUT), then, when the block writes binds, `TTI_RXD` and each OUT or IN OUT

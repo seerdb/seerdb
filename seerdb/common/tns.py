@@ -9901,7 +9901,9 @@ _OCI_OER: wire_schema.Schema = (
     ('u8', 'status'),  # SUCCESS 0x01, ERROR 0x05; 2 on a DML
     ('pad', 3),
     ('n2', 'sequence'),  # the end-to-end sequence
-    ('const', b'\x01'),
+    # 1, as the Mirror sends it; 0 in live 11g's array-DML batch-error status
+    # (#2466).
+    ('u8', 'unpinned_7'),
     # 1 on a LOB / LONG-row status, 2 on a LONG; a DML carries its row count.
     ('n4', 'row_kind'),
     ('n4', 'error_code'),
@@ -9929,7 +9931,19 @@ _OCI_OER: wire_schema.Schema = (
     ('bytes', 'marker', 4),
     ('pad', 4),
     ('u8', 'unpinned_80'),
-    ('pad', 51),
+    ('pad', 7),
+    # An array DML's batch errors (ORA-24381), as live 11g sends them (#2466):
+    # the error codes', the rows' and the messages' arrays, each a pointer and a
+    # count; the arrays follow the OER (decode_oci11_status). Absent and zero
+    # from the Mirror. The native 9.2 status carries the same three.
+    ('ptr', 'batch_codes_present'),
+    ('n4', 'batch_code_count'),
+    ('pad', 4),
+    ('ptr', 'batch_offsets_present'),
+    ('n4', 'batch_offset_count'),
+    ('pad', 4),
+    ('ptr', 'batch_messages_present'),
+    ('n4', 'batch_message_count'),
     ('when', 'oci_12c', (('n4', 'ext_error_code'), ('n8', 'rowcount'))),
     ('when', 'oci_pre12c', (('pad', 4),)),
 )
@@ -9973,7 +9987,14 @@ def _oci_oer(fields: dict, *, wide: bool | None = None) -> bytes:
         wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
     return _OCI_OER_OCI(
         {
+            'unpinned_7': 1,
             'unpinned_23': 0,
+            'batch_codes_present': False,
+            'batch_code_count': 0,
+            'batch_offsets_present': False,
+            'batch_offset_count': 0,
+            'batch_messages_present': False,
+            'batch_message_count': 0,
             **fields,
             'ext_error_code': fields['error_code'],
             'oci_12c': wide,
@@ -17306,7 +17327,13 @@ _OCI11_EXEC_BLOCK = 0x40000
 
 
 def encode_oci11_execute(
-    Seq: int, Sql: bytes, StmtType: int, Rows: int = 1, Binds: list | None = None
+    Seq: int,
+    Sql: bytes,
+    StmtType: int,
+    Rows: int = 1,
+    Binds: list | None = None,
+    Batch: list | None = None,
+    BatchErrors: bool = False,
 ) -> bytes:
     """A pooled 11g session's execute (#2466): parse and execute ``Sql`` with
     ``Binds``, and for a query fetch up to ``Rows`` rows with it. The binds are
@@ -17315,6 +17342,10 @@ def encode_oci11_execute(
     values, a value wider than 4000 bytes
     behind the others outside a block; an unset OUT Var sends the placeholder."""
     Binds = Binds or []
+    # An executemany's rows: each its own TTI_RXD and values behind the one set
+    # of descriptors, as the native 9.2 form sends them (_encode_9i_oall8),
+    # al8i4[1] the row count, batch errors asked for with BATCH_ERRORS.
+    BindRows = _widen_batch_datetimes([Binds, *Batch]) if Batch else [Binds]
     Query = StmtType == O8I_STMT_SELECT
     Block = StmtType in (O8I_STMT_BEGIN, O8I_STMT_DECLARE)
     Options = TNS_EXEC_OPTION_PARSE | TNS_EXEC_OPTION_EXECUTE
@@ -17326,6 +17357,8 @@ def encode_oci11_execute(
         Options |= _OCI11_EXEC_BLOCK | (_OCI11_EXEC_BLOCK_BINDS if Binds else 0)
     elif StmtType not in (OCI11_STMT_COMMIT, OCI11_STMT_ROLLBACK):
         Options |= _OCI11_EXEC_NOT_PLSQL
+    if BatchErrors:
+        Options |= TNS_EXEC_OPTION_BATCH_ERRORS
     Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
     try:
         Head = _ALL8_HEAD_OCI_WIDE(
@@ -17354,7 +17387,8 @@ def encode_oci11_execute(
                 'define_count': 0,
             }
         )
-        Al8i4 = [1, 0 if Query else 1, 0, 0, 0, 0, 0, StmtType, 0, 0, 0, 0, 0]
+        Al8i4 = [1, 0 if Query else len(BindRows), 0, 0, 0, 0, 0, StmtType]
+        Al8i4 += [0] * 5
         Message = (
             Head
             + _OCI11_EXEC_MIDDLE
@@ -17362,16 +17396,17 @@ def encode_oci11_execute(
             + b''.join(_OCI.n4(V) for V in Al8i4)
         )
         if Binds:
-            Oacs = [_encode_oci11_bind_oac(V) for V in _oac_rep_row([Binds])]
+            Oacs = [_encode_oci11_bind_oac(V) for V in _oac_rep_row(BindRows)]
             Message += b''.join(Oacs)
             Long = [
                 not Block and int.from_bytes(Oac[5:9], 'little') > 4000 for Oac in Oacs
             ]
-            Message += bytes([TTI_RXD])
-            for Value in [V for V, L in zip(Binds, Long) if not L] + [
-                V for V, L in zip(Binds, Long) if L
-            ]:
-                Message += _encode_9i_bind_value(Value)
+            for Row in BindRows:
+                Message += bytes([TTI_RXD])
+                for Value in [V for V, L in zip(Row, Long) if not L] + [
+                    V for V, L in zip(Row, Long) if L
+                ]:
+                    Message += _encode_9i_bind_value(Value)
         return Message
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
@@ -17615,7 +17650,8 @@ def decode_oci11_status(Data: bytes) -> dict:
     text, with piggybacks ahead of each. Returns the OER's fields with ``cursor``
     (the statement's cursor, measured where _OCI_OER says ``category``),
     ``message``, ``keywords`` (the settings an ALTER SESSION changed) and
-    ``rowid`` (the row a DML touched). A status
+    ``rowid`` (the row a DML touched) and ``batch_errors`` (an array DML's
+    failed rows, as {offset, code, message}). A status
     cut short raises Truncated, for the reader to read on; anything else in its
     place raises DataError, not a wait for bytes that will not come."""
     (_, Rest) = decode_oci11_piggybacks(Data)
@@ -17637,6 +17673,26 @@ def decode_oci11_status(Data: bytes) -> dict:
             (Cell, Rest) = _O9I_UROWID_CELL_FROM_O9I(Rest)
             if Cell['length']:
                 Rowid = urowid_to_string(bytes(Cell['urowid']))
+        Batch: list[dict] = []
+        Codes = []
+        for _ in range(Oer['batch_code_count']):
+            (Code, Rest) = _OCI.read_n2(Rest)
+            Codes.append(Code)
+        Offsets = []
+        for _ in range(Oer['batch_offset_count']):
+            (Offset, Rest) = _OCI.read_n4(Rest)
+            Offsets.append(Offset)
+        Texts = []
+        for _ in range(Oer['batch_message_count']):
+            (_, Rest) = _OCI.read_n4(Rest)  # the message's length
+            (Text, Rest) = _OCI.read_chr(Rest)
+            _oci_fixed(Rest, 6, 'batch error')
+            Rest = Rest[6:]
+            Texts.append(bytes(Text).decode('utf-8', 'replace').rstrip())
+        Batch = [
+            {'offset': O, 'code': C, 'message': T}
+            for (C, O, T) in zip(Codes, Offsets, Texts)
+        ]
         Message = None
         if Oer['error_code']:
             (Text, Rest) = _OCI.read_value(Rest)
@@ -17649,6 +17705,7 @@ def decode_oci11_status(Data: bytes) -> dict:
         'message': Message,
         'keywords': Keywords,
         'rowid': Rowid,
+        'batch_errors': Batch,
     }
 
 
