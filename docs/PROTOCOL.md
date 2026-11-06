@@ -978,6 +978,20 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   block carries `PLSQL_BIND` (`0x400`, with binds) and the block bit
   (`0x40000`) and no `NOT_PLSQL`, statement type 8 (`0x40021` without binds,
   `0x40429` with them).
+- **A value past the SQL inline limits** (4000 bytes of text, 2000 of RAW)
+  goes as itself, as an OCI 11.2 program sends one through the pool: a VARCHAR
+  (type 1) or a RAW (type 23) declared at its byte size, the value inline in
+  ub1-length chunks. The server takes it into a CLOB, BLOB, LONG or LONG RAW
+  column alike: 50,000 bytes into a CLOB and 300,000 into a BLOB, measured. A
+  LONG or LONG RAW bind is sent the same way, as OCI sends `SQLT_LNG` and
+  `SQLT_LBI`. In PL/SQL, past 32,767 bytes, the server refuses one with
+  ORA-01460, as it does OCI's.
+- **11g's own conversion corrupts some large text binds.** A CLOB bound from
+  the 320,000-byte UTF-8 value `'中😀x' * 40000` is stored with the `中` at
+  UTF-16 offset 8132, the LOB's chunk size, broken into two replacement
+  characters, and one unit too long. OCI 11.2's own bind of it, over a pooled
+  or a dedicated connection, and seerdb's dedicated thin bind are stored the
+  same way. A value of `中` or `😀` alone, at that size, is stored whole.
 - **An array DML** (`executemany`) sends its rows in the one execute, each its
   own `TTI_RXD` and values behind the one set of descriptors, `al8i4[1]` the
   row count, as the native 9.2 form does; batch errors are asked for with

@@ -15009,6 +15009,12 @@ _CHARACTER_BIND_TYPES = frozenset(
 _OCI11_BIND_FLAGS = 0x03
 
 
+_OCI11_LONG_BIND_TYPES = {
+    TNS_TYPE_LONG: TNS_TYPE_VARCHAR,
+    TNS_TYPE_LONGRAW: TNS_TYPE_RAW,
+}
+
+
 def _encode_oci11_bind_oac(Value: object) -> bytes:
     # A pooled 11g session's bind descriptor (#2466): the native 9.2 form's type
     # and size, with sqlplus 11.2's flags, and a character bind's charset and
@@ -15025,6 +15031,12 @@ def _encode_oci11_bind_oac(Value: object) -> bytes:
         # declares one: an OUT value in the session's UTF-8 fills more bytes
         # than characters.
         Size = 3 * Size
+    if DType in _OCI11_LONG_BIND_TYPES:
+        # A LONG or LONG RAW Var goes as a VARCHAR or a RAW of its value's
+        # size, as OCI 11.2 sends one: the server takes it into a LONG, a LOB
+        # or a VARCHAR2 column alike.
+        DType = _OCI11_LONG_BIND_TYPES[DType]
+        Size = max(Size, len(_encode_9i_bind_value(Value)))
     if _is_national_var(Value):
         (Charset, Csfrm) = (AL16UTF16_CHARSET, 2)
     elif DType in _CHARACTER_BIND_TYPES:

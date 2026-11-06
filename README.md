@@ -503,7 +503,8 @@ descriptor sets `server_type`, which `connect()` also takes: `dedicated`,
 the session, as in python-oracledb). Oracle 11g's pool serves only clients in
 OCI's native form, which seerdb speaks for a pooled 11g connection. There it
 runs queries, DML, DDL, `commit` and `rollback` and PL/SQL blocks, with
-scalar IN, OUT and IN OUT binds, so far (with `lastrowid`, `callproc` /
+scalar IN, OUT and IN OUT binds and values of any size into LOB and LONG
+columns, so far (with `lastrowid`, `callproc` /
 `callfunc`, array DML with batch errors and `transaction_in_progress`, and no
 statement cache), and CLOB, NCLOB and BLOB columns, read whole or as LOB
 objects, with their size, write, trim, open and close; an array DML with

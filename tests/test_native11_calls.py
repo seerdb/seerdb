@@ -169,6 +169,73 @@ class Native11BindRequestTest(_At11g):
         )
 
 
+class Native11WideBindTest(_At11g):
+    """A value past the SQL inline limits, and a LONG or LONG RAW bind, against
+    an OCI 11.2 program's own executes."""
+
+    @staticmethod
+    def _bind(Message):
+        # An execute's one descriptor, and its value behind TTI_RXD: after the
+        # SQL text come the 13 al8i4 ub4s, then the descriptor.
+        from seerdb.common.tns import _OAC_FROM_OCI, _OCI, _oci_all8_head
+
+        (_, LengthAt, _) = _oci_all8_head(Message)
+        (_, Rest) = _OCI.read_chr(Message[LengthAt:])
+        (Oac, Rest) = _OAC_FROM_OCI(bytes(Rest)[52:], {'oci_12c': False})
+        Rest = bytes(Rest)
+        assert Rest[0] == 7, Rest[:4].hex()  # TTI_RXD
+        return (Oac, bytes(_OCI.read_value(Rest[1:])[0]))
+
+    def test_a_wide_value_is_declared_as_oci_declares_it(self):
+        # Its own type and its byte size, the charset and form a character
+        # one's, and the value inline; the server takes it into a CLOB or a
+        # BLOB column as it is.
+        for Name, Value in (
+            ('oci11_execute_wide_varchar_bind.hexdump', 'a' * 7000),
+            ('oci11_execute_wide_raw_bind.hexdump', bytes(range(256)) * 12),
+        ):
+            with self.subTest(Name):
+                Captured = _capture(Name)
+                Mine = encode_oci11_execute(
+                    Captured[2],
+                    Native11BindRequestTest._sql_of(Captured),
+                    2,
+                    1,
+                    [Value],
+                )
+                (Theirs, TheirValue) = self._bind(Captured)
+                (Ours, OurValue) = self._bind(Mine)
+                Fields = ('data_type', 'max_length', 'charset', 'csfrm')
+                self.assertEqual([Ours[F] for F in Fields], [Theirs[F] for F in Fields])
+                self.assertEqual(OurValue, TheirValue)
+
+    def test_a_long_var_goes_as_a_varchar_and_a_long_raw_one_as_a_raw(self):
+        from seerdb import DB_TYPE_LONG, DB_TYPE_LONG_RAW
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _OAC_FROM_OCI, _encode_oci11_bind_oac
+
+        for DbType, Value, Type in (
+            (DB_TYPE_LONG, 'c' * 9000, 1),
+            (DB_TYPE_LONG_RAW, b'\x01' * 9000, 23),
+        ):
+            with self.subTest(Type):
+                V = Var(DbType, 100)
+                V.setvalue(0, Value)
+                (Oac, _) = _OAC_FROM_OCI(_encode_oci11_bind_oac(V), {'oci_12c': False})
+                self.assertEqual(Oac['data_type'], Type)
+                self.assertGreaterEqual(Oac['max_length'], 9000)
+
+    def test_neither_is_refused(self):
+        from seerdb import DB_TYPE_CLOB, DB_TYPE_LONG, DB_TYPE_LONG_RAW
+        from seerdb.client.dialect import CAP_WIDE_BINDS
+        from seerdb.common.datatypes import Var
+
+        self.assertIn(CAP_WIDE_BINDS, Oci11Dialect(lambda: 1).capabilities())
+        Oci11Dialect._check_binds([Var(DB_TYPE_LONG), Var(DB_TYPE_LONG_RAW)])
+        with self.assertRaises(NotSupportedError):
+            Oci11Dialect._check_binds([Var(DB_TYPE_CLOB)])
+
+
 class Native11BlockReplyTest(_At11g):
     """A block's reply: its prompt, its OUT values, its status."""
 
