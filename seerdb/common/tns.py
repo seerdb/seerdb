@@ -17596,47 +17596,123 @@ _OCI11_RPA: wire_schema.Schema = (
 )
 _OCI11_RPA_FROM_OCI = wire_schema.compile_decoder(_OCI11_RPA, _OCI)
 _OCI11_RPA_CURSOR = 2
-# A LOB's content, read with TTI_LOBOPS READ as sqlplus 11.2 reads it through
-# 11g's pool (#2466): _LOBOPS_READ in OCI's wide form, the locator, the source
-# offset, sqlplus's dest offset of 4, and the amount. The reply is TTI_LOB and
-# the content as a value (chunked past 252 bytes; none for an empty LOB), then
-# TTI_RPA, the locator again, the amount read (a ub8), and the status.
+# A LOB's calls through 11g's pool (#2466), as sqlplus 11.2 reads a LOB and
+# OCI 11.2 makes the rest: _LOBOPS_READ in OCI's wide form, the locator as
+# fetched (its ub2 length and the body). What each call carries:
+# - READ: the source offset, sqlplus's dest offset of 4, and the amount;
+# - GET_LENGTH and GET_CHUNK_SIZE: an amount of 0, for the reply to fill;
+# - OPEN: its mode in the amount; TRIM: the new length;
+# - WRITE: the source offset, the amount (characters for a CLOB, bytes for a
+#   BLOB), and then the data as TTI_LOB and a value (`_OCI11_LOBOPS_WRITE`);
+# - IS_OPEN: the null-LOB pointer and no amount; CLOSE: neither.
+# A READ's reply is TTI_LOB and the content as a value (chunked past 252
+# bytes; none for an empty LOB), then TTI_RPA, the locator again, the amount
+# read (a ub8), and the status. The other calls' is `_OCI11_LOBOPS_REPLY`.
 _LOBOPS_READ_OCI_WIDE = wire_schema.compile_encoder(_LOBOPS_READ, _OCI_WIDE)
+_OCI11_LOBOPS_WRITE: wire_schema.Schema = (
+    *_LOBOPS_READ,
+    ('const', bytes([TTI_LOB])),
+    ('value', 'data'),
+)
+_OCI11_LOBOPS_WRITE_OCI_WIDE = wire_schema.compile_encoder(
+    _OCI11_LOBOPS_WRITE, _OCI_WIDE
+)
+# The reply to a LOB call other than READ: TTI_RPA, the locator as the server
+# now sees it (a WRITE or TRIM changes it), then the call's value -- a ub8 when
+# the request carried an amount (the size, the chunk size, OPEN's mode, TRIM's
+# new length, the amount a WRITE wrote), IS_OPEN's one byte -- then the status.
+# A call that fails answers with the status alone.
+_OCI11_LOBOPS_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('be2', 'locator_length'),
+    ('bytes', 'locator', 'locator_length'),
+    ('when', 'amount_present', (('n8', 'amount'),)),
+    ('when', 'null_lob_present', (('u8', 'flag'),)),
+)
+_OCI11_LOBOPS_REPLY_FROM_OCI = wire_schema.compile_decoder(_OCI11_LOBOPS_REPLY, _OCI)
 _OCI11_LOB_READ_DEST_OFFSET = 4
+# The LOB calls served, and the pointers each sets besides the source's.
+OCI11_LOB_CALLS = {
+    TNS_LOB_OP_READ: {'amount_present': True},
+    TNS_LOB_OP_GET_LENGTH: {'amount_present': True},
+    TNS_LOB_OP_GET_CHUNK_SIZE: {'amount_present': True},
+    TNS_LOB_OP_OPEN: {'amount_present': True},
+    TNS_LOB_OP_TRIM: {'amount_present': True},
+    TNS_LOB_OP_WRITE: {'amount_present': True},
+    TNS_LOB_OP_IS_OPEN: {'null_lob_present': True},
+    TNS_LOB_OP_CLOSE: {},
+}
+
+
+def encode_oci11_lobop(
+    Seq: int,
+    Locator: bytes,
+    Operation: int,
+    Offset: int = 0,
+    Amount: int = 0,
+    Data: bytes | None = None,
+) -> bytes:
+    """One of a LOB's calls (`OCI11_LOB_CALLS`) in the native form: ``Offset``
+    (1-based) for a READ or a WRITE, ``Amount`` the call's value, ``Data`` a
+    WRITE's bytes."""
+    Values = {
+        'seq': Seq,
+        'token_number': None,
+        'source_present': True,
+        'source_length': len(Locator),
+        'dest_present': False,
+        'dest_length': 0,
+        'short_source_offset': 0,
+        'short_dest_offset': 0,
+        'charset_present': False,
+        'short_amount_present': False,
+        'null_lob_present': False,
+        'operation': Operation,
+        'scn_present': False,
+        'scn_length': 0,
+        'source_offset': Offset,
+        'dest_offset': (
+            _OCI11_LOB_READ_DEST_OFFSET if Operation == TNS_LOB_OP_READ else 0
+        ),
+        'amount_present': False,
+        'array_slot_1': False,
+        'array_length_1': 0,
+        'array_slot_2': False,
+        'array_length_2': 0,
+        'array_slot_3': False,
+        'array_length_3': 0,
+        'locator': Locator,
+        'amount': Amount,
+    }
+    Values.update(OCI11_LOB_CALLS[Operation])
+    if Operation == TNS_LOB_OP_WRITE:
+        return _OCI11_LOBOPS_WRITE_OCI_WIDE({**Values, 'data': Data or b''})
+    return _LOBOPS_READ_OCI_WIDE(Values)
 
 
 def encode_oci11_lob_read(Seq: int, Locator: bytes, Offset: int, Amount: int) -> bytes:
     """Read ``Amount`` (characters for a CLOB, bytes for a BLOB) of a LOB from
     ``Offset`` (1-based), in the native form."""
-    return _LOBOPS_READ_OCI_WIDE(
-        {
-            'seq': Seq,
-            'token_number': None,
-            'source_present': True,
-            'source_length': len(Locator),
-            'dest_present': False,
-            'dest_length': 0,
-            'short_source_offset': 0,
-            'short_dest_offset': 0,
-            'charset_present': False,
-            'short_amount_present': False,
-            'null_lob_present': False,
-            'operation': TNS_LOB_OP_READ,
-            'scn_present': False,
-            'scn_length': 0,
-            'source_offset': Offset,
-            'dest_offset': _OCI11_LOB_READ_DEST_OFFSET,
-            'amount_present': True,
-            'array_slot_1': False,
-            'array_length_1': 0,
-            'array_slot_2': False,
-            'array_length_2': 0,
-            'array_slot_3': False,
-            'array_length_3': 0,
-            'locator': Locator,
-            'amount': Amount,
-        }
-    )
+    return encode_oci11_lobop(Seq, Locator, TNS_LOB_OP_READ, Offset, Amount)
+
+
+def decode_oci11_lobop(
+    Data: bytes, Operation: int
+) -> tuple[int | None, bytes | None, bytes]:
+    """The reply to a LOB call other than READ: (its value, the locator as the
+    server now sees it without its ub2 length, the status behind them). A
+    failed call's reply is its status alone: (None, None, the status). A reply
+    cut short raises Truncated."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, None, Data)
+    Given = {'amount_present': False, 'null_lob_present': False}
+    Given.update(OCI11_LOB_CALLS[Operation])
+    try:
+        (Reply, Rest) = _OCI11_LOBOPS_REPLY_FROM_OCI(Data, Given)
+    except IndexError as Exc:
+        raise Truncated(f'11g LOB call: {Exc}') from Exc
+    Value = Reply.get('flag', Reply.get('amount'))
+    return (Value, bytes(Reply['locator']), bytes(Rest))
 
 
 def decode_oci11_lob_read(Data: bytes, LocatorLength: int) -> tuple[bytes, bytes]:

@@ -34,6 +34,7 @@ from seerdb.common.tns import (
     FV2_BIND_OUT,
     O8I_STMT_SELECT,
     O8I_STMT_TXN,
+    OCI11_LOB_CALLS,
     decode_8i_block_cursor,
     decode_8i_block_out,
     decode_8i_cursor_id,
@@ -75,6 +76,7 @@ from seerdb.common.tns import (
     decode_oci11_block,
     decode_oci11_describe,
     decode_oci11_lob_read,
+    decode_oci11_lobop,
     decode_oci11_piggybacks,
     decode_oci11_rows,
     decode_oci11_status,
@@ -112,6 +114,7 @@ from seerdb.common.tns import (
     encode_oci11_execute,
     encode_oci11_fetch,
     encode_oci11_lob_read,
+    encode_oci11_lobop,
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
@@ -1528,10 +1531,12 @@ class Oci11Dialect(Oall8Dialect):
     decode_oci11_*, measured against sqlplus 11.2 through 11g XE's pool). The
     rows are the native 9i form's, which 11g's are.
 
-    Served: queries over scalar columns, DML, DDL, COMMIT and ROLLBACK, and
-    PL/SQL blocks, with scalar IN, OUT and IN OUT binds. Not yet, and refused
-    before anything is sent: array DML, LOB, BFILE, REF CURSOR and object binds,
-    and LOB, LONG, REF CURSOR and object columns (refused at the describe)."""
+    Served: queries over scalar, CLOB, NCLOB and BLOB columns, DML and array
+    DML, DDL, COMMIT and ROLLBACK, and PL/SQL blocks, with scalar IN, OUT and
+    IN OUT binds, and a LOB object's calls. Not yet, and refused before
+    anything is sent: an array DML's RETURNING, LOB, BFILE, REF CURSOR and
+    object binds, and BFILE, LONG, REF CURSOR and object columns (refused at
+    the describe)."""
 
     _wire = '11g native'
 
@@ -1745,8 +1750,8 @@ class Oci11Dialect(Oall8Dialect):
 
     def resolve_lobs(self, rows: list, columns: list):
         # CLOB / BLOB content in place of the locators, unless the connection
-        # keeps LOB objects (fetch_lobs=False); this session serves no LOB
-        # object calls yet, so those are refused when made.
+        # keeps LOB objects (fetch_lobs, the default), whose calls are
+        # lob_read and lob_operation below.
         if self.keep_lobs:
             return
         yield from super().resolve_lobs(rows, columns)
@@ -1786,10 +1791,33 @@ class Oci11Dialect(Oall8Dialect):
         offset: int = 0,
         data: bytes | None = None,
     ):
-        # A LOB object's other calls -- its size, a write, a trim, open and
-        # close -- are not measured in the native form yet; reading is.
-        raise _oci11_unsupported('this LOB call')
-        yield  # unreachable -- makes this a generator, as the protocol has it
+        # A LOB object's other calls -- its size and chunk size, a write, a
+        # trim, open, close and is-open -- as OCI 11.2 makes them through the
+        # pool: one native TTI_LOBOPS each (encode_oci11_lobop), answered with
+        # the call's value and the locator as the server now sees it, or, for
+        # one that fails (ORA-22920 for a row not locked), the status alone.
+        from seerdb.common.exceptions import Truncated
+
+        if operation not in OCI11_LOB_CALLS:
+            raise _oci11_unsupported('this LOB call')
+        yield Send(
+            encode_oci11_lobop(
+                self._next_seq(), locator, operation, offset, amount, data
+            )
+        )
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during an 11g LOB call')
+            buf += received[1]
+            try:
+                (value, updated, rest) = decode_oci11_lobop(buf, operation)
+                status = self._status(rest)
+            except Truncated:
+                continue
+            _raise_ora(status.get('error_code', 0), status.get('message'))
+            return (value, updated)
 
     def execute_block(self, sql: str, bind: list | None = None):
         # An anonymous PL/SQL block, its binds inline. The reply opens with the

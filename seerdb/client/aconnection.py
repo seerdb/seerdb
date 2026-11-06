@@ -2367,7 +2367,13 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
 
         if dialect_lob_objects(self._dialect):
-            (Bytes, Amount) = fv2_lob_payload(Data, is_blob, charset)
+            # In the charset the dialect reads the LOB's text in: UTF-16 on a
+            # pooled 11g session (#2466), the 9i session's otherwise (#2383).
+            from seerdb.client.dialect import lob_object_charset
+
+            (Bytes, Amount) = fv2_lob_payload(
+                Data, is_blob, lob_object_charset(self._dialect, charset)
+            )
             (_, Updated) = cast(
                 tuple,
                 await self._drive(
