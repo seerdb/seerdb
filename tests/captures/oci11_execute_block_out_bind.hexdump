@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# sqlplus 11.2's execute of `BEGIN :n := 42; END;` for `variable n number`
+# (#2466): options 0x40429 (bind 0x08, PLSQL_BIND 0x400, block 0x40000), one
+# descriptor (NUMBER, flags 3, 22 bytes), then TTI_RXD and the unset OUT bind's
+# placeholder `fd 01`. sqlplus leaves its own address in the pointer at 131.
+# Captured 2026-11-05 through tools/capture_proxy.py: sqlplus 11.2 (instant
+# client 11.2, x86-64 Linux) running statements on Oracle 11g XE 11.2.0.2 with
+# SERVER=POOLED, the DRCP pool started. The TTC payload, without the packet's
+# header, as `hexdump -C` output; the offset column and the |ascii| gutter are
+# ignored by tests.replay.parse_hexdump.
+00000000  03 5e 16 29 04 04 00 00  00 00 00 fe ff ff ff ff  |.^.)............|
+00000010  ff ff ff 42 00 00 00 00  00 00 00 fe ff ff ff ff  |...B............|
+00000020  ff ff ff 0d 00 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000030  ff ff ff fe ff ff ff ff  ff ff ff 00 00 00 00 01  |................|
+00000040  00 00 00 00 00 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000050  ff ff ff 01 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000060  00 00 00 fe ff ff ff ff  ff ff ff 00 00 00 00 00  |................|
+00000070  00 00 00 fe ff ff ff ff  ff ff ff fe ff ff ff ff  |................|
+00000080  ff ff ff 48 14 a9 2c 00  00 00 00 00 00 00 00 00  |...H..,.........|
+00000090  00 00 00 fe ff ff ff ff  ff ff ff fe ff ff ff ff  |................|
+000000a0  ff ff ff 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000b0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000c0  00 00 00 16 42 45 47 49  4e 20 3a 6e 20 3a 3d 20  |....BEGIN :n := |
+000000d0  34 32 3b 20 45 4e 44 3b  0a 00 01 00 00 00 01 00  |42; END;........|
+000000e0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000f0  00 00 00 00 00 00 08 00  00 00 00 00 00 00 00 00  |................|
+00000100  00 00 00 00 00 00 00 00  00 00 00 00 00 00 01 02  |................|
+00000110  03 00 00 16 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000120  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000130  00 00 00 00 00 00 00 07  fd 01                    |..........|
+0000013a

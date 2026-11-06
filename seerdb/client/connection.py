@@ -630,7 +630,8 @@ _FV2_MAX_VARCHAR_BIND = 4000
 # and truncated to the fetch request's long-size field (#377).
 
 
-def _check_fv2_bind_sizes(Bind, Batch=None) -> None:
+def _check_fv2_bind_sizes(Bind, Batch=None, Tier: str = '9i') -> None:
+    # Tier: the server the refusal names (_pre10_tier_name_for).
     from seerdb.common.exceptions import NotSupportedError
 
     Rows = [Bind] if Bind else []
@@ -642,7 +643,7 @@ def _check_fv2_bind_sizes(Bind, Batch=None) -> None:
             if isinstance(Value, (bytes, bytearray)):
                 if len(Value) > _FV2_MAX_RAW_BIND:
                     raise NotSupportedError(
-                        f'Oracle 9i cannot bind a bytes value larger than '
+                        f'Oracle {Tier} cannot bind a bytes value larger than '
                         f'{_FV2_MAX_RAW_BIND} bytes (got {len(Value)}): declare a '
                         f"LONG RAW column's value DB_TYPE_LONG_RAW, and write a "
                         f'BLOB through its locator (#2260)'
@@ -650,7 +651,7 @@ def _check_fv2_bind_sizes(Bind, Batch=None) -> None:
             elif isinstance(Value, str):
                 if len(Value.encode('utf-8')) > _FV2_MAX_VARCHAR_BIND:
                     raise NotSupportedError(
-                        f'Oracle 9i cannot bind a str value larger than '
+                        f'Oracle {Tier} cannot bind a str value larger than '
                         f'{_FV2_MAX_VARCHAR_BIND} bytes (utf-8): declare a LONG '
                         f"column's value DB_TYPE_LONG, and write a CLOB through "
                         f'its locator (#2260)'
@@ -2245,7 +2246,7 @@ class OracleConnect(_ConnectionLogic):
                     'cursor.parse() is not supported on Oracle '
                     + _pre10_tier_name_for(self._dialect)
                 )
-            _check_fv2_bind_sizes(Bind, Batch)
+            _check_fv2_bind_sizes(Bind, Batch, _pre10_tier_name_for(self._dialect))
             if Batch:
                 refuse_pre10_batch(self._dialect, Head, ReturnBinds, BatchErrors)
             if Head.startswith('SELECT'):

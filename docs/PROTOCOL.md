@@ -969,6 +969,22 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   indicator. The fetch (`_FETCH`) and the close of finished cursors, piggybacked
   in front of the next call (`_CLOSE_CURSORS`), are the shared schemas at OCI's
   widths.
+- **Binds** follow the al8i4 array: one descriptor each (`_OAC` at OCI's widths:
+  sqlplus 11.2 sends flags `0x03` whatever the direction, a character bind with
+  the session's charset and form 1 and its buffer at three bytes a character, a
+  NUMBER at 22 bytes), then `TTI_RXD` and the values in the native 9.2 form (an
+  unset OUT bind is the placeholder `fd 01`; a value wider than 4000 bytes goes
+  last, outside a block). A bind adds `BIND` (`0x08`) to the options; a PL/SQL
+  block carries `PLSQL_BIND` (`0x400`, with binds) and the block bit
+  (`0x40000`) and no `NOT_PLSQL`, statement type 8 (`0x40021` without binds,
+  `0x40429` with them).
+- **A block's reply** opens with the bind prompt (`TTI_IOV`, the 9.2 form's: a
+  50-byte head and one direction mask a bind, `0x10` OUT, `0x20` IN, `0x30` IN
+  OUT), then, when the block writes binds, `TTI_RXD` and each OUT or IN OUT
+  value followed by a ub2 indicator (0, `0xFFFF` for a NULL; 9.2 sends four
+  bytes), then the status. A session's first call has its session return
+  between the prompt and the values. A block that fails answers with the status
+  alone.
 - **A query's reply** is the describe (`_DCB_COLUMN` at OCI's widths, the uds
   flags included), its trailer, the row header and the rows, then the status. A
   fetch's reply is the rows and the status. ORA-01403 in the OER ends the rows.

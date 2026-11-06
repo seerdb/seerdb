@@ -72,6 +72,7 @@ from seerdb.common.tns import (
     decode_fv2_version,
     decode_fv2_warn_flags,
     decode_o8i_bfile_getlen,
+    decode_oci11_block,
     decode_oci11_describe,
     decode_oci11_piggybacks,
     decode_oci11_rows,
@@ -1510,9 +1511,10 @@ class Oci11Dialect(Oall8Dialect):
     decode_oci11_*, measured against sqlplus 11.2 through 11g XE's pool). The
     rows are the native 9i form's, which 11g's are.
 
-    Served: queries over scalar columns, DML, DDL, COMMIT and ROLLBACK. Not yet,
-    and refused before anything is sent: binds, PL/SQL blocks, array DML, and
-    LOB, LONG, REF CURSOR and object columns (refused at the describe)."""
+    Served: queries over scalar columns, DML, DDL, COMMIT and ROLLBACK, and
+    PL/SQL blocks, with scalar IN, OUT and IN OUT binds. Not yet, and refused
+    before anything is sent: array DML, LOB, BFILE, REF CURSOR and object binds,
+    and LOB, LONG, REF CURSOR and object columns (refused at the describe)."""
 
     _wire = '11g native'
 
@@ -1541,7 +1543,18 @@ class Oci11Dialect(Oall8Dialect):
         return rest
 
     def capabilities(self) -> frozenset[str]:
-        return frozenset({CAP_QUERY, CAP_DML, CAP_OWN_TXN})
+        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN})
+
+    @staticmethod
+    def _check_binds(bind: list | None) -> None:
+        # The binds this session sends: scalar values and Vars. A LOB, BFILE,
+        # REF CURSOR or object Var travels in forms not measured against 11g.
+        from seerdb.common.datatypes import Var
+
+        for value in bind or []:
+            if isinstance(value, Var) and value.dbtype.tns_type in _OCI11_UNREAD_TYPES:
+                name = _OCI11_UNREAD_TYPES[value.dbtype.tns_type]
+                raise _oci11_unsupported(f'a {name} bind')
 
     # --- the 11g hooks for the shared call sequences in Oall8Dialect
 
@@ -1620,10 +1633,9 @@ class Oci11Dialect(Oall8Dialect):
         return decode_oci11_rows(buf, columns, last_row)
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
-        if bind:
-            raise _oci11_unsupported('a bind')
+        self._check_binds(bind)
         return encode_oci11_execute(
-            self._next_seq(), sql_text, O8I_STMT_SELECT, self._rows
+            self._next_seq(), sql_text, O8I_STMT_SELECT, self._rows, bind
         )
 
     def _encode_fetch(self, cursor: int, count: int, long_size: int) -> bytes:
@@ -1632,21 +1644,19 @@ class Oci11Dialect(Oall8Dialect):
     def _encode_dml(
         self, sql_text: bytes, stmt_type: int, bind: list | None = None
     ) -> bytes:
-        if bind:
-            raise _oci11_unsupported('a bind')
+        self._check_binds(bind)
         if stmt_type == O8I_STMT_TXN:
             # COMMIT and ROLLBACK, which 8i's table types as 0, have their own.
             stmt_type = oci11_stmt_type(
                 sql_text.decode('utf-8', 'replace').strip().upper()
             )
-        return encode_oci11_execute(self._next_seq(), sql_text, stmt_type)
+        return encode_oci11_execute(self._next_seq(), sql_text, stmt_type, 1, bind)
 
     # --- the calls
 
     def execute_query(self, sql: str, bind: list | None = None, fetch: int = 15):
         # The execute brings the first `fetch` rows, as a fetch does.
-        if bind:
-            raise _oci11_unsupported('a bind')
+        self._check_binds(bind)
         self._rows = fetch or 15
         return (yield from super().execute_query(sql, bind, fetch))
 
@@ -1661,11 +1671,11 @@ class Oci11Dialect(Oall8Dialect):
         # INSERT / UPDATE / DELETE, DDL and transaction statements. The error
         # comes back in the result, as the other dialects return it, so the
         # cursor reports what the statement did.
-        if bind:
-            raise _oci11_unsupported('a bind')
         assert not batch
         stmt_type = oci11_stmt_type(sql.strip().upper())
-        yield Send(self._closing() + self._encode_dml(self._sql_text(sql), stmt_type))
+        yield Send(
+            self._closing() + self._encode_dml(self._sql_text(sql), stmt_type, bind)
+        )
         buf = yield from self._recv_terminal('DML')
         status = self._status(buf)
         self._finished(status.get('cursor', 0))
@@ -1685,8 +1695,51 @@ class Oci11Dialect(Oall8Dialect):
         )
 
     def execute_block(self, sql: str, bind: list | None = None):
-        raise _oci11_unsupported('a PL/SQL block')
-        yield  # unreachable -- makes this a generator, as the protocol has it
+        # An anonymous PL/SQL block, its binds inline. The reply opens with the
+        # bind prompt when there are binds, which says each bind's direction,
+        # then the OUT and IN OUT values, then the status (decode_oci11_block).
+        # The values go back to the cursor by bind position, as on the native
+        # 9i dialect; a block without OUT binds returns its status alone.
+        bind = bind or []
+        self._check_binds(bind)
+        stmt_type = oci11_stmt_type(sql.strip().upper())
+        yield Send(
+            self._closing() + self._encode_dml(self._sql_text(sql), stmt_type, bind)
+        )
+        buf = yield from self._recv_block(len(bind))
+        (directions, out_values, rest, session) = decode_oci11_block(buf, len(bind))
+        if session is not None and self._on_session is not None:
+            self._on_session(session['session_id'], session['serial'])
+        status = self._status(rest)
+        self._finished(status.get('cursor', 0))
+        _raise_ora(status.get('error_code', 0), status.get('message'))
+        if directions is None:
+            return (0, 0, 0, (None, None), [], None, None, [], None)
+        out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
+        record = {
+            'out_positions': out_positions,
+            'out_values': out_values,
+            'directions': directions,
+        }
+        return (0, 0, 0, (None, None), [record], None, None, [], None)
+
+    def _recv_block(self, num_binds: int):
+        # A block's reply, read on across packets until it holds its prompt, its
+        # OUT values and a whole status: a long OUT value spans packets.
+        from seerdb.common.exceptions import Truncated
+
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during an 11g PL/SQL block')
+            buf += received[1]
+            try:
+                (_, _, rest, _) = decode_oci11_block(buf, num_binds)
+                decode_oci11_status(self._session_return(rest))
+            except Truncated:
+                continue
+            return buf
 
     def bfile_read(self, locator: bytes):
         raise _oci11_unsupported('reading a BFILE')
