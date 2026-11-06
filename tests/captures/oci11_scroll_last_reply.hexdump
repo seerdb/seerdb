@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# 11g's reply to it (#2466): the row 10, and the status, its position 10.
+# Captured 2026-11-06 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8;
+# OCIStmtExecute with OCI_STMT_SCROLLABLE_READONLY and OCIStmtFetch2, called
+# through ctypes) on Oracle 11g XE 11.2.0.2 with SERVER=POOLED, the DRCP pool
+# started, scrolling `select level n from dual connect by level <= 10`. The TTC
+# payload, without the packet's header, as `hexdump -C` output; the offset
+# column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  06 01 02 00 01 00 00 00  00 00 01 00 00 00 00 00  |................|
+00000010  00 00 00 00 00 00 00 00  00 00 00 00 c5 d0 0f 7f  |................|
+00000020  00 00 00 00 00 00 00 00  00 00 00 00 c8 88 00 00  |................|
+00000030  00 00 07 02 c1 0b 08 06  00 00 00 00 00 00 00 00  |................|
+00000040  00 01 00 00 00 00 00 00  00 0a 00 00 00 0c 0f 71  |...............q|
+00000050  c9 00 00 00 00 00 00 00  00 04 01 00 00 00 0e 00  |................|
+00000060  01 0a 00 00 00 00 00 00  00 00 00 01 00 00 00 03  |................|
+00000070  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000080  00 00 00 00 00 00 00 00  00 00 0e 00 00 01 00 00  |................|
+00000090  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000a0  00 20 f6 31 0a 00 00 00  00 00 00 00 00 00 00 00  |. .1............|
+000000b0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000c0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000d0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000e0  00                                                |.|
+000000e1

@@ -24,6 +24,7 @@ from seerdb.client._conn_logic import (
     dialect_lob_objects,
     dialect_parses,
     dialect_pings,
+    dialect_scrolls,
     dialect_temp_lobs,
     fv2_lob_payload,
     pre10_dml_applied,
@@ -2241,6 +2242,18 @@ class OracleConnect(_ConnectionLogic):
             if ParseOnly and dialect_parses(self._dialect):
                 # Parsed in the dialect's own form (a pooled 11g session's).
                 return self._drive(self._dialect.parse(Query))
+            if (
+                scrollable
+                and statement_head(Query).startswith('SELECT')
+                and dialect_scrolls(self._dialect)
+            ):
+                # Opened scrollable in the dialect's own form, its cursor kept
+                # open for scroll_fetch (a pooled 11g session's, #2466).
+                return self._drive(
+                    self._dialect.execute_scrollable(
+                        Query, Bind, self.fetch if Prefetch is None else Prefetch
+                    )
+                )
             if ParseOnly:
                 # The pre-10g dialects build their own request (TTI_ALL7 / the
                 # 8i OALL8), and both hard-wire PARSE|EXECUTE — there is no
@@ -2526,6 +2539,21 @@ class OracleConnect(_ConnectionLogic):
         rows means the scroll ran off the end (the cursor stays open thanks to
         NO_CANCEL_ON_EOF). ``Fetch`` overrides the prefetch row count for this
         batch (default: the connection's ``fetch``)."""
+        if dialect_scrolls(self._dialect):
+            # A pooled 11g session's own positioned fetch (#2466).
+            return cast(
+                tuple,
+                self._drive(
+                    self._dialect.scroll_fetch(
+                        CursorId,
+                        Orientation,
+                        Position,
+                        RowFormat,
+                        self.fetch if Fetch is None else Fetch,
+                        PrevRow,
+                    )
+                ),
+            )
         QueryDict = {
             'type': 'select',
             'auto': 0,

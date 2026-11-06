@@ -1046,6 +1046,79 @@ class Native11ObjectTest(_At11g):
         self.assertEqual((NoPoint, NoNumbers), (None, None))
 
 
+class Native11ScrollTest(_At11g):
+    """Scrollable cursors, against an OCI 11.2 program's own."""
+
+    _SQL = 'select level n from dual connect by level <= 10'
+
+    @staticmethod
+    def _al8i4(Message):
+        # An execute's 13 al8i4 ub4s, after its SQL text.
+        from seerdb.common.tns import _OCI, _oci_all8_head
+
+        (_, LengthAt, _) = _oci_all8_head(Message)
+        (_, Rest) = _OCI.read_chr(Message[LengthAt:])
+        Rest = bytes(Rest)
+        return [int.from_bytes(Rest[K : K + 4], 'little') for K in range(0, 52, 4)]
+
+    def test_the_open_asks_for_a_scrollable_cursor(self):
+        # OCI's al8i4: SCROLLABLE | NO_CANCEL_ON_EOF, CURRENT, row 1.
+        Captured = _capture('oci11_execute_scrollable.hexdump')
+        Mine = encode_oci11_execute(
+            Captured[2], self._SQL.encode(), O8I_STMT_SELECT, 1, Scrollable=True
+        )
+        self.assertEqual(self._al8i4(Mine), self._al8i4(Captured))
+
+    def test_the_fetches_are_oci_11_2s(self):
+        from seerdb.common.tns import encode_oci11_scroll_fetch
+
+        for Name, Last, Position in (
+            ('oci11_scroll_fetch_next.hexdump', False, 2),
+            ('oci11_scroll_fetch_last.hexdump', True, 0),
+        ):
+            with self.subTest(Name):
+                Captured = _capture(Name)
+                Native11BindRequestTest._same_but_the_pointer(
+                    self,
+                    encode_oci11_scroll_fetch(Captured[2], 1, 1, 4, Last, Position),
+                    Captured,
+                )
+
+    def test_the_dialect_opens_and_scrolls(self):
+        # The open brings the first row and keeps the cursor; a scroll brings
+        # its rows and the cursor's position; past the end, none, at the end.
+        from seerdb.common.tns_consts import (
+            TNS_FETCH_ORIENTATION_ABSOLUTE,
+            TNS_FETCH_ORIENTATION_LAST,
+        )
+
+        Dialect = Oci11Dialect(lambda: 7)
+        (_, Result) = _drive(
+            Dialect.execute_scrollable(self._SQL, None, 1),
+            [_capture('oci11_scrollable_reply.hexdump')],
+        )
+        (Code, Cursor, (Position, Columns), Rows) = (
+            Result[1],
+            Result[2],
+            Result[3],
+            Result[4],
+        )
+        self.assertEqual((Code, Cursor, Position, Rows), (0, 1, 1, [[1]]))
+        self.assertEqual(Dialect._to_close, [])  # kept open
+        (_, Scrolled) = _drive(
+            Dialect.scroll_fetch(1, TNS_FETCH_ORIENTATION_LAST, 0, Columns, 1, None),
+            [_capture('oci11_scroll_last_reply.hexdump')],
+        )
+        self.assertEqual(Scrolled, ([[10]], False, 10))
+        (_, Past) = _drive(
+            Dialect.scroll_fetch(
+                1, TNS_FETCH_ORIENTATION_ABSOLUTE, 20, Columns, 1, None
+            ),
+            [_capture('oci11_scroll_past_end_reply.hexdump')],
+        )
+        self.assertEqual(Past[:2], ([], True))
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 

@@ -6,7 +6,7 @@
 
 from typing import Any
 
-from seerdb.client._conn_logic import temp_lobs_available
+from seerdb.client._conn_logic import dialect_scrolls, temp_lobs_available
 from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
 from seerdb.client.cursor import (
     _assign_out_binds,
@@ -79,7 +79,11 @@ class AsyncCursor(_CursorLogic):
             Conn = self._connection
             if Conn is not None and getattr(Conn, '_writer', None) is not None:
                 try:
-                    Conn._cursors_to_close.append(self._scroll_cursor_id)
+                    if dialect_scrolls(Conn._dialect):
+                        # A native session closes it with its own next call (#2466).
+                        Conn._dialect._finished(self._scroll_cursor_id)
+                    else:
+                        Conn._cursors_to_close.append(self._scroll_cursor_id)
                 except Exception:
                     # Best-effort cleanup (see sync Cursor._release_scroll_cursor):
                     # the server frees the cursor on session end regardless.

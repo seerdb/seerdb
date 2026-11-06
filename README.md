@@ -510,7 +510,8 @@ statement cache), and CLOB, NCLOB and BLOB columns, read whole or as LOB
 objects, with their size, write, trim, open and close, temporary LOBs
 (`createlob()`) and LOB binds IN, OUT and IN OUT, LONG and LONG RAW
 columns, REF CURSOR OUT binds and `CURSOR()` columns, BFILE columns, object
-and collection columns (XMLType among them), `ping()` and `cursor.parse()`;
+and collection columns (XMLType among them), server-side scrollable cursors,
+`ping()` and `cursor.parse()`;
 an array DML with RETURNING, a BFILE or a cursor bound IN, and application
 contexts are refused with
 `NotSupportedError` until they are built (#2466), and `changepassword()`

@@ -4052,6 +4052,7 @@ def encode_fetch_response(
 from seerdb.common.tns_consts import (
     TNS_BIND_DIR_INPUT_OUTPUT,
     TNS_BIND_DIR_OUTPUT,
+    TNS_FETCH_ORIENTATION_CURRENT,
     TNS_FETCH_ORIENTATION_FIRST,
     TNS_FETCH_ORIENTATION_LAST,
     TNS_LOB_OP_ARRAY,
@@ -17426,6 +17427,7 @@ def encode_oci11_execute(
     Batch: list | None = None,
     BatchErrors: bool = False,
     ParseOnly: bool = False,
+    Scrollable: bool = False,
 ) -> bytes:
     """A pooled 11g session's execute (#2466): parse and execute ``Sql`` with
     ``Binds``, and for a query fetch up to ``Rows`` rows with it. The binds are
@@ -17437,7 +17439,12 @@ def encode_oci11_execute(
     ``ParseOnly`` parses ``Sql`` and runs nothing, as OCI 11.2's
     OCI_PARSE_ONLY and OCI_DESCRIBE_ONLY executes do: PARSE alone in the
     options, and for a query DESCRIBE and NOT_PLSQL too, which brings its
-    describe; al8i4[1] 0."""
+    describe; al8i4[1] 0.
+
+    ``Scrollable`` opens a query's cursor scrollable, as OCI 11.2's
+    OCI_STMT_SCROLLABLE_READONLY execute does: al8i4[9] SCROLLABLE and
+    NO_CANCEL_ON_EOF, so the cursor stays open past its last row, and the
+    fetch positioned at row one (_OCI11_SCROLL_AL8I4)."""
     Binds = Binds or []
     # An executemany's rows: each its own TTI_RXD and values behind the one set
     # of descriptors, as the native 9.2 form sends them (_encode_9i_oall8),
@@ -17492,6 +17499,8 @@ def encode_oci11_execute(
         )
         Al8i4 = [1, 0 if Query or ParseOnly else len(BindRows), 0, 0, 0, 0, 0, StmtType]
         Al8i4 += [0] * 5
+        if Scrollable and Query:
+            Al8i4[9:12] = _oci11_scroll_al8i4(TNS_FETCH_ORIENTATION_CURRENT, 1)
         Message = (
             Head
             + _OCI11_EXEC_MIDDLE
@@ -17545,8 +17554,41 @@ def encode_oci11_cursor_fetch(Seq: int, Cursor: int, Rows: int, MaxLong: int) ->
     return _oci11_fetch_all8(Seq, Cursor, Rows, MaxLong, TNS_EXEC_OPTION_FETCH)
 
 
+# A scrollable cursor's al8i4[9:12], as OCI 11.2 sends them through the pool:
+# the exec flags SCROLLABLE and NO_CANCEL_ON_EOF (0x82), the orientation and the
+# 1-based row. OCI asks for every row by its position -- CURRENT and the row,
+# a NEXT, a PRIOR and a RELATIVE among them, worked out on its side -- and the
+# last as LAST and -1.
+_OCI11_SCROLL_FLAGS = TNS_EXEC_FLAGS_SCROLLABLE | TNS_EXEC_FLAGS_NO_CANCEL_ON_EOF
+
+
+def _oci11_scroll_al8i4(Orientation: int, Position: int) -> list[int]:
+    return [_OCI11_SCROLL_FLAGS, Orientation, Position & 0xFFFFFFFF]
+
+
+def encode_oci11_scroll_fetch(
+    Seq: int, Cursor: int, Rows: int, MaxLong: int, Last: bool, Position: int = 1
+) -> bytes:
+    """A pooled 11g session's fetch of up to ``Rows`` rows from a scrollable
+    ``Cursor``, as OCI 11.2's OCIStmtFetch2 makes it: the LONG fetch's call
+    (encode_oci11_long_fetch), positioned at ``Position`` (1-based), or at the
+    last row."""
+    if Last:
+        Scroll = _oci11_scroll_al8i4(TNS_FETCH_ORIENTATION_LAST, -1)
+    else:
+        Scroll = _oci11_scroll_al8i4(TNS_FETCH_ORIENTATION_CURRENT, Position)
+    return _oci11_fetch_all8(
+        Seq, Cursor, Rows, MaxLong, _OCI11_LONG_FETCH_OPTIONS, Scroll
+    )
+
+
 def _oci11_fetch_all8(
-    Seq: int, Cursor: int, Rows: int, MaxLong: int, Options: int
+    Seq: int,
+    Cursor: int,
+    Rows: int,
+    MaxLong: int,
+    Options: int,
+    Scroll: list[int] | None = None,
 ) -> bytes:
     Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
     try:
@@ -17579,6 +17621,8 @@ def _oci11_fetch_all8(
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
     Al8i4 = [0, Rows, 0, 0, 0, 0, 0, O8I_STMT_SELECT] + [0] * 5
+    if Scroll:
+        Al8i4[9:12] = Scroll
     return Head + _OCI11_EXEC_MIDDLE + b''.join(_OCI.n4(V) for V in Al8i4)
 
 

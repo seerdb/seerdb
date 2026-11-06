@@ -1113,6 +1113,14 @@ def dialect_pings(Dialect) -> 'TypeGuard[Oci11Dialect]':
     return Dialect is not None and CAP_PING in Dialect.capabilities()
 
 
+def dialect_scrolls(Dialect) -> 'TypeGuard[Oci11Dialect]':
+    """Whether a pre-10g dialect serves a server-side scrollable cursor in its
+    own form (a pooled 11g session, #2466)."""
+    from seerdb.client.dialect import CAP_SCROLL
+
+    return Dialect is not None and CAP_SCROLL in Dialect.capabilities()
+
+
 def temp_lobs_available(Conn) -> bool:
     """Whether the connection can make a temporary LOB to bind: 12c+, or a
     dialect that makes one itself."""

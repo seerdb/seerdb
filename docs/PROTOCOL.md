@@ -1026,6 +1026,19 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   token (`encode_oci11_ping`), answered with a bare `TTI_STA`, call status 1
   and the session's sequence; a first call's reply has the session return
   ahead of it.
+- **A scrollable cursor** is OCI 11.2's `OCI_STMT_SCROLLABLE_READONLY` cursor
+  through the pool. Its open is the query's execute with `al8i4[9]`
+  SCROLLABLE | NO_CANCEL_ON_EOF (`0x82`), `[10]` CURRENT and `[11]` row 1, so
+  the cursor stays open past its last row; the reply brings the first rows,
+  and the OER's row count (`row_kind` in `_OCI_OER`) is the cursor's
+  position. Each `OCIStmtFetch2` is the LONG fetch's OALL8 with the same
+  `al8i4[9]`, positioned: OCI asks for every row by its 1-based position,
+  CURRENT and the row (a NEXT, a PRIOR, a RELATIVE worked out on its side),
+  and for the last as LAST and -1 (`encode_oci11_scroll_fetch`). Past the
+  last row the reply is ORA-01403 and no rows, and the cursor stays open.
+  seerdb's cursor already works out the row, so it sends OCI's form; the
+  cursor is closed with the next call once the Python cursor is closed or
+  run again.
 - **`cursor.parse()`** is OCI 11.2's parse-only execute: PARSE alone in the
   options, `al8i4[1]` 0, nothing run. For a query, as OCI_DESCRIBE_ONLY, also
   DESCRIBE and NOT_PLSQL (`0x28001`), and the reply is the describe and the
