@@ -362,8 +362,9 @@ class _ConnectionLogic:
                 f'createlob() needs DB_TYPE_CLOB, DB_TYPE_NCLOB or DB_TYPE_BLOB, '
                 f'not {lob_type!r}'
             )
-        if self.field_version < FIELD_VERSION_12_1:
-            # The temp LOB it sits on is a CREATE_TEMP, which 11g refuses (#91).
+        if not temp_lobs_available(self):
+            # The temp LOB it sits on is a CREATE_TEMP, which 11g's converted
+            # form refuses (#91); a pooled 11g session makes its own (#2466).
             raise NotSupportedError(
                 'createlob() requires an Oracle 12.1+ server (it makes a server '
                 'temporary LOB, which older servers refuse)'
@@ -1086,6 +1087,24 @@ def dialect_lob_objects(Dialect) -> 'TypeGuard[Fv2Dialect]':
     from seerdb.client.dialect import CAP_LOB_OBJECT
 
     return Dialect is not None and CAP_LOB_OBJECT in Dialect.capabilities()
+
+
+def dialect_temp_lobs(Dialect) -> 'TypeGuard[Oci11Dialect]':
+    """Whether a pre-12c dialect makes a temporary LOB itself (a pooled 11g
+    session, #2466), so a LOB Var's value binds through one as on 12c+."""
+    from seerdb.client.dialect import CAP_TEMP_LOB
+
+    return Dialect is not None and CAP_TEMP_LOB in Dialect.capabilities()
+
+
+def temp_lobs_available(Conn) -> bool:
+    """Whether the connection can make a temporary LOB to bind: 12c+, or a
+    dialect that makes one itself."""
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1
+
+    return getattr(Conn, 'field_version', 0) >= FIELD_VERSION_12_1 or (
+        dialect_temp_lobs(getattr(Conn, '_dialect', None))
+    )
 
 
 def fv2_lob_payload(

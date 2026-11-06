@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# The same for an NCLOB (#2466): the charset form 2, the charset 873 still.
+# Captured 2026-11-06 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8;
+# OCILobCreateTemporary, OCIBindByPos and the like, called through ctypes) on
+# Oracle 11g XE 11.2.0.2 with SERVER=POOLED, the DRCP pool started. The TTC
+# payload, without the packet's header, as `hexdump -C` output; the offset
+# column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  03 60 0d fe ff ff ff ff  ff ff ff 56 00 00 00 00  |.`.........V....|
+00000010  00 00 00 00 00 00 00 00  00 00 00 0a 00 00 00 00  |................|
+00000020  00 00 00 00 00 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000030  ff ff ff 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000040  00 00 00 10 01 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000050  ff ff ff 01 00 00 00 00  00 00 00 02 00 00 00 00  |................|
+00000060  00 00 00 70 00 00 00 00  00 00 00 fe ff ff ff ff  |...p............|
+00000070  ff ff ff 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000080  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000090  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000a0  00 00 00 00 54 00 00 00  00 00 00 00 00 00 00 00  |....T...........|
+000000b0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000c0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000d0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000e0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000f0  00 00 00 00 00 00 00 00  00 69 03 00 00 00 00 0a  |.........i......|
+00000100  00 00 00 00 00 00 00                              |.......|
+00000107

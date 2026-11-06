@@ -4,6 +4,7 @@
 import re
 from typing import Any
 
+from seerdb.client._conn_logic import temp_lobs_available
 from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
 from seerdb.client.typehandlers import apply_fetch_plan, lob_columns
 from seerdb.common.datatypes import (
@@ -188,13 +189,11 @@ class Cursor(_CursorLogic):
         # bind over the 32767-byte PL/SQL VARCHAR2 / RAW limit can't go through
         # the streamed path (ORA-01460). Stream it into a server temp LOB and
         # bind the locator instead. Only for PL/SQL blocks (plain DML keeps the
-        # streamed-LONG path) and only on 12c+ (11g rejects CREATE_TEMP).
+        # streamed-LONG path) and only where a temp LOB can be made: 12c+, and a
+        # pooled 11g session in the native form (#2466); 11g's converted form
+        # rejects CREATE_TEMP.
         Conn = self._connection
-        if (
-            getattr(Conn, 'field_version', 0) < FIELD_VERSION_12_1
-            or not is_plsql(operation)
-            or not Bind
-        ):
+        if not temp_lobs_available(Conn) or not is_plsql(operation) or not Bind:
             return Bind
         Promoted = []
         for Value in Bind:
@@ -216,10 +215,11 @@ class Cursor(_CursorLogic):
         # python-oracledb's createlob does (#902). Promote each such Var's
         # non-NULL value to a server temp LOB and bind that; a NULL Var (a pure
         # OUT, or a NULL IN bind) keeps its typed form, which now carries the LOB
-        # bind OAC. 12c+ only (11g has no CREATE_TEMP); an 11g Var(CLOB) keeps its
+        # bind OAC. 12c+ only, and a pooled 11g session (#2466): 11g's converted form
+        # has no CREATE_TEMP, so an 11g Var(CLOB) there keeps its
         # prior behaviour.
         Conn = self._connection
-        if getattr(Conn, 'field_version', 0) < FIELD_VERSION_12_1 or not Bind:
+        if not temp_lobs_available(Conn) or not Bind:
             return Bind
         Out: list = []
         for V in Bind:

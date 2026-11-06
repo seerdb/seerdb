@@ -264,14 +264,20 @@ class _Target(NamedTuple):
     # The Mirror leg this is (SEERDB_TEST_MIRROR): 'postgres', 'passthrough',
     # '1' for a runner that does not name its backend, or '' for none.
     mirror: str
+    # Whether the session makes a temporary LOB: 12c+, and a pooled 11g one in
+    # the native form (#2466).
+    temp_lobs: bool = False
 
 
 def _target_of(conn) -> _Target:
+    from seerdb.client._conn_logic import temp_lobs_available
+
     return _Target(
         conn.field_version,
         _conn_is_8i(conn),
         conn.server_version >> 24,
         os.environ.get('SEERDB_TEST_MIRROR', ''),
+        temp_lobs_available(conn),
     )
 
 
@@ -309,9 +315,13 @@ class _Need(NamedTuple):
     # The Mirror legs that lack it: '*' for any Mirror, else backend names. A
     # runner that names no backend ('1') lacks what any backend lacks.
     not_mirror: tuple[str, ...] = ()
+    # Whether it needs a session that makes a temporary LOB.
+    temp_lobs: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
+        if self.temp_lobs and not target.temp_lobs:
+            return True
         if self.min_fv and fv < self.min_fv:
             return True
         if self.below_fv and fv >= self.below_fv:
@@ -456,7 +466,10 @@ _ARRAY_DML_ROWCOUNTS = _Need('arraydmlrowcounts needs a 12.1+ server', min_fv=_F
 _TIME_ZONE_SYNC = _Need(
     'client time-zone sync is 12c+ (AUTH_ALTER_SESSION)', min_fv=_FV
 )
-_TEMP_LOB = _Need('a temporary LOB needs a 12c+ server (CREATE_TEMP)', min_fv=_FV)
+_TEMP_LOB = _Need(
+    'a temporary LOB needs a 12c+ server (CREATE_TEMP), or a pooled 11g one',
+    temp_lobs=True,
+)
 _END_TO_END = _Need('end-to-end tracing requires 12c+', min_fv=_FV)
 _IMPLICIT_RESULTS = _Need('DBMS_SQL.RETURN_RESULT is 12c+', min_server=12)
 _PRE12_VECTOR_REFUSAL = _Need('a 12.1+ session binds a VECTOR', below_fv=_FV)

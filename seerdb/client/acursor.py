@@ -6,6 +6,7 @@
 
 from typing import Any
 
+from seerdb.client._conn_logic import temp_lobs_available
 from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
 from seerdb.client.cursor import (
     _assign_out_binds,
@@ -141,11 +142,7 @@ class AsyncCursor(_CursorLogic):
         > 32767-byte CLOB / BLOB bind for a PL/SQL block into a server temp LOB
         and bind the locator, sidestepping ORA-01460. 12c+ / PL/SQL only."""
         Conn = self._connection
-        if (
-            getattr(Conn, 'field_version', 0) < FIELD_VERSION_12_1
-            or not is_plsql(operation)
-            or not Bind
-        ):
+        if not temp_lobs_available(Conn) or not is_plsql(operation) or not Bind:
             return Bind
         Promoted = []
         for Value in Bind:
@@ -167,7 +164,7 @@ class AsyncCursor(_CursorLogic):
         # Var's non-NULL value to a server temp LOB. A NULL Var keeps its typed
         # form (a LOB bind OAC + NULL value). 12c+ only.
         Conn = self._connection
-        if getattr(Conn, 'field_version', 0) < FIELD_VERSION_12_1 or not Bind:
+        if not temp_lobs_available(Conn) or not Bind:
             return Bind
         Out: list = []
         for V in Bind:

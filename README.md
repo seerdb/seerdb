@@ -507,8 +507,9 @@ scalar IN, OUT and IN OUT binds and values of any size into LOB and LONG
 columns, so far (with `lastrowid`, `callproc` /
 `callfunc`, array DML with batch errors and `transaction_in_progress`, and no
 statement cache), and CLOB, NCLOB and BLOB columns, read whole or as LOB
-objects, with their size, write, trim, open and close; an array DML with
-RETURNING, LOB binds, BFILE, cursor and object binds and columns,
+objects, with their size, write, trim, open and close, temporary LOBs
+(`createlob()`) and LOBs bound IN; an array DML with RETURNING, LOB OUT
+binds, BFILE, cursor and object binds and columns,
 LONG columns, application
 contexts, `ping()` and `changepassword()` are refused with `NotSupportedError`
 until they are built (#2466). A

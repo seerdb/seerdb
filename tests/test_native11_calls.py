@@ -538,6 +538,119 @@ class Native11LobCallTest(_At11g):
         )
 
 
+class Native11TempLobTest(_At11g):
+    """Temporary LOBs and LOBs bound by their locators, against an OCI 11.2
+    program's own calls."""
+
+    def test_the_creation_is_oci_11_2s(self):
+        from seerdb.common.tns import encode_oci11_create_temp
+
+        for Name, LobType, Csfrm in (
+            ('oci11_create_temp_clob.hexdump', 112, 1),
+            ('oci11_create_temp_nclob.hexdump', 112, 2),
+            ('oci11_create_temp_blob.hexdump', 113, 0),
+        ):
+            with self.subTest(Name):
+                Captured = _capture(Name)
+                self.assertEqual(
+                    encode_oci11_create_temp(Captured[2], LobType, Csfrm), Captured
+                )
+
+    def test_the_dialect_returns_the_new_locator(self):
+        from seerdb.common.tns import encode_oci11_create_temp
+
+        (Sends, Locator) = _drive(
+            Oci11Dialect(lambda: 7).create_temp_lob(False),
+            [_capture('oci11_create_temp_reply.hexdump')],
+        )
+        self.assertEqual(Sends, [encode_oci11_create_temp(7, 112, 1)])
+        self.assertEqual(len(Locator), 40)
+        self.assertEqual(int.from_bytes(Locator[:2], 'big'), 38)
+
+    @staticmethod
+    def _binds(Message, Count):
+        # An execute's descriptors and what follows them: TTI_RXD and the
+        # values. After the SQL text come the 13 al8i4 ub4s.
+        from seerdb.common.tns import _OAC_FROM_OCI, _OCI, _oci_all8_head
+
+        (_, LengthAt, _) = _oci_all8_head(Message)
+        (_, Rest) = _OCI.read_chr(Message[LengthAt:])
+        Rest = bytes(Rest)[52:]
+        Oacs = []
+        for _ in range(Count):
+            (Oac, Rest) = _OAC_FROM_OCI(Rest, {'oci_12c': False})
+            Oacs.append(Oac)
+        return (Oacs, bytes(Rest))
+
+    @staticmethod
+    def _locators(Values, Count):
+        # The locators a TTI_RXD of LOB binds carries: each a ub4 length and
+        # the locator as a value.
+        from seerdb.common.tns import _OCI
+
+        Rest = Values[1:]
+        Out = []
+        for _ in range(Count):
+            (_, Rest) = _OCI.read_n4(Rest)
+            (Locator, Rest) = _OCI.read_value(Rest)
+            Out.append(bytes(Locator))
+        return Out
+
+    def _same_binds(self, Name, Count, Make):
+        Captured = _capture(Name)
+        (Theirs, TheirValues) = self._binds(Captured, Count)
+        Mine = encode_oci11_execute(
+            Captured[2],
+            Native11BindRequestTest._sql_of(Captured),
+            2,
+            1,
+            Make(self._locators(TheirValues, Count)),
+        )
+        (Ours, OurValues) = self._binds(Mine, Count)
+        Fields = ('data_type', 'max_length', 'charset', 'csfrm')
+        self.assertEqual(
+            [[O[F] for F in Fields] for O in Ours],
+            [[T[F] for F in Fields] for T in Theirs],
+        )
+        self.assertEqual(OurValues, TheirValues)
+
+    def test_temporary_lobs_bind_as_oci_binds_them(self):
+        from seerdb.common.datatypes import TempLob
+
+        self._same_binds(
+            'oci11_execute_lob_binds.hexdump',
+            3,
+            lambda Locators: [
+                TempLob(Locators[0][2:], False),
+                TempLob(Locators[1][2:], False, csfrm=2),
+                TempLob(Locators[2][2:], True),
+            ],
+        )
+
+    def test_a_fetched_lob_binds_as_oci_binds_it(self):
+        from seerdb.common.lob import LOB
+
+        self._same_binds(
+            'oci11_execute_lob_bind_fetched.hexdump',
+            1,
+            lambda Locators: [LOB(112, Locators[0])],
+        )
+
+    def test_a_temporary_lob_can_be_made(self):
+        from seerdb.client._conn_logic import temp_lobs_available
+
+        class _Pooled11g:
+            field_version = 6
+            _dialect = Oci11Dialect(lambda: 1)
+
+        class _Dedicated11g:
+            field_version = 6
+            _dialect = None
+
+        self.assertTrue(temp_lobs_available(_Pooled11g()))
+        self.assertFalse(temp_lobs_available(_Dedicated11g()))
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 
