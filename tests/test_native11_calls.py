@@ -719,6 +719,55 @@ class Native11LobOutTest(_At11g):
         Oci11Dialect._check_binds([Var(DB_TYPE_CLOB)], block=True)
 
 
+class Native11LongTest(_At11g):
+    """LONG columns, against sqlplus 11.2's own query of one."""
+
+    _REPLIES = (
+        'oci11_long_describe_reply.hexdump',
+        'oci11_long_row_reply.hexdump',
+        'oci11_long_null_row_reply.hexdump',
+        'oci11_long_wide_row_reply.hexdump',
+        'oci11_long_end_reply.hexdump',
+    )
+
+    def test_the_fetch_is_sqlplus_11_2s(self):
+        from seerdb.common.tns import encode_oci11_long_fetch
+
+        Captured = _capture('oci11_long_fetch.hexdump')
+        Native11BindRequestTest._same_but_the_pointer(
+            self, encode_oci11_long_fetch(Captured[2], 3, 100000), Captured
+        )
+
+    def test_the_dialect_reads_each_row_with_it(self):
+        # The execute brings the describe alone; each row then comes with the
+        # LONG fetch, the whole value asked for, until ORA-01403.
+        from seerdb.client.dialect import _LONG_WHOLE
+        from seerdb.common.tns import encode_oci11_long_fetch
+
+        Seq = iter(range(10, 99))
+        (Sends, Result) = _drive(
+            Oci11Dialect(lambda: next(Seq)).execute_query(
+                'select id, l, n from pyo_drcp_lg order by id', None, 15
+            ),
+            [_capture(Name) for Name in self._REPLIES],
+        )
+        self.assertEqual(
+            Result[4], [[1, 'abc', 10], [2, None, 20], [3, 'x' * 30000, 30]]
+        )
+        self.assertEqual(
+            Sends[1:],
+            [encode_oci11_long_fetch(S, 3, _LONG_WHOLE) for S in (11, 12, 13, 14)],
+        )
+
+    def test_any_other_fetch_is_the_plain_one(self):
+        from seerdb.common.tns import encode_oci11_fetch
+
+        self.assertEqual(
+            Oci11Dialect(lambda: 7)._encode_fetch(3, 15, 4001),
+            encode_oci11_fetch(7, 3, 15),
+        )
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 

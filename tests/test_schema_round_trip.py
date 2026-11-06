@@ -347,6 +347,9 @@ _RECHUNKED_TEXT = {
     # codec rewrites the value in 252-byte chunks, so the bytes differ while the
     # value is the same (#2293).
     ('_LONG_CELL', '_THIN'): ('long', 'content'),
+    # 11g sends a pooled session's LONG in OCI's chunks of 255 bytes, where the
+    # 9.2 codec writes 252 (#2466).
+    ('_O8I_LONG_CELL', '_O9I'): ('long', 'value'),
 }
 
 
