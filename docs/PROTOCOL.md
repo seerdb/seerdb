@@ -1005,6 +1005,18 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   as a value, its ub2 length in front, as a row's LOB cell carries it. A LOB
   Var's value and a value past 32,767 bytes into PL/SQL go through a temporary
   LOB, as on 12c+.
+- **A LONG or LONG RAW column** is read as sqlplus 11.2 reads one through the
+  pool. The query's execute asks for none of the value (`max_long` 0), and its
+  reply is the describe and the status, no rows. Each row then comes with an
+  OALL8 that carries no SQL: the cursor, the options FETCH | `0x40000`,
+  `max_long` the most of the value to read (sqlplus's `set long`; seerdb's
+  `0x7FFFFFFF`, the whole value), `al8i4[1]` the one row and `[7]` SELECT. The
+  row's LONG cell is the 9.2 form's: chunked, `fe`, 255-byte chunks and `00`,
+  then a ub2 indicator and a ub2 return code, both 0; a NULL is an empty value,
+  the indicator -1 and the return code 1405 (ORA-01405, `ff ff 7d 05`). sqlplus
+  fetches the rows after
+  the first with the plain fetch, `max_long` holding; seerdb sends the LONG
+  fetch for each, which the server answers the same way.
 - **A LOB bound OUT** sends the empty locator, a ub4 86 and 86 bytes (`00 54`
   and zeros), as CREATE_TEMP does; IN OUT, its temporary LOB's. The block's
   reply carries the new locator the same way, a ub4 length and the locator as

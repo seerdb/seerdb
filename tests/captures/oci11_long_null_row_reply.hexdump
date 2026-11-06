@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# The next row (#2466), sqlplus's plain fetch's: (2, NULL, 20), the LONG an
+# empty value, its indicator -1 and return code 1405 (`ff ff 7d 05`).
+# Captured 2026-11-06 through tools/capture_proxy.py: sqlplus 11.2 (instant
+# client 11.2, x86-64 Linux, `set long 100000`) running `select id, l, n from
+# pyo_drcp_lg order by id` on Oracle 11g XE 11.2.0.2 with SERVER=POOLED, the
+# DRCP pool started, over rows (1, 'abc', 10), (2, NULL, 20) and
+# (3, 30000 x's, 30). The TTC payload, without the packet's header, as
+# `hexdump -C` output; the offset column and the |ascii| gutter are ignored by
+# tests.replay.parse_hexdump.
+00000000  06 01 02 00 03 00 00 00  00 00 01 00 00 00 00 00  |................|
+00000010  00 00 00 00 00 00 00 00  00 00 00 00 07 c6 ff 7f  |................|
+00000020  00 00 00 00 00 00 00 00  00 00 00 00 7d 6d e0 06  |............}m..|
+00000030  79 e5 07 02 c1 03 00 ff  ff 7d 05 02 c1 15 04 01  |y........}......|
+00000040  00 00 00 1f 00 01 02 00  00 00 00 00 00 00 00 00  |................|
+00000050  03 00 00 00 03 00 00 00  00 00 66 f6 01 00 04 00  |..........f.....|
+00000060  00 00 63 28 00 00 01 00  00 00 00 00 00 00 00 20  |..c(........... |
+00000070  00 00 01 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000080  00 00 00 00 00 00 20 f6  31 0a 00 00 00 00 00 00  |...... .1.......|
+00000090  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000a0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000b0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000c0  00 00 00 00 00 00                                 |......|
+000000c6

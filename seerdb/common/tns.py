@@ -17486,6 +17486,51 @@ def encode_oci11_fetch(Seq: int, Cursor: int, Rows: int) -> bytes:
     )
 
 
+# A query with a LONG or LONG RAW column fetches each row with an OALL8 that
+# carries the most of the value to read, as sqlplus 11.2 fetches one through
+# the pool (its `set long` in max_long): no SQL, the cursor, FETCH and the bit
+# 0x40000 in the options, al8i4[1] the one row and [7] SELECT. The query's own
+# execute, which asks for none of it (max_long 0), brings no rows.
+_OCI11_LONG_FETCH_OPTIONS = TNS_EXEC_OPTION_FETCH | 0x40000
+
+
+def encode_oci11_long_fetch(Seq: int, Cursor: int, MaxLong: int) -> bytes:
+    """A pooled 11g session's fetch of the next row from ``Cursor``, its LONG
+    or LONG RAW value read up to ``MaxLong`` bytes."""
+    Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
+    try:
+        Head = _ALL8_HEAD_OCI_WIDE(
+            {
+                'seq': Seq,
+                'token_number': None,
+                'options': _OCI11_LONG_FETCH_OPTIONS,
+                'cursor': Cursor,
+                'sql_present': False,
+                'sql_length': 0,
+                'al8i4_present': True,
+                'al8i4_length': 13,
+                'al8o4': True,
+                'al8o4l': True,
+                'prefetch_size': 0,
+                'prefetch_rows': 0,
+                'max_long': MaxLong,
+                'binds_present': False,
+                'bind_count': 0,
+                'al8app': False,
+                'al8txn': True,
+                'al8txl': False,
+                'al8kv': True,
+                'al8kvl': True,
+                'defines_present': True,
+                'define_count': 0,
+            }
+        )
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
+    Al8i4 = [0, 1, 0, 0, 0, 0, 0, O8I_STMT_SELECT] + [0] * 5
+    return Head + _OCI11_EXEC_MIDDLE + b''.join(_OCI.n4(V) for V in Al8i4)
+
+
 def encode_oci11_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
     """The close of finished cursors, piggybacked ahead of the next call, as
     sqlplus 11.2 closes them."""

@@ -119,6 +119,7 @@ from seerdb.common.tns import (
     encode_oci11_fetch,
     encode_oci11_lob_read,
     encode_oci11_lobop,
+    encode_oci11_long_fetch,
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
@@ -138,8 +139,6 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_BFILE,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
-    TNS_TYPE_LONG,
-    TNS_TYPE_LONGRAW,
     TNS_TYPE_REFCURSOR,
     TTI_LOB,
     TTI_OER,
@@ -149,6 +148,8 @@ from seerdb.common.tns_consts import (
 # Oracle 8i LONG / LONG RAW type codes — a LONG changes the fetch shape (one row
 # per round trip, read the whole value) (#377).
 _O8I_LONG_TYPES = frozenset((8, 24))
+# The fetch's LONG cap that asks for a LONG / LONG RAW value whole (#377).
+_LONG_WHOLE = 0x7FFFFFFF
 
 
 class Send:
@@ -870,7 +871,7 @@ class Oall8Dialect:
         # long-size field and returns one row per fetch, so ask for the whole
         # value (#377).
         has_long = any(col.get('data_type') in _O8I_LONG_TYPES for col in columns)
-        long_size = 0x7FFFFFFF if has_long else self._long_size(columns, fetch)
+        long_size = _LONG_WHOLE if has_long else self._long_size(columns, fetch)
         row_count = 1 if has_long else (fetch or 15)
         rows: list = []
         ended = False
@@ -1508,8 +1509,6 @@ _OCI11_UNREAD_BINDS = {
 _OCI11_LOB_TYPES = frozenset({TNS_TYPE_CLOB, TNS_TYPE_BLOB})
 _OCI11_UNREAD_TYPES = {
     TNS_TYPE_BFILE: 'BFILE',
-    TNS_TYPE_LONG: 'LONG',
-    TNS_TYPE_LONGRAW: 'LONG RAW',
     TNS_TYPE_REFCURSOR: 'cursor',
     TNS_TYPE_ADT: 'object or collection',
 }
@@ -1549,8 +1548,9 @@ class Oci11Dialect(Oall8Dialect):
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT. Not yet, and
     refused before anything is sent: an array DML's RETURNING, an array DML's
-    LOB Var, BFILE, REF CURSOR and object binds, and BFILE, LONG, REF CURSOR and object columns (refused at
-    the describe)."""
+    LOB Var, BFILE, REF CURSOR and object binds, and BFILE, REF CURSOR and
+    object columns (refused at the describe). LONG and LONG RAW columns are
+    read a row a fetch, each value whole."""
 
     _wire = '11g native'
 
@@ -1728,6 +1728,12 @@ class Oci11Dialect(Oall8Dialect):
         )
 
     def _encode_fetch(self, cursor: int, count: int, long_size: int) -> bytes:
+        # A query with a LONG or LONG RAW column fetches each row with the
+        # OALL8 that says how much of the value to read; its execute brought
+        # none (encode_oci11_long_fetch, sqlplus 11.2's). Any other, the plain
+        # fetch.
+        if long_size == _LONG_WHOLE:
+            return encode_oci11_long_fetch(self._next_seq(), cursor, long_size)
         return encode_oci11_fetch(self._next_seq(), cursor, count)
 
     def _encode_dml(
