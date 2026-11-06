@@ -22,6 +22,8 @@ from seerdb.client._conn_logic import (
     _pre10_tier_name_for,
     _transaction_priority,
     dialect_lob_objects,
+    dialect_parses,
+    dialect_pings,
     dialect_temp_lobs,
     fv2_lob_payload,
     pre10_dml_applied,
@@ -2236,6 +2238,9 @@ class OracleConnect(_ConnectionLogic):
         if self._dialect is not None:
             # Whether the fetch keeps LOB objects or reads their content (#2259).
             self._dialect.keep_lobs = self.fetch_lobs
+            if ParseOnly and dialect_parses(self._dialect):
+                # Parsed in the dialect's own form (a pooled 11g session's).
+                return self._drive(self._dialect.parse(Query))
             if ParseOnly:
                 # The pre-10g dialects build their own request (TTI_ALL7 / the
                 # 8i OALL8), and both hard-wire PARSE|EXECUTE — there is no
@@ -3425,6 +3430,10 @@ class OracleConnect(_ConnectionLogic):
             self._sessionless_txn_active = False
 
     def ping(self) -> None:
+        if dialect_pings(self._dialect):
+            # A pooled 11g session's own ping (#2466).
+            self._drive(self._dialect.ping())
+            return
         if self.field_version < FIELD_VERSION_10_2:
             # Oracle 9i lacks the TTI_PING (func 147) message — it closes the
             # connection on receipt. Use a trivial round trip instead so ping
@@ -3457,6 +3466,14 @@ class OracleConnect(_ConnectionLogic):
             from_ora_code,
         )
 
+        if self._native11:
+            # A pooled 11g session: the server refuses a password change on a
+            # DRCP session (ORA-56609 to OCI 11.2's OCIPasswordChange, #2466).
+            raise NotSupportedError(
+                'changepassword is not supported on a pooled Oracle 11g '
+                'connection: the server refuses a password change on a DRCP '
+                'session (ORA-56609)'
+            )
         if self.field_version < FIELD_VERSION_10_2:
             # 9i changes a password via the O3LOGON-era exchange, not the single
             # TTI_AUTH this sends; gate it rather than break the session (#168).

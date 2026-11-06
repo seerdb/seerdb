@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 11.2's OCIPing (#2466): TTI_PING (147) and the sequence, no token.
+# Captured 2026-11-06 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8; OCIPing and
+# OCIStmtExecute, called through ctypes) on Oracle 11g XE 11.2.0.2 with
+# SERVER=POOLED, the DRCP pool started. The TTC payload, without the packet's
+# header, as `hexdump -C` output; the offset column and the |ascii| gutter are
+# ignored by tests.replay.parse_hexdump.
+00000000  03 93 06                                          |...|
+00000003

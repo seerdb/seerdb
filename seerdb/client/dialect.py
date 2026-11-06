@@ -81,6 +81,7 @@ from seerdb.common.tns import (
     decode_oci11_lob_read,
     decode_oci11_lobop,
     decode_oci11_piggybacks,
+    decode_oci11_ping,
     decode_oci11_rows,
     decode_oci11_status,
     decode_ub4,
@@ -121,6 +122,7 @@ from seerdb.common.tns import (
     encode_oci11_lob_read,
     encode_oci11_lobop,
     encode_oci11_long_fetch,
+    encode_oci11_ping,
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
@@ -141,6 +143,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
     TNS_TYPE_REFCURSOR,
+    TTI_DCB,
     TTI_LOB,
     TTI_OER,
     TTI_RPA,
@@ -237,6 +240,10 @@ CAP_WIDE_BINDS = 'wide_binds'
 # The dialect makes a temporary LOB itself (create_temp_lob), so a LOB Var's
 # value and a large PL/SQL value bind through one, as on 12c+ (#2466).
 CAP_TEMP_LOB = 'temp_lob'
+# The dialect serves cursor.parse() (parse) and connection.ping() (ping) in
+# its own form (#2466).
+CAP_PARSE = 'parse'
+CAP_PING = 'ping'
 
 
 # The cursor cache's cap, as on 10g+ (OracleConnect._cursor_cache_max).
@@ -1550,7 +1557,8 @@ class Oci11Dialect(Oall8Dialect):
     LOB Var, BFILE, a REF CURSOR bound IN or outside a block, and object binds,
     and BFILE and object columns (refused at the describe). LONG and LONG RAW
     columns are read a row a fetch, each value whole; a cursor the server opened
-    (a REF CURSOR OUT bind's, a CURSOR(...) column's) with sqlplus's fetch."""
+    (a REF CURSOR OUT bind's, a CURSOR(...) column's) with sqlplus's fetch.
+    ping() and cursor.parse() are OCI's own calls."""
 
     _wire = '11g native'
 
@@ -1592,6 +1600,8 @@ class Oci11Dialect(Oall8Dialect):
                 CAP_LOB_OBJECT,
                 CAP_WIDE_BINDS,
                 CAP_TEMP_LOB,
+                CAP_PARSE,
+                CAP_PING,
             }
         )
 
@@ -1668,8 +1678,8 @@ class Oci11Dialect(Oall8Dialect):
     def _close_frames(self, cursors: list[int]) -> bytes:
         return encode_oci11_close_cursors(self._next_seq(), cursors)
 
-    def _status(self, reply: bytes) -> dict:
-        status = decode_oci11_status(self._session_return(reply))
+    def _status(self, reply: bytes, executed: bool = True) -> dict:
+        status = decode_oci11_status(self._session_return(reply), executed)
         if self._on_call_status is not None:
             self._on_call_status(status['status'])
         return status
@@ -1922,6 +1932,54 @@ class Oci11Dialect(Oall8Dialect):
                 continue
             _raise_ora(status.get('error_code', 0), status.get('message'))
             return (value, updated)
+
+    def ping(self):
+        # A round trip that runs nothing, as OCI 11.2's OCIPing makes one
+        # through the pool: TTI_PING, answered with a bare TTI_STA.
+        yield Send(encode_oci11_ping(self._next_seq()))
+        received = yield RECV
+        if received is False:
+            raise Exception('Connection closed during an 11g ping')
+        # A first call's reply has the session return ahead of it.
+        reply = self._session_return(received[1])
+        if decode_oci11_ping(reply) is None:
+            status = self._status(reply)
+            _raise_ora(status.get('error_code', 0), status.get('message'))
+
+    def parse(self, sql: str):
+        # Parse a statement and run nothing, as OCI 11.2 parses one through the
+        # pool: a query with DESCRIBE, which brings its describe, so the cursor
+        # has its description; anything else with PARSE alone. Returns the
+        # 9-tuple a query's or a DML's execute does, with no rows.
+        stmt_type = oci11_stmt_type(sql.strip().upper())
+        query = stmt_type == O8I_STMT_SELECT
+        yield Send(
+            self._closing()
+            + encode_oci11_execute(
+                self._next_seq(), self._sql_text(sql), stmt_type, 1, ParseOnly=True
+            )
+        )
+        received = yield RECV
+        if received is False:
+            raise Exception('Connection closed during an 11g parse')
+        packet = self._session_return(received[1])
+        columns = None
+        if query and packet[:1] == bytes([TTI_DCB]):
+            (columns, packet) = yield from self._recv_describe(packet)
+        status = self._status(packet, executed=False)
+        self._finished(status.get('cursor', 0))
+        if status.get('error_code'):
+            from seerdb.common.exceptions import from_ora_code
+
+            exc = from_ora_code(status['error_code'])(
+                status.get('message') or f'ORA-{status["error_code"]:05d}',
+                code=status['error_code'],
+            )
+            exc.offset = status.get('error_pos', 0)
+            raise exc
+        if columns is None:
+            return (0, 0, 0, (None, None), [], None, None, [], None)
+        return (0, 0, 0, (0, columns), [], None, None, [], None)
 
     def create_temp_lob(self, is_blob: bool, csfrm: int = 1):
         # A temporary CLOB, NCLOB (csfrm 2) or BLOB of the session's duration,

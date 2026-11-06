@@ -858,6 +858,70 @@ class Native11RefCursorTest(_At11g):
         Oci11Dialect._check_binds([Var(DB_TYPE_CURSOR)], block=True)
 
 
+class Native11PingAndParseTest(_At11g):
+    """ping() and parse(), against an OCI 11.2 program's OCIPing and its
+    describe-only execute."""
+
+    def test_the_ping_is_oci_11_2s(self):
+        from seerdb.common.tns import decode_oci11_ping, encode_oci11_ping
+
+        Captured = _capture('oci11_ping.hexdump')
+        self.assertEqual(encode_oci11_ping(Captured[2]), Captured)
+        self.assertEqual(
+            decode_oci11_ping(_capture('oci11_ping_reply.hexdump'))['call_status'], 1
+        )
+
+    def test_the_dialect_pings(self):
+        # A first call's reply has the session return ahead of the TTI_STA.
+        Sessions = []
+        for Name in ('oci11_ping_reply.hexdump', 'oci11_ping_first_reply.hexdump'):
+            with self.subTest(Name):
+                Dialect = Oci11Dialect(lambda: 7, lambda S, N: Sessions.append(S))
+                (Sends, _) = _drive(Dialect.ping(), [_capture(Name)])
+                self.assertEqual(len(Sends), 1)
+        self.assertEqual(len(Sessions), 1)
+
+    def test_a_parsed_query_is_described_as_oci_describes_it(self):
+        # OCI's OCI_DESCRIBE_ONLY execute: PARSE | DESCRIBE | NOT_PLSQL, nothing
+        # to run; the SQL's length the one difference, which seerdb declares at
+        # three times, as sqlplus 11.2 does.
+        from seerdb.common.tns import _ALL8_HEAD_FROM_OCI_WIDE
+
+        Captured = _capture('oci11_execute_describe_only.hexdump')
+        Sql = Native11BindRequestTest._sql_of(Captured)
+        Mine = encode_oci11_execute(
+            Captured[2], Sql, O8I_STMT_SELECT, 1, ParseOnly=True
+        )
+        (Ours, _) = _ALL8_HEAD_FROM_OCI_WIDE(Mine)
+        (Theirs, _) = _ALL8_HEAD_FROM_OCI_WIDE(Captured)
+        self.assertEqual(
+            {K: V for K, V in Ours.items() if Ours[K] != Theirs[K]},
+            {'sql_length': 3 * len(Sql)},
+        )
+        self.assertEqual(Mine[-52:], Captured[-52:])  # the al8i4
+        (_, Result) = _drive(
+            Oci11Dialect(lambda: 7).parse(Sql.decode()),
+            [_capture('oci11_describe_only_reply.hexdump')],
+        )
+        self.assertEqual([C['column_name'] for C in Result[3][1]], ['A', 'B'])
+        self.assertEqual(Result[4], [])
+
+    def test_a_parsed_dml_ran_nothing(self):
+        # Its status has an INSERT's command type and no rowid behind it: read
+        # as an executed one's, the rowid that is not there ran off the end.
+        from seerdb.common.exceptions import Truncated
+
+        Reply = _capture('oci11_parse_dml_reply.hexdump')
+        with self.assertRaises(Truncated):
+            decode_oci11_status(Reply)
+        self.assertIsNone(decode_oci11_status(Reply, Executed=False)['rowid'])
+        (_, Result) = _drive(
+            Oci11Dialect(lambda: 7).parse('insert into pyo_drcp_pz values (1)'),
+            [Reply],
+        )
+        self.assertEqual(Result[3], (None, None))
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 

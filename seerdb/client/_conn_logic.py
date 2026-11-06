@@ -1097,6 +1097,22 @@ def dialect_temp_lobs(Dialect) -> 'TypeGuard[Oci11Dialect]':
     return Dialect is not None and CAP_TEMP_LOB in Dialect.capabilities()
 
 
+def dialect_parses(Dialect) -> 'TypeGuard[Oci11Dialect]':
+    """Whether a pre-10g dialect serves cursor.parse() in its own form (a
+    pooled 11g session, #2466)."""
+    from seerdb.client.dialect import CAP_PARSE
+
+    return Dialect is not None and CAP_PARSE in Dialect.capabilities()
+
+
+def dialect_pings(Dialect) -> 'TypeGuard[Oci11Dialect]':
+    """Whether a pre-10g dialect serves connection.ping() in its own form (a
+    pooled 11g session, #2466)."""
+    from seerdb.client.dialect import CAP_PING
+
+    return Dialect is not None and CAP_PING in Dialect.capabilities()
+
+
 def temp_lobs_available(Conn) -> bool:
     """Whether the connection can make a temporary LOB to bind: 12c+, or a
     dialect that makes one itself."""

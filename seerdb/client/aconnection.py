@@ -35,6 +35,8 @@ from seerdb.client._conn_logic import (
     _pre10_tier_name_for,
     _transaction_priority,
     dialect_lob_objects,
+    dialect_parses,
+    dialect_pings,
     dialect_temp_lobs,
     fv2_lob_payload,
     pre10_dml_applied,
@@ -1447,6 +1449,9 @@ class AsyncOracleConnect(_ConnectionLogic):
 
             # Whether the fetch keeps LOB objects or reads their content (#2259).
             self._dialect.keep_lobs = self.fetch_lobs
+            if ParseOnly and dialect_parses(self._dialect):
+                # Parsed in the dialect's own form (a pooled 11g session's).
+                return await self._drive(self._dialect.parse(Query))
             if ParseOnly:
                 # No parse-without-execute shape exists on these tiers -- see
                 # the sync twin.
@@ -2606,6 +2611,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             self._sessionless_txn_active = False
 
     async def ping(self) -> None:
+        if dialect_pings(self._dialect):
+            # A pooled 11g session's own ping (#2466).
+            await self._drive(self._dialect.ping())
+            return
         if self.field_version < FIELD_VERSION_10_2:
             # 9i lacks TTI_PING (func 147); use a trivial round trip (#168).
             await self.execute("SELECT 'X' FROM dual")
@@ -2626,6 +2635,13 @@ class AsyncOracleConnect(_ConnectionLogic):
         call reusing the login session key, same error behaviour."""
         from seerdb.common.exceptions import from_ora_code
 
+        if self._native11:
+            # The server refuses a password change on a DRCP session (#2466).
+            raise NotSupportedError(
+                'changepassword is not supported on a pooled Oracle 11g '
+                'connection: the server refuses a password change on a DRCP '
+                'session (ORA-56609)'
+            )
         if self.field_version < FIELD_VERSION_10_2:
             raise NotSupportedError(
                 'changepassword is not supported on Oracle 9i'

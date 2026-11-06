@@ -270,6 +270,9 @@ class _Target(NamedTuple):
     # Whether a DML's RETURNING runs as a PL/SQL block, as below 10g and on a
     # pooled 11g session, whose INTO targets take one row.
     wrapped_returning: bool = False
+    # Whether the server refuses a password change on the session: a pooled 11g
+    # one answers ORA-56609 (#2466).
+    no_password_change: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -282,6 +285,7 @@ def _target_of(conn) -> _Target:
         os.environ.get('SEERDB_TEST_MIRROR', ''),
         temp_lobs_available(conn),
         getattr(conn, '_dialect', None) is not None,
+        bool(getattr(conn, '_native11', False)),
     )
 
 
@@ -323,12 +327,16 @@ class _Need(NamedTuple):
     temp_lobs: bool = False
     # Whether it needs RETURNING over several rows, which a wrapped one lacks.
     rows_returning: bool = False
+    # Whether it changes a password, which some sessions' servers refuse.
+    password_change: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
         if self.temp_lobs and not target.temp_lobs:
             return True
         if self.rows_returning and target.wrapped_returning:
+            return True
+        if self.password_change and target.no_password_change:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -428,7 +436,12 @@ _STREAMED_LOB_BIND = _Need(
 _NATIONAL_OUT_BIND = _Need(
     'a national OUT bind is refused on fv2 (ORA-03120)', min_fv=_FV
 )
-_CHANGE_PASSWORD = _Need('changepassword is not supported on Oracle 9i', min_fv=_FV)
+_CHANGE_PASSWORD = _Need(
+    'changepassword is not supported on Oracle 9i, and a pooled 11g session '
+    'refuses it (ORA-56609)',
+    min_fv=_FV,
+    password_change=True,
+)
 _PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV)
 _ARRAY_DML = _Need('executemany (array DML) is not supported on Oracle 8i', not_8i=True)
 _FV2_EXECUTE_PATH = _Need('fv2 (9i) uses a separate execute path', min_fv=_FV)
@@ -12928,6 +12941,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             # the test just verifies no exception escapes.
             await Conn.ping()
 
+    @_requires(_CHANGE_PASSWORD)
     async def test_changepassword_roundtrip(self):
         # Async mirror of ChangePasswordIntegration (#21): change the test
         # user's password and always restore it on the original session.
@@ -12952,6 +12966,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         Ok = await seerdb.connect_async(**dict(Kw, password=_PASSWORD))
         await Ok.close()
 
+    @_requires(_CHANGE_PASSWORD)
     async def test_changepassword_wrong_old_raises(self):
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             with self.assertRaises(seerdb.DatabaseError):
