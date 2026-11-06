@@ -1005,6 +1005,23 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   as a value, its ub2 length in front, as a row's LOB cell carries it. A LOB
   Var's value and a value past 32,767 bytes into PL/SQL go through a temporary
   LOB, as on 12c+.
+- **A REF CURSOR OUT bind** is bound as sqlplus 11.2 binds a `variable
+  refcursor`: a REF CURSOR (102) of one byte, the value a cursor id of 0 in
+  four bytes. The block's reply carries the cursor it opened, in the cell a
+  `CURSOR(...)` column's row carries too (`_OCI11_CURSOR_CELL`):
+  - a lead byte, `0x4c`, as the Mirror's `_REFCURSOR_OUT` has it;
+  - the describe's body as a query's `TTI_DCB` carries it: the row size, the
+    column count, the columns and the trailer;
+  - the cursor's id; an OUT bind's then its indicator.
+
+  A cursor the block left unopened, or closed, has no columns, and then the
+  byte OCI's trailer opens with (`date_lead`) is not sent either: it belongs
+  to the column array, as 9.2's describe has it (`columns_lead`). seerdb reads
+  it as None (`_OCI11_UNOPENED_CURSOR_CELL`). The cursor's rows come with an
+  OALL8 with no SQL: the cursor, FETCH in the options, `max_long` the widest
+  column's buffer and one, `al8i4[1]` the rows (sqlplus's 15) and `[7]`
+  SELECT (`encode_oci11_cursor_fetch`). sqlplus fetches a query's own rows
+  after the first with the plain fetch, and a nested cursor's with this.
 - **A LONG or LONG RAW column** is read as sqlplus 11.2 reads one through the
   pool. The query's execute asks for none of the value (`max_long` 0), and its
   reply is the describe and the status, no rows. Each row then comes with an

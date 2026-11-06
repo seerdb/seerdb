@@ -768,6 +768,96 @@ class Native11LongTest(_At11g):
         )
 
 
+class Native11RefCursorTest(_At11g):
+    """REF CURSOR OUT binds and CURSOR(...) columns, against sqlplus 11.2's."""
+
+    _BLOCK = (
+        "BEGIN open :rc for select level n, 'r' || level s from dual connect by "
+        'level <= 3; END;'
+    )
+
+    def test_the_bind_is_sqlplus_11_2s(self):
+        from seerdb import DB_TYPE_CURSOR
+        from seerdb.common.datatypes import Var
+
+        Captured = _capture('oci11_execute_refcursor_out.hexdump')
+        Mine = encode_oci11_execute(
+            Captured[2],
+            Native11BindRequestTest._sql_of(Captured),
+            8,
+            1,
+            [Var(DB_TYPE_CURSOR)],
+        )
+        (Theirs, TheirValues) = Native11TempLobTest._binds(Captured, 1)
+        (Ours, OurValues) = Native11TempLobTest._binds(Mine, 1)
+        Fields = ('data_type', 'max_length', 'charset', 'csfrm')
+        self.assertEqual([Ours[0][F] for F in Fields], [Theirs[0][F] for F in Fields])
+        self.assertEqual(OurValues, TheirValues)
+
+    def test_the_fetch_is_sqlplus_11_2s(self):
+        from seerdb.common.tns import encode_oci11_cursor_fetch
+
+        Captured = _capture('oci11_cursor_fetch.hexdump')
+        Native11BindRequestTest._same_but_the_pointer(
+            self, encode_oci11_cursor_fetch(Captured[2], 3, 15, 42), Captured
+        )
+
+    def test_the_dialect_reads_the_cursor_it_opened(self):
+        # The block's OUT value is the opened cursor; its rows come with the
+        # cursor's fetch, as wide as its widest column, then it is closed.
+        from seerdb import DB_TYPE_CURSOR
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import encode_oci11_cursor_fetch
+
+        Seq = iter(range(10, 99))
+        Dialect = Oci11Dialect(lambda: next(Seq))
+        (Sends, Result) = _drive(
+            Dialect.execute_block(self._BLOCK, [Var(DB_TYPE_CURSOR)]),
+            [
+                _capture('oci11_block_refcursor_reply.hexdump'),
+                _capture('oci11_cursor_rows_reply.hexdump'),
+            ],
+        )
+        (Marker,) = Result[4][0]['out_values']
+        self.assertEqual(Marker['cursor_id'], 3)
+        self.assertEqual([C['column_name'] for C in Marker['row_format']], ['N', 'S'])
+        self.assertEqual(Marker['rows'], [[1, 'r1'], [2, 'r2'], [3, 'r3']])
+        self.assertEqual(Sends[1], encode_oci11_cursor_fetch(11, 3, 15, 42))
+        self.assertIn(3, Dialect._to_close)  # with the block's own
+
+    def test_an_unopened_cursor_is_none(self):
+        from seerdb.common.tns import decode_oci11_block
+
+        (_, Values, Rest, _) = decode_oci11_block(
+            _capture('oci11_block_refcursor_unopened_reply.hexdump'),
+            1,
+            Cursors=frozenset({0}),
+        )
+        self.assertEqual(Values, [None])
+        self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+
+    def test_a_cursor_column_carries_its_cursor(self):
+        from seerdb.common.tns import decode_oci11_rows
+
+        (Columns, Rest) = decode_oci11_describe(
+            _capture('oci11_cursor_column_reply.hexdump')
+        )
+        (Rows, _, _) = decode_oci11_rows(Rest, Columns, None)
+        ((K, (Cursor, Nested)),) = Rows
+        self.assertEqual((K, Cursor), ('x', 1))
+        self.assertEqual([C['column_name'] for C in Nested], ['M'])
+
+    def test_what_is_still_refused(self):
+        from seerdb import DB_TYPE_CURSOR
+        from seerdb.common.datatypes import RefCursorBind, Var
+
+        with self.assertRaises(NotSupportedError):
+            Oci11Dialect._check_binds([Var(DB_TYPE_CURSOR)])  # outside a block
+        with self.assertRaises(NotSupportedError):
+            Oci11Dialect._check_binds([RefCursorBind()], block=True)  # IN
+        Oci11Dialect._check_binds([Var(DB_TYPE_CURSOR)], block=True)
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 
@@ -938,8 +1028,8 @@ class Native11DialectTest(_At11g):
         from seerdb.common.datatypes import Var
 
         for Call in (
-            lambda: self.dialect.execute_block(
-                'begin open :1 for select 1 from dual; end;', [Var(DB_TYPE_CURSOR)]
+            lambda: self.dialect.execute_query(
+                'select :1 from dual', [Var(DB_TYPE_CURSOR)], 15
             ),
             lambda: self.dialect.execute_query(
                 'select :1 from dual', [Var(DB_TYPE_CLOB)], 15

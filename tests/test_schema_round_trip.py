@@ -55,6 +55,8 @@ ONE_WAY = {
     '_O9I_DESCRIBE',
     '_O9I_CURSOR_CELL',
     '_O9I_REFCURSOR_OUT',
+    # 11g's cursor cell carries the same columns (#2466).
+    '_OCI11_CURSOR_CELL',
     # The describe body it carries per result is pre-encoded, a raw field.
     '_IMPLICIT_RESULTS',
     # 9i's SQL length counts characters, not the bytes its text takes (#2275).
