@@ -509,9 +509,9 @@ columns, so far (with `lastrowid`, `callproc` /
 statement cache), and CLOB, NCLOB and BLOB columns, read whole or as LOB
 objects, with their size, write, trim, open and close, temporary LOBs
 (`createlob()`) and LOB binds IN, OUT and IN OUT, LONG and LONG RAW
-columns, REF CURSOR OUT binds and `CURSOR()` columns, `ping()` and
-`cursor.parse()`; an array DML with RETURNING, BFILE, a cursor bound IN,
-object binds and columns, and application contexts are refused with
+columns, REF CURSOR OUT binds and `CURSOR()` columns, BFILE columns, `ping()`
+and `cursor.parse()`; an array DML with RETURNING, a BFILE or a cursor bound
+IN, object binds and columns, and application contexts are refused with
 `NotSupportedError` until they are built (#2466), and `changepassword()`
 because the server refuses a password change on a DRCP session (ORA-56609). A
 descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is

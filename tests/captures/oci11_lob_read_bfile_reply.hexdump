@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# 11g's reply to OCILobRead of the opened BFILE (#2466): TTI_LOB and the 21
+# bytes, then TTI_RPA, the locator and the amount, then the status.
+# Captured 2026-11-06 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8;
+# OCILobFileExists, OCILobFileOpen and the like, called through ctypes) on
+# Oracle 11g XE 11.2.0.2 with SERVER=POOLED, the DRCP pool started, reading
+# BFILENAME('SEERDB_BFILE_DIR', 'pyoracle_bfile_test.txt'), 21 bytes. The TTC
+# payload, without the packet's header, as `hexdump -C` output; the offset
+# column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  0e fe 15 68 65 6c 6c 6f  20 62 66 69 6c 65 20 66  |...hello bfile f|
+00000010  72 6f 6d 20 64 69 73 6b  00 08 00 39 00 01 08 08  |rom disk...9....|
+00000020  00 00 00 01 00 01 00 00  00 00 00 10 53 45 45 52  |............SEER|
+00000030  44 42 5f 42 46 49 4c 45  5f 44 49 52 00 17 70 79  |DB_BFILE_DIR..py|
+00000040  6f 72 61 63 6c 65 5f 62  66 69 6c 65 5f 74 65 73  |oracle_bfile_tes|
+00000050  74 2e 74 78 74 15 00 00  00 00 00 00 00 04 01 00  |t.txt...........|
+00000060  00 00 19 00 01 01 00 00  00 00 00 00 00 00 00 00  |................|
+00000070  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000080  00 00 00 00 00 00 00 00  00 00 00 00 00 00 19 00  |................|
+00000090  00 01 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000a0  00 00 00 00 00 20 f6 31  0a 00 00 00 00 00 00 00  |..... .1........|
+000000b0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000c0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000d0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000e0  00 00 00 00 00                                    |.....|
+000000e5
