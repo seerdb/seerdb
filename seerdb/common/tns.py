@@ -17832,7 +17832,7 @@ _OCI11_RPA: wire_schema.Schema = (
 _OCI11_RPA_FROM_OCI = wire_schema.compile_decoder(_OCI11_RPA, _OCI)
 _OCI11_RPA_CURSOR = 2
 # A LOB's calls through 11g's pool (#2466), as sqlplus 11.2 reads a LOB and
-# OCI 11.2 makes the rest: _LOBOPS_READ in OCI's wide form, the locator as
+# OCI 11.2 makes the rest (a BFILE's too, OCI11_LOB_CALLS): _LOBOPS_READ in OCI's wide form, the locator as
 # fetched (its ub2 length and the body). What each call carries:
 # - READ: the source offset, sqlplus's dest offset of 4, and the amount;
 # - GET_LENGTH and GET_CHUNK_SIZE: an amount of 0, for the reply to fill;
@@ -17876,6 +17876,13 @@ OCI11_LOB_CALLS = {
     TNS_LOB_OP_WRITE: {'amount_present': True},
     TNS_LOB_OP_IS_OPEN: {'null_lob_present': True},
     TNS_LOB_OP_CLOSE: {},
+    # A BFILE's, as OCI 11.2's OCILobFile* make them: FILE_EXISTS and
+    # FILE_ISOPEN a flag byte back, FILE_OPEN its mode (11, read-only) in the
+    # amount and the opened locator back, FILE_CLOSE neither.
+    TNS_LOB_OP_FILE_EXISTS: {'null_lob_present': True},
+    TNS_LOB_OP_FILE_ISOPEN: {'null_lob_present': True},
+    TNS_LOB_OP_FILE_OPEN: {'amount_present': True},
+    TNS_LOB_OP_FILE_CLOSE: {},
 }
 
 

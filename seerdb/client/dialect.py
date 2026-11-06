@@ -154,6 +154,9 @@ from seerdb.common.tns_consts import (
 _O8I_LONG_TYPES = frozenset((8, 24))
 # The fetch's LONG cap that asks for a LONG / LONG RAW value whole (#377).
 _LONG_WHOLE = 0x7FFFFFFF
+# FILE_OPEN's mode for a BFILE opened to read (OCI_FILE_READONLY, as the native
+# clients send it).
+_BFILE_READ_ONLY = 0x0B
 
 
 class Send:
@@ -1349,7 +1352,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # file is always closed.
         yield Send(
             encode_9i_oall8_lobop(
-                self._next_seq(), locator, TNS_LOB_OP_FILE_OPEN, 0, 0x0B
+                self._next_seq(), locator, TNS_LOB_OP_FILE_OPEN, 0, _BFILE_READ_ONLY
             )
         )
         resp = yield RECV
@@ -1515,7 +1518,6 @@ _OCI11_UNREAD_BINDS = {
 }
 _OCI11_LOB_TYPES = frozenset({TNS_TYPE_CLOB, TNS_TYPE_BLOB})
 _OCI11_UNREAD_TYPES = {
-    TNS_TYPE_BFILE: 'BFILE',
     TNS_TYPE_ADT: 'object or collection',
 }
 
@@ -1555,7 +1557,8 @@ class Oci11Dialect(Oall8Dialect):
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT. Not yet, and
     refused before anything is sent: an array DML's RETURNING, an array DML's
     LOB Var, BFILE, a REF CURSOR bound IN or outside a block, and object binds,
-    and BFILE and object columns (refused at the describe). LONG and LONG RAW
+    and object columns (refused at the describe). A BFILE column is read with
+    OCI's file calls. LONG and LONG RAW
     columns are read a row a fetch, each value whole; a cursor the server opened
     (a REF CURSOR OUT bind's, a CURSOR(...) column's) with sqlplus's fetch.
     ping() and cursor.parse() are OCI's own calls."""
@@ -2080,5 +2083,23 @@ class Oci11Dialect(Oall8Dialect):
             return buf
 
     def bfile_read(self, locator: bytes):
-        raise _oci11_unsupported('reading a BFILE')
-        yield  # unreachable -- makes this a generator, as the protocol has it
+        # A BFILE's content, read as OCI 11.2 reads one through the pool, each
+        # a native TTI_LOBOPS: FILE_OPEN (read-only) answers with the opened
+        # locator the rest use, then GET_LENGTH and READ, and FILE_CLOSE in a
+        # finally, so an opened file is always closed. A file or directory
+        # that is not there fails the open (ORA-22285).
+        (_, opened) = yield from self.lob_operation(
+            locator, TNS_LOB_OP_FILE_OPEN, _BFILE_READ_ONLY
+        )
+        opened_locator = (
+            locator if not opened else len(opened).to_bytes(2, 'big') + opened
+        )
+        try:
+            (length, _) = yield from self.lob_operation(
+                opened_locator, TNS_LOB_OP_GET_LENGTH
+            )
+            if not length:
+                return b''
+            return (yield from self.lob_read(opened_locator, 1, length))
+        finally:
+            yield from self.lob_operation(opened_locator, TNS_LOB_OP_FILE_CLOSE)

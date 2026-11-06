@@ -1005,6 +1005,15 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   as a value, its ub2 length in front, as a row's LOB cell carries it. A LOB
   Var's value and a value past 32,767 bytes into PL/SQL go through a temporary
   LOB, as on 12c+.
+- **A BFILE column** comes in the row as the 9.2 form's LOB cell, its locator
+  (59 bytes for `BFILENAME('SEERDB_BFILE_DIR', 'pyoracle_bfile_test.txt')`).
+  Its calls are `_LOBOPS_READ`'s fields too, as OCI 11.2's `OCILobFile*` make
+  them: FILE_EXISTS (`0x800`) and FILE_ISOPEN (`0x400`) set the null-LOB
+  pointer and are answered with a flag byte; FILE_OPEN (`0x100`) sends its mode
+  (11, read-only) in the amount and is answered with the opened locator, which
+  is not the one sent, and which GET_LENGTH, READ and FILE_CLOSE (`0x200`, no
+  pointer) take. A directory or file that is not there fails the call with a
+  break, then ORA-22285.
 - **`ping()`** is OCI 11.2's OCIPing: `TTI_PING` (147) and the sequence, no
   token (`encode_oci11_ping`), answered with a bare `TTI_STA`, call status 1
   and the session's sequence; a first call's reply has the session return

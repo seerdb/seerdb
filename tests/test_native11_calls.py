@@ -520,11 +520,15 @@ class Native11LobCallTest(_At11g):
         self.assertEqual(Raised.exception.code, 22920)
 
     def test_an_unmeasured_call_is_refused(self):
-        from seerdb.common.tns_consts import TNS_LOB_OP_FILE_OPEN
+        # A call on an array of locators, which no capture holds.
+        from seerdb.common.tns_consts import TNS_LOB_OP_ARRAY, TNS_LOB_OP_GET_LENGTH
 
         Dialect = Oci11Dialect(lambda: 1)
         with self.assertRaises(NotSupportedError):
-            _drive(Dialect.lob_operation(b'x', TNS_LOB_OP_FILE_OPEN), [])
+            _drive(
+                Dialect.lob_operation(b'x', TNS_LOB_OP_ARRAY | TNS_LOB_OP_GET_LENGTH),
+                [],
+            )
 
     def test_a_write_counts_utf_16_code_units(self):
         # A character past the BMP is two of them; counted as one, the pooled
@@ -922,6 +926,99 @@ class Native11PingAndParseTest(_At11g):
         self.assertEqual(Result[3], (None, None))
 
 
+class Native11BfileTest(_At11g):
+    """BFILE columns and their calls, against an OCI 11.2 program's own."""
+
+    @staticmethod
+    def _bfile():
+        # The BFILE the captured query returned, as the dialect reads its row.
+        from seerdb.common.tns import decode_oci11_rows
+
+        (Columns, Rest) = decode_oci11_describe(
+            _capture('oci11_bfile_query_reply.hexdump')
+        )
+        ((Lob,),) = decode_oci11_rows(Rest, Columns, None)[0]
+        return Lob
+
+    def test_the_row_carries_the_locator(self):
+        Lob = self._bfile()
+        self.assertEqual((Lob.data_type, len(Lob.raw)), (114, 59))
+
+    def test_the_calls_are_oci_11_2s(self):
+        from seerdb.client.dialect import _BFILE_READ_ONLY
+        from seerdb.common.tns import encode_oci11_lobop
+        from seerdb.common.tns_consts import (
+            TNS_LOB_OP_FILE_CLOSE,
+            TNS_LOB_OP_FILE_EXISTS,
+            TNS_LOB_OP_FILE_OPEN,
+        )
+
+        for Name, Operation, Amount in (
+            ('oci11_lobop_file_exists.hexdump', TNS_LOB_OP_FILE_EXISTS, 0),
+            ('oci11_lobop_file_open.hexdump', TNS_LOB_OP_FILE_OPEN, _BFILE_READ_ONLY),
+            ('oci11_lobop_file_close.hexdump', TNS_LOB_OP_FILE_CLOSE, 0),
+        ):
+            with self.subTest(Name):
+                Captured = _capture(Name)
+                self.assertEqual(
+                    encode_oci11_lobop(
+                        Captured[2],
+                        Native11LobCallTest._locator(Captured),
+                        Operation,
+                        0,
+                        Amount,
+                    ),
+                    Captured,
+                )
+
+    def test_the_dialect_reads_the_file(self):
+        # FILE_OPEN, then GET_LENGTH and READ on the locator it opened, then
+        # FILE_CLOSE on it too.
+        from seerdb.common.tns import encode_oci11_lobop
+        from seerdb.common.tns_consts import (
+            TNS_LOB_OP_FILE_CLOSE,
+            TNS_LOB_OP_FILE_OPEN,
+            TNS_LOB_OP_GET_LENGTH,
+        )
+
+        Locator = self._bfile().raw
+        Seq = iter(range(10, 99))
+        (Sends, Content) = _drive(
+            Oci11Dialect(lambda: next(Seq)).bfile_read(Locator),
+            [
+                _capture(Name)
+                for Name in (
+                    'oci11_lobop_file_open_reply.hexdump',
+                    'oci11_lobop_file_length_reply.hexdump',
+                    'oci11_lob_read_bfile_reply.hexdump',
+                    'oci11_lobop_file_close_reply.hexdump',
+                )
+            ],
+        )
+        self.assertEqual(Content, b'hello bfile from disk')
+        self.assertEqual(
+            Sends[0], encode_oci11_lobop(10, Locator, TNS_LOB_OP_FILE_OPEN, 0, 11)
+        )
+        Opened = Native11LobCallTest._locator(Sends[1])
+        self.assertNotEqual(Opened, Locator)
+        self.assertEqual(
+            Sends[1], encode_oci11_lobop(11, Opened, TNS_LOB_OP_GET_LENGTH)
+        )
+        self.assertEqual(
+            Sends[3], encode_oci11_lobop(13, Opened, TNS_LOB_OP_FILE_CLOSE)
+        )
+
+    def test_exists_is_a_flag(self):
+        from seerdb.common.tns import decode_oci11_lobop
+        from seerdb.common.tns_consts import TNS_LOB_OP_FILE_EXISTS
+
+        (Value, _, Rest) = decode_oci11_lobop(
+            _capture('oci11_lobop_file_exists_reply.hexdump'), TNS_LOB_OP_FILE_EXISTS
+        )
+        self.assertEqual(Value, 1)
+        self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 
@@ -1098,7 +1195,6 @@ class Native11DialectTest(_At11g):
             lambda: self.dialect.execute_query(
                 'select :1 from dual', [Var(DB_TYPE_CLOB)], 15
             ),
-            lambda: self.dialect.bfile_read(b''),
         ):
             with self.assertRaises(NotSupportedError):
                 _drive(Call(), [])
