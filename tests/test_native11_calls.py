@@ -283,6 +283,82 @@ class Native11ArrayDmlTest(_At11g):
         self.assertEqual(Result[9], 1)  # at row 1
 
 
+class Native11LobTest(_At11g):
+    """CLOB and BLOB columns: their locators in the rows, their content read."""
+
+    def _query(self):
+        # The describe (no rows with the execute), then the fetch's rows.
+        from seerdb.common.tns import decode_oci11_rows
+
+        (Columns, _) = decode_oci11_describe(
+            _capture('oci11_lob_describe_reply.hexdump')
+        )
+        (Rows, Terminal, _) = decode_oci11_rows(
+            _capture('oci11_lob_fetch_reply.hexdump'), Columns, None
+        )
+        return (Columns, Rows, Terminal)
+
+    def test_the_rows_carry_locators(self):
+        from seerdb.common.lob import LOB
+
+        (Columns, Rows, Terminal) = self._query()
+        self.assertEqual([C['column_name'] for C in Columns], ['ID', 'C', 'B'])
+        self.assertEqual(Rows[0][0], 1)
+        self.assertIsInstance(Rows[0][1], LOB)
+        self.assertEqual(len(Rows[0][1].raw), 122)
+        self.assertEqual(len(Rows), 1)  # the next fetch brings (2, NULL, NULL)
+
+    def test_the_read_is_sqlplus_11_2s(self):
+        from seerdb.common.tns import encode_oci11_lob_read
+
+        (_, Rows, _) = self._query()
+        Captured = _capture('oci11_lob_read.hexdump')
+        self.assertEqual(
+            encode_oci11_lob_read(Captured[2], Rows[0][1].raw, 1, 100000), Captured
+        )
+
+    def test_the_read_replies(self):
+        from seerdb.common.tns import decode_oci11_lob_read
+
+        (_, Rows, _) = self._query()
+        for Name, Locator, Content in (
+            (
+                'oci11_lob_read_clob_reply.hexdump',
+                Rows[0][1].raw,
+                'hello clob'.encode('utf-16-be'),
+            ),
+            (
+                'oci11_lob_read_blob_reply.hexdump',
+                Rows[0][2].raw,
+                bytes.fromhex('deadbeef'),
+            ),
+        ):
+            with self.subTest(Name):
+                (Got, Rest) = decode_oci11_lob_read(_capture(Name), len(Locator))
+                self.assertEqual(Got, Content)
+                self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+
+    def test_the_dialect_reads_a_clob_as_utf_16(self):
+        from seerdb.common.types import decode_fv2_lob
+
+        (Columns, Rows, _) = self._query()
+        Seq = iter(range(10, 99))
+        Dialect = Oci11Dialect(lambda: next(Seq))
+        (_, Content) = _drive(
+            Dialect.lob_read(Rows[0][1].raw),
+            [_capture('oci11_lob_read_clob_reply.hexdump')],
+        )
+        self.assertEqual(
+            decode_fv2_lob(112, Content, Dialect._clob_charset(Columns[1])),
+            'hello clob',
+        )
+
+    def test_the_other_lob_calls_are_refused(self):
+        Dialect = Oci11Dialect(lambda: 1)
+        with self.assertRaises(NotSupportedError):
+            _drive(Dialect.lob_operation(b'x', 1), [])
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 
