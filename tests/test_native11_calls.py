@@ -121,6 +121,116 @@ class Native11RequestTest(_At11g):
         self.assertEqual(options(OCI11_STMT_ROLLBACK), 0x21)
 
 
+class Native11BindRequestTest(_At11g):
+    """Executes carrying binds, against sqlplus 11.2's."""
+
+    @staticmethod
+    def _sql_of(Captured):
+        # The captured execute's own SQL text, as sqlplus sent it.
+        from seerdb.common.tns import _OCI, _oci_all8_head
+
+        (_, LengthAt, _) = _oci_all8_head(Captured)
+        return bytes(_OCI.read_chr(Captured[LengthAt:])[0])
+
+    def _same_but_the_pointer(self, Mine, Captured):
+        self.assertEqual(len(Mine), len(Captured))
+        Pointer = _LEAKED_POINTER
+        self.assertEqual(Mine[: Pointer.start], Captured[: Pointer.start])
+        self.assertEqual(Mine[Pointer.stop :], Captured[Pointer.stop :])
+
+    def test_a_block_without_binds(self):
+        Captured = _capture('oci11_execute_block.hexdump')
+        Mine = encode_oci11_execute(Captured[2], self._sql_of(Captured), 8, 1)
+        self._same_but_the_pointer(Mine, Captured)
+
+    def test_a_block_with_an_out_bind(self):
+        from seerdb import DB_TYPE_NUMBER
+        from seerdb.common.datatypes import Var
+
+        Captured = _capture('oci11_execute_block_out_bind.hexdump')
+        Mine = encode_oci11_execute(
+            Captured[2], self._sql_of(Captured), 8, 1, [Var(DB_TYPE_NUMBER, 22)]
+        )
+        self._same_but_the_pointer(Mine, Captured)
+
+    def test_a_character_var_is_declared_at_three_bytes_a_character(self):
+        # As sqlplus 11.2 declares a VARCHAR2(20) variable: 60 bytes, the
+        # session's charset (873) and form 1.
+        from seerdb import DB_TYPE_VARCHAR
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _OAC_FROM_OCI, _encode_oci11_bind_oac
+
+        (Oac, _) = _OAC_FROM_OCI(
+            _encode_oci11_bind_oac(Var(DB_TYPE_VARCHAR, 20)), {'oci_12c': False}
+        )
+        self.assertEqual(
+            (Oac['flags'], Oac['max_length'], Oac['charset'], Oac['csfrm']),
+            (3, 60, 873, 1),
+        )
+
+
+class Native11BlockReplyTest(_At11g):
+    """A block's reply: its prompt, its OUT values, its status."""
+
+    def test_the_out_values_and_their_directions(self):
+        from seerdb.common.tns import decode_oci11_block
+
+        (Directions, Values, Rest, Session) = decode_oci11_block(
+            _capture('oci11_block_out_reply.hexdump'), 3
+        )
+        self.assertEqual(Directions, [0x30, 0x30, 0x10])
+        self.assertEqual(
+            Values, [b'\xc1U', b'HELLO', bytes.fromhex('bff8000000000000')]
+        )
+        self.assertIsNone(Session)
+        self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+
+    def test_a_returning_that_matched_no_row_is_null(self):
+        from seerdb.common.tns import decode_oci11_block
+
+        (Directions, Values, Rest, _) = decode_oci11_block(
+            _capture('oci11_block_null_returning_reply.hexdump'), 3
+        )
+        self.assertEqual(Directions, [0x20, 0x20, 0x10])
+        self.assertEqual(Values, [None])
+        self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+
+    def test_a_first_call_has_its_session_return_after_the_prompt(self):
+        from seerdb.common.tns import decode_oci11_block
+
+        (Directions, Values, Rest, Session) = decode_oci11_block(
+            _capture('oci11_block_first_reply.hexdump'), 4
+        )
+        self.assertEqual(Directions, [0x10, 0x30, 0x10, 0x10])
+        self.assertEqual(Values[:2], [b'\xc1+', b'HELLO'])
+        self.assertIsNone(Values[3])  # a NULL, its indicator 0xFFFF
+        self.assertIsNotNone(Session)
+        self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+
+
+class Native11BindTypeTest(unittest.TestCase):
+    """A bind's descriptor says the type its value goes as."""
+
+    def _type(self, Value):
+        from seerdb.common.tns import _OAC_FROM_OCI, _encode_oci11_bind_oac
+
+        (Oac, _) = _OAC_FROM_OCI(_encode_oci11_bind_oac(Value), {'oci_12c': False})
+        return (Oac['data_type'], Oac['max_length'])
+
+    def test_binary_floats_and_non_finite_floats(self):
+        from seerdb import BinaryDouble, BinaryFloat
+
+        self.assertEqual(self._type(BinaryDouble(1234.5678)), (101, 8))
+        self.assertEqual(self._type(BinaryFloat(1.5)), (100, 4))
+        self.assertEqual(self._type(float('inf')), (101, 8))
+        self.assertEqual(self._type(1.5), (2, 22))  # a finite float, a NUMBER
+
+    def test_a_bc_date(self):
+        from seerdb.common.datatypes import BcDate
+
+        self.assertEqual(self._type(BcDate(-44, 3, 15, 12, 30, 45)), (12, 7))
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 
@@ -287,14 +397,47 @@ class Native11DialectTest(_At11g):
         self.assertEqual(Raised.exception.offset, 14)
 
     def test_what_is_not_built_is_refused_before_it_is_sent(self):
+        from seerdb import DB_TYPE_CLOB, DB_TYPE_CURSOR
+        from seerdb.common.datatypes import Var
+
         for Call in (
-            lambda: self.dialect.execute_query('select :1 from dual', [1], 15),
-            lambda: self.dialect.execute_dml('insert into t values (:1)', [1]),
-            lambda: self.dialect.execute_block('begin null; end;'),
+            lambda: self.dialect.execute_block(
+                'begin open :1 for select 1 from dual; end;', [Var(DB_TYPE_CURSOR)]
+            ),
+            lambda: self.dialect.execute_query(
+                'select :1 from dual', [Var(DB_TYPE_CLOB)], 15
+            ),
             lambda: self.dialect.bfile_read(b''),
         ):
             with self.assertRaises(NotSupportedError):
                 _drive(Call(), [])
+
+    def test_a_block_reads_its_out_values(self):
+        from seerdb import DB_TYPE_BINARY_DOUBLE, DB_TYPE_NUMBER, DB_TYPE_VARCHAR
+        from seerdb.common.datatypes import Var
+
+        Binds = [Var(DB_TYPE_NUMBER, 22), Var(DB_TYPE_VARCHAR, 20)]
+        Binds[0].setvalue(0, 42)
+        Binds[1].setvalue(0, 'hello')
+        Binds.append(Var(DB_TYPE_BINARY_DOUBLE, 8))
+        (_, Result) = _drive(
+            self.dialect.execute_block(
+                'begin :n := :n * 2; :s := upper(:s); :d := 1.5; end;', Binds
+            ),
+            [_capture('oci11_block_out_reply.hexdump')],
+        )
+        Record = Result[4][0]
+        self.assertEqual(Record['directions'], [0x30, 0x30, 0x10])
+        self.assertEqual(Record['out_positions'], [0, 1, 2])
+        self.assertEqual(Record['out_values'][1], b'HELLO')
+
+    def test_a_first_block_tells_the_pooled_session(self):
+        (_, Result) = _drive(
+            self.dialect.execute_block('begin :n := 42; end;', [None] * 4),
+            [_capture('oci11_block_first_reply.hexdump')],
+        )
+        self.assertEqual(len(self.sessions), 1)
+        self.assertIsNone(Result[4][0]['out_values'][3])  # the NULL
 
     def test_it_serves_queries_dml_and_its_own_transactions(self):
         from seerdb.client.dialect import (
@@ -309,7 +452,8 @@ class Native11DialectTest(_At11g):
         self.assertEqual(
             Caps & {CAP_QUERY, CAP_DML, CAP_OWN_TXN}, {CAP_QUERY, CAP_DML, CAP_OWN_TXN}
         )
-        self.assertFalse(Caps & {CAP_BLOCK, CAP_ARRAY_DML})
+        self.assertIn(CAP_BLOCK, Caps)
+        self.assertNotIn(CAP_ARRAY_DML, Caps)
 
 
 if __name__ == '__main__':

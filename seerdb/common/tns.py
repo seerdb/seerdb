@@ -14870,6 +14870,49 @@ def _encode_9i_oall8(
 
 
 def _encode_9i_bind_oac(Value: object) -> bytes:
+    (DType, Size, Flag) = _native_bind_type(Value)
+    # A national bind declares AL16UTF16 and charset form 2 -- where a native
+    # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and its
+    # value rides as UTF-16BE (#798; through the database charset it lost every
+    # character Latin-1 lacks, as on the compact path, #174).
+    National = _is_national_var(Value)
+    return _native_bind_oac(
+        DType,
+        Flag,
+        Size,
+        AL16UTF16_CHARSET if National else 0,
+        2 if National else 0,
+    )
+
+
+def _native_bind_oac(
+    DType: int, Flag: int, Size: int, Charset: int, Csfrm: int
+) -> bytes:
+    # A bind descriptor at OCI's widths before 12c (_OAC), as a native client
+    # writes one.
+    return _OAC_OCI(
+        {
+            'lead': 1,
+            'data_type': DType,
+            'oci_plain': DType != TNS_TYPE_ADT,
+            'flags': Flag,
+            'precision': 0,
+            'scale': 0,
+            'max_length': Size,
+            'max_array': 0,
+            'oci_12c': False,
+            'cont_flags': 0,
+            'toid_length': 0,
+            'version': 0,
+            'charset': Charset,
+            'csfrm': Csfrm,
+            'max_chars': 0,
+            'oaccolid': 0,
+        }
+    )
+
+
+def _native_bind_type(Value: object) -> tuple[int, int, int]:
     # The 9i OALL8 bind descriptor, 41 bytes: OCI's (_OAC), as a native 9.2
     # client writes it (#798) -- a lead byte, the TNS type, the flag (0x05 for an
     # OUT-capable Var, 0x01 otherwise), the max size (a ub4, then a zero max
@@ -14898,8 +14941,24 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
         DType, Size, Flag = TNS_TYPE_VARCHAR, _MAX_UROWID_LENGTH, 0x05
     elif isinstance(Value, Var):
         DType, Size, Flag = Value.dbtype.tns_type, max(Value.size or 22, 1), 0x05
+    elif isinstance(Value, BinaryFloat):
+        # The value goes out as a BINARY_FLOAT (encode_token_rxd), so the
+        # descriptor says so; declared a NUMBER, 11g read it back as NaN.
+        DType, Size = TNS_TYPE_BFLOAT, 4
+    elif isinstance(Value, BinaryDouble) or (
+        isinstance(Value, float) and not math.isfinite(Value)
+    ):
+        # A BinaryDouble, and an inf / nan a NUMBER cannot hold, go as a
+        # BINARY_DOUBLE, as on the thin path.
+        DType, Size = TNS_TYPE_BDOUBLE, 8
     elif isinstance(Value, (bool, int, float, Decimal)):
         DType, Size = 2, 22
+    elif isinstance(Value, BcDate):
+        # A BC date goes out as a DATE, or a TIMESTAMP with its fraction.
+        if _is_wide_datetime(Value):
+            DType, Size = TNS_TYPE_TIMESTAMP, 11
+        else:
+            DType, Size = TNS_TYPE_DATE, 7
     elif isinstance(Value, (bytes, bytearray)):
         DType, Size = TNS_TYPE_RAW, max(len(Value), 1)
     elif isinstance(Value, datetime.datetime):
@@ -14917,31 +14976,41 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
         DType, Size = TNS_TYPE_INTERVALYM, 5
     else:
         DType, Size = TNS_TYPE_VARCHAR, max(len(str(Value).encode('utf-8')), 1)
-    # A national bind declares AL16UTF16 and charset form 2 -- where a native
-    # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and its
-    # value rides as UTF-16BE (#798; through the database charset it lost every
-    # character Latin-1 lacks, as on the compact path, #174).
-    National = _is_national_var(Value)
-    return _OAC_OCI(
-        {
-            'lead': 1,
-            'data_type': DType,
-            'oci_plain': DType != TNS_TYPE_ADT,
-            'flags': Flag,
-            'precision': 0,
-            'scale': 0,
-            'max_length': Size,
-            'max_array': 0,
-            'oci_12c': False,
-            'cont_flags': 0,
-            'toid_length': 0,
-            'version': 0,
-            'charset': AL16UTF16_CHARSET if National else 0,
-            'csfrm': 2 if National else 0,
-            'max_chars': 0,
-            'oaccolid': 0,
-        }
-    )
+    return (DType, Size, Flag)
+
+
+# The bind types a character set describes (sqlplus 11.2 declares their charset
+# and form, #2466).
+_CHARACTER_BIND_TYPES = frozenset(
+    (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_LONG, TNS_TYPE_CLOB)
+)
+# sqlplus 11.2's bind flags, whatever the direction (#2466).
+_OCI11_BIND_FLAGS = 0x03
+
+
+def _encode_oci11_bind_oac(Value: object) -> bytes:
+    # A pooled 11g session's bind descriptor (#2466): the native 9.2 form's type
+    # and size, with sqlplus 11.2's flags, and a character bind's charset and
+    # form declared -- the session's, or AL16UTF16 and form 2 for a national one.
+    from seerdb.common.datatypes import Var
+
+    (DType, Size, _) = _native_bind_type(Value)
+    if (
+        isinstance(Value, Var)
+        and DType in _CHARACTER_BIND_TYPES
+        and not _is_national_var(Value)
+    ):
+        # A character Var's buffer at three bytes a character, as sqlplus 11.2
+        # declares one: an OUT value in the session's UTF-8 fills more bytes
+        # than characters.
+        Size = 3 * Size
+    if _is_national_var(Value):
+        (Charset, Csfrm) = (AL16UTF16_CHARSET, 2)
+    elif DType in _CHARACTER_BIND_TYPES:
+        (Charset, Csfrm) = (AL32UTF8_CHARSET, 1)
+    else:
+        (Charset, Csfrm) = (0, 0)
+    return _native_bind_oac(DType, _OCI11_BIND_FLAGS, Size, Charset, Csfrm)
 
 
 def _is_national_var(Value: object) -> bool:
@@ -17229,14 +17298,33 @@ def oci11_stmt_type(Head: str) -> int:
     return _OCI11_STMT_TYPES.get(Word, o8i_stmt_type(Head))
 
 
-def encode_oci11_execute(Seq: int, Sql: bytes, StmtType: int, Rows: int = 1) -> bytes:
-    """A pooled 11g session's execute (#2466): parse and execute ``Sql``, and for
-    a query fetch up to ``Rows`` rows with it."""
+# A PL/SQL block's options: thin's PLSQL_BIND (0x400, with binds) and the
+# block bit (0x40000), and no NOT_PLSQL, as sqlplus 11.2 sends them (and a
+# native 9.2 client, _encode_9i_oall8).
+_OCI11_EXEC_BLOCK_BINDS = 0x400
+_OCI11_EXEC_BLOCK = 0x40000
+
+
+def encode_oci11_execute(
+    Seq: int, Sql: bytes, StmtType: int, Rows: int = 1, Binds: list | None = None
+) -> bytes:
+    """A pooled 11g session's execute (#2466): parse and execute ``Sql`` with
+    ``Binds``, and for a query fetch up to ``Rows`` rows with it. The binds are
+    the native 9.2 form's values (_encode_9i_bind_value) behind sqlplus 11.2's
+    descriptors (_encode_oci11_bind_oac): the descriptors, then TTI_RXD and the
+    values, a value wider than 4000 bytes
+    behind the others outside a block; an unset OUT Var sends the placeholder."""
+    Binds = Binds or []
     Query = StmtType == O8I_STMT_SELECT
+    Block = StmtType in (O8I_STMT_BEGIN, O8I_STMT_DECLARE)
     Options = TNS_EXEC_OPTION_PARSE | TNS_EXEC_OPTION_EXECUTE
     if Query:
         Options |= TNS_EXEC_OPTION_FETCH
-    if StmtType not in (OCI11_STMT_COMMIT, OCI11_STMT_ROLLBACK):
+    if Binds:
+        Options |= TNS_EXEC_OPTION_BIND
+    if Block:
+        Options |= _OCI11_EXEC_BLOCK | (_OCI11_EXEC_BLOCK_BINDS if Binds else 0)
+    elif StmtType not in (OCI11_STMT_COMMIT, OCI11_STMT_ROLLBACK):
         Options |= _OCI11_EXEC_NOT_PLSQL
     Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
     try:
@@ -17255,8 +17343,8 @@ def encode_oci11_execute(Seq: int, Sql: bytes, StmtType: int, Rows: int = 1) -> 
                 'prefetch_size': 0,
                 'prefetch_rows': Rows,
                 'max_long': 0,
-                'binds_present': False,
-                'bind_count': 0,
+                'binds_present': bool(Binds),
+                'bind_count': len(Binds),
                 'al8app': False,
                 'al8txn': True,
                 'al8txl': False,
@@ -17267,12 +17355,24 @@ def encode_oci11_execute(Seq: int, Sql: bytes, StmtType: int, Rows: int = 1) -> 
             }
         )
         Al8i4 = [1, 0 if Query else 1, 0, 0, 0, 0, 0, StmtType, 0, 0, 0, 0, 0]
-        return (
+        Message = (
             Head
             + _OCI11_EXEC_MIDDLE
             + _OCI.chr(Sql)
             + b''.join(_OCI.n4(V) for V in Al8i4)
         )
+        if Binds:
+            Oacs = [_encode_oci11_bind_oac(V) for V in _oac_rep_row([Binds])]
+            Message += b''.join(Oacs)
+            Long = [
+                not Block and int.from_bytes(Oac[5:9], 'little') > 4000 for Oac in Oacs
+            ]
+            Message += bytes([TTI_RXD])
+            for Value in [V for V, L in zip(Binds, Long) if not L] + [
+                V for V, L in zip(Binds, Long) if L
+            ]:
+                Message += _encode_9i_bind_value(Value)
+        return Message
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
 
@@ -17462,6 +17562,45 @@ _OCI11_RPA: wire_schema.Schema = (
 _OCI11_RPA_FROM_OCI = wire_schema.compile_decoder(_OCI11_RPA, _OCI)
 _OCI11_RPA_CURSOR = 2
 _OCI11_OER_GIVEN = {'oci_12c': False, 'oci_pre12c': True}
+
+
+def decode_oci11_block(
+    Data: bytes, NumBinds: int
+) -> tuple[list[int] | None, list, bytes, dict | None]:
+    """A pooled 11g block's reply (#2466): its bind prompt (TTI_IOV, the native
+    9.2 form's: a 50-byte head, then one direction mask a bind, 0x10 OUT, 0x20
+    IN, 0x30 IN OUT), the OUT and IN OUT values behind TTI_RXD -- each a value
+    (a NULL an empty one, or 0xFF) and a ub2 indicator or return code (0;
+    0xFFFF, or 3105 behind 0xFF, for a NULL), where 9.2 sends four bytes
+    -- and the status. A session's first call has its session return between
+    the prompt and the values. Returns (directions, the OUT values' bytes in
+    bind order, None for a NULL, the status, the session return or None). A
+    block that fails answers with the status alone: no directions. A reply cut
+    short raises Truncated, for the reader to read on."""
+    Directions = decode_9i_oall8_bind_directions(Data, NumBinds)
+    if Directions is None:
+        return (None, [], Data, None)
+    (Session, Rest) = decode_oci11_piggybacks(Data[50 + NumBinds :])
+    Values: list = []
+    try:
+        if Rest[:1] == bytes([TTI_RXD]):
+            Rest = Rest[1:]
+            for Mask in Directions:
+                if not Mask & FV2_BIND_OUT:
+                    continue
+                if Rest[:1] == b'\xff':
+                    # A NULL as a row cell's (a RETURNING that matched no row:
+                    # `ff 21 0c`), where a NULL assigned is an empty value.
+                    (Value, Rest) = (b'', Rest[1:])
+                else:
+                    (Value, Rest) = _OCI.read_value(Rest)
+                (_, Rest) = _OCI.read_n2(Rest)  # its indicator or return code
+                Values.append(bytes(Value) if Value else None)
+    except IndexError as Exc:
+        raise Truncated(f'11g block reply: {Exc}') from Exc
+    return (Directions, Values, Rest, Session)
+
+
 # Behind the OER of an INSERT, UPDATE or DELETE that succeeded (told by the
 # command it ran, as a SELECT's status can look like a DML's) comes the touched
 # row's rowid, as the native 9.2 form's UROWID cell frames one (a ub2 size and
