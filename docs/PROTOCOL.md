@@ -1005,6 +1005,22 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   as a value, its ub2 length in front, as a row's LOB cell carries it. A LOB
   Var's value and a value past 32,767 bytes into PL/SQL go through a temporary
   LOB, as on 12c+.
+- **`ping()`** is OCI 11.2's OCIPing: `TTI_PING` (147) and the sequence, no
+  token (`encode_oci11_ping`), answered with a bare `TTI_STA`, call status 1
+  and the session's sequence; a first call's reply has the session return
+  ahead of it.
+- **`cursor.parse()`** is OCI 11.2's parse-only execute: PARSE alone in the
+  options, `al8i4[1]` 0, nothing run. For a query, as OCI_DESCRIBE_ONLY, also
+  DESCRIBE and NOT_PLSQL (`0x28001`), and the reply is the describe and the
+  status, so the cursor has its description. A DML that was only parsed has
+  its command type in the OER and no rowid behind it, where an executed one
+  has the touched row's. A statement that fails to parse is answered as a
+  failed execute is, with its error's offset.
+- **A password change is refused by the server on a DRCP session.** OCI
+  11.2's `OCIPasswordChange` (TTI_AUTH) through the pool is answered with
+  ORA-56609 (*Usage not supported with DRCP*), with a right old password or a
+  wrong one, and the password is not changed. seerdb refuses
+  `changepassword()` there before sending it, naming that error.
 - **A REF CURSOR OUT bind** is bound as sqlplus 11.2 binds a `variable
   refcursor`: a REF CURSOR (102) of one byte, the value a cursor id of 0 in
   four bytes. The block's reply carries the cursor it opened, in the cell a

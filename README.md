@@ -328,7 +328,7 @@ exercise.
 | **Transactions** — commit, rollback, autocommit, ping | ✅ |
 | **Array DML** — `executemany`, `getbatcherrors`, `getarraydmlrowcounts` (12.1+) | ✅ |
 | **Result handling** — large-result `TTI_FETCH` drain, server-side scrollable cursors (`scroll()`, with a client-buffered fallback), `rowfactory`, `lastrowid` | ✅ |
-| **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+) | ✅ |
+| **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+, and a pooled 11g session) | ✅ |
 | **Arrow / DataFrame fetch** — `cursor.fetch_df_all` / `fetch_df_batches` (pyarrow `Table` / record batches) | ✅ |
 | **SODA** — document store over `DBMS_SODA`: collections, documents, query-by-example (with streaming), insert / read / upsert / update / delete / bulk, indexing + data guide (18c+) | ✅ |
 | **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, `is_healthy()` with no round trip, `transaction_in_progress` (10g+), `max_identifier_length` and `instance_name` from the login reply, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects; `instance_name` (a parameter, the Easy Connect `/service/instance` form, or `INSTANCE_NAME`), `expire_time` (TCP keepalive), `dsn` as an Easy Connect string, a connect descriptor (with address failover) or a `tnsnames.ora` alias, IPv6, TCPS through an HTTPS proxy; `ws://` / `wss://` to a Mirror's WebSocket listener (a seerdb extension, the `ws` extra) | ✅ |
@@ -509,11 +509,11 @@ columns, so far (with `lastrowid`, `callproc` /
 statement cache), and CLOB, NCLOB and BLOB columns, read whole or as LOB
 objects, with their size, write, trim, open and close, temporary LOBs
 (`createlob()`) and LOB binds IN, OUT and IN OUT, LONG and LONG RAW
-columns, and REF CURSOR OUT binds and `CURSOR()` columns; an array DML with
-RETURNING, BFILE, a cursor bound IN, and object binds and columns,
-application
-contexts, `ping()` and `changepassword()` are refused with `NotSupportedError`
-until they are built (#2466). A
+columns, REF CURSOR OUT binds and `CURSOR()` columns, `ping()` and
+`cursor.parse()`; an array DML with RETURNING, BFILE, a cursor bound IN,
+object binds and columns, and application contexts are refused with
+`NotSupportedError` until they are built (#2466), and `changepassword()`
+because the server refuses a password change on a DRCP session (ORA-56609). A
 descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is
 refused with `NotSupportedError` for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`
 (`cclass`), `pool_purity` (`new` / `self`), `transport_connect_timeout`

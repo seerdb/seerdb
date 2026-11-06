@@ -323,6 +323,7 @@ from seerdb.common.tns_consts import (
     TTI_OCCA,
     TTI_OER,
     TTI_PFN,
+    TTI_PING,
     TTI_PRO,
     TTI_RPA,
     TTI_RXD,
@@ -17424,13 +17425,19 @@ def encode_oci11_execute(
     Binds: list | None = None,
     Batch: list | None = None,
     BatchErrors: bool = False,
+    ParseOnly: bool = False,
 ) -> bytes:
     """A pooled 11g session's execute (#2466): parse and execute ``Sql`` with
     ``Binds``, and for a query fetch up to ``Rows`` rows with it. The binds are
     the native 9.2 form's values (_encode_9i_bind_value) behind sqlplus 11.2's
     descriptors (_encode_oci11_bind_oac): the descriptors, then TTI_RXD and the
     values, a value wider than 4000 bytes
-    behind the others outside a block; an unset OUT Var sends the placeholder."""
+    behind the others outside a block; an unset OUT Var sends the placeholder.
+
+    ``ParseOnly`` parses ``Sql`` and runs nothing, as OCI 11.2's
+    OCI_PARSE_ONLY and OCI_DESCRIBE_ONLY executes do: PARSE alone in the
+    options, and for a query DESCRIBE and NOT_PLSQL too, which brings its
+    describe; al8i4[1] 0."""
     Binds = Binds or []
     # An executemany's rows: each its own TTI_RXD and values behind the one set
     # of descriptors, as the native 9.2 form sends them (_encode_9i_oall8),
@@ -17441,9 +17448,15 @@ def encode_oci11_execute(
     Options = TNS_EXEC_OPTION_PARSE | TNS_EXEC_OPTION_EXECUTE
     if Query:
         Options |= TNS_EXEC_OPTION_FETCH
-    if Binds:
+    if ParseOnly:
+        Options = TNS_EXEC_OPTION_PARSE
+        if Query:
+            Options |= _EXEC_OPTION_DESCRIBE | _OCI11_EXEC_NOT_PLSQL
+    elif Binds:
         Options |= TNS_EXEC_OPTION_BIND
-    if Block:
+    if ParseOnly:
+        pass
+    elif Block:
         Options |= _OCI11_EXEC_BLOCK | (_OCI11_EXEC_BLOCK_BINDS if Binds else 0)
     elif StmtType not in (OCI11_STMT_COMMIT, OCI11_STMT_ROLLBACK):
         Options |= _OCI11_EXEC_NOT_PLSQL
@@ -17477,7 +17490,7 @@ def encode_oci11_execute(
                 'define_count': 0,
             }
         )
-        Al8i4 = [1, 0 if Query else len(BindRows), 0, 0, 0, 0, 0, StmtType]
+        Al8i4 = [1, 0 if Query or ParseOnly else len(BindRows), 0, 0, 0, 0, 0, StmtType]
         Al8i4 += [0] * 5
         Message = (
             Head
@@ -17567,6 +17580,31 @@ def _oci11_fetch_all8(
         _ENCODE_FIELD_VERSION.reset(Token)
     Al8i4 = [0, Rows, 0, 0, 0, 0, 0, O8I_STMT_SELECT] + [0] * 5
     return Head + _OCI11_EXEC_MIDDLE + b''.join(_OCI.n4(V) for V in Al8i4)
+
+
+# A ping, as OCI 11.2's OCIPing makes it through the pool (#2466): TTI_PING
+# (147), the sequence, and no token; answered with a bare TTI_STA (call status
+# 1 and the session's sequence), or an error's status.
+_OCI11_PING: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_PING])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+)
+_OCI11_PING_OCI = wire_schema.compile_encoder(_OCI11_PING, _OCI)
+_STA_FROM_OCI = wire_schema.compile_decoder(_STA, _OCI)
+
+
+def encode_oci11_ping(Seq: int) -> bytes:
+    """A pooled 11g session's ping."""
+    return _OCI11_PING_OCI({'seq': Seq, 'token_number': None})
+
+
+def decode_oci11_ping(Data: bytes) -> dict | None:
+    """A ping's reply: the TTI_STA's call status and sequence, or None for one
+    that is not, an error's status, for the caller to read."""
+    if Data[:1] != bytes([TTI_STA]):
+        return None
+    return _STA_FROM_OCI(Data)[0]
 
 
 def encode_oci11_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
@@ -18084,16 +18122,17 @@ def decode_oci11_block(
 _OCI11_DML_COMMANDS = frozenset({2, 6, 7, 189})  # INSERT, UPDATE, DELETE, MERGE
 
 
-def decode_oci11_status(Data: bytes) -> dict:
+def decode_oci11_status(Data: bytes, Executed: bool = True) -> dict:
     """The status ending an 11g native reply: the return parameters
     (_OCI11_RPA) an execute's carries, the OER, a DML's trailer, and the error's
     text, with piggybacks ahead of each. Returns the OER's fields with ``cursor``
     (the statement's cursor, measured where _OCI_OER says ``category``),
     ``message``, ``keywords`` (the settings an ALTER SESSION changed) and
     ``rowid`` (the row a DML touched) and ``batch_errors`` (an array DML's
-    failed rows, as {offset, code, message}). A status
-    cut short raises Truncated, for the reader to read on; anything else in its
-    place raises DataError, not a wait for bytes that will not come."""
+    failed rows, as {offset, code, message}). A DML that was only parsed
+    (``Executed`` false) touched no row and has no rowid behind its OER. A
+    status cut short raises Truncated, for the reader to read on; anything else
+    in its place raises DataError, not a wait for bytes that will not come."""
     (_, Rest) = decode_oci11_piggybacks(Data)
     try:
         Keywords: list = []
@@ -18107,7 +18146,11 @@ def decode_oci11_status(Data: bytes) -> dict:
             raise DataError(f'11g native status: token {Rest[0]} where the OER is')
         (Oer, Rest) = _OCI_OER_FROM_OCI(Rest, _OCI11_OER_GIVEN)
         Rowid = None
-        if Oer['command_type'] in _OCI11_DML_COMMANDS and not Oer['error_code']:
+        if (
+            Executed
+            and Oer['command_type'] in _OCI11_DML_COMMANDS
+            and not Oer['error_code']
+        ):
             from seerdb.common.types import urowid_to_string
 
             (Cell, Rest) = _O9I_UROWID_CELL_FROM_O9I(Rest)

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# 11g's reply to a pooled session's ping as its first call (#2466): the
+# server's piggybacks, the session return among them, then the TTI_STA.
+# Captured 2026-11-06 through tools/capture_proxy.py: seerdb's pooled session on
+# Oracle 11g XE 11.2.0.2, the DRCP pool started. The TTC payload, without the
+# packet's header, as `hexdump -C` output; the offset column and the |ascii|
+# gutter are ignored by tests.replay.parse_hexdump.
+00000000  17 02 05 00 05 34 38 35  30 33 17 04 01 00 14 00  |.....48503......|
+00000010  00 00 00 02 00 00 00 1c  00 00 00 c3 06 09 01 00  |................|
+00000020  00 00 04 00                                       |....|
+00000024
