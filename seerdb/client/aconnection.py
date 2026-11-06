@@ -1903,11 +1903,14 @@ class AsyncOracleConnect(_ConnectionLogic):
         `offset` / `amount` select a slice (#964)."""
         if dialect_lob_objects(self._dialect):
             # 9i reads through its own LOBOPS form (#2259); see the sync twin.
-            from seerdb.common.types import decode_fv2_lob, fv2_lob_charset
+            from seerdb.client.dialect import lob_object_charset
+            from seerdb.common.types import decode_fv2_lob
 
             Content = await self._drive(self._dialect.lob_read(Locator, offset, amount))
             return decode_fv2_lob(
-                DataType, cast(bytes, Content), fv2_lob_charset(charset)
+                DataType,
+                cast(bytes, Content),
+                lob_object_charset(self._dialect, charset),
             )
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 

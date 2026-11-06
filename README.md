@@ -505,8 +505,10 @@ OCI's native form, which seerdb speaks for a pooled 11g connection. There it
 runs queries, DML, DDL, `commit` and `rollback` and PL/SQL blocks, with
 scalar IN, OUT and IN OUT binds, so far (with `lastrowid`, `callproc` /
 `callfunc`, array DML with batch errors and `transaction_in_progress`, and no
-statement cache); an array DML with RETURNING, LOB, BFILE, cursor and object
-binds and columns, LONG columns, application
+statement cache), and CLOB, NCLOB and BLOB columns, read whole or as LOB
+objects; an array DML with RETURNING, a LOB object's other calls (size, write,
+trim, open and close), LOB binds, BFILE, cursor and object binds and columns,
+LONG columns, application
 contexts, `ping()` and `changepassword()` are refused with `NotSupportedError`
 until they are built (#2466). A
 descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is

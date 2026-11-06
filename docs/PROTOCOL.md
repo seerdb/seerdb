@@ -1018,6 +1018,16 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   DELETE or MERGE that succeeded comes the touched row's rowid as the 9.2 form's
   UROWID cell (a ub2 size and the bytes): 13 bytes for a heap table's, a logical
   rowid for an index-organized table's.
+- **CLOB and BLOB columns:** the execute's reply is the describe and the status
+  alone; the fetch brings the rows, each LOB cell `_LOB_CELL` (a ub4 locator
+  size, the locator as a value, the content's start inline in it; a NULL the
+  zero size). The content is read with `TTI_LOBOPS` READ in OCI's wide form
+  (`_LOBOPS_READ`: the locator, source offset 1, sqlplus's dest offset 4, the
+  amount); the reply is `TTI_LOB` and the content as a value (none for an empty
+  LOB), then `TTI_RPA`, the locator again and a ub8 amount, then the status. A
+  CLOB's text comes as UTF-16, an NCLOB's too. sqlplus frees a temporary LOB
+  after reading it (`FREE_TEMP`, `0x111`); seerdb leaves that to the session's
+  end for now.
 - **The statement's cursor** is in the OER at offset 18 (a ub2), where the
   Mirror writes a category that sqlplus does not read, and in the RPA. The next
   close names it.

@@ -17596,6 +17596,66 @@ _OCI11_RPA: wire_schema.Schema = (
 )
 _OCI11_RPA_FROM_OCI = wire_schema.compile_decoder(_OCI11_RPA, _OCI)
 _OCI11_RPA_CURSOR = 2
+# A LOB's content, read with TTI_LOBOPS READ as sqlplus 11.2 reads it through
+# 11g's pool (#2466): _LOBOPS_READ in OCI's wide form, the locator, the source
+# offset, sqlplus's dest offset of 4, and the amount. The reply is TTI_LOB and
+# the content as a value (chunked past 252 bytes; none for an empty LOB), then
+# TTI_RPA, the locator again, the amount read (a ub8), and the status.
+_LOBOPS_READ_OCI_WIDE = wire_schema.compile_encoder(_LOBOPS_READ, _OCI_WIDE)
+_OCI11_LOB_READ_DEST_OFFSET = 4
+
+
+def encode_oci11_lob_read(Seq: int, Locator: bytes, Offset: int, Amount: int) -> bytes:
+    """Read ``Amount`` (characters for a CLOB, bytes for a BLOB) of a LOB from
+    ``Offset`` (1-based), in the native form."""
+    return _LOBOPS_READ_OCI_WIDE(
+        {
+            'seq': Seq,
+            'token_number': None,
+            'source_present': True,
+            'source_length': len(Locator),
+            'dest_present': False,
+            'dest_length': 0,
+            'short_source_offset': 0,
+            'short_dest_offset': 0,
+            'charset_present': False,
+            'short_amount_present': False,
+            'null_lob_present': False,
+            'operation': TNS_LOB_OP_READ,
+            'scn_present': False,
+            'scn_length': 0,
+            'source_offset': Offset,
+            'dest_offset': _OCI11_LOB_READ_DEST_OFFSET,
+            'amount_present': True,
+            'array_slot_1': False,
+            'array_length_1': 0,
+            'array_slot_2': False,
+            'array_length_2': 0,
+            'array_slot_3': False,
+            'array_length_3': 0,
+            'locator': Locator,
+            'amount': Amount,
+        }
+    )
+
+
+def decode_oci11_lob_read(Data: bytes, LocatorLength: int) -> tuple[bytes, bytes]:
+    """A native LOB read's reply: (the content, the status behind it). A reply
+    cut short raises Truncated, for the reader to read on."""
+    Content = b''
+    Rest = Data
+    try:
+        if Rest[:1] == bytes([TTI_LOB]):
+            (Value, Rest) = _OCI.read_value(Rest[1:])
+            Content = bytes(Value)
+        if Rest[:1] == bytes([TTI_RPA]):
+            _oci_fixed(Rest, 1 + LocatorLength + 8, 'LOB read reply')
+            Rest = Rest[1 + LocatorLength + 8 :]
+    except IndexError as Exc:
+        raise Truncated(f'11g LOB read: {Exc}') from Exc
+    return (Content, Rest)
+
+
 _OCI11_OER_GIVEN = {'oci_12c': False, 'oci_pre12c': True}
 
 

@@ -74,6 +74,7 @@ from seerdb.common.tns import (
     decode_o8i_bfile_getlen,
     decode_oci11_block,
     decode_oci11_describe,
+    decode_oci11_lob_read,
     decode_oci11_piggybacks,
     decode_oci11_rows,
     decode_oci11_status,
@@ -110,6 +111,7 @@ from seerdb.common.tns import (
     encode_oci11_close_cursors,
     encode_oci11_execute,
     encode_oci11_fetch,
+    encode_oci11_lob_read,
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
@@ -1478,18 +1480,33 @@ class Fv2Oall8Dialect(Oall8Dialect):
         return (0, 0, 0, (None, None), [], None, None, [], None)
 
 
-# The column types a pooled 11g session reads so far (#2466): their cells are
-# the scalar values the native 9i row decoder reads. LOB, LONG, REF CURSOR and
-# object columns come back in forms not measured against 11g yet.
+# The column and bind types a pooled 11g session does not read yet (#2466):
+# they come back in forms not measured against 11g. CLOB and BLOB columns are
+# read (their locators, then the content); as binds they are not yet.
 _OCI11_UNREAD_TYPES = {
-    TNS_TYPE_BLOB: 'BLOB',
-    TNS_TYPE_CLOB: 'CLOB or NCLOB',
     TNS_TYPE_BFILE: 'BFILE',
     TNS_TYPE_LONG: 'LONG',
     TNS_TYPE_LONGRAW: 'LONG RAW',
     TNS_TYPE_REFCURSOR: 'cursor',
     TNS_TYPE_ADT: 'object or collection',
 }
+
+
+_OCI11_UNREAD_BINDS = {
+    **_OCI11_UNREAD_TYPES,
+    TNS_TYPE_BLOB: 'BLOB',
+    TNS_TYPE_CLOB: 'CLOB or NCLOB',
+}
+
+
+def lob_object_charset(dialect: object, charset: int | None) -> int:
+    """The charset a dialect's LOB object reads a CLOB's text in: UTF-16 on a
+    pooled 11g session (#2466), the 9i session's otherwise (#2383)."""
+    from seerdb.common.types import fv2_lob_charset
+
+    if isinstance(dialect, Oci11Dialect):
+        return dialect._clob_charset({'charset': charset})
+    return fv2_lob_charset(charset)
 
 
 def _oci11_unsupported(what: str):
@@ -1543,7 +1560,9 @@ class Oci11Dialect(Oall8Dialect):
         return rest
 
     def capabilities(self) -> frozenset[str]:
-        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN, CAP_ARRAY_DML})
+        return frozenset(
+            {CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN, CAP_ARRAY_DML, CAP_LOB_OBJECT}
+        )
 
     @staticmethod
     def _check_binds(bind: list | None) -> None:
@@ -1552,8 +1571,8 @@ class Oci11Dialect(Oall8Dialect):
         from seerdb.common.datatypes import Var
 
         for value in bind or []:
-            if isinstance(value, Var) and value.dbtype.tns_type in _OCI11_UNREAD_TYPES:
-                name = _OCI11_UNREAD_TYPES[value.dbtype.tns_type]
+            if isinstance(value, Var) and value.dbtype.tns_type in _OCI11_UNREAD_BINDS:
+                name = _OCI11_UNREAD_BINDS[value.dbtype.tns_type]
                 raise _oci11_unsupported(f'a {name} bind')
 
     # --- the 11g hooks for the shared call sequences in Oall8Dialect
@@ -1714,6 +1733,63 @@ class Oci11Dialect(Oall8Dialect):
             offset,
             status.get('warn_flags', 0),
         )
+
+    # --- LOBs
+
+    def _clob_charset(self, column: dict) -> int:
+        # 11g sends a CLOB's text as UTF-16 to a native client, as it does to
+        # the converted form (measured through the pool, #2466).
+        from seerdb.common.tns_consts import AL16UTF16_CHARSET
+
+        return AL16UTF16_CHARSET
+
+    def resolve_lobs(self, rows: list, columns: list):
+        # CLOB / BLOB content in place of the locators, unless the connection
+        # keeps LOB objects (fetch_lobs=False); this session serves no LOB
+        # object calls yet, so those are refused when made.
+        if self.keep_lobs:
+            return
+        yield from super().resolve_lobs(rows, columns)
+
+    def lob_read(self, locator: bytes, offset: int = 1, amount: int | None = None):
+        # A LOB's content from `offset` (1-based): one native TTI_LOBOPS READ
+        # asking for all of it, its reply read on across packets.
+        from seerdb.common.exceptions import Truncated
+
+        yield Send(
+            encode_oci11_lob_read(
+                self._next_seq(),
+                locator,
+                offset,
+                (1 << 30) if amount is None else amount,
+            )
+        )
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during an 11g LOB read')
+            buf += received[1]
+            try:
+                (content, rest) = decode_oci11_lob_read(buf, len(locator))
+                status = self._status(rest)
+            except Truncated:
+                continue
+            _raise_ora(status.get('error_code', 0), status.get('message'))
+            return content
+
+    def lob_operation(
+        self,
+        locator: bytes,
+        operation: int,
+        amount: int = 0,
+        offset: int = 0,
+        data: bytes | None = None,
+    ):
+        # A LOB object's other calls -- its size, a write, a trim, open and
+        # close -- are not measured in the native form yet; reading is.
+        raise _oci11_unsupported('this LOB call')
+        yield  # unreachable -- makes this a generator, as the protocol has it
 
     def execute_block(self, sql: str, bind: list | None = None):
         # An anonymous PL/SQL block, its binds inline. The reply opens with the
