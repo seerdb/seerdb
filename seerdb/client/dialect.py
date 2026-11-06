@@ -1506,10 +1506,12 @@ class Fv2Oall8Dialect(Oall8Dialect):
         return (0, 0, 0, (None, None), [], None, None, [], None)
 
 
-# The column and bind types a pooled 11g session does not read yet (#2466):
-# they come back in forms not measured against 11g. CLOB and BLOB columns are
-# read (their locators, then the content); as binds they are not yet. A LONG
-# or LONG RAW bind is: OCI sends it as a VARCHAR or a RAW of its size.
+# The bind types a pooled 11g session does not send as themselves (#2466). A
+# CLOB or BLOB Var goes by a locator (_check_binds); a BFILE goes by none yet;
+# an object or collection bind needs the 12c+ bind form, refused below 12.1 on
+# every tier (_check_object_bind_support). Every column type is read: an
+# object's or a collection's cell is the native 9.2 form's image, decoded
+# against the type the dictionary describes, as on the native 9i dialect.
 _OCI11_UNREAD_BINDS = {
     TNS_TYPE_BFILE: 'BFILE',
     TNS_TYPE_ADT: 'object or collection',
@@ -1517,9 +1519,6 @@ _OCI11_UNREAD_BINDS = {
     TNS_TYPE_CLOB: 'CLOB or NCLOB',
 }
 _OCI11_LOB_TYPES = frozenset({TNS_TYPE_CLOB, TNS_TYPE_BLOB})
-_OCI11_UNREAD_TYPES = {
-    TNS_TYPE_ADT: 'object or collection',
-}
 
 
 def lob_object_charset(dialect: object, charset: int | None) -> int:
@@ -1556,9 +1555,10 @@ class Oci11Dialect(Oall8Dialect):
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT. Not yet, and
     refused before anything is sent: an array DML's RETURNING, an array DML's
-    LOB Var, BFILE, a REF CURSOR bound IN or outside a block, and object binds,
-    and object columns (refused at the describe). A BFILE column is read with
-    OCI's file calls. LONG and LONG RAW
+    LOB Var, BFILE, and a REF CURSOR bound IN or outside a block; an object
+    bind, as on every tier below 12.1. Every column type is read: a BFILE's
+    with OCI's file calls, an object's or a collection's as the native 9.2
+    form's image. LONG and LONG RAW
     columns are read a row a fetch, each value whole; a cursor the server opened
     (a REF CURSOR OUT bind's, a CURSOR(...) column's) with sqlplus's fetch.
     ping() and cursor.parse() are OCI's own calls."""
@@ -1739,12 +1739,7 @@ class Oci11Dialect(Oall8Dialect):
             )
             exc.offset = self._error_offset(reply)
             raise exc
-        (columns, rest) = decode_oci11_describe(reply)
-        for col in columns:
-            if col['data_type'] in _OCI11_UNREAD_TYPES:
-                name = _OCI11_UNREAD_TYPES[col['data_type']]
-                raise _oci11_unsupported(f'a {name} column')
-        return (columns, rest)
+        return decode_oci11_describe(reply)
 
     def _decode_rows(self, buf: bytes, columns: list, last_row: list | None) -> tuple:
         return decode_oci11_rows(buf, columns, last_row)
