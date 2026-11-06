@@ -1543,7 +1543,7 @@ class Oci11Dialect(Oall8Dialect):
         return rest
 
     def capabilities(self) -> frozenset[str]:
-        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN})
+        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN, CAP_ARRAY_DML})
 
     @staticmethod
     def _check_binds(bind: list | None) -> None:
@@ -1671,26 +1671,47 @@ class Oci11Dialect(Oall8Dialect):
         # INSERT / UPDATE / DELETE, DDL and transaction statements. The error
         # comes back in the result, as the other dialects return it, so the
         # cursor reports what the statement did.
-        assert not batch
         stmt_type = oci11_stmt_type(sql.strip().upper())
+        self._check_binds(bind)
+        for row in batch or []:
+            self._check_binds(row)
         yield Send(
-            self._closing() + self._encode_dml(self._sql_text(sql), stmt_type, bind)
+            self._closing()
+            + encode_oci11_execute(
+                self._next_seq(),
+                self._sql_text(sql),
+                stmt_type,
+                1,
+                bind,
+                batch,
+                batcherrors,
+            )
         )
         buf = yield from self._recv_terminal('DML')
         status = self._status(buf)
         self._finished(status.get('cursor', 0))
         err_code = status.get('error_code', 0)
+        applied = status.get('row_kind', 0)
+        # A batch's count is the rows it applied, a failing one's too, and the
+        # row it failed at is its error's offset, as python-oracledb reports it;
+        # in batch-errors mode the failed rows come back as a list.
+        if batch:
+            offset = applied if err_code and not batcherrors else 0
+            row_count = applied
+        else:
+            offset = status.get('error_pos', 0) if err_code else 0
+            row_count = 0 if err_code else applied
         return (
             0,
             err_code,
             0,
-            (0 if err_code else status.get('row_kind', 0), None),
+            (row_count, None),
             [],
             status.get('message'),
             status.get('rowid'),  # the touched row, cursor.lastrowid
-            [],
+            status.get('batch_errors', []) if batcherrors else [],
             None,
-            status.get('error_pos', 0) if err_code else 0,
+            offset,
             status.get('warn_flags', 0),
         )
 

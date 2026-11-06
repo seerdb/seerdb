@@ -231,6 +231,58 @@ class Native11BindTypeTest(unittest.TestCase):
         self.assertEqual(self._type(BcDate(-44, 3, 15, 12, 30, 45)), (12, 7))
 
 
+class Native11ArrayDmlTest(_At11g):
+    """executemany: its rows in one execute, and what the status says."""
+
+    def test_each_row_rides_its_own_rxd(self):
+        from seerdb.common.tns import _ALL8_HEAD, _OCI_WIDE, wire_schema
+
+        Message = encode_oci11_execute(
+            5, b'insert into t values (:1)', 4, 1, [1], [[2], [3]]
+        )
+        (Head, _) = wire_schema.compile_decoder(_ALL8_HEAD, _OCI_WIDE)(Message)
+        self.assertEqual(Head['bind_count'], 1)
+        # al8i4[1], the execute flag, counts the rows; three rows behind TTI_RXD.
+        Sql = b'insert into t values (:1)'
+        At = Message.index(Sql) + len(Sql)
+        self.assertEqual(int.from_bytes(Message[At + 4 : At + 8], 'little'), 3)
+        self.assertTrue(
+            Message.endswith(b'\x07\x02\xc1\x02\x07\x02\xc1\x03\x07\x02\xc1\x04')
+        )
+
+    def test_batch_errors_are_asked_for(self):
+        Options = int.from_bytes(
+            encode_oci11_execute(
+                5, b'insert into t values (:1)', 4, 1, [1], [[2]], True
+            )[3:7],
+            'little',
+        )
+        self.assertTrue(Options & 0x80000)
+
+    def test_a_batch_counts_its_rows(self):
+        Status = decode_oci11_status(_capture('oci11_array_dml_reply.hexdump'))
+        self.assertEqual((Status['row_kind'], Status['error_code']), (3, 0))
+
+    def test_batch_errors_name_their_rows(self):
+        Status = decode_oci11_status(_capture('oci11_batch_errors_reply.hexdump'))
+        self.assertEqual((Status['error_code'], Status['row_kind']), (24381, 2))
+        [Error] = Status['batch_errors']
+        self.assertEqual((Error['offset'], Error['code']), (1, 1))
+        self.assertTrue(Error['message'].startswith('ORA-00001'))
+        self.assertTrue(Status['message'].startswith('ORA-24381'))
+
+    def test_a_failing_batch_reports_the_row_it_stopped_at(self):
+        Seq = iter(range(10, 99))
+        Dialect = Oci11Dialect(lambda: next(Seq))
+        (_, Result) = _drive(
+            Dialect.execute_dml('insert into t values (:1)', [6], [[1], [7]]),
+            [_capture('oci11_array_dml_error_reply.hexdump')],
+        )
+        self.assertEqual(Result[1], 1)  # ORA-00001
+        self.assertEqual(Result[3][0], 1)  # one row applied
+        self.assertEqual(Result[9], 1)  # at row 1
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 
@@ -453,7 +505,7 @@ class Native11DialectTest(_At11g):
             Caps & {CAP_QUERY, CAP_DML, CAP_OWN_TXN}, {CAP_QUERY, CAP_DML, CAP_OWN_TXN}
         )
         self.assertIn(CAP_BLOCK, Caps)
-        self.assertNotIn(CAP_ARRAY_DML, Caps)
+        self.assertIn(CAP_ARRAY_DML, Caps)
 
 
 if __name__ == '__main__':
