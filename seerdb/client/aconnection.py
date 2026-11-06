@@ -65,6 +65,7 @@ from seerdb.client.connection import (
 from seerdb.client.defaults import defaults
 from seerdb.client.dialect import (
     CAP_OWN_TXN,
+    CAP_WIDE_BINDS,
     Dialect,
     Fv2Dialect,
     O8iDialect,
@@ -1454,7 +1455,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                     'cursor.parse() is not supported on Oracle '
                     + _pre10_tier_name_for(self._dialect)
                 )
-            _check_fv2_bind_sizes(Bind, Batch, _pre10_tier_name_for(self._dialect))
+            if CAP_WIDE_BINDS not in self._dialect.capabilities():
+                _check_fv2_bind_sizes(Bind, Batch, _pre10_tier_name_for(self._dialect))
             if Batch:
                 refuse_pre10_batch(self._dialect, Head, ReturnBinds, BatchErrors)
             if Head.startswith('SELECT'):

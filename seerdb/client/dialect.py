@@ -224,6 +224,10 @@ CAP_LOB_OBJECT = 'lob_object'
 # The dialect drives its own COMMIT / ROLLBACK (8i has no modern TTI_COMMIT); a
 # dialect without this capability leaves transaction control to the modern path.
 CAP_OWN_TXN = 'own_txn'
+# The dialect binds a plain str or bytes past the SQL inline limits (4000 and
+# 2000 bytes) as itself, as OCI does on a pooled 11g session (#2466); the 8i
+# and 9i dialects, without it, refuse one up front (#2260).
+CAP_WIDE_BINDS = 'wide_binds'
 
 
 # The cursor cache's cap, as on 10g+ (OracleConnect._cursor_cache_max).
@@ -1485,20 +1489,21 @@ class Fv2Oall8Dialect(Oall8Dialect):
 
 # The column and bind types a pooled 11g session does not read yet (#2466):
 # they come back in forms not measured against 11g. CLOB and BLOB columns are
-# read (their locators, then the content); as binds they are not yet.
+# read (their locators, then the content); as binds they are not yet. A LONG
+# or LONG RAW bind is: OCI sends it as a VARCHAR or a RAW of its size.
+_OCI11_UNREAD_BINDS = {
+    TNS_TYPE_BFILE: 'BFILE',
+    TNS_TYPE_REFCURSOR: 'cursor',
+    TNS_TYPE_ADT: 'object or collection',
+    TNS_TYPE_BLOB: 'BLOB',
+    TNS_TYPE_CLOB: 'CLOB or NCLOB',
+}
 _OCI11_UNREAD_TYPES = {
     TNS_TYPE_BFILE: 'BFILE',
     TNS_TYPE_LONG: 'LONG',
     TNS_TYPE_LONGRAW: 'LONG RAW',
     TNS_TYPE_REFCURSOR: 'cursor',
     TNS_TYPE_ADT: 'object or collection',
-}
-
-
-_OCI11_UNREAD_BINDS = {
-    **_OCI11_UNREAD_TYPES,
-    TNS_TYPE_BLOB: 'BLOB',
-    TNS_TYPE_CLOB: 'CLOB or NCLOB',
 }
 
 
@@ -1533,7 +1538,8 @@ class Oci11Dialect(Oall8Dialect):
 
     Served: queries over scalar, CLOB, NCLOB and BLOB columns, DML and array
     DML, DDL, COMMIT and ROLLBACK, and PL/SQL blocks, with scalar IN, OUT and
-    IN OUT binds, and a LOB object's calls. Not yet, and refused before
+    IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
+    calls. Not yet, and refused before
     anything is sent: an array DML's RETURNING, LOB, BFILE, REF CURSOR and
     object binds, and BFILE, LONG, REF CURSOR and object columns (refused at
     the describe)."""
@@ -1566,7 +1572,15 @@ class Oci11Dialect(Oall8Dialect):
 
     def capabilities(self) -> frozenset[str]:
         return frozenset(
-            {CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_OWN_TXN, CAP_ARRAY_DML, CAP_LOB_OBJECT}
+            {
+                CAP_QUERY,
+                CAP_DML,
+                CAP_BLOCK,
+                CAP_OWN_TXN,
+                CAP_ARRAY_DML,
+                CAP_LOB_OBJECT,
+                CAP_WIDE_BINDS,
+            }
         )
 
     @staticmethod
