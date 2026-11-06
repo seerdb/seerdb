@@ -212,6 +212,14 @@ _OALL8_UNSUPPORTED = tuple(
 )
 
 
+# What a pooled 11g session in the native form (#2466) lacks by design, as the
+# 9i OALL8 opt-in and 8i do: a cursor cache. Its open gaps are left to fail.
+_NATIVE11_UNSUPPORTED = tuple(
+    (Pattern, 'a pooled 11g session keeps no cursor cache, as 8i and 9i OALL8 (#2466)')
+    for (Pattern, _) in _OALL8_UNSUPPORTED
+)
+
+
 def _8i_skip_reason(test_method_name: str) -> str | None:
     # The skip reason for a test Oracle 8i lacks or has a tracked bug in, or None.
     for Pattern, Reason in _8I_UNSUPPORTED:
@@ -939,6 +947,15 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
         # Close the connection first: a SkipTest from setUp means tearDown does
         # not run, so we must not leak the connection (a leak on the slow 9i VM
         # piles up sessions).
+        if getattr(self.conn, '_native11', False):
+            Reason = next(
+                (R for (P, R) in _NATIVE11_UNSUPPORTED if P in self._testMethodName),
+                None,
+            )
+            if Reason is not None:
+                self.conn.close()
+                self.skipTest(Reason)
+            return
         if self.conn.field_version >= FIELD_VERSION_10_2:
             return
         Reason = _fv2_skip_reason(self._testMethodName)
@@ -3501,6 +3518,11 @@ class CursorIntegration(_IntegrationBase):
             )
             if int(conn.version.split('.')[0]) < 11:
                 return  # v$session_connect_info has no CLIENT_DRIVER before 11g
+            if _FV_KW.get('server_type') == 'pooled':
+                # A DRCP session's v$session_connect_info is its pooled server
+                # process's, which keeps the details of the client that first
+                # attached to it, whoever runs on it now (#2466).
+                return
             cur.execute(
                 'SELECT DISTINCT client_driver FROM v$session_connect_info '
                 "WHERE sid = sys_context('userenv', 'sid')"
@@ -11334,6 +11356,8 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 )
                 if int(Conn.version.split('.')[0]) < 11:
                     return  # no CLIENT_DRIVER column before 11g
+                if _FV_KW.get('server_type') == 'pooled':
+                    return  # the pooled server's, its first client's (sync twin)
                 await Cur.execute(
                     'SELECT DISTINCT client_driver FROM v$session_connect_info '
                     "WHERE sid = sys_context('userenv', 'sid')"
