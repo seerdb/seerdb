@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# 11g's answer to `insert into pyo_drcp_rf (v) values (:1) returning id into :2`
+# failing on its NOT NULL id (#2466), after its break: a bare TTI_FOB, asking
+# the client to flush out its binds -- to echo it -- before it sends the error.
+# Captured 2026-11-06 through tools/capture_proxy.py: seerdb's pooled session on
+# Oracle 11g XE 11.2.0.2, the DRCP pool started. The TTC payload, without the
+# packet's header, as `hexdump -C` output; the offset column and the |ascii|
+# gutter are ignored by tests.replay.parse_hexdump.
+00000000  13                                                |.|
+00000001

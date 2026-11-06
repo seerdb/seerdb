@@ -82,6 +82,7 @@ from seerdb.common.tns import (
     decode_oci11_lobop,
     decode_oci11_piggybacks,
     decode_oci11_ping,
+    decode_oci11_returning,
     decode_oci11_rows,
     decode_oci11_status,
     decode_ub4,
@@ -146,6 +147,8 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_CLOB,
     TNS_TYPE_REFCURSOR,
     TTI_DCB,
+    TTI_FOB,
+    TTI_IOV,
     TTI_LOB,
     TTI_OER,
     TTI_RPA,
@@ -252,6 +255,9 @@ CAP_PING = 'ping'
 # The dialect serves a server-side scrollable cursor -- its open and its
 # positioned fetches -- in its own form (#2466).
 CAP_SCROLL = 'scroll'
+# The dialect runs a DML's RETURNING ... INTO as itself, an array DML's too,
+# not as the PL/SQL block 8i and 9i take (#2466).
+CAP_RETURNING = 'returning'
 
 
 # The cursor cache's cap, as on 10g+ (OracleConnect._cursor_cache_max).
@@ -1559,8 +1565,8 @@ class Oci11Dialect(Oall8Dialect):
     DML, DDL, COMMIT and ROLLBACK, and PL/SQL blocks, with scalar IN, OUT and
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT. Not yet, and
-    refused before anything is sent: an array DML's RETURNING, an array DML's
-    LOB Var, BFILE, and a REF CURSOR bound IN or outside a block; an object
+    refused before anything is sent: an array DML's LOB Var, BFILE, and a REF
+    CURSOR bound IN or outside a block; an object
     bind, as on every tier below 12.1. Every column type is read: a BFILE's
     with OCI's file calls, an object's or a collection's as the native 9.2
     form's image. LONG and LONG RAW
@@ -1611,6 +1617,7 @@ class Oci11Dialect(Oall8Dialect):
                 CAP_PARSE,
                 CAP_PING,
                 CAP_SCROLL,
+                CAP_RETURNING,
             }
         )
 
@@ -2016,6 +2023,85 @@ class Oci11Dialect(Oall8Dialect):
         if code not in (0, ORA_NO_DATA_FOUND):
             _raise_ora(code, status.get('message'))
         return (rows, code == ORA_NO_DATA_FOUND, status.get('row_kind'))
+
+    def execute_returning(
+        self,
+        sql: str,
+        bind: list,
+        batch: list | None,
+        returning: frozenset[int],
+    ):
+        # A DML's RETURNING ... INTO, as OCI 11.2 runs one through the pool: the
+        # statement as it is, its targets OUT (encode_oci11_execute's
+        # Returning), every iteration of an array DML in the one execute. The
+        # reply has, per iteration, each target's rows (decode_oci11_returning),
+        # which go back as the return records the 10g+ path leaves; an error
+        # comes back in the result, as execute_dml's does.
+        stmt_type = oci11_stmt_type(sql.strip().upper())
+        self._check_binds([v for (i, v) in enumerate(bind) if i not in returning])
+        for row in batch or []:
+            self._check_binds([v for (i, v) in enumerate(row) if i not in returning])
+        iterations = 1 + len(batch or [])
+        yield Send(
+            self._closing()
+            + encode_oci11_execute(
+                self._next_seq(),
+                self._sql_text(sql),
+                stmt_type,
+                1,
+                bind,
+                batch,
+                Returning=returning,
+            )
+        )
+        from seerdb.common.exceptions import Truncated
+
+        positions = sorted(returning)
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during an 11g DML RETURNING')
+            buf += received[1]
+            if self._session_return(buf)[:1] == bytes([TTI_FOB]):
+                # A statement that failed asks to flush out its binds, a bare
+                # TTI_FOB, and waits for the client to echo it before its error
+                # (as on 10g+, #697); unanswered, the server read the next
+                # call as a protocol violation and the pooled server process
+                # died (ORA-03137).
+                yield Send(bytes([TTI_FOB]))
+                buf = b''
+                continue
+            try:
+                (records, rest, session) = decode_oci11_returning(
+                    buf, len(bind), positions, iterations
+                )
+                if not records and not rest and buf[:1] == bytes([TTI_IOV]):
+                    # Or sends its bind prompt alone, which OCI 11.2 answers
+                    # with the same call.
+                    yield Send(bytes([TTI_FOB]))
+                    buf = b''
+                    continue
+                status = self._status(rest)
+            except Truncated:
+                continue
+            break
+        if session is not None and self._on_session is not None:
+            self._on_session(session['session_id'], session['serial'])
+        self._finished(status.get('cursor', 0))
+        err_code = status.get('error_code', 0)
+        applied = status.get('row_kind', 0)
+        return (
+            0,
+            err_code,
+            0,
+            (applied if batch or not err_code else 0, None),
+            records,
+            status.get('message'),
+            status.get('rowid'),
+            [],
+            None,
+        )
 
     def ping(self):
         # A round trip that runs nothing, as OCI 11.2's OCIPing makes one

@@ -40,6 +40,7 @@ from seerdb.client._conn_logic import (
     dialect_scrolls,
     dialect_temp_lobs,
     fv2_lob_payload,
+    native_returning,
     pre10_dml_applied,
     refuse_pre10_batch,
     returning_block_error,
@@ -1476,8 +1477,13 @@ class AsyncOracleConnect(_ConnectionLogic):
                 )
             if CAP_WIDE_BINDS not in self._dialect.capabilities():
                 _check_fv2_bind_sizes(Bind, Batch, _pre10_tier_name_for(self._dialect))
+            Native = bool(ReturnBinds) and native_returning(
+                self._dialect, Bind, ReturnBinds
+            )
             if Batch:
-                refuse_pre10_batch(self._dialect, Head, ReturnBinds, BatchErrors)
+                refuse_pre10_batch(
+                    self._dialect, Head, None if Native else ReturnBinds, BatchErrors
+                )
             if Head.startswith('SELECT'):
                 return await self._drain_cursor(
                     await self._drive(
@@ -1488,6 +1494,12 @@ class AsyncOracleConnect(_ConnectionLogic):
                 # A block may invalidate the cached cursors, as DDL does (#720).
                 await self._drive(self._dialect.flush_cursors(self._cursor_cache))
                 Result = await self._drive(self._dialect.execute_block(Query, Bind))
+            elif Native and native_returning(self._dialect, Bind, ReturnBinds):
+                # The DML's RETURNING as itself, an array DML's too (a pooled 11g
+                # session's, #2466).
+                Result = await self._drive(
+                    self._dialect.execute_returning(Query, Bind, Batch, ReturnBinds)
+                )
             elif ReturnBinds:
                 # Pre-10g DML ... RETURNING (#801) -- see the sync twin.
                 Wrapped, BlockBind = returning_block_request(Query, Bind)
