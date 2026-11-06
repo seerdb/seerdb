@@ -15015,12 +15015,54 @@ _OCI11_LONG_BIND_TYPES = {
 }
 
 
+# A LOB bound by its locator on a pooled 11g session, as OCI 11.2 binds a
+# temporary or a fetched one (#2466): the descriptor a CLOB (112) or a BLOB
+# (113) of 72 bytes, a CLOB's or an NCLOB's with the session's charset and form
+# 1; the value a ub4 length and the locator as a value, its ub2 length in
+# front, as a row's LOB cell carries it.
+_OCI11_LOB_BIND_SIZE = 72
+
+
+def _oci11_lob_bind(Value: object) -> tuple[bool, bytes] | None:
+    # (whether it is a BLOB, its locator with its ub2 length) for a LOB bound by
+    # its locator: a temporary one's marker or a LOB object. None otherwise.
+    from seerdb.common.lob import LOB
+
+    if isinstance(Value, TempLob):
+        return (Value.is_blob, len(Value.locator).to_bytes(2, 'big') + Value.locator)
+    if isinstance(Value, LOB) and Value.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+        return (Value.data_type == TNS_TYPE_BLOB, bytes(Value.raw))
+    return None
+
+
+def _encode_oci11_bind_value(Value: object) -> bytes:
+    # A pooled 11g session's bind value: a LOB's locator, or the native 9.2
+    # form's value.
+    Lob = _oci11_lob_bind(Value)
+    if Lob is not None:
+        return _OCI.n4(len(Lob[1])) + _OCI.value(Lob[1])
+    return _encode_9i_bind_value(Value)
+
+
 def _encode_oci11_bind_oac(Value: object) -> bytes:
     # A pooled 11g session's bind descriptor (#2466): the native 9.2 form's type
     # and size, with sqlplus 11.2's flags, and a character bind's charset and
     # form declared -- the session's, or AL16UTF16 and form 2 for a national one.
     from seerdb.common.datatypes import Var
 
+    Lob = _oci11_lob_bind(Value)
+    if Lob is not None:
+        if Lob[0]:
+            return _native_bind_oac(
+                TNS_TYPE_BLOB, _OCI11_BIND_FLAGS, _OCI11_LOB_BIND_SIZE, 0, 0
+            )
+        return _native_bind_oac(
+            TNS_TYPE_CLOB,
+            _OCI11_BIND_FLAGS,
+            _OCI11_LOB_BIND_SIZE,
+            AL32UTF8_CHARSET,
+            1,
+        )
     (DType, Size, _) = _native_bind_type(Value)
     if (
         isinstance(Value, Var)
@@ -17418,7 +17460,7 @@ def encode_oci11_execute(
                 for Value in [V for V, L in zip(Row, Long) if not L] + [
                     V for V, L in zip(Row, Long) if L
                 ]:
-                    Message += _encode_9i_bind_value(Value)
+                    Message += _encode_oci11_bind_value(Value)
         return Message
     finally:
         _ENCODE_FIELD_VERSION.reset(Token)
@@ -17725,6 +17767,96 @@ def decode_oci11_lobop(
         raise Truncated(f'11g LOB call: {Exc}') from Exc
     Value = Reply.get('flag', Reply.get('amount'))
     return (Value, bytes(Reply['locator']), bytes(Rest))
+
+
+# A temporary LOB's creation through 11g's pool, as OCI 11.2's
+# OCILobCreateTemporary makes it (#2466): _LOBOPS_READ's fields, the
+# session's duration (10) in the destination length, the charset form in the
+# source offset (1 a CLOB, 2 an NCLOB, 0 a BLOB) and the type in the
+# destination offset (112 a CLOB or an NCLOB, 113 a BLOB), an empty 86-byte
+# locator, then the charset (the session's for a CLOB or an NCLOB, 0 for a
+# BLOB), the one SCN slot and the duration again.
+_OCI11_LOB_DURATION_SESSION = 10
+_OCI11_TEMP_LOCATOR_LENGTH = 86
+_OCI11_LOBOPS_CREATE_TEMP: wire_schema.Schema = (
+    *_LOBOPS_READ[:-1],
+    ('n2', 'charset'),
+    ('n4', 'scn'),
+    ('n8', 'amount'),
+)
+_OCI11_LOBOPS_CREATE_TEMP_OCI_WIDE = wire_schema.compile_encoder(
+    _OCI11_LOBOPS_CREATE_TEMP, _OCI_WIDE
+)
+# Its reply: TTI_RPA, the new locator (a ub2 length and the body, 40 bytes in
+# all) in the 86 bytes the request's took, the rest zero, the charset again
+# and a ub8 of 1, then the status.
+_OCI11_CREATE_TEMP_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('bytes', 'locator', 'locator_space'),
+    ('n2', 'charset'),
+    ('n8', 'amount'),
+)
+_OCI11_CREATE_TEMP_REPLY_FROM_OCI = wire_schema.compile_decoder(
+    _OCI11_CREATE_TEMP_REPLY, _OCI
+)
+
+
+def encode_oci11_create_temp(Seq: int, LobType: int, Csfrm: int) -> bytes:
+    """A temporary CLOB (``LobType`` 112, ``Csfrm`` 1), NCLOB (112, 2) or BLOB
+    (113, 0) of the session's duration, in the native form."""
+    Blob = LobType == TNS_TYPE_BLOB
+    return _OCI11_LOBOPS_CREATE_TEMP_OCI_WIDE(
+        {
+            'seq': Seq,
+            'token_number': None,
+            'source_present': True,
+            'source_length': _OCI11_TEMP_LOCATOR_LENGTH,
+            'dest_present': False,
+            'dest_length': _OCI11_LOB_DURATION_SESSION,
+            'short_source_offset': 0,
+            'short_dest_offset': 0,
+            'charset_present': True,
+            'short_amount_present': False,
+            'null_lob_present': False,
+            'operation': TNS_LOB_OP_CREATE_TEMP,
+            'scn_present': True,
+            'scn_length': 1,
+            'source_offset': 0 if Blob else Csfrm,
+            'dest_offset': LobType,
+            'amount_present': True,
+            'array_slot_1': False,
+            'array_length_1': 0,
+            'array_slot_2': False,
+            'array_length_2': 0,
+            'array_slot_3': False,
+            'array_length_3': 0,
+            'locator': (_OCI11_TEMP_LOCATOR_LENGTH - 2).to_bytes(2, 'big')
+            + bytes(_OCI11_TEMP_LOCATOR_LENGTH - 2),
+            'charset': 0 if Blob else AL32UTF8_CHARSET,
+            'scn': 0,
+            'amount': _OCI11_LOB_DURATION_SESSION,
+        }
+    )
+
+
+def decode_oci11_create_temp(Data: bytes) -> tuple[bytes | None, bytes]:
+    """A temporary LOB's creation reply: (its locator as the LOB object keeps
+    it, its ub2 length in front, the status behind it). A failed call's reply
+    is its status alone: (None, the status). A reply cut short raises
+    Truncated."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, Data)
+    try:
+        (Reply, Rest) = _OCI11_CREATE_TEMP_REPLY_FROM_OCI(
+            Data, {'locator_space': _OCI11_TEMP_LOCATOR_LENGTH}
+        )
+    except IndexError as Exc:
+        raise Truncated(f'11g CREATE_TEMP: {Exc}') from Exc
+    Space = bytes(Reply['locator'])
+    Length = int.from_bytes(Space[:2], 'big')
+    if Length + 2 > len(Space):
+        raise DataError(f'11g CREATE_TEMP: a {Length}-byte locator in {len(Space)}')
+    return (Space[: 2 + Length], bytes(Rest))
 
 
 def decode_oci11_lob_read(Data: bytes, LocatorLength: int) -> tuple[bytes, bytes]:

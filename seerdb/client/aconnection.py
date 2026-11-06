@@ -35,6 +35,7 @@ from seerdb.client._conn_logic import (
     _pre10_tier_name_for,
     _transaction_priority,
     dialect_lob_objects,
+    dialect_temp_lobs,
     fv2_lob_payload,
     pre10_dml_applied,
     refuse_pre10_batch,
@@ -2310,6 +2311,13 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def create_temp_lob(self, is_blob: bool = False, *, csfrm: int = 1) -> bytes:
         """Async port of the sync `create_temp_lob` (#91). Allocates a
         session-duration temporary LOB and returns its locator. 12c+ only."""
+        if dialect_temp_lobs(self._dialect):
+            # A pooled 11g session makes its own (#2466); the LOB object keeps
+            # the locator with its ub2 length, this returns it bare.
+            Prefixed = cast(
+                bytes, await self._drive(self._dialect.create_temp_lob(is_blob, csfrm))
+            )
+            return Prefixed[2:]
         from seerdb.common.tns_consts import TTI_RPA
 
         Data = encode_dictionary(
@@ -2333,6 +2341,13 @@ class AsyncOracleConnect(_ConnectionLogic):
         self, Locator: bytes, Data: str | bytes, is_blob: bool = False
     ) -> None:
         """Async port of the sync `write_temp_lob` (#91)."""
+        if dialect_temp_lobs(self._dialect):
+            # Through the LOB object's write, a pooled 11g session's own form
+            # (#2466): the text in UTF-16, counted in its code units.
+            await self.lob_write(
+                len(Locator).to_bytes(2, 'big') + Locator, Data, is_blob=is_blob
+            )
+            return
         from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
 
         Payload = Data if is_blob else cast(str, Data).encode('utf-16-be')

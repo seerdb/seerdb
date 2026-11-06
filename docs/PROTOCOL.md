@@ -985,7 +985,26 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   column alike: 50,000 bytes into a CLOB and 300,000 into a BLOB, measured. A
   LONG or LONG RAW bind is sent the same way, as OCI sends `SQLT_LNG` and
   `SQLT_LBI`. In PL/SQL, past 32,767 bytes, the server refuses one with
-  ORA-01460, as it does OCI's.
+  ORA-01460, as it does OCI's, so seerdb sends such a value through a
+  temporary LOB (below).
+- **A temporary LOB** is made as OCI 11.2's `OCILobCreateTemporary` makes one
+  through the pool: `TTI_LOBOPS` CREATE_TEMP (`0x110`) in `_LOBOPS_READ`'s
+  fields, the session's duration (10) in the destination length, the charset
+  form in the source offset (1 a CLOB, 2 an NCLOB, 0 a BLOB), the type in the
+  destination offset (112 or 113), an empty 86-byte locator (`00 54` and
+  zeros), then the charset as a ub2 (873 for a CLOB or an NCLOB, 0 for a BLOB),
+  one zero ub4 SCN slot and the duration as a ub8 (`_OCI11_LOBOPS_CREATE_TEMP`).
+  The reply is `TTI_RPA`, the new 40-byte locator (`00 26` and 38 bytes) in the
+  86 bytes the request's took, the charset and a ub8 of 1, then the status
+  (`_OCI11_CREATE_TEMP_REPLY`). A pooled session's temporary LOBs are gone once
+  it's released back to the pool (`v$temporary_lobs`, the same session), so
+  seerdb, like the thin path, frees none of its own.
+- **A LOB bound IN** goes by its locator, as OCI binds a temporary or a fetched
+  one: the descriptor a CLOB (112) or a BLOB (113) of 72 bytes, a CLOB's or an
+  NCLOB's with charset 873 and form 1; the value a ub4 length and the locator
+  as a value, its ub2 length in front, as a row's LOB cell carries it. A LOB
+  Var's value and a value past 32,767 bytes into PL/SQL go through a temporary
+  LOB, as on 12c+.
 - **11g's own conversion corrupts some large text binds.** A CLOB bound from
   the 320,000-byte UTF-8 value `'中😀x' * 40000` is stored with the `中` at
   UTF-16 offset 8132, the LOB's chunk size, broken into two replacement

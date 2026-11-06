@@ -22,6 +22,7 @@ from seerdb.client._conn_logic import (
     _pre10_tier_name_for,
     _transaction_priority,
     dialect_lob_objects,
+    dialect_temp_lobs,
     fv2_lob_payload,
     pre10_dml_applied,
     refuse_pre10_batch,
@@ -3111,6 +3112,13 @@ class OracleConnect(_ConnectionLogic):
         # path fails with ORA-01460. 12c+ only — 11g rejects CREATE_TEMP — so
         # callers gate on field_version. The response is a single TTI_RPA token
         # carrying the new locator: 0x08, ub2 length, then the locator bytes.
+        if dialect_temp_lobs(self._dialect):
+            # A pooled 11g session makes its own (#2466); the LOB object keeps
+            # the locator with its ub2 length, this returns it bare.
+            Prefixed = cast(
+                bytes, self._drive(self._dialect.create_temp_lob(is_blob, csfrm))
+            )
+            return Prefixed[2:]
         from seerdb.common.tns_consts import TTI_RPA
 
         Data = encode_dictionary(
@@ -3189,6 +3197,13 @@ class OracleConnect(_ConnectionLogic):
         # locator + bytes written) followed by TTI_OER (call status); we walk to
         # the OER and raise on a real error. 12c+ only (paired with
         # create_temp_lob). The encoder chunks payloads > 0xFC bytes itself.
+        if dialect_temp_lobs(self._dialect):
+            # Through the LOB object's write, a pooled 11g session's own form
+            # (#2466): the text in UTF-16, counted in its code units.
+            self.lob_write(
+                len(Locator).to_bytes(2, 'big') + Locator, Data, is_blob=is_blob
+            )
+            return
         from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
 
         Payload = Data if is_blob else cast(str, Data).encode('utf-16-be')

@@ -74,6 +74,7 @@ from seerdb.common.tns import (
     decode_fv2_warn_flags,
     decode_o8i_bfile_getlen,
     decode_oci11_block,
+    decode_oci11_create_temp,
     decode_oci11_describe,
     decode_oci11_lob_read,
     decode_oci11_lobop,
@@ -111,6 +112,7 @@ from seerdb.common.tns import (
     encode_o8i_bfile_getlen,
     encode_o8i_bfile_open,
     encode_oci11_close_cursors,
+    encode_oci11_create_temp,
     encode_oci11_execute,
     encode_oci11_fetch,
     encode_oci11_lob_read,
@@ -228,6 +230,9 @@ CAP_OWN_TXN = 'own_txn'
 # 2000 bytes) as itself, as OCI does on a pooled 11g session (#2466); the 8i
 # and 9i dialects, without it, refuse one up front (#2260).
 CAP_WIDE_BINDS = 'wide_binds'
+# The dialect makes a temporary LOB itself (create_temp_lob), so a LOB Var's
+# value and a large PL/SQL value bind through one, as on 12c+ (#2466).
+CAP_TEMP_LOB = 'temp_lob'
 
 
 # The cursor cache's cap, as on 10g+ (OracleConnect._cursor_cache_max).
@@ -1539,9 +1544,9 @@ class Oci11Dialect(Oall8Dialect):
     Served: queries over scalar, CLOB, NCLOB and BLOB columns, DML and array
     DML, DDL, COMMIT and ROLLBACK, and PL/SQL blocks, with scalar IN, OUT and
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
-    calls. Not yet, and refused before
-    anything is sent: an array DML's RETURNING, LOB, BFILE, REF CURSOR and
-    object binds, and BFILE, LONG, REF CURSOR and object columns (refused at
+    calls, temporary LOBs and LOBs bound IN. Not yet, and refused before
+    anything is sent: an array DML's RETURNING, LOB OUT binds, BFILE, REF
+    CURSOR and object binds, and BFILE, LONG, REF CURSOR and object columns (refused at
     the describe)."""
 
     _wire = '11g native'
@@ -1580,6 +1585,7 @@ class Oci11Dialect(Oall8Dialect):
                 CAP_ARRAY_DML,
                 CAP_LOB_OBJECT,
                 CAP_WIDE_BINDS,
+                CAP_TEMP_LOB,
             }
         )
 
@@ -1832,6 +1838,36 @@ class Oci11Dialect(Oall8Dialect):
                 continue
             _raise_ora(status.get('error_code', 0), status.get('message'))
             return (value, updated)
+
+    def create_temp_lob(self, is_blob: bool, csfrm: int = 1):
+        # A temporary CLOB, NCLOB (csfrm 2) or BLOB of the session's duration,
+        # as OCI 11.2's OCILobCreateTemporary makes one through the pool: one
+        # native TTI_LOBOPS CREATE_TEMP (encode_oci11_create_temp), answered
+        # with the new locator, its ub2 length in front.
+        from seerdb.common.exceptions import Truncated
+
+        yield Send(
+            encode_oci11_create_temp(
+                self._next_seq(),
+                TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB,
+                0 if is_blob else csfrm,
+            )
+        )
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during an 11g CREATE_TEMP')
+            buf += received[1]
+            try:
+                (locator, rest) = decode_oci11_create_temp(buf)
+                status = self._status(rest)
+            except Truncated:
+                continue
+            _raise_ora(status.get('error_code', 0), status.get('message'))
+            if locator is None:
+                raise Exception('An 11g CREATE_TEMP answered without a locator')
+            return locator
 
     def execute_block(self, sql: str, bind: list | None = None):
         # An anonymous PL/SQL block, its binds inline. The reply opens with the
