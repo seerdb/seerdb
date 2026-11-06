@@ -1005,6 +1005,14 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   as a value, its ub2 length in front, as a row's LOB cell carries it. A LOB
   Var's value and a value past 32,767 bytes into PL/SQL go through a temporary
   LOB, as on 12c+.
+- **An object or collection column** (XMLType among them) is described as
+  type 109 with its type's schema and name, and its row cell is the native 9.2
+  form's image (`_O9I_OBJECT_CELL`): the 9i native dialect's reader takes it as
+  it is, and the cursor decodes the image against the type the dictionary
+  describes, as on every tier. sqlplus 11.2 fetches each type's descriptor
+  first, with a run of `TTI_KOD` (`0x5c`) calls; seerdb needs none of them.
+  Nothing new is sent, so nothing new was measured to send: the change is
+  that the column is no longer refused.
 - **A BFILE column** comes in the row as the 9.2 form's LOB cell, its locator
   (59 bytes for `BFILENAME('SEERDB_BFILE_DIR', 'pyoracle_bfile_test.txt')`).
   Its calls are `_LOBOPS_READ`'s fields too, as OCI 11.2's `OCILobFile*` make

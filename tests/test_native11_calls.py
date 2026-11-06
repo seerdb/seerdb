@@ -1019,6 +1019,33 @@ class Native11BfileTest(_At11g):
         self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
 
 
+class Native11ObjectTest(_At11g):
+    """Object and collection columns, against 11g's reply to a pooled session."""
+
+    _SQL = 'select id, p, ns from pyo_drcp_ot order by id'
+
+    def test_the_cells_are_the_types_images(self):
+        # Each an image for the cursor to decode against its type, as on the
+        # native 9i dialect; a NULL none.
+        from seerdb.common.dbobject import ObjectImage
+
+        (_, Result) = _drive(
+            Oci11Dialect(lambda: 7).execute_query(self._SQL, None, 15),
+            [_capture('oci11_object_query_reply.hexdump')],
+        )
+        (Columns, Rows) = (Result[3][1], Result[4])
+        self.assertEqual(
+            [(C['column_name'], C.get('type_name')) for C in Columns],
+            [('ID', None), ('P', 'PYO_DRCP_PT'), ('NS', 'PYO_DRCP_NUMS')],
+        )
+        ((One, Point, Numbers), (Two, NoPoint, NoNumbers)) = Rows
+        self.assertEqual((One, Two), (1, 2))
+        for Cell, Name in ((Point, 'PYO_DRCP_PT'), (Numbers, 'PYO_DRCP_NUMS')):
+            self.assertIsInstance(Cell, ObjectImage)
+            self.assertEqual(Cell.type_name, Name)
+        self.assertEqual((NoPoint, NoNumbers), (None, None))
+
+
 class Native11ReplyTest(_At11g):
     """11g's replies, read by the codec."""
 
