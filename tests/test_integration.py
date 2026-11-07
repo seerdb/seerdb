@@ -6361,16 +6361,10 @@ class CreateLobIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [(1, 1, 1), (2, 50000, 40000), (3, 3, 2)])
 
-    @_requires(
-        _Need(
-            'a NULL declared LOB bind is a 12.1+ one; a pooled 11g session '
-            'refuses it (#2466)',
-            min_fv=FIELD_VERSION_12_1,
-        )
-    )
     def test_a_declared_null_lob_in_an_executemany(self):
         # A NULL row keeps the LOB bind with a NULL value, among rows that go
-        # as temporary LOBs (#902).
+        # as temporary LOBs (#902); a pooled 11g session sends it as OCI 11.2
+        # does, the zero length alone (#2466).
         self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB, b BLOB)')
         self.cur.setinputsizes(None, seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_BLOB)
         self.cur.executemany(
