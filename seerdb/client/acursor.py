@@ -205,8 +205,14 @@ class AsyncCursor(_CursorLogic):
             Batch = [self._typed_binds(operation, Row) for Row in Batch]
         # Then the input type handler, for each bind still untyped (#2458).
         (Bind, Batch) = self._handled_binds(Bind, Batch)
-        if not Batch:
-            Bind = await self._promote_lob_var_binds(Bind)
+        # A declared CLOB / BLOB value goes as a temporary LOB, every row of an
+        # executemany too, as python-oracledb makes one for each (#902).
+        Bind = await self._promote_lob_var_binds(Bind)
+        if Batch:
+            Promoted = []
+            for Row in Batch:
+                Promoted.append(await self._promote_lob_var_binds(Row))
+            Batch = Promoted
         self._inputsizes = ((), {})
         _check_object_bind_support(self._connection, Bind, Batch)
         Kw: dict[str, Any] = {

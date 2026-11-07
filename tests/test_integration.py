@@ -6340,6 +6340,51 @@ class CreateLobIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [(1, 12, 3), (2, 50000, 40000)])
 
+    def test_declared_lob_values_in_every_row_of_an_executemany(self):
+        # Every row's value goes as a temporary LOB, as python-oracledb makes
+        # one for each (#902). Only a single execute's were: an executemany's
+        # rows went as text under the LOB bind, which 12c+ answered with
+        # ORA-64219 (invalid LOB locator) and a pooled 11g session refused.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB, b BLOB)')
+        self.cur.setinputsizes(None, seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_BLOB)
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3)',
+            [
+                (1, 'a', b'\x01'),
+                (2, 'x' * 50000, b'\xaa' * 40000),
+                (3, 'ccc', b'\x02\x03'),
+            ],
+        )
+        self.cur.execute(
+            f'SELECT id, DBMS_LOB.GETLENGTH(c), DBMS_LOB.GETLENGTH(b) '
+            f'FROM {self.TABLE} ORDER BY id'
+        )
+        self.assertEqual(self.cur.fetchall(), [(1, 1, 1), (2, 50000, 40000), (3, 3, 2)])
+
+    @_requires(
+        _Need(
+            'a NULL declared LOB bind is a 12.1+ one; a pooled 11g session '
+            'refuses it (#2466)',
+            min_fv=FIELD_VERSION_12_1,
+        )
+    )
+    def test_a_declared_null_lob_in_an_executemany(self):
+        # A NULL row keeps the LOB bind with a NULL value, among rows that go
+        # as temporary LOBs (#902).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB, b BLOB)')
+        self.cur.setinputsizes(None, seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_BLOB)
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3)',
+            [(1, None, b'\x01'), (2, 'bb', None), (3, None, None)],
+        )
+        self.cur.execute(
+            f'SELECT id, DBMS_LOB.GETLENGTH(c), DBMS_LOB.GETLENGTH(b) '
+            f'FROM {self.TABLE} ORDER BY id'
+        )
+        self.assertEqual(
+            self.cur.fetchall(), [(1, None, 1), (2, 2, None), (3, None, None)]
+        )
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ErrorAndRowcountIntegration(_IntegrationBase):
