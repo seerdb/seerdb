@@ -1675,17 +1675,19 @@ def _serve_thin_session(
             if completed is None:  # answered already: it never completes
                 continue
             body = completed
-            request = _mark_ltz_binds(
-                _resolve_temp_lob_binds(
-                    parse_exec(
-                        body,
-                        bind_types=cached_types,
-                        max_string_size=max_size,
-                        cached_plsql=cached_plsql,
-                    ),
-                    temp_lobs,
-                )
+            resolved = _resolve_or_refuse(
+                stream,
+                parse_exec(
+                    body,
+                    bind_types=cached_types,
+                    max_string_size=max_size,
+                    cached_plsql=cached_plsql,
+                ),
+                temp_lobs,
             )
+            if resolved is None:  # refused, and answered with its error
+                continue
+            request = _mark_ltz_binds(resolved)
             _attach_object_bind_lobs(request, lob_emit_log, temp_lobs)
             if request.scrollable:
                 lobs = _answer_scroll(stream, backend, request, cursors)
@@ -3969,6 +3971,23 @@ def _mark_ltz_binds(request: ExecRequest) -> ExecRequest:
     return replace(request, binds=binds, bind_rows=rows)
 
 
+def _resolve_or_refuse(
+    stream: PacketStream, request: ExecRequest, temp_lobs: _TempLobs
+) -> ExecRequest | None:
+    # The request with its LOB locator binds resolved, or None once a bind the
+    # Mirror cannot resolve has been answered with its ORA error. Raised from
+    # here, before the call is answered, the error ended the session and the
+    # client saw its connection closed (#2505).
+    try:
+        return _resolve_temp_lob_binds(request, temp_lobs)
+    except BackendError as err:
+        logger.info('bind refused: %s', err.ora_message)
+        stream.write_packet(
+            TNS_DATA, encode_error(err.ora_code, err.ora_message, err.error_offset)
+        )
+        return None
+
+
 def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecRequest:
     # Swap any temp-LOB locator bind for the bytes streamed into it over
     # TTI_LOBOPS WRITE, so the backend sees a str / bytes value (#412). A
@@ -3987,16 +4006,24 @@ def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecR
     single = len(request.bind_rows) <= 1
 
     def resolve(value: object) -> object:
+        if isinstance(value, TempLobRef) and temp_lobs.resolve(value.locator) is None:
+            # Not a temporary LOB the Mirror minted: a column LOB a query
+            # returned, bound back. The Mirror served it under a locator of its
+            # own and logged the content against it (LobEmitLog), as for an
+            # object attribute (#1262); that content is the value (#2505).
+            served = _emitted_lob(_LOB_EMIT_LOG.get(), value.locator)
+            if served is not None:
+                (data, is_clob) = served
+                if is_clob:
+                    return ClobValue(data if isinstance(data, str) else str(data))
+                return BlobValue(data if isinstance(data, bytes) else data.encode())
         if isinstance(value, BfileRef) or (
             isinstance(value, TempLobRef) and temp_lobs.resolve(value.locator) is None
         ):
-            # A locator the Mirror did not mint for a temporary LOB: a LOB a
-            # query returned, bound back. Resolving a column LOB it served to
-            # its content is not built yet (#2505); bound as empty content it
+            # A locator the Mirror never handed out. Bound as empty content it
             # stored a wrong value without a word, so it is refused.
             raise BackendError(
-                'invalid LOB locator specified: a LOB a query returned cannot be '
-                'bound back through the Mirror yet',
+                'invalid LOB locator specified: the Mirror did not serve this LOB',
                 ora_code=ORA_INVALID_LOB_LOCATOR,
             )
         if isinstance(value, TempLobRef):
@@ -5054,12 +5081,10 @@ def _answer_reexecute_binds(
             iterations=max(request.fetch, 1),
             from_reexecute=True,
         )
-        return _answer_query(
-            stream,
-            backend,
-            _mark_ltz_binds(_resolve_temp_lob_binds(execute, temp_lobs)),
-            cursors,
-        )
+        resolved = _resolve_or_refuse(stream, execute, temp_lobs)
+        if resolved is None:  # refused, and answered with its error
+            return []
+        return _answer_query(stream, backend, _mark_ltz_binds(resolved), cursors)
     sql = cursors.query_sql(request.cursor)
     if sql is None:
         stream.write_packet(

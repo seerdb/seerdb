@@ -6060,7 +6060,6 @@ class MixedPrecisionBatchIntegration(_IntegrationBase):
         'binding a fetched LOB needs the 10g+ bind (8i and 9i: not measured)',
         min_fv=FIELD_VERSION_10_2,
     ),
-    _mirror_lacks('binding back a LOB it served (#2505)'),
 )
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class FetchedLobBindIntegration(_IntegrationBase):
@@ -6124,7 +6123,7 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
             Conn.close()
 
     @_requires(
-        _mirror_lacks('binding back a LOB it served (#2505)'),
+        _mirror_lacks('binding back a BFILE it served (#2510)'),
         _Need(
             'a BFILE bind needs the 10g+ bind',
             min_fv=FIELD_VERSION_10_2,
