@@ -17706,6 +17706,82 @@ def encode_oci11_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
     )
 
 
+# An application context's change (func 154, #1775), as OCI 11.2's
+# OCIAppCtxSet / OCIAppCtxClearAll send one through the pool (#2466),
+# piggybacked ahead of the next call, a ping's too: thin's fields at OCI's
+# widths -- the namespace's pointer and its length a ub8, the entries' pointer
+# (none for a clear) and their count, the flags, then eight bytes no field is
+# known for -- and the namespace and each entry's key and value with their
+# lengths (an empty one just the zero count) and a ub4 of 0. OCI's flags are
+# thin's with 0x08 set: 9 to set, 10 to clear.
+_OCI11_APP_CONTEXT_SET = 0x09
+_OCI11_APP_CONTEXT_CLEAR = 0x0A
+_OCI11_APP_CONTEXT: wire_schema.Schema = (
+    ('const', bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_APP_CONTEXT])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('ptr', 'namespace_present'),
+    ('wn4', 'namespace_length'),
+    ('ptr', 'entries_present'),
+    ('n4', 'count'),
+    ('n4', 'flags'),
+    ('pad', 8),
+    ('value', 'namespace'),
+    (
+        'each',
+        'entries',
+        'count',
+        (
+            ('n4', 'key_length'),
+            ('when', 'key_length', (('value', 'key'),)),
+            ('n4', 'value_length'),
+            ('when', 'value_length', (('value', 'value'),)),
+            ('n4', 'unpinned_entry'),
+        ),
+    ),
+)
+_OCI11_APP_CONTEXT_OCI_WIDE = wire_schema.compile_encoder(_OCI11_APP_CONTEXT, _OCI_WIDE)
+_OCI11_APP_CONTEXT_FROM_OCI_WIDE = wire_schema.compile_decoder(
+    _OCI11_APP_CONTEXT, _OCI_WIDE
+)
+
+
+def encode_oci11_app_context(Seq: int, Namespace: str, Entries: dict) -> bytes:
+    """An application context namespace's change, piggybacked ahead of a pooled
+    11g session's next call: its ``Entries`` (key: value) set, or the
+    namespace cleared when there are none."""
+    Name = Namespace.encode('utf-8')
+    Pairs = [(K.encode('utf-8'), V.encode('utf-8')) for K, V in Entries.items()]
+    return _OCI11_APP_CONTEXT_OCI_WIDE(
+        {
+            'seq': Seq,
+            'token_number': None,
+            'namespace_present': True,
+            'namespace_length': len(Name),
+            'entries_present': bool(Pairs),
+            'count': len(Pairs),
+            'flags': _OCI11_APP_CONTEXT_SET if Pairs else _OCI11_APP_CONTEXT_CLEAR,
+            'namespace': Name,
+            'entries': [
+                {
+                    'key_length': len(K),
+                    'key': K,
+                    'value_length': len(V),
+                    'value': V,
+                    'unpinned_entry': 0,
+                }
+                for (K, V) in Pairs
+            ],
+        }
+    )
+
+
+def decode_oci11_app_context(Data: bytes) -> tuple[dict, bytes]:
+    """An application context piggyback (encode_oci11_app_context): its fields,
+    and the bytes after it."""
+    return _OCI11_APP_CONTEXT_FROM_OCI_WIDE(Data)
+
+
 # The session return a pooled server sends ahead of the first reply once it
 # has the session (TNS_SERVER_PIGGYBACK_SESS_RET), python-oracledb's layout at
 # OCI's widths: a ub2, a ub1, the session state's pair count, the flags, and the
