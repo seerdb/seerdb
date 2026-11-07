@@ -196,10 +196,36 @@ class Native11ChoiceTest(unittest.TestCase):
         Conn._native11_choose(TNS_VERSION_11_2)
         self.assertTrue(Conn._native11)
 
+    def test_a_dedicated_login_to_11g_is_native_when_opted_in(self):
+        # `oall8`, which asks for the native OALL8 form on 9i, asks for it on a
+        # dedicated 11g session too (#2463).
+        for kw in ({'oall8': True}, {'oall8': True, 'server_type': 'dedicated'}):
+            with self.subTest(kw=kw):
+                Conn = self._conn(**kw)
+                Conn._native11_choose(TNS_VERSION_11_2)
+                self.assertTrue(Conn._native11)
+
+    def test_a_dedicated_native_session_ends_with_the_logoff(self):
+        # As sqlplus 11.2 ends one (`03 09 17`, captured on 11g XE): the plain
+        # logoff; the DRCP session release aborted the dedicated server's call
+        # (ORA-03137 [DRCP:kpplsSessRls_1]). A pooled one keeps the release.
+        from seerdb.common.tns import encode_logoff_oci, encode_session_release_oci
+
+        self.assertEqual(encode_logoff_oci(0x17), bytes.fromhex('030917'))
+        Conn = self._conn(oall8=True)
+        Conn.seq = 0x17
+        self.assertEqual(Conn._native11_close_call(), bytes.fromhex('030917'))
+        Pooled = self._conn(server_type='pooled')
+        Pooled.seq = 0x17
+        self.assertEqual(
+            Pooled._native11_close_call(), encode_session_release_oci(0x17)
+        )
+
     def test_other_logins_are_not(self):
         for kw, version in (
             ({'server_type': 'pooled'}, TNS_VERSION_12_1),
             ({'server_type': 'dedicated'}, TNS_VERSION_11_2),
+            ({'oall8': True}, TNS_VERSION_12_1),
             ({}, TNS_VERSION_11_2),
         ):
             with self.subTest(kw=kw, version=version):

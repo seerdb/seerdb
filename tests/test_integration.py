@@ -454,8 +454,8 @@ _NATIONAL_OUT_BIND = _Need(
     'a national OUT bind is refused on fv2 (ORA-03120)', min_fv=_FV
 )
 _CHANGE_PASSWORD = _Need(
-    'changepassword is not supported on Oracle 9i, and a pooled 11g session '
-    'refuses it (ORA-56609)',
+    'changepassword is not supported on Oracle 9i, a pooled 11g session refuses '
+    "it (ORA-56609), and 11g's native form does not send it yet",
     min_fv=_FV,
     password_change=True,
 )
@@ -584,8 +584,9 @@ _SERVICE = os.environ.get('SEERDB_TEST_SERVICE', 'XE')
 # testbeds (issue #27).
 _FIELD_VERSION = int(os.environ.get('SEERDB_TEST_FIELD_VERSION', '0'))
 _FV_KW: dict[str, Any] = {'field_version': _FIELD_VERSION} if _FIELD_VERSION else {}
-# Run the suite over the experimental native 9i OALL8 dialect (#798); a 9.2 bed
-# only, every other server ignores the option.
+# Run the suite over the experimental native OALL8 form: the 9i dialect on a 9.2
+# bed (#798), 11g's native form on a dedicated 11g session (#2463); every other
+# server ignores the option.
 if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
     _FV_KW['oall8'] = True
 # Run the suite over pooled sessions, as DRCP serves them (#2466): on 11g that

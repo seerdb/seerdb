@@ -112,7 +112,6 @@ from seerdb.common.tns import (
     encode_packet,
     encode_pipeline_begin,
     encode_pipeline_end,
-    encode_session_release_oci,
     encode_tpc_change_state,
     encode_tpc_switch,
     ends_response,
@@ -2697,6 +2696,12 @@ class AsyncOracleConnect(_ConnectionLogic):
 
         if self._native11:
             # The server refuses a password change on a DRCP session (#2466).
+            if self.server_type != 'pooled':
+                # A dedicated session in the native form (#2463): its password
+                # change is not measured yet.
+                raise NotSupportedError(
+                    "changepassword is not supported in Oracle 11g's native form yet"
+                )
             raise NotSupportedError(
                 'changepassword is not supported on a pooled Oracle 11g '
                 'connection: the server refuses a password change on a DRCP '
@@ -3246,9 +3251,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                     await self.rollback()
                 self._native11_sending = True
                 try:
-                    await self.send(
-                        TNS_DATA, encode_session_release_oci(self._next_seq())
-                    )
+                    await self.send(TNS_DATA, self._native11_close_call())
                 finally:
                     self._native11_sending = False
                 await self._next_data_packet()
