@@ -703,6 +703,47 @@ class Native11TempLobTest(_At11g):
         with self.assertRaises(NotSupportedError):
             Gen.send(None)
 
+    def test_an_object_comes_back_in_its_cell(self):
+        # A block's object OUT value is the native object cell it went out in,
+        # with no indicator behind it: its image, the status after it (#2463).
+        from seerdb.common.tns import decode_oci11_block
+
+        (Directions, Values, Rest, _) = decode_oci11_block(
+            _capture('oci11_object_out_reply.hexdump'), 1, Objects=frozenset({0})
+        )
+        self.assertEqual(Directions, [0x10])
+        self.assertEqual(Values, [bytes.fromhex('84010c02c12b0568656c6c6f')])
+        self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+
+    def test_an_object_var_binds_out_as_a_null_object(self):
+        # An unset object Var -- the OUT bind -- goes as OCI 11.2's atomically
+        # NULL instance: the toid, an image length of 0 and no image (#2463).
+        from seerdb.common.datatypes import Var
+        from seerdb.common.dbobject import DbObjectType
+        from seerdb.common.tns import _encode_oci11_bind_value
+
+        Captured = _capture('oci11_execute_object_null_out.hexdump')
+        ([Theirs], Values) = self._binds(Captured, 1)
+        Typ = DbObjectType('PYO', 'PYO_OBJ_T', Theirs['toid'], 1, [])
+        Cell = _encode_oci11_bind_value(Var(Typ))
+        self.assertEqual(bytes(Values[1 : 1 + len(Cell)]), Cell)
+
+    def test_the_dialect_reads_an_object_out_as_its_image(self):
+        # The block wraps the image in an ObjectImage of the bind's type, which
+        # the cursor turns into a DbObject (#2463).
+        from seerdb.common.datatypes import Var
+        from seerdb.common.dbobject import DbObjectType, ObjectImage
+
+        Typ = DbObjectType('PYO', 'PYO_OBJ_T', bytes(16), 1, [])
+        Dialect = Oci11Dialect(lambda: 7)
+        self.assertEqual(
+            Dialect._object_outs([1, Var(Typ), Typ.newobject()]), frozenset({1, 2})
+        )
+        Image = Dialect._object_out_value(Var(Typ), b'\x84\x01')
+        self.assertIsInstance(Image, ObjectImage)
+        self.assertEqual((Image.type_name, Image.image), ('PYO_OBJ_T', b'\x84\x01'))
+        self.assertIsNone(Dialect._object_out_value(Var(Typ), None))
+
     def test_an_object_binds_in_as_oci_binds_it(self):
         # OCI 11.2's SQLT_NTY bind (OCIBindObject) of PYO_OBJ_T (42, 'hello'),
         # on a dedicated 11g session (#2463): the descriptor an ADT of 2000

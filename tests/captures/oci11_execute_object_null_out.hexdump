@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 11.2's execute of the same block with an atomically NULL instance bound,
+# the pure OUT bind (#2463): the object's descriptor as an IN bind's, and its
+# value the cell of a NULL object, the toid with an image length of 0 and no
+# image.
+# Captured 2026-11-07 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8, the object
+# cache on; OCIObjectNew, then OCIBindObject of an SQLT_NTY bind, called through
+# ctypes) on Oracle 11g XE 11.2.0.2, a DEDICATED session, with a throwaway type
+# PYO_OBJ_T (n NUMBER, s VARCHAR2(20)) dropped after. The TTC payload, without
+# the packet's header, as `hexdump -C` output; the offset column and the |ascii|
+# gutter are ignored by tests.replay.parse_hexdump.
+00000000  03 5e 07 29 04 04 00 00  00 00 00 fe ff ff ff ff  |.^.)............|
+00000010  ff ff ff 28 00 00 00 00  00 00 00 fe ff ff ff ff  |...(............|
+00000020  ff ff ff 0d 00 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000030  ff ff ff fe ff ff ff ff  ff ff ff 00 00 00 00 01  |................|
+00000040  00 00 00 00 00 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000050  ff ff ff 01 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000060  00 00 00 fe ff ff ff ff  ff ff ff 00 00 00 00 00  |................|
+00000070  00 00 00 fe ff ff ff ff  ff ff ff fe ff ff ff ff  |................|
+00000080  ff ff ff f0 ec f4 42 cf  55 00 00 00 00 00 00 00  |......B.U.......|
+00000090  00 00 00 fe ff ff ff ff  ff ff ff fe ff ff ff ff  |................|
+000000a0  ff ff ff 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000b0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000c0  00 00 00 28 62 65 67 69  6e 20 3a 31 20 3a 3d 20  |...(begin :1 := |
+000000d0  70 79 6f 5f 6f 62 6a 5f  74 28 34 32 2c 20 27 68  |pyo_obj_t(42, 'h|
+000000e0  65 6c 6c 6f 27 29 3b 20  65 6e 64 3b 01 00 00 00  |ello'); end;....|
+000000f0  01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000100  00 00 00 00 00 00 00 00  08 00 00 00 00 00 00 00  |................|
+00000110  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000120  00 6d 00 00 00 d0 07 00  00 00 00 00 00 00 00 00  |.m..............|
+00000130  00 10 00 00 00 10 5f b7  c1 21 93 5c f0 98 e0 60  |......_..!.\...`|
+00000140  a8 c0 96 00 60 7c 01 00  00 00 00 00 00 00 00 07  |....`|..........|
+00000150  24 00 00 00 24 00 22 02  08 5f b7 c1 21 93 5c f0  |$...$.".._..!.\.|
+00000160  98 e0 60 a8 c0 96 00 60  7c 00 00 00 00 00 00 00  |..`....`|.......|
+00000170  00 00 00 00 00 00 01 00  01 00 00 00 00 00 00 00  |................|
+00000180  00 00 00 00 00 00 00 01  00                       |.........|
+00000189

@@ -15164,13 +15164,25 @@ _O9I_OBJECT_CELL_OCI = wire_schema.compile_encoder(_O9I_OBJECT_CELL, _OCI)
 
 
 def _is_oci11_object_bind(Value: object) -> bool:
-    from seerdb.common.dbobject import DbObject
+    # An object or a collection, or a Var of an object type (an OUT bind).
+    from seerdb.common.datatypes import Var
+    from seerdb.common.dbobject import DbObject, DbObjectType
 
-    return isinstance(Value, DbObject)
+    return isinstance(Value, DbObject) or (
+        isinstance(Value, Var) and isinstance(Value.dbtype, DbObjectType)
+    )
+
+
+def _oci11_object_type(Value: object) -> object:
+    from seerdb.common.datatypes import Var
+
+    if isinstance(Value, Var):
+        return Value.dbtype
+    return object.__getattribute__(Value, '_dbtype')
 
 
 def _oci11_object_bind_oac(Value: object, Flags: int) -> bytes:
-    Typ = object.__getattribute__(Value, '_dbtype')
+    Typ = cast(Any, _oci11_object_type(Value))
     return _OAC_OCI(
         {
             'lead': 0,
@@ -15193,10 +15205,17 @@ def _oci11_object_bind_oac(Value: object, Flags: int) -> bytes:
     )
 
 
-def _oci11_object_bind_value(Value: 'DbObject') -> bytes:
-    Typ = object.__getattribute__(Value, '_dbtype')
+def _oci11_object_bind_value(Value: object) -> bytes:
+    # A Var's value, or none: an unset one -- the OUT bind -- goes as the cell
+    # of a NULL object, as OCI 11.2 binds an atomically NULL instance: the toid,
+    # an image length of 0 and no image.
+    from seerdb.common.datatypes import Var
+    from seerdb.common.dbobject import DbObject
+
+    Typ = cast(Any, _oci11_object_type(Value))
     Toid = _OBJ_TOID_PREFIX + Typ.oid + _OBJ_EXTENT_OID
-    Image = encode_object_image(Value)
+    Obj = Value._value if isinstance(Value, Var) else Value
+    Image = encode_object_image(Obj) if isinstance(Obj, DbObject) else b''
     return _O9I_OBJECT_CELL_OCI(
         {
             'toid_length': len(Toid),
@@ -15215,7 +15234,7 @@ def _encode_oci11_bind_value(Value: object) -> bytes:
     # A pooled 11g session's bind value: a REF CURSOR's, a LOB's locator, an
     # object's cell, or the native 9.2 form's value.
     if _is_oci11_object_bind(Value):
-        return _oci11_object_bind_value(cast('DbObject', Value))
+        return _oci11_object_bind_value(Value)
     if isinstance(Value, RefCursorBind):
         # An open cursor bound IN, as OCI 11.2's SQLT_RSET bind of a statement
         # handle goes through the pool: its id, where the OUT form sends 0.
@@ -18486,8 +18505,12 @@ def decode_oci11_block(
     NumBinds: int,
     Lobs: frozenset[int] = frozenset(),
     Cursors: frozenset[int] = frozenset(),
+    Objects: frozenset[int] = frozenset(),
 ) -> tuple[list[int] | None, list, bytes, dict | None]:
-    """A pooled 11g block's reply (#2466): its bind prompt (TTI_IOV, the native
+    """A pooled 11g block's reply (#2466). An object's or a collection's value,
+    at a position in ``Objects``, is the native object cell it went out in
+    (_O9I_OBJECT_CELL), with no indicator behind it: its image, None for a NULL
+    object (#2463). The rest, its bind prompt (TTI_IOV, the native
     9.2 form's: a 50-byte head, then one direction mask a bind, 0x10 OUT, 0x20
     IN, 0x30 IN OUT), the OUT and IN OUT values behind TTI_RXD -- each a value
     (a NULL an empty one, or 0xFF) and a ub2 indicator or return code (0;
@@ -18513,6 +18536,12 @@ def decode_oci11_block(
             Rest = Rest[1:]
             for Position, Mask in enumerate(Directions):
                 if not Mask & FV2_BIND_OUT:
+                    continue
+                if Position in Objects:
+                    (Cell, Rest) = _O9I_OBJECT_CELL_FROM_O9I(Rest)
+                    Values.append(
+                        bytes(Cell['image']) if Cell['image_length'] else None
+                    )
                     continue
                 if Position in Cursors:
                     (Opened, Rest) = _oci11_cursor_cell(bytes(Rest))
