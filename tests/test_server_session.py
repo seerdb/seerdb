@@ -5425,3 +5425,50 @@ def test_a_lob_the_mirror_did_not_mint_is_refused_not_bound_empty() -> None:
         with pytest.raises(BackendError) as raised:
             _resolve_temp_lob_binds(request(foreign), temp_lobs)
         assert raised.value.ora_code == 22275
+
+
+def test_a_column_lob_the_mirror_served_resolves_when_bound_back() -> None:
+    # A column LOB the Mirror served went out under a locator it minted and
+    # logged the content against (LobEmitLog); bound back, that content is the
+    # value, as an object attribute's is (#2505, #1262). A locator it never
+    # handed out is answered with ORA-22275 -- raised instead, the error ended
+    # the session.
+    from seerdb.common.tns import _LOB_EMIT_LOG, ExecRequest, LobEmitLog, TempLobRef
+    from seerdb.server.backend import BlobValue, ClobValue
+    from seerdb.server.session import _resolve_or_refuse, _TempLobs
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.packets: list[bytes] = []
+
+        def write_packet(self, _kind: int, data: bytes) -> None:
+            self.packets.append(data)
+
+    log = LobEmitLog()
+    clob = log.record('hello', True)
+    blob = log.record(b'\x01\x02', False)
+    token = _LOB_EMIT_LOG.set(log)
+    try:
+        values = [TempLobRef(clob, False), TempLobRef(blob, True)]
+        request = ExecRequest(
+            'insert into t values (:1, :2)', 0, 2, 0, values, [values]
+        )
+        resolved = _resolve_or_refuse(_Stream(), request, _TempLobs())  # type: ignore[arg-type]
+        assert resolved is not None
+        (c, b) = resolved.binds
+        assert isinstance(c, ClobValue) and c == 'hello'
+        assert isinstance(b, BlobValue) and b == b'\x01\x02'
+
+        foreign = [TempLobRef(b'\x00' * 112, False)]
+        stream = _Stream()
+        assert (
+            _resolve_or_refuse(
+                stream,  # type: ignore[arg-type]
+                ExecRequest('select :1 from dual', 0, 1, 0, foreign, [foreign]),
+                _TempLobs(),
+            )
+            is None
+        )
+        assert b'ORA-22275' in b''.join(stream.packets)
+    finally:
+        _LOB_EMIT_LOG.reset(token)

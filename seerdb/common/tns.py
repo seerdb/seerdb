@@ -4185,9 +4185,11 @@ _BFILE_BIND_BUFFER_SIZE = 4000
 
 def _lob_bind_locator(Data: bytes) -> tuple[bytes, bytes] | None:
     # A CLOB / BLOB bound by its locator, as a client writes it: a ub4 length,
-    # then the locator as bytes with their length, the locator's own ub2 in front
-    # (python-oracledb's write_lob_with_length). A temporary one's is 40 bytes,
-    # `01 28 28`; a persistent one's 114, `01 72 72`. Returns (the bare locator,
+    # then the locator as bytes with their length (python-oracledb's
+    # write_lob_with_length). An Oracle locator leads with its own ub2 length,
+    # which is dropped here: a temporary one's is 40 bytes, `01 28 28`, a
+    # persistent one's 114, `01 72 72`. One the Mirror minted for a column it
+    # served does not, and is the locator whole (#2505). Returns (the locator,
     # the bytes after it), or None for a value in some other form.
     try:
         (Length, Rest) = decode_ub4(Data)
@@ -4195,10 +4197,12 @@ def _lob_bind_locator(Data: bytes) -> tuple[bytes, bytes] | None:
         return None
     if not 2 <= Length <= 252 or Rest[:1] != bytes([Length]):
         return None
-    Prefixed = Rest[1 : 1 + Length]
-    if len(Prefixed) != Length or int.from_bytes(Prefixed[:2], 'big') != Length - 2:
+    Locator = Rest[1 : 1 + Length]
+    if len(Locator) != Length:
         return None
-    return (bytes(Prefixed[2:]), Rest[1 + Length :])
+    if int.from_bytes(Locator[:2], 'big') == Length - 2:
+        return (bytes(Locator[2:]), Rest[1 + Length :])
+    return (bytes(Locator), Rest[1 + Length :])
 
 
 # The fixed head of a native JSON bind value (_native_lob_bind_value): the

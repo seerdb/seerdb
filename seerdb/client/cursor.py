@@ -33,7 +33,7 @@ from seerdb.common.sqltext import (
     returning_bind_positions,
     strip_non_bind_text,
 )
-from seerdb.common.tns import _object_bind_type
+from seerdb.common.tns import _object_bind_type, is_prefixed_locator
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     FIELD_VERSION_10_2,
@@ -1528,7 +1528,10 @@ def _bind_temp_lobs(Bind: list, Connection: object = None) -> list:
         elif V.data_type == TNS_TYPE_BFILE:
             Out.append(BfileBind(bytes(V.raw)))
         elif V.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
-            Out.append(TempLob(V.raw[2:], V.data_type == TNS_TYPE_BLOB, csfrm=V._csfrm))
+            # Oracle's locator leads with its own ub2 length, which the marker
+            # writes itself; a Mirror's does not, and goes whole (#2505).
+            Bare = V.raw[2:] if is_prefixed_locator(V.raw) else V.raw
+            Out.append(TempLob(Bare, V.data_type == TNS_TYPE_BLOB, csfrm=V._csfrm))
         else:
             Out.append(V)
     return Out
