@@ -1083,6 +1083,12 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   (`ends_session`), closes it, and fails the call with an `OperationalError`
   worded as python-oracledb's DPY-4011; it no longer hands the empty reply
   to the dialect to misread.
+- **An open cursor bound IN** to a block (a scrollable one, open on the
+  server) goes as OCI 11.2's `SQLT_RSET` bind of an open statement handle: the
+  OUT bind's descriptor, a REF CURSOR (102) of one byte, and the cursor's id as
+  a 4-byte value where the OUT form sends 0. Bound to an IN OUT parameter the
+  cursor comes back in the cursor cell below (an unopened one once the block
+  has closed it). Outside a block it is refused, as the OUT bind is.
 - **A REF CURSOR OUT bind** is bound as sqlplus 11.2 binds a `variable
   refcursor`: a REF CURSOR (102) of one byte, the value a cursor id of 0 in
   four bytes. The block's reply carries the cursor it opened, in the cell a

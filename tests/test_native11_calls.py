@@ -667,6 +667,42 @@ class Native11TempLobTest(_At11g):
         )
         self.assertEqual(OurValues, TheirValues)
 
+    def test_an_open_cursor_binds_in_as_oci_binds_it(self):
+        # OCI 11.2's SQLT_RSET bind of an open statement handle IN: the OUT
+        # form's descriptor, a REF CURSOR (102) of one byte, and the cursor's id
+        # as a 4-byte value where the OUT form sends 0. The block's NUMBER OUT
+        # bind follows, its descriptor NUMBER's.
+        from seerdb.client.cursor import cursor as CursorBind
+        from seerdb.common.tns import (
+            _OAC_FROM_OCI,
+            _encode_oci11_bind_oac,
+            _encode_oci11_bind_value,
+        )
+
+        Captured = _capture('oci11_execute_refcursor_in.hexdump')
+        ([Theirs, _], Rest) = self._binds(Captured, 2)
+        self.assertEqual(Rest[:1], b'\x07')
+        Bind = CursorBind()
+        Bind.id = int.from_bytes(Rest[2:6], 'little')
+        self.assertEqual(Bind.id, 3)
+        (Ours, _) = _OAC_FROM_OCI(_encode_oci11_bind_oac(Bind), {'oci_12c': False})
+        Fields = ('data_type', 'max_length', 'charset', 'csfrm')
+        self.assertEqual([Ours[F] for F in Fields], [Theirs[F] for F in Fields])
+        self.assertEqual(_encode_oci11_bind_value(Bind), bytes(Rest[1:6]))
+
+    def test_the_dialect_takes_an_open_cursor_in_a_block_only(self):
+        # Measured in a block; anywhere else it is refused before anything is
+        # sent. Bound to an IN OUT parameter the cursor comes back, so its
+        # position reads as a cursor cell.
+        from seerdb.client.cursor import cursor as CursorBind
+
+        Bind = CursorBind()
+        Bind.id = 3
+        self.assertEqual(Oci11Dialect._cursor_outs([1, Bind]), frozenset({1}))
+        Gen = Oci11Dialect(lambda: 7).execute_query('select :1 from dual', [Bind])
+        with self.assertRaises(NotSupportedError):
+            Gen.send(None)
+
     def test_a_fetched_bfile_binds_as_oci_binds_it(self):
         # OCI 11.2's SQLT_BFILE bind of a fetched locator: the descriptor a
         # BFILE (114) of the LOB bind's 72 bytes, no charset; the value a ub4
@@ -930,14 +966,16 @@ class Native11RefCursorTest(_At11g):
         self.assertEqual([C['column_name'] for C in Nested], ['M'])
 
     def test_what_is_still_refused(self):
+        # A REF CURSOR, OUT or bound IN, outside a block; in a block, both go.
         from seerdb import DB_TYPE_CURSOR
         from seerdb.common.datatypes import RefCursorBind, Var
 
         with self.assertRaises(NotSupportedError):
             Oci11Dialect._check_binds([Var(DB_TYPE_CURSOR)])  # outside a block
         with self.assertRaises(NotSupportedError):
-            Oci11Dialect._check_binds([RefCursorBind()], block=True)  # IN
+            Oci11Dialect._check_binds([RefCursorBind()])  # IN, outside a block
         Oci11Dialect._check_binds([Var(DB_TYPE_CURSOR)], block=True)
+        Oci11Dialect._check_binds([RefCursorBind()], block=True)
 
 
 class Native11PingAndParseTest(_At11g):

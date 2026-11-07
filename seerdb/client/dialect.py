@@ -1579,8 +1579,9 @@ class Oci11Dialect(Oall8Dialect):
     DML, DDL, COMMIT and ROLLBACK, and PL/SQL blocks, with scalar IN, OUT and
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT, a NULL one and
-    an array DML's too, and a fetched BFILE bound IN. Not yet, and refused
-    before anything is sent: a REF CURSOR bound IN or outside a block; an object
+    an array DML's too, a fetched BFILE bound IN, and an open cursor bound IN
+    to a block. Not yet, and refused before anything is sent: a REF CURSOR
+    bound outside a block; an object
     bind, as on every tier below 12.1. Every column type is read: a BFILE's
     with OCI's file calls, an object's or a collection's as the native 9.2
     form's image. LONG and LONG RAW
@@ -1654,7 +1655,11 @@ class Oci11Dialect(Oall8Dialect):
 
         for value in bind or []:
             if isinstance(value, RefCursorBind):
-                raise _oci11_unsupported('a REF CURSOR IN bind')
+                # An open cursor bound IN to a block, as OCI 11.2 binds one
+                # (SQLT_RSET); anywhere else its form is not measured.
+                if not block:
+                    raise _oci11_unsupported('a REF CURSOR IN bind outside a block')
+                continue
             if isinstance(value, Var) and value.dbtype.tns_type == TNS_TYPE_REFCURSOR:
                 if not block:
                     raise _oci11_unsupported('a REF CURSOR bind outside a block')
@@ -1671,8 +1676,15 @@ class Oci11Dialect(Oall8Dialect):
 
     @staticmethod
     def _cursor_outs(bind: list) -> frozenset[int]:
-        # The positions whose OUT value is a cursor the block opened.
-        return frozenset(i for (i, value) in enumerate(bind) if _is_cursor_var(value))
+        # The positions whose OUT value is a cursor: one the block opened, or
+        # an open cursor bound IN to an IN OUT parameter, which comes back.
+        from seerdb.common.datatypes import RefCursorBind
+
+        return frozenset(
+            i
+            for (i, value) in enumerate(bind)
+            if _is_cursor_var(value) or isinstance(value, RefCursorBind)
+        )
 
     @staticmethod
     def _lob_outs(bind: list) -> frozenset[int]:
