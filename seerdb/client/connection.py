@@ -3527,11 +3527,30 @@ class OracleConnect(_ConnectionLogic):
             # A pooled 11g session: the server refuses a password change on a
             # DRCP session (ORA-56609 to OCI 11.2's OCIPasswordChange, #2466).
             if self.server_type != 'pooled':
-                # A dedicated session in the native form (#2463): its password
-                # change is not measured yet.
-                raise NotSupportedError(
-                    "changepassword is not supported in Oracle 11g's native form yet"
+                # A dedicated session in the native form (#2463), as OCI 11.2's
+                # OCIPasswordChange on an open session changes it.
+                from seerdb.client.dialect import Oci11Dialect
+                from seerdb.common.tns import encode_chgpwd_oci11
+
+                if self.conn_key is None or not isinstance(self._dialect, Oci11Dialect):
+                    raise InterfaceError(
+                        'changepassword requires an authenticated connection'
+                    )
+
+                self._drive(
+                    self._dialect.change_password(
+                        encode_chgpwd_oci11(
+                            self._next_seq(),
+                            self.user.encode('utf-8'),
+                            self.conn_key,
+                            old_password,
+                            new_password,
+                            self._o7_session_pairs(),
+                        )
+                    )
                 )
+                self.password = new_password
+                return
             raise NotSupportedError(
                 'changepassword is not supported on a pooled Oracle 11g '
                 'connection: the server refuses a password change on a DRCP '

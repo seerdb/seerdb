@@ -17438,6 +17438,53 @@ def encode_auth_oci11(
 
 _AUTH_REPLY_FROM_OCI = wire_schema.compile_decoder(_PRE10_AUTH_REPLY, _OCI)
 
+# A dedicated 11g session's password change in the native form, as OCI 11.2's
+# OCIPasswordChange on an open session makes it (#2463): an AUTH of mode 0x102
+# (WITH_PASSWORD | CHANGE_PASSWORD), an empty AUTH_SESSKEY, the current and the
+# new password each AES-encrypted with the login's ConnKey, as the converted
+# form's (encode_dictionary_chgpwd), and the session's own pairs. OCI sends a
+# TTI_80SES piggyback naming the session ahead of it; the server does not need
+# it. The reply is an RPA with no pairs and the status, or the status alone.
+_OCI11_CHGPWD_MODE = 0x102
+
+
+def encode_chgpwd_oci11(
+    Seq: int,
+    User: bytes,
+    ConnKey: bytes,
+    Current: str,
+    New: str,
+    Pairs: list[tuple[bytes, bytes]],
+) -> bytes:
+    """Change the session user's password, in 11g's native form."""
+    Out: list[tuple[bytes, bytes, int]] = [
+        (b'AUTH_SESSKEY', b'', 1),
+        (
+            b'AUTH_PASSWORD',
+            encrypt_password(ConnKey, Current.encode('utf-8')).hex().upper().encode(),
+            0,
+        ),
+        (
+            b'AUTH_NEWPASSWORD',
+            encrypt_password(ConnKey, New.encode('utf-8')).hex().upper().encode(),
+            0,
+        ),
+    ]
+    Out += [(K, V, 0) for K, V in Pairs]
+    return _auth_call_oci(TTI_AUTH, Seq, User, _OCI11_CHGPWD_MODE, Out)
+
+
+def decode_chgpwd_reply_oci11(Data: bytes) -> bytes:
+    """A native password change's reply, its RPA (no pairs) passed over: the
+    status behind it. A reply cut short raises Truncated."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return Data
+    try:
+        (_, Rest) = _AUTH_REPLY_FROM_OCI(Data)
+    except IndexError as Exc:
+        raise Truncated(f'11g password change: {Exc}') from Exc
+    return Rest
+
 
 def decode_token_rpa_oci(Payload: bytes) -> tuple:
     """A native login reply (#2466), the RPA and its pairs at OCI's widths, read

@@ -296,7 +296,8 @@ def _target_of(conn) -> _Target:
         os.environ.get('SEERDB_TEST_MIRROR', ''),
         temp_lobs_available(conn),
         getattr(conn, '_dialect', None) is not None,
-        bool(getattr(conn, '_native11', False)),
+        bool(getattr(conn, '_native11', False))
+        and getattr(conn, 'server_type', None) == 'pooled',
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
     )
@@ -454,8 +455,8 @@ _NATIONAL_OUT_BIND = _Need(
     'a national OUT bind is refused on fv2 (ORA-03120)', min_fv=_FV
 )
 _CHANGE_PASSWORD = _Need(
-    'changepassword is not supported on Oracle 9i, a pooled 11g session refuses '
-    "it (ORA-56609), and 11g's native form does not send it yet",
+    'changepassword is not supported on Oracle 9i, and a pooled 11g session '
+    'refuses it (ORA-56609)',
     min_fv=_FV,
     password_change=True,
 )
