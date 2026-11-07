@@ -264,8 +264,11 @@ class Cursor(_CursorLogic):
             Batch = [self._typed_binds(operation, Row) for Row in Batch]
         # Then the input type handler, for each bind still untyped (#2458).
         (Bind, Batch) = self._handled_binds(Bind, Batch)
-        if not Batch:
-            Bind = self._promote_lob_var_binds(Bind)
+        # A declared CLOB / BLOB value goes as a temporary LOB, every row of an
+        # executemany too, as python-oracledb makes one for each (#902).
+        Bind = self._promote_lob_var_binds(Bind)
+        if Batch:
+            Batch = [self._promote_lob_var_binds(Row) for Row in Batch]
         self._inputsizes = ((), {})
         _check_object_bind_support(self._connection, Bind, Batch)
         Kw: dict[str, Any] = {
