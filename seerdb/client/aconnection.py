@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from seerdb.common.dbobject import DbObjectType
 
 from seerdb.client._conn_logic import (
+    SESSION_SHUTDOWN_MESSAGE,
     _ConnectionLogic,
     _pre10_tier_name_for,
     _transaction_priority,
@@ -115,6 +116,7 @@ from seerdb.common.tns import (
     encode_tpc_change_state,
     encode_tpc_switch,
     ends_response,
+    ends_session,
     exec_oac_signature,
     find_fast_auth_rpa,
     has_long_class_bind,
@@ -461,6 +463,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         # The last reply's call status and error code, recorded as it decodes
         # (#2456): transaction_in_progress and is_healthy read them.
         self._call_status: list[int] = []
+        # Set when the server ended the session with an EOF DATA packet (a
+        # killed pooled 11g session's, #2466): is_healthy reads it.
+        self._session_shutdown = False
         # Negotiated TTC field version; see OracleConnect for the full note.
         self.field_version = field_version
         self._field_version_requested = field_version  # for the nego-cache retry
@@ -830,6 +835,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                     # independently encrypted + MAC'd, so decrypt/verify per packet
                     # before reassembly concatenates the plaintext.
                     Ends = Type == TNS_DATA and ends_response(Acc)
+                    if Type == TNS_DATA and ends_session(Acc):
+                        self._session_shutdown = True
                     if Ends:
                         self._replies_marked = True
                     if Type == TNS_DATA and self._ano is not None and self._ano.active:
@@ -1277,6 +1284,12 @@ class AsyncOracleConnect(_ConnectionLogic):
                 intent = gen.send(to_send)  # type: ignore[attr-defined]
                 if intent is RECV:
                     to_send = await self._next_data_packet()
+                    if self._session_shutdown:
+                        # The server ended the session (a killed pooled 11g
+                        # one answers so, #2466): no reply comes for the
+                        # dialect to read.
+                        await self.disconnect()
+                        raise OperationalError(SESSION_SHUTDOWN_MESSAGE)
                 elif isinstance(intent, Send):
                     # The dialect's own call: a pooled 11g session sends it (#2466).
                     self._native11_sending = True

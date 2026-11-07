@@ -1066,6 +1066,13 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   ORA-56609 (*Usage not supported with DRCP*), with a right old password or a
   wrong one, and the password is not changed. seerdb refuses
   `changepassword()` there before sending it, naming that error.
+- **A killed session** (`ALTER SYSTEM KILL SESSION`) is answered on its next
+  call with a DATA packet of data flags `0x0040` (EOF) alone and no payload:
+  no ORA-00028, which a dedicated server sends. python-oracledb reads that as
+  the session shut down (TNS-12572). seerdb marks the connection unhealthy
+  (`ends_session`), closes it, and fails the call with an `OperationalError`
+  worded as python-oracledb's DPY-4011; it no longer hands the empty reply
+  to the dialect to misread.
 - **A REF CURSOR OUT bind** is bound as sqlplus 11.2 binds a `variable
   refcursor`: a REF CURSOR (102) of one byte, the value a cursor id of 0 in
   four bytes. The block's reply carries the cursor it opened, in the cell a

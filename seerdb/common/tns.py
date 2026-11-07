@@ -215,6 +215,7 @@ from seerdb.common.tns_consts import (
     TNS_CCAP_END_OF_RESPONSE,
     TNS_DATA,
     TNS_DATA_FLAGS_END_OF_RESPONSE,
+    TNS_DATA_FLAGS_EOF,
     TNS_DATA_FLAGS_MORE,
     TNS_DATA_TYPE_ALTSESS,
     TNS_END_TO_END_ACTION,
@@ -837,6 +838,14 @@ def ends_response(Packet: bytes) -> bool:
     # framing sets on the last packet of every reply (#1845). The data flags
     # follow the 8-byte header in both header layouts.
     return bool(int.from_bytes(Packet[8:10], 'big') & TNS_DATA_FLAGS_END_OF_RESPONSE)
+
+
+def ends_session(Packet: bytes) -> bool:
+    # Whether the DATA packet at the start of ``Packet`` (header included) is
+    # the server ending the session: data flags of EOF alone and no payload, as
+    # 11g's pool answers a call on a session that was killed (#2466) and as
+    # python-oracledb reads one (TNS-12572, session shutdown).
+    return int.from_bytes(Packet[8:10], 'big') == TNS_DATA_FLAGS_EOF
 
 
 _REDIRECT_HOST_RE = re.compile(rb'\(HOST\s*=\s*([^)\s]+)\s*\)', re.IGNORECASE)
