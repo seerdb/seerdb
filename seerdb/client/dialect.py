@@ -1581,9 +1581,9 @@ class Oci11Dialect(Oall8Dialect):
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT, a NULL one and
     an array DML's too, a fetched BFILE bound IN, and an open cursor bound IN
-    to a block, and an object or a collection bound IN. Not yet, and refused
-    before anything is sent: a REF CURSOR bound outside a block, and an object
-    bound OUT. Every column type is read: a BFILE's
+    to a block, and an object or a collection bound IN, OUT and IN OUT. Not
+    yet, and refused before anything is sent: a REF CURSOR or an object Var
+    bound outside a block. Every column type is read: a BFILE's
     with OCI's file calls, an object's or a collection's as the native 9.2
     form's image. LONG and LONG RAW
     columns are read a row a fetch, each value whole; a cursor the server opened
@@ -1653,6 +1653,7 @@ class Oci11Dialect(Oall8Dialect):
         # unset one outside a block, which has no OUT value to take. A REF
         # CURSOR Var is served OUT, in a block; an open cursor bound IN is not.
         from seerdb.common.datatypes import RefCursorBind, Var
+        from seerdb.common.dbobject import DbObjectType
 
         for value in bind or []:
             if isinstance(value, RefCursorBind):
@@ -1665,6 +1666,12 @@ class Oci11Dialect(Oall8Dialect):
                 if not block:
                     raise _oci11_unsupported('a REF CURSOR bind outside a block')
                 continue
+            if isinstance(value, Var) and isinstance(value.dbtype, DbObjectType):
+                # An object or a collection bound OUT or IN OUT, as OCI 11.2's
+                # SQLT_NTY bind of one (#2463); measured in a block only.
+                if not block:
+                    raise _oci11_unsupported('an object bound OUT outside a block')
+                continue
             if not isinstance(value, Var) or (
                 block
                 and value.dbtype.tns_type in _OCI11_LOB_TYPES
@@ -1674,6 +1681,36 @@ class Oci11Dialect(Oall8Dialect):
             if value.dbtype.tns_type in _OCI11_UNREAD_BINDS:
                 name = _OCI11_UNREAD_BINDS[value.dbtype.tns_type]
                 raise _oci11_unsupported(f'a {name} bind')
+
+    @staticmethod
+    def _object_outs(bind: list) -> frozenset[int]:
+        # The positions whose OUT value is an object's cell: an object or a
+        # collection bound itself, or a Var of an object type (#2463).
+        from seerdb.common.datatypes import Var
+        from seerdb.common.dbobject import DbObject, DbObjectType
+
+        return frozenset(
+            i
+            for (i, value) in enumerate(bind)
+            if isinstance(value, DbObject)
+            or (isinstance(value, Var) and isinstance(value.dbtype, DbObjectType))
+        )
+
+    @staticmethod
+    def _object_out_value(value: object, image: object) -> object:
+        # An object's OUT image as the cursor reads one: an ObjectImage of the
+        # bind's type, or None for a NULL object.
+        from seerdb.common.datatypes import Var
+        from seerdb.common.dbobject import ObjectImage
+
+        if image is None:
+            return None
+        typ = (
+            value.dbtype
+            if isinstance(value, Var)
+            else object.__getattribute__(value, '_dbtype')
+        )
+        return ObjectImage(typ.oid, typ.schema, typ.name, None, image)
 
     @staticmethod
     def _cursor_outs(bind: list) -> frozenset[int]:
@@ -2105,6 +2142,18 @@ class Oci11Dialect(Oall8Dialect):
         # comes back in the result, as execute_dml's does.
         stmt_type = oci11_stmt_type(sql.strip().upper())
         self._check_binds([v for (i, v) in enumerate(bind) if i not in returning])
+        from seerdb.common.datatypes import Var as _Var
+        from seerdb.common.dbobject import DbObjectType as _DbObjectType
+
+        if any(
+            isinstance(bind[i], _Var) and isinstance(bind[i].dbtype, _DbObjectType)
+            for i in returning
+            if i < len(bind)
+        ):
+            # Its native form is not measured, and its placeholder ended the
+            # server process (ORA-03137 [3146]); the connection takes the
+            # PL/SQL block for it instead (native_returning, #2463).
+            raise _oci11_unsupported('a RETURNING into an object, as itself')
         for row in batch or []:
             self._check_binds([v for (i, v) in enumerate(row) if i not in returning])
         iterations = 1 + len(batch or [])
@@ -2284,9 +2333,10 @@ class Oci11Dialect(Oall8Dialect):
         )
         lobs = self._lob_outs(bind)
         cursors = self._cursor_outs(bind)
-        buf = yield from self._recv_block(len(bind), lobs, cursors)
+        objects = self._object_outs(bind)
+        buf = yield from self._recv_block(len(bind), lobs, cursors, objects)
         (directions, out_values, rest, session) = decode_oci11_block(
-            buf, len(bind), lobs, cursors
+            buf, len(bind), lobs, cursors, objects
         )
         if session is not None and self._on_session is not None:
             self._on_session(session['session_id'], session['serial'])
@@ -2297,7 +2347,11 @@ class Oci11Dialect(Oall8Dialect):
             return (0, 0, 0, (None, None), [], None, None, [], None)
         out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
         out_values = [
-            self._lob_out_value(bind[pos], value) if pos in lobs else value
+            self._lob_out_value(bind[pos], value)
+            if pos in lobs
+            else self._object_out_value(bind[pos], value)
+            if pos in objects
+            else value
             for (pos, value) in zip(out_positions, out_values)
         ]
         # A REF CURSOR the block opened comes back as its (id, columns): its rows
@@ -2320,6 +2374,7 @@ class Oci11Dialect(Oall8Dialect):
         num_binds: int,
         lobs: frozenset[int] = frozenset(),
         cursors: frozenset[int] = frozenset(),
+        objects: frozenset[int] = frozenset(),
     ):
         # A block's reply, read on across packets until it holds its prompt, its
         # OUT values and a whole status: a long OUT value spans packets.
@@ -2332,7 +2387,9 @@ class Oci11Dialect(Oall8Dialect):
                 raise Exception('Connection closed during an 11g PL/SQL block')
             buf += received[1]
             try:
-                (_, _, rest, _) = decode_oci11_block(buf, num_binds, lobs, cursors)
+                (_, _, rest, _) = decode_oci11_block(
+                    buf, num_binds, lobs, cursors, objects
+                )
                 decode_oci11_status(self._session_return(rest))
             except Truncated:
                 continue

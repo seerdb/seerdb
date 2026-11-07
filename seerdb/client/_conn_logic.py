@@ -1140,17 +1140,22 @@ def dialect_pings(Dialect) -> 'TypeGuard[Oci11Dialect]':
 def native_returning(Dialect, Bind, ReturnBinds) -> 'TypeGuard[Oci11Dialect]':
     """Whether a pre-10g dialect runs this DML's RETURNING ... INTO as itself (a
     pooled 11g session, #2466) rather than as the PL/SQL block 8i and 9i take.
-    A LOB target keeps the block, which serves it; its native form is not
-    measured."""
+    A LOB or an object target keeps the block, which serves it as an OUT bind;
+    its native form is not measured. Sent natively, an object target's
+    placeholder ended the server process (ORA-03137 [3146], #2463)."""
     from seerdb.client.dialect import CAP_RETURNING
     from seerdb.common.datatypes import Var
+    from seerdb.common.dbobject import DbObjectType
     from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
 
     if Dialect is None or CAP_RETURNING not in Dialect.capabilities():
         return False
     return not any(
         isinstance(Bind[Pos], Var)
-        and Bind[Pos].dbtype.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
+        and (
+            Bind[Pos].dbtype.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
+            or isinstance(Bind[Pos].dbtype, DbObjectType)
+        )
         for Pos in ReturnBinds
         if Pos < len(Bind)
     )

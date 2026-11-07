@@ -1038,7 +1038,13 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   object column carries (`_O9I_OBJECT_CELL`): the constructed 36-byte toid, no
   object OID or snapshot, version 0, the image's length, the TOP_LEVEL flags and
   the packed image -- the toid and image the 12c+ thin bind sends, byte for
-  byte. An object bound OUT is not measured yet.
+  byte. Bound OUT, an unset object Var goes as OCI's atomically NULL instance:
+  the toid, an image length of 0 and no image. Its value comes back in the
+  block's reply in the cell it went out in, with no indicator behind it
+  (`decode_oci11_block`'s `Objects`): the new image, or none for a NULL object.
+  A DML's RETURNING into an object goes through the PL/SQL block, as one into a
+  LOB does; sent as itself, an object target's placeholder ended the server
+  process (`ORA-03137 [3146]`).
 - **An object or collection column** (XMLType among them) is described as
   type 109 with its type's schema and name, and its row cell is the native 9.2
   form's image (`_O9I_OBJECT_CELL`): the 9i native dialect's reader takes it as
