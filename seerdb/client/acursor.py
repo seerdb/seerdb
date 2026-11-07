@@ -93,7 +93,9 @@ class AsyncCursor(_CursorLogic):
         self._check_open()
         self._fetch_decimals_for(fetch_decimals)
         self._release_scroll_cursor()  # free any prior scrollable cursor (#181)
-        Bind = _bind_temp_lobs(_resolve_parameters(operation, parameters))
+        Bind = _bind_temp_lobs(
+            _resolve_parameters(operation, parameters), self._connection
+        )
         Bind = self._resolve_cursor_binds(Bind)
         Bind = await self._promote_large_lob_binds(operation, Bind)
         # A plain loop: an await inside a nested comprehension is a SyntaxError
@@ -546,7 +548,10 @@ class AsyncCursor(_CursorLogic):
             raise NotSupportedError('arraydmlrowcounts requires an Oracle 12.1+ server')
         self._batcherrors = []
         self._arraydmlrowcounts = []
-        Rows = [_resolve_parameters(operation, P) for P in seq_of_parameters]
+        Rows = [
+            _bind_temp_lobs(_resolve_parameters(operation, P), self._connection)
+            for P in seq_of_parameters
+        ]
         if not Rows:
             self._description = None
             self._rows = []

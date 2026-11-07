@@ -82,6 +82,24 @@ class TempLob:
         return f'TempLob({kind}, {len(self.locator)}B locator)'
 
 
+class BfileBind:
+    """A bind marker for a BFILE bound IN by its locator, as fetched.
+
+    python-oracledb binds one with the BFILE OAC -- type 114, the type's
+    buffer of 4000, no LOB cont-flag, no charset -- and the locator in the LOB
+    framing a CLOB's or BLOB's takes (a ub4 length, then the bytes with their
+    length), measured against a live 21c. The marker holds the locator as a
+    row carries it, its own ub2 length in front."""
+
+    __slots__ = ('locator',)
+
+    def __init__(self, locator: bytes):
+        self.locator = locator
+
+    def __repr__(self) -> str:
+        return f'BfileBind({len(self.locator)}B locator)'
+
+
 class _DbType:
     """An Oracle bind type usable as a `cursor.var()` / OUT-bind type spec."""
 

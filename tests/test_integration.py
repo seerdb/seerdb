@@ -281,6 +281,8 @@ class _Target(NamedTuple):
     # Whether the server refuses a password change on the session: a pooled 11g
     # one answers ORA-56609 (#2466).
     no_password_change: bool = False
+    # Whether the session is a pooled 11g one in the native form (#2466).
+    native11: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -293,6 +295,7 @@ def _target_of(conn) -> _Target:
         os.environ.get('SEERDB_TEST_MIRROR', ''),
         temp_lobs_available(conn),
         getattr(conn, '_dialect', None) is not None,
+        bool(getattr(conn, '_native11', False)),
         bool(getattr(conn, '_native11', False)),
     )
 
@@ -337,6 +340,8 @@ class _Need(NamedTuple):
     rows_returning: bool = False
     # Whether it changes a password, which some sessions' servers refuse.
     password_change: bool = False
+    # Whether a pooled 11g session lacks it.
+    not_native11: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -345,6 +350,8 @@ class _Need(NamedTuple):
         if self.rows_returning and target.wrapped_returning:
             return True
         if self.password_change and target.no_password_change:
+            return True
+        if self.not_native11 and target.native11:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -6043,6 +6050,45 @@ class MixedPrecisionBatchIntegration(_IntegrationBase):
         self.assertEqual([r[0] for r in self.cur.fetchall()], values)
 
 
+@_requires(
+    _Need(
+        'binding a fetched LOB needs the 10g+ bind (8i and 9i: not measured)',
+        min_fv=FIELD_VERSION_10_2,
+    ),
+    _mirror_lacks('binding back a LOB it served (#2505)'),
+)
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class FetchedLobBindIntegration(_IntegrationBase):
+    """A CLOB or BLOB a query returned, bound back IN by its locator."""
+
+    def test_a_fetched_clob_and_blob_bind_back(self):
+        # Bound by its locator, as python-oracledb binds one: the temp-LOB bind's
+        # OAC and the LOB framing, a persistent locator's 114 bytes as much as a
+        # temporary one's 40. It raised `Unknown OAC token` before anything was
+        # sent; below 12.1 it takes the older OAC layout.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, c CLOB, b BLOB)')
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (1, 'hello', HEXTORAW('0102'))"
+        )
+        self.conn.commit()
+        self.cur.execute(f'SELECT c, b FROM {self.TABLE}')
+        (Clob, Blob) = self.cur.fetchone()
+        self.cur.execute(
+            'SELECT DBMS_LOB.GETLENGTH(:1), DBMS_LOB.GETLENGTH(:2) FROM dual',
+            [Clob, Blob],
+        )
+        self.assertEqual(self.cur.fetchone(), (5, 2))
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3)',
+            [(2, Clob, Blob), (3, Clob, Blob)],
+        )
+        self.cur.execute(
+            f'SELECT n, DBMS_LOB.GETLENGTH(c), DBMS_LOB.GETLENGTH(b) '
+            f'FROM {self.TABLE} ORDER BY n'
+        )
+        self.assertEqual(self.cur.fetchall(), [(1, 5, 2), (2, 5, 2), (3, 5, 2)])
+
+
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class BFileMissingDirectoryIntegration(_IntegrationBase):
     """A BFILE naming a directory that does not exist (#1101).
@@ -6071,6 +6117,36 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
             self.assertEqual(caught.exception.code, 22285)
         finally:
             Conn.close()
+
+    @_requires(
+        _mirror_lacks('binding back a LOB it served (#2505)'),
+        _Need(
+            'a BFILE bind needs the 10g+ bind; a pooled 11g session refuses it (#2466)',
+            min_fv=FIELD_VERSION_10_2,
+            not_native11=True,
+        ),
+    )
+    def test_a_fetched_bfile_binds_back(self):
+        # Bound by its locator with the BFILE OAC -- type 114, the type's buffer
+        # of 4000, no LOB cont-flag -- as python-oracledb binds one. It raised
+        # `Unknown OAC token` before anything was sent. The server takes the
+        # locator without opening the file, so the missing directory is fine.
+        self.cur.execute(
+            'SELECT BFILENAME(:1, :2) FROM dual',
+            ['PYO_MISSING_DIR', 'pyo_missing_file.txt'],
+        )
+        (Lob,) = self.cur.fetchone()
+        self.cur.execute(
+            "SELECT CASE WHEN :1 IS NULL THEN 'null' ELSE 'set' END FROM dual", [Lob]
+        )
+        self.assertEqual(self.cur.fetchone(), ('set',))
+        Out = self.cur.var(str)
+        self.cur.execute(
+            'DECLARE d VARCHAR2(30); f VARCHAR2(200); '
+            "BEGIN DBMS_LOB.FILEGETNAME(:1, d, f); :2 := d || '/' || f; END;",
+            [Lob, Out],
+        )
+        self.assertEqual(Out.getvalue(), 'PYO_MISSING_DIR/pyo_missing_file.txt')
 
     @_requires(_postgres_cannot('serve a BFILE column'))
     def test_bfile_methods_on_a_missing_directory(self):

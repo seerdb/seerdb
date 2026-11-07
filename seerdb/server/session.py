@@ -75,6 +75,7 @@ from seerdb.common.tns import (
     LOBOPS_ERR_NOT_OPENED,
     OCI_NLS_KEYWORDS,
     ArrayOutBind,
+    BfileRef,
     ColumnMeta,
     ExecRequest,
     FetchRequest,
@@ -3986,6 +3987,18 @@ def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecR
     single = len(request.bind_rows) <= 1
 
     def resolve(value: object) -> object:
+        if isinstance(value, BfileRef) or (
+            isinstance(value, TempLobRef) and temp_lobs.resolve(value.locator) is None
+        ):
+            # A locator the Mirror did not mint for a temporary LOB: a LOB a
+            # query returned, bound back. Resolving a column LOB it served to
+            # its content is not built yet (#2505); bound as empty content it
+            # stored a wrong value without a word, so it is refused.
+            raise BackendError(
+                'invalid LOB locator specified: a LOB a query returned cannot be '
+                'bound back through the Mirror yet',
+                ora_code=ORA_INVALID_LOB_LOCATOR,
+            )
         if isinstance(value, TempLobRef):
             data = temp_lobs.content(value.locator)
             content: bytes | str = (
@@ -4002,7 +4015,9 @@ def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecR
             return content
         return value
 
-    if not any(isinstance(v, TempLobRef) for row in request.bind_rows for v in row):
+    if not any(
+        isinstance(v, (TempLobRef, BfileRef)) for row in request.bind_rows for v in row
+    ):
         return request
     rows = [[resolve(v) for v in row] for row in request.bind_rows]
     return replace(request, binds=rows[0], bind_rows=rows)

@@ -12,6 +12,7 @@ from seerdb.common.datatypes import (
     _NUMBER_TNS_TYPES,
     DB_TYPE_OBJECT,
     DB_TYPE_XMLTYPE,
+    BfileBind,
     RefCursorBind,
     TempLob,
     Var,
@@ -120,7 +121,9 @@ class Cursor(_CursorLogic):
         self._fetch_decimals_for(fetch_decimals)
         # Re-executing frees any cursor left open by a prior scrollable SELECT.
         self._release_scroll_cursor()
-        Bind = _bind_temp_lobs(_resolve_parameters(operation, parameters))
+        Bind = _bind_temp_lobs(
+            _resolve_parameters(operation, parameters), self._connection
+        )
         Bind = self._resolve_cursor_binds(Bind)
         Bind = self._promote_large_lob_binds(operation, Bind)
         Bind = _with_object_bind_lobs(
@@ -524,7 +527,10 @@ class Cursor(_CursorLogic):
             raise NotSupportedError('arraydmlrowcounts requires an Oracle 12.1+ server')
         self._batcherrors = []
         self._arraydmlrowcounts = []
-        Rows = [_resolve_parameters(operation, P) for P in seq_of_parameters]
+        Rows = [
+            _bind_temp_lobs(_resolve_parameters(operation, P), self._connection)
+            for P in seq_of_parameters
+        ]
         if not Rows:
             self._description = None
             self._rows = []
@@ -1495,22 +1501,33 @@ def _resolve_objects(Connection, Row: list) -> list:
     return Out
 
 
-def _bind_temp_lobs(Bind: list) -> list:
-    """Turn every temp LOB the caller made into the marker that binds it (#1066).
+def _bind_temp_lobs(Bind: list, Connection: object = None) -> list:
+    """Turn every LOB object bound into the marker that binds it by its locator.
 
-    A LOB from ``connection.createlob`` is bound by its locator, exactly as the
-    temp-LOB locator bind of #91 -- same OAC, same value, both captured byte for
-    byte against python-oracledb binding one. The marker holds the BARE locator
-    and writes its own ub2 in front, so the ub2 the LOB object carries is
-    stripped here rather than written twice. Anything else is left alone: a LOB a
-    query returned is a persistent locator, whose bind has not been measured."""
+    A LOB from ``connection.createlob`` (#1066) and one a query returned bind
+    alike, as python-oracledb binds them: a CLOB or BLOB with the temp-LOB
+    locator bind of #91 -- same OAC, the same value framing, a persistent
+    CLOB's 114-byte locator as much as a temporary one's 40, captured against
+    python-oracledb on 21c -- and a BFILE with its own OAC (BfileBind). The
+    TempLob marker holds the BARE locator and writes its own ub2 in front, so the
+    ub2 the LOB object carries is stripped here rather than written twice.
+
+    A fetched one is bound so on the thin 10g+ path alone, where it is measured.
+    A dialect's session (8i, 9i, a pooled 11g one) keeps it as the LOB object,
+    which its own codec binds or refuses: given a marker it does not know, a
+    pooled 11g server process aborted (ORA-03137)."""
     from seerdb.common.lob import LOB
 
     if not Bind:
         return Bind
-    Out = []
+    Thin = getattr(Connection, '_dialect', None) is None
+    Out: list = []
     for V in Bind:
-        if isinstance(V, LOB) and V._temp:
+        if not isinstance(V, LOB) or not (V._temp or Thin):
+            Out.append(V)
+        elif V.data_type == TNS_TYPE_BFILE:
+            Out.append(BfileBind(bytes(V.raw)))
+        elif V.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
             Out.append(TempLob(V.raw[2:], V.data_type == TNS_TYPE_BLOB, csfrm=V._csfrm))
         else:
             Out.append(V)

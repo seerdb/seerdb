@@ -28,6 +28,7 @@ from seerdb.common.datatypes import (
     JSON,
     BcDate,
     BFile,
+    BfileBind,
     BinaryDouble,
     BinaryFloat,
     IntervalYM,
@@ -476,6 +477,14 @@ class ExecRequest:
     # define (the DEFINE execute option). Empty on every other execute; a define
     # execute carries no binds, so this and ``bind_types`` never both fill (#826).
     define_types: list = field(default_factory=list)
+
+
+class BfileRef(NamedTuple):
+    """A BFILE bound by its locator, as a row carries it (its ub2 length in
+    front). The Mirror never mints one, so only a backend that binds a real
+    locator on to Oracle can use it."""
+
+    locator: bytes
 
 
 @dataclass(frozen=True)
@@ -4170,6 +4179,28 @@ def _oci_lob_data(content: bytes) -> bytes:
 # The LOB-descriptor prefix a temp-LOB locator bind carries (shared with the
 # native VECTOR / JSON binds): 01 28 28 then a ub2 locator length + locator.
 _TEMP_LOB_BIND_PREFIX = b'\x01\x28\x28'
+# A BFILE bind's buffer: python-oracledb's DB_TYPE_BFILE buffer_size_factor.
+_BFILE_BIND_BUFFER_SIZE = 4000
+
+
+def _lob_bind_locator(Data: bytes) -> tuple[bytes, bytes] | None:
+    # A CLOB / BLOB bound by its locator, as a client writes it: a ub4 length,
+    # then the locator as bytes with their length, the locator's own ub2 in front
+    # (python-oracledb's write_lob_with_length). A temporary one's is 40 bytes,
+    # `01 28 28`; a persistent one's 114, `01 72 72`. Returns (the bare locator,
+    # the bytes after it), or None for a value in some other form.
+    try:
+        (Length, Rest) = decode_ub4(Data)
+    except (IndexError, ValueError, Truncated):
+        return None
+    if not 2 <= Length <= 252 or Rest[:1] != bytes([Length]):
+        return None
+    Prefixed = Rest[1 : 1 + Length]
+    if len(Prefixed) != Length or int.from_bytes(Prefixed[:2], 'big') != Length - 2:
+        return None
+    return (bytes(Prefixed[2:]), Rest[1 + Length :])
+
+
 # The fixed head of a native JSON bind value (_native_lob_bind_value): the
 # 19-byte descriptor + a ub2 image length + 22 zero bytes; the OSON image
 # (bytes_with_length) follows.
@@ -4217,15 +4248,17 @@ def _read_bind_value(
         # DbObject to re-bind; a plain DALC read would mistake the toid's own
         # length prefix for the value length and desync.
         return _read_object_column(after, {'type_oid': toid})
-    if (
-        data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
-        and after[:3] == _TEMP_LOB_BIND_PREFIX
-    ):
-        loclen = (after[3] << 8) | after[4]
-        locator = after[5 : 5 + loclen]
-        # Kept as a reference; the session swaps in the bytes streamed over
-        # TTI_LOBOPS WRITE (the backend never sees a locator, only the value).
-        return TempLobRef(locator, data_type == TNS_TYPE_BLOB), after[5 + loclen :]
+    if data_type == TNS_TYPE_BFILE:
+        bound = _lob_bind_locator(after)
+        if bound is not None:
+            return BfileRef(prefixed_locator(bound[0])), bound[1]
+    if data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+        bound = _lob_bind_locator(after)
+        if bound is not None:
+            # Kept as a reference; the session swaps in the bytes streamed over
+            # TTI_LOBOPS WRITE (the backend never sees a locator, only the value).
+            (locator, rest) = bound
+            return TempLobRef(locator, data_type == TNS_TYPE_BLOB), rest
     if data_type == TNS_TYPE_JSON and after[:3] == _TEMP_LOB_BIND_PREFIX:
         # A native JSON bind (#50/#70): the client sends the value inline as its
         # OSON image, not a plain DALC — the _native_lob_bind_value framing of a
@@ -4476,14 +4509,10 @@ def parse_exec(
                     # stops short of (the same trailer a 12.2+ describe column
                     # carries) — consume it so the next OAC aligns.
                     _, after = decode_ub4(after)
-                elif field_version < FIELD_VERSION_12_1 and data_type in (
-                    TNS_TYPE_CLOB,
-                    TNS_TYPE_BLOB,
-                ):
-                    # A thin CLOB / BLOB bind is the temp-LOB locator form (#412),
-                    # whose OAC appends a trailing oaccolid field the shared
-                    # decoder stops short of — swallow it so the next OAC aligns.
-                    after = after[1:]
+                # Below 12.1 a CLOB / BLOB bind's OAC is the older layout, as every
+                # other bind's: seerdb's client sent the 12c one there, a byte
+                # longer, which this swallowed, and which a real 11g server
+                # refuses (ORA-03106). The client now sends the older one.
                 # csfrm distinguishes an NCHAR / NVARCHAR bind (2 → UTF-16BE) from
                 # an ordinary char bind (1); maxlen is the OUT return-buffer size a
                 # PL/SQL OUT bind needs (#483/#484). toid is the referenced type's
@@ -19477,15 +19506,18 @@ def encode_token_rxd(Token: object) -> bytes:
         if Declared is not None:
             return Declared
         return encode_token_rxd(Token._value)
-    if isinstance(Token, TempLob):
-        # Temp-LOB locator bind (#91): the LOB-descriptor prefix (shared with the
-        # native VECTOR / JSON binds), a ub2 locator length, then the locator
-        # bytes. Verified against python-oracledb on 21c.
-        return (
-            _TEMP_LOB_BIND_PREFIX
-            + struct.pack('>H', len(Token.locator))
-            + Token.locator
+    if isinstance(Token, (TempLob, BfileBind)):
+        # A LOB bound by its locator (#91): the LOB framing python-oracledb
+        # writes (write_lob_with_length), a ub4 length and the locator as bytes
+        # with their length, the locator as a row carries it, its ub2 length in
+        # front. A temporary one's is 40 bytes (`01 28 28`); a persistent CLOB's
+        # 114 (`01 72 72`), measured against python-oracledb on 21c.
+        Prefixed = (
+            Token.locator
+            if isinstance(Token, BfileBind)
+            else prefixed_locator(Token.locator)
         )
+        return encode_sb4(len(Prefixed)) + _bytes_with_length(Prefixed)
     if Token is None:
         return bytes([0])
     from seerdb.common.dbobject import DbObject, DbRef
@@ -19805,6 +19837,11 @@ def encode_token_oac(Token: object) -> bytes:
         raise NotSupportedError(
             f'no bind encoding for data type {DT}',
         )
+    if isinstance(Token, BfileBind):
+        # A BFILE bound by its locator: type 114, the type's buffer of 4000, no
+        # LOB cont-flag and no charset, as python-oracledb binds one (measured on
+        # a live 21c).
+        return encode_token_raw(TNS_TYPE_BFILE, _BFILE_BIND_BUFFER_SIZE, 0, 0, 0)
     if isinstance(Token, TempLob):
         # Temp-LOB locator bind (#91): a CLOB / BLOB OAC carrying the LOB
         # cont-flag 0x02000000 (the same flag the native VECTOR / JSON OACs
@@ -19818,6 +19855,20 @@ def encode_token_oac(Token: object) -> bytes:
         # for a non-empty LOB (any non-zero length does) but bound an **empty**
         # temp LOB as NULL -- ORA-01400 on a NOT NULL column, and a silent NULL
         # otherwise (#903).
+        if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
+            # Below 12.1 there is no temporary LOB, so this is a fetched one bound
+            # back: the older OAC layout, the same buffer and no cont-flag. The
+            # 12c layout broke the session there (ORA-03106); measured on 11g.
+            Csfrm = getattr(Token, 'csfrm', _CSFRM_DB)
+            return encode_token_raw(
+                TNS_TYPE_BLOB if Token.is_blob else TNS_TYPE_CLOB,
+                _LOB_BIND_BUFFER_SIZE,
+                0,
+                0
+                if Token.is_blob
+                else (AL16UTF16_CHARSET if Csfrm == 2 else AL32UTF8_CHARSET),
+                0,
+            )
         return _encode_lob_bind_oac(Token.is_blob, getattr(Token, 'csfrm', _CSFRM_DB))
     if Token is None:
         # NULL value (0 bytes): a minimal VARCHAR OAC, again avoiding the
