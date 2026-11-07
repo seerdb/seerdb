@@ -15030,6 +15030,10 @@ def _native_bind_type(Value: object) -> tuple[int, int, int]:
         DType, Size, Flag = TNS_TYPE_VARCHAR, _MAX_UROWID_LENGTH, 0x05
     elif isinstance(Value, Var):
         DType, Size, Flag = Value.dbtype.tns_type, max(Value.size or 22, 1), 0x05
+        if DType == TNS_TYPE_INT:
+            # A BINARY_INTEGER Var goes as a NUMBER of 22 bytes, as OCI 11.2
+            # declares its SQLT_INT bind; the client truncates the value (#2463).
+            (DType, Size) = (TNS_TYPE_NUMBER, 22)
     elif isinstance(Value, BinaryFloat):
         # The value goes out as a BINARY_FLOAT (encode_token_rxd), so the
         # descriptor says so; declared a NUMBER, 11g read it back as NaN.
@@ -19997,8 +20001,12 @@ def encode_token_oac(Token: object) -> bytes:
             # the NUMBER buffer, because the VALUE rides the wire as an Oracle
             # NUMBER. Only the declared TYPE differs, and it is what makes the
             # server truncate (`:v := 2.9` yields 2) and what resolves a call
-            # overloaded on NUMBER vs BINARY_INTEGER.
-            return encode_token_raw(TNS_TYPE_INT, 22, 0, 0, 0, A)
+            # overloaded on NUMBER vs BINARY_INTEGER. Before 12.1 the type is the
+            # client's alone: OCI 11.2 declares its SQLT_INT bind a NUMBER of 22
+            # bytes, and truncates the NUMBER that comes back (#2463).
+            if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+                return encode_token_raw(TNS_TYPE_INT, 22, 0, 0, 0, A)
+            return encode_token_raw(TNS_TYPE_NUMBER, 22, 0, 0, 0, A)
         if DT == TNS_TYPE_TIMESTAMPLTZ:
             # 11 bytes, like TIMESTAMP -- the local-time-zone variant carries no
             # extra offset on the wire, the session's zone supplies it.
