@@ -1011,7 +1011,10 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   unset LOB Var in a DML, `NullLobBind`) keeps that descriptor, and its value is
   a ub4 of 0 with no locator behind it, as OCI 11.2's `SQLT_CLOB` / `SQLT_BLOB`
   bind with indicator -1 sends it. In a PL/SQL block an unset LOB Var is an OUT
-  bind, the empty 86-byte locator.
+  bind, the empty 86-byte locator. A fetched BFILE bound IN goes as OCI 11.2's
+  `SQLT_BFILE` bind of one: the descriptor a BFILE (114) of the same 72 bytes,
+  no charset and no form, and the value a ub4 length and the locator as it was
+  fetched, its ub2 length in front.
 - **An object or collection column** (XMLType among them) is described as
   type 109 with its type's schema and name, and its row cell is the native 9.2
   form's image (`_O9I_OBJECT_CELL`): the 9i native dialect's reader takes it as
