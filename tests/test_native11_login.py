@@ -171,6 +171,17 @@ class Native11AuthTest(unittest.TestCase):
         (Fields, _) = self._pairs(role=2)  # SYSOPER
         self.assertEqual(Fields['mode'], 0x101 | 2 * 32)
 
+    def test_a_proxy_login_names_the_schema_first(self):
+        # As sqlplus 11.2's `pyo[seerdb_proxy_target]` login through the pool:
+        # PROXY_CLIENT_NAME ahead of the proof, the user the proxy one. Without
+        # it the pool logged in as the proxy user itself (#2466).
+        (Fields, Pairs) = self._pairs(proxy_user='seerdb_proxy_target')
+        self.assertEqual(Fields['pairs'][0]['key'], b'PROXY_CLIENT_NAME')
+        self.assertEqual(Pairs[b'PROXY_CLIENT_NAME'], (b'seerdb_proxy_target', 0))
+        self.assertEqual(Fields['user'], b'pyo')
+        (_, Plain) = self._pairs()
+        self.assertNotIn(b'PROXY_CLIENT_NAME', Plain)
+
 
 class Native11ChoiceTest(unittest.TestCase):
     """When the native form is spoken, and that nothing else leaves once it is."""

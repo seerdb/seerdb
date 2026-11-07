@@ -17347,7 +17347,13 @@ def encode_auth_oci11(
         Auth.get('sder_count'),
         Auth.get('verifier_type'),
     )
-    Out: list[tuple[bytes, bytes, int]] = [
+    Out: list[tuple[bytes, bytes, int]] = []
+    if Env.get('proxy_user'):
+        # Proxy authentication (#126): the schema the session runs as, the
+        # first pair, as sqlplus 11.2's `user[schema]` login sends it through
+        # the pool. Without it the pool logged in as the proxy user itself.
+        Out.append((b'PROXY_CLIENT_NAME', Env['proxy_user'].encode('utf-8'), 0))
+    Out += [
         (b'AUTH_SESSKEY', AuthSess.hex().upper().encode('ascii'), 1),
         (b'AUTH_PASSWORD', AuthPass.hex().upper().encode('ascii'), 0),
     ]
