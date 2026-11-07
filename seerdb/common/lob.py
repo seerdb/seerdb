@@ -407,15 +407,13 @@ class LOB:
         # 23ai: reply == row[2:]). Adopting the reply's bytes as-is therefore
         # produced a locator the next call refused with ORA-22275, so the prefix
         # is put back when the original had one.
+        from seerdb.common.tns import is_prefixed_locator, prefixed_locator
+
         if not locator:
             return
-        prefixed = (
-            len(self.raw) >= 2
-            and int.from_bytes(self.raw[:2], 'big') == len(self.raw) - 2
-        )
         self.raw = (
-            len(locator).to_bytes(2, 'big') + bytes(locator)
-            if prefixed
+            prefixed_locator(locator)
+            if is_prefixed_locator(self.raw)
             else bytes(locator)
         )
 
