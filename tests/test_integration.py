@@ -281,8 +281,6 @@ class _Target(NamedTuple):
     # Whether the server refuses a password change on the session: a pooled 11g
     # one answers ORA-56609 (#2466).
     no_password_change: bool = False
-    # Whether the session is a pooled 11g one in the native form (#2466).
-    native11: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -295,7 +293,6 @@ def _target_of(conn) -> _Target:
         os.environ.get('SEERDB_TEST_MIRROR', ''),
         temp_lobs_available(conn),
         getattr(conn, '_dialect', None) is not None,
-        bool(getattr(conn, '_native11', False)),
         bool(getattr(conn, '_native11', False)),
     )
 
@@ -340,8 +337,6 @@ class _Need(NamedTuple):
     rows_returning: bool = False
     # Whether it changes a password, which some sessions' servers refuse.
     password_change: bool = False
-    # Whether a pooled 11g session lacks it.
-    not_native11: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -350,8 +345,6 @@ class _Need(NamedTuple):
         if self.rows_returning and target.wrapped_returning:
             return True
         if self.password_change and target.no_password_change:
-            return True
-        if self.not_native11 and target.native11:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -6121,9 +6114,8 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
     @_requires(
         _mirror_lacks('binding back a LOB it served (#2505)'),
         _Need(
-            'a BFILE bind needs the 10g+ bind; a pooled 11g session refuses it (#2466)',
+            'a BFILE bind needs the 10g+ bind',
             min_fv=FIELD_VERSION_10_2,
-            not_native11=True,
         ),
     )
     def test_a_fetched_bfile_binds_back(self):

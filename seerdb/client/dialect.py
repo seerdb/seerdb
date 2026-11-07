@@ -1579,8 +1579,8 @@ class Oci11Dialect(Oall8Dialect):
     DML, DDL, COMMIT and ROLLBACK, and PL/SQL blocks, with scalar IN, OUT and
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT, a NULL one and
-    an array DML's too. Not yet, and refused before anything is sent: a
-    BFILE, and a REF CURSOR bound IN or outside a block; an object
+    an array DML's too, and a fetched BFILE bound IN. Not yet, and refused
+    before anything is sent: a REF CURSOR bound IN or outside a block; an object
     bind, as on every tier below 12.1. Every column type is read: a BFILE's
     with OCI's file calls, an object's or a collection's as the native 9.2
     form's image. LONG and LONG RAW
@@ -1650,18 +1650,11 @@ class Oci11Dialect(Oall8Dialect):
         # holding a value here -- an array DML's row -- is not served, nor an
         # unset one outside a block, which has no OUT value to take. A REF
         # CURSOR Var is served OUT, in a block; an open cursor bound IN is not.
-        from seerdb.common.datatypes import BfileBind, RefCursorBind, Var
-        from seerdb.common.lob import LOB
+        from seerdb.common.datatypes import RefCursorBind, Var
 
         for value in bind or []:
             if isinstance(value, RefCursorBind):
                 raise _oci11_unsupported('a REF CURSOR IN bind')
-            if isinstance(value, BfileBind) or (
-                isinstance(value, LOB) and value.data_type == TNS_TYPE_BFILE
-            ):
-                # Its native form is not measured; sent as anything else, the
-                # pooled server process aborts (ORA-03137).
-                raise _oci11_unsupported('a BFILE bind')
             if isinstance(value, Var) and value.dbtype.tns_type == TNS_TYPE_REFCURSOR:
                 if not block:
                     raise _oci11_unsupported('a REF CURSOR bind outside a block')

@@ -15098,29 +15098,38 @@ class NullLobBind(NamedTuple):
     is_blob: bool
 
 
-def _oci11_lob_bind(Value: object) -> tuple[bool, bytes] | None:
-    # (whether it is a BLOB, its locator with its ub2 length) for a LOB bound by
-    # its locator: a temporary one's marker or a LOB object, or for an unset
-    # LOB Var (an OUT bind) the empty 86-byte locator OCI sends for one; a NULL
-    # one bound IN (NullLobBind) has none, b''. None otherwise.
-    from seerdb.common.datatypes import Var
+def _oci11_lob_bind(Value: object) -> tuple[int, bytes] | None:
+    # (its TNS type, its locator with its ub2 length) for a LOB bound by its
+    # locator: a temporary one's marker, a LOB object, a BFILE as fetched
+    # (BfileBind), or for an unset CLOB / BLOB Var (an OUT bind) the empty
+    # 86-byte locator OCI sends for one; a NULL one bound IN (NullLobBind) has
+    # none, b''. None otherwise. A BFILE goes as OCI 11.2 binds one through the
+    # pool (SQLT_BFILE): its own type, the LOB bind's 72 bytes, no charset, and
+    # the locator as it was fetched.
+    from seerdb.common.datatypes import BfileBind, Var
     from seerdb.common.lob import LOB
 
     if isinstance(Value, NullLobBind):
-        return (Value.is_blob, b'')
+        return (TNS_TYPE_BLOB if Value.is_blob else TNS_TYPE_CLOB, b'')
     if (
         isinstance(Value, Var)
         and Value.dbtype.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
         and not Value.has_value
     ):
-        return (
-            Value.dbtype.tns_type == TNS_TYPE_BLOB,
-            _OCI11_EMPTY_LOCATOR,
-        )
+        return (Value.dbtype.tns_type, _OCI11_EMPTY_LOCATOR)
     if isinstance(Value, TempLob):
-        return (Value.is_blob, prefixed_locator(Value.locator))
-    if isinstance(Value, LOB) and Value.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
-        return (Value.data_type == TNS_TYPE_BLOB, bytes(Value.raw))
+        return (
+            TNS_TYPE_BLOB if Value.is_blob else TNS_TYPE_CLOB,
+            prefixed_locator(Value.locator),
+        )
+    if isinstance(Value, BfileBind):
+        return (TNS_TYPE_BFILE, bytes(Value.locator))
+    if isinstance(Value, LOB) and Value.data_type in (
+        TNS_TYPE_CLOB,
+        TNS_TYPE_BLOB,
+        TNS_TYPE_BFILE,
+    ):
+        return (Value.data_type, bytes(Value.raw))
     return None
 
 
@@ -15161,8 +15170,8 @@ def _encode_oci11_bind_oac(Value: object, Flags: int = _OCI11_BIND_FLAGS) -> byt
         )
     Lob = _oci11_lob_bind(Value)
     if Lob is not None:
-        if Lob[0]:
-            return _native_bind_oac(TNS_TYPE_BLOB, Flags, _OCI11_LOB_BIND_SIZE, 0, 0)
+        if Lob[0] in (TNS_TYPE_BLOB, TNS_TYPE_BFILE):
+            return _native_bind_oac(Lob[0], Flags, _OCI11_LOB_BIND_SIZE, 0, 0)
         return _native_bind_oac(
             TNS_TYPE_CLOB,
             Flags,

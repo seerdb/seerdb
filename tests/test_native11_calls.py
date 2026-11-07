@@ -667,6 +667,36 @@ class Native11TempLobTest(_At11g):
         )
         self.assertEqual(OurValues, TheirValues)
 
+    def test_a_fetched_bfile_binds_as_oci_binds_it(self):
+        # OCI 11.2's SQLT_BFILE bind of a fetched locator: the descriptor a
+        # BFILE (114) of the LOB bind's 72 bytes, no charset; the value a ub4
+        # length and the locator, its ub2 length in front, as fetched. OCI
+        # follows its bind's descriptor with the select item's define, which
+        # seerdb does not send.
+        from seerdb.common.datatypes import BfileBind
+        from seerdb.common.lob import LOB
+        from seerdb.common.tns import (
+            _OAC_FROM_OCI,
+            _encode_oci11_bind_oac,
+            _encode_oci11_bind_value,
+        )
+
+        Captured = _capture('oci11_execute_bfile_bind.hexdump')
+        ([Theirs], Rest) = self._binds(Captured, 1)
+        (_, Rest) = _OAC_FROM_OCI(Rest, {'oci_12c': False})  # the define
+        self.assertEqual(Rest[:1], b'\x07')
+        Value = bytes(Rest[1:])
+        Locator = Value[5:]
+        self.assertEqual(int.from_bytes(Locator[:2], 'big'), len(Locator) - 2)
+        Fields = ('data_type', 'max_length', 'charset', 'csfrm')
+        for Bind in (BfileBind(Locator), LOB(114, Locator)):
+            with self.subTest(type(Bind).__name__):
+                (Ours, _) = _OAC_FROM_OCI(
+                    _encode_oci11_bind_oac(Bind), {'oci_12c': False}
+                )
+                self.assertEqual([Ours[F] for F in Fields], [Theirs[F] for F in Fields])
+                self.assertEqual(_encode_oci11_bind_value(Bind), Value)
+
     def test_the_dialect_binds_an_unset_lob_var_in_a_dml_as_a_null(self):
         # In a DML an unset LOB Var is a NULL bound IN; in a block, an OUT bind.
         from seerdb.common.datatypes import DB_TYPE_BLOB, DB_TYPE_CLOB, Var
