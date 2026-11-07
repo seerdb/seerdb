@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 11.2's OCIAppCtxClearAll of CLIENTCONTEXT (#2466): no entries' pointer, a
+# count of 0, the flags 10.
+# Captured 2026-11-07 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8; OCIAppCtxSet,
+# OCIAppCtxClearAll and OCIPing called through ctypes) on Oracle 11g XE 11.2.0.2
+# with SERVER=POOLED, the DRCP pool started. The TTC payload, without the
+# packet's header, as `hexdump -C` output; the offset column and the |ascii|
+# gutter are ignored by tests.replay.parse_hexdump.
+00000000  11 9a 0f fe ff ff ff ff  ff ff ff 0d 00 00 00 00  |................|
+00000010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 0a  |................|
+00000020  00 00 00 00 00 00 00 00  00 00 00 0d 43 4c 49 45  |............CLIE|
+00000030  4e 54 43 4f 4e 54 45 58  54                       |NTCONTEXT|
+00000039

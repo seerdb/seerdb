@@ -652,6 +652,12 @@ class _ConnectionLogic:
         (#460), reverting to operations without an attached context."""
         self._end_user_sec_context = None
 
+    def _take_app_context(self) -> dict:
+        # What changed since the last call, for a dialect that sends it itself
+        # (a pooled 11g session's, #2466), and forgotten as it is sent.
+        (Changed, self._app_context) = (self._app_context, {})
+        return Changed
+
     def _flush_app_context_bytes(self) -> bytes:
         # One func-154 piggyback per namespace changed since the last call
         # (#1775), each sent once. Empty when nothing changed.
@@ -673,13 +679,6 @@ class _ConnectionLogic:
         # would silently never take effect (#1775).
         if self.field_version < FIELD_VERSION_10_2:
             raise NotSupportedError('application context requires Oracle 10g or later')
-        # A pooled 11g session's calls carry no piggyback in front of them yet:
-        # set, the context would never reach the server (#2466).
-        if getattr(self, '_native11', False):
-            raise NotSupportedError(
-                'application context is not supported on a pooled Oracle 11g '
-                'connection yet'
-            )
 
     def set_app_context(self, namespace: str, **values: str) -> None:
         """Set attributes of an application context namespace (#1775), as
@@ -904,7 +903,10 @@ class _ConnectionLogic:
         elif getattr(self, '_native11', False):
             # A pooled 11g session speaks the native form throughout (#2466).
             self._dialect = Oci11Dialect(
-                self._next_seq, self._native11_session, self._native11_call_status
+                self._next_seq,
+                self._native11_session,
+                self._native11_call_status,
+                self._take_app_context,
             )
         elif self.field_version < FIELD_VERSION_10_2:
             # The 9i OALL8 opt-in (#716) speaks the native 64-bit request form;

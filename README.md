@@ -511,9 +511,9 @@ objects, with their size, write, trim, open and close, temporary LOBs
 (`createlob()`) and LOB binds IN, OUT and IN OUT, LONG and LONG RAW
 columns, REF CURSOR OUT binds and `CURSOR()` columns, BFILE columns, object
 and collection columns (XMLType among them), server-side scrollable cursors,
-a DML's RETURNING, an array DML's too, `ping()` and `cursor.parse()`; a BFILE
-or a cursor bound IN, and application contexts are refused with
-`NotSupportedError` until they are built (#2466), and `changepassword()`
+a DML's RETURNING, an array DML's too, `ping()`, `cursor.parse()` and
+application contexts; a BFILE or a cursor bound IN is refused with
+`NotSupportedError` until it is built (#2466), and `changepassword()`
 because the server refuses a password change on a DRCP session (ORA-56609). A
 descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is
 refused with `NotSupportedError` for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`

@@ -116,6 +116,7 @@ from seerdb.common.tns import (
     encode_o8i_bfile_close,
     encode_o8i_bfile_getlen,
     encode_o8i_bfile_open,
+    encode_oci11_app_context,
     encode_oci11_close_cursors,
     encode_oci11_create_temp,
     encode_oci11_cursor_fetch,
@@ -248,6 +249,9 @@ CAP_WIDE_BINDS = 'wide_binds'
 # The dialect makes a temporary LOB itself (create_temp_lob), so a LOB Var's
 # value and a large PL/SQL value bind through one, as on 12c+ (#2466).
 CAP_TEMP_LOB = 'temp_lob'
+# The dialect sends an application context's change itself, piggybacked ahead
+# of its next call (#2466).
+CAP_APP_CONTEXT = 'app_context'
 # The dialect serves cursor.parse() (parse) and connection.ping() (ping) in
 # its own form (#2466).
 CAP_PARSE = 'parse'
@@ -1581,7 +1585,8 @@ class Oci11Dialect(Oall8Dialect):
     form's image. LONG and LONG RAW
     columns are read a row a fetch, each value whole; a cursor the server opened
     (a REF CURSOR OUT bind's, a CURSOR(...) column's) with sqlplus's fetch.
-    ping(), cursor.parse() and a scrollable cursor are OCI's own calls."""
+    ping(), cursor.parse() and a scrollable cursor are OCI's own calls, and
+    an application context's change OCI's piggyback ahead of the next one."""
 
     _wire = '11g native'
 
@@ -1590,8 +1595,12 @@ class Oci11Dialect(Oall8Dialect):
         next_seq: Callable[[], int],
         on_session: Callable[[int, int], None] | None = None,
         on_call_status: Callable[[int], None] | None = None,
+        take_app_context: Callable[[], dict] | None = None,
     ) -> None:
         super().__init__(next_seq)
+        # Hands over the application context changed since the last call (one
+        # {key: value} a namespace, {} to clear it), and forgets it.
+        self._take_app_context = take_app_context
         # The rows an execute asks for with it, the cursor's arraysize.
         self._rows = 1
         # Told the pooled session's id and serial when the server hands it over
@@ -1623,6 +1632,7 @@ class Oci11Dialect(Oall8Dialect):
                 CAP_LOB_OBJECT,
                 CAP_WIDE_BINDS,
                 CAP_TEMP_LOB,
+                CAP_APP_CONTEXT,
                 CAP_PARSE,
                 CAP_PING,
                 CAP_SCROLL,
@@ -1702,6 +1712,16 @@ class Oci11Dialect(Oall8Dialect):
 
     def _close_frames(self, cursors: list[int]) -> bytes:
         return encode_oci11_close_cursors(self._next_seq(), cursors)
+
+    def _closing(self) -> bytes:
+        # OCI 11.2 sends an application context's change ahead of the cursors'
+        # close, each piggyback taking its sequence number in that order. A call
+        # that takes no piggybacks (a LOB call) leaves it for the next one.
+        frames = b''
+        if self._take_app_context is not None:
+            for namespace, entries in self._take_app_context().items():
+                frames += encode_oci11_app_context(self._next_seq(), namespace, entries)
+        return frames + super()._closing()
 
     def _status(self, reply: bytes, executed: bool = True) -> dict:
         status = decode_oci11_status(self._session_return(reply), executed)
@@ -2115,7 +2135,8 @@ class Oci11Dialect(Oall8Dialect):
     def ping(self):
         # A round trip that runs nothing, as OCI 11.2's OCIPing makes one
         # through the pool: TTI_PING, answered with a bare TTI_STA.
-        yield Send(encode_oci11_ping(self._next_seq()))
+        # Its piggybacks ride on it, as on OCIPing's (#1775).
+        yield Send(self._closing() + encode_oci11_ping(self._next_seq()))
         received = yield RECV
         if received is False:
             raise Exception('Connection closed during an 11g ping')

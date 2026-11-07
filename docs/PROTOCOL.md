@@ -1025,7 +1025,22 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
 - **`ping()`** is OCI 11.2's OCIPing: `TTI_PING` (147) and the sequence, no
   token (`encode_oci11_ping`), answered with a bare `TTI_STA`, call status 1
   and the session's sequence; a first call's reply has the session return
-  ahead of it.
+  ahead of it. The piggybacks waiting ride on it, as on OCIPing's.
+- **An application context's change** is OCI 11.2's OCIAppCtxSet or
+  OCIAppCtxClearAll through the pool (`encode_oci11_app_context`): the func-154
+  piggyback thin sends (#1775), at OCI's widths, ahead of the next call's
+  cursor closes, a ping's included. Its fields:
+  - the namespace's pointer, and its length as a ub8;
+  - the entries' pointer (none for a clear) and their count;
+  - the flags, thin's with `0x08` set: 9 to set, 10 to clear;
+  - eight bytes no field is known for, zero;
+  - the namespace, then each entry's key and value, each a ub4 length and the
+    bytes (an empty one just the zero count), and a ub4 of 0.
+
+  OCI 11.2 refuses a namespace the session may not set in OCIAppCtxSet itself
+  (ORA-28267), before anything is sent. seerdb, as on 10g+, lets the server
+  refuse it: the call that carries it fails with ORA-28267, and the session
+  goes on.
 - **A scrollable cursor** is OCI 11.2's `OCI_STMT_SCROLLABLE_READONLY` cursor
   through the pool. Its open is the query's execute with `al8i4[9]`
   SCROLLABLE | NO_CANCEL_ON_EOF (`0x82`), `[10]` CURRENT and `[11]` row 1, so
@@ -9447,7 +9462,8 @@ old form; 23ai takes the old form when held at 11.2, and the new one at 12.1,
 
 **8i and 9i take the piggyback and ignore it**: no error, and the context is not
 set. seerdb refuses `set_app_context()` / `clear_app_context()` there
-(`NotSupportedError`) rather than let a change silently not happen.
+(`NotSupportedError`) rather than let a change silently not happen. A pooled
+11g session sends OCI's form of it (§4.1.4).
 
 A namespace the session may not set fails the call the piggyback rode in front
 of with ORA-28267, through a break/reset; the session carries on. `CLIENTCONTEXT`

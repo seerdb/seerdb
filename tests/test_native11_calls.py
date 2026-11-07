@@ -1455,5 +1455,57 @@ class Native11DialectTest(_At11g):
         self.assertIn(CAP_ARRAY_DML, Caps)
 
 
+class Native11AppContextTest(_At11g):
+    """An application context's change, against an OCI 11.2 program's
+    OCIAppCtxSet, OCIAppCtxClearAll and OCIPing through the pool."""
+
+    def test_a_set_and_a_clear_are_oci_11_2s(self):
+        from seerdb.common.tns import (
+            decode_oci11_app_context,
+            encode_oci11_app_context,
+        )
+
+        for Name, Entries in (
+            ('oci11_app_context_set.hexdump', {'ATTR1': 'VALUE1', 'ATTR2': 'VALUE2'}),
+            ('oci11_app_context_clear.hexdump', {}),
+        ):
+            with self.subTest(Name):
+                Captured = _capture(Name)
+                self.assertEqual(
+                    encode_oci11_app_context(Captured[2], 'CLIENTCONTEXT', Entries),
+                    Captured,
+                )
+                (Fields, Rest) = decode_oci11_app_context(Captured)
+                self.assertEqual(Rest, b'')
+                self.assertEqual(Fields['namespace'], b'CLIENTCONTEXT')
+                self.assertEqual(
+                    {E['key']: E['value'] for E in Fields['entries']},
+                    {K.encode(): V.encode() for K, V in Entries.items()},
+                )
+
+    def test_a_ping_carries_the_context_ahead_of_the_close(self):
+        # As OCIPing's: the context's piggyback, the close of the cursor the
+        # last query left, then the ping, each its sequence number in order;
+        # the change sent once.
+        from seerdb.common.tns_consts import TNS_FUNC_APP_CONTEXT
+
+        Changed = [{'CLIENTCONTEXT': {'ATTR1': 'PING'}}]
+        Seq = iter(range(20, 30))
+        Dialect = Oci11Dialect(
+            lambda: next(Seq),
+            take_app_context=lambda: Changed.pop() if Changed else {},
+        )
+        Dialect.close_cursor(1)
+        (Sends, _) = _drive(Dialect.ping(), [_capture('oci11_ping_reply.hexdump')])
+        self.assertEqual(Sends, [_capture('oci11_ping_with_piggybacks.hexdump')])
+        (Sends, _) = _drive(Dialect.ping(), [_capture('oci11_ping_reply.hexdump')])
+        self.assertNotIn(bytes([0x11, TNS_FUNC_APP_CONTEXT]), Sends[0])
+
+    def test_the_dialect_takes_application_context(self):
+        from seerdb.client.dialect import CAP_APP_CONTEXT
+
+        self.assertIn(CAP_APP_CONTEXT, Oci11Dialect(lambda: 7).capabilities())
+
+
 if __name__ == '__main__':
     unittest.main()
