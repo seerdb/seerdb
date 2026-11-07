@@ -947,7 +947,10 @@ form throughout: the OCI banner in the PRO (§19.18), the data-type request with
 table and sqlplus 11.2's capability vectors (§4.2.1), and the OSESSKEY and AUTH at
 OCI's widths (§4.1.2), every length declared at three bytes a character, as
 sqlplus 11.2 declares them. The O5LOGON values and the DRCP pairs
-(`AUTH_KPPL_CONN_CLASS`, `AUTH_KPPL_PURITY`) are the converted AUTH's. It ends
+(`AUTH_KPPL_CONN_CLASS`, `AUTH_KPPL_PURITY`) are the converted AUTH's. A proxy
+login (`user[schema]`, #126) names the schema first, `PROXY_CLIENT_NAME` ahead
+of the proof, as sqlplus 11.2's does through the pool; without it the pool
+logged in as the proxy user itself. It ends
 as sqlplus ends it: `TNS_FUNC_SESSION_RELEASE` (163) with an absent tag pointer, a
 zero tag length and mode 3, which the server answers with a bare `TTI_STA`, then
 the EOF packet. The native form is the client machine's own, and seerdb assumes
