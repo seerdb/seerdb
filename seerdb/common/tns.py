@@ -15060,14 +15060,25 @@ _OCI11_LONG_BIND_TYPES = {
 _OCI11_LOB_BIND_SIZE = 72
 
 
+class NullLobBind(NamedTuple):
+    """A NULL CLOB or BLOB bound IN on a pooled 11g session (#2466), as OCI 11.2
+    binds one through the pool: the LOB bind's descriptor, and a value of a
+    zero length with no locator behind it. The dialect binds an unset LOB Var
+    so in a DML; in a PL/SQL block one is an OUT bind, the empty locator."""
+
+    is_blob: bool
+
+
 def _oci11_lob_bind(Value: object) -> tuple[bool, bytes] | None:
     # (whether it is a BLOB, its locator with its ub2 length) for a LOB bound by
     # its locator: a temporary one's marker or a LOB object, or for an unset
-    # LOB Var (an OUT bind) the empty 86-byte locator OCI sends for one. None
-    # otherwise.
+    # LOB Var (an OUT bind) the empty 86-byte locator OCI sends for one; a NULL
+    # one bound IN (NullLobBind) has none, b''. None otherwise.
     from seerdb.common.datatypes import Var
     from seerdb.common.lob import LOB
 
+    if isinstance(Value, NullLobBind):
+        return (Value.is_blob, b'')
     if (
         isinstance(Value, Var)
         and Value.dbtype.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
@@ -15103,6 +15114,8 @@ def _encode_oci11_bind_value(Value: object) -> bytes:
         return _OCI.value(bytes(4))
     Lob = _oci11_lob_bind(Value)
     if Lob is not None:
+        if not Lob[1]:
+            return _OCI.n4(0)  # a NULL bound IN: the zero length alone
         return _OCI.n4(len(Lob[1])) + _OCI.value(Lob[1])
     return _encode_9i_bind_value(Value)
 

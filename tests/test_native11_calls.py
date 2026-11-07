@@ -641,6 +641,53 @@ class Native11TempLobTest(_At11g):
             lambda Locators: [LOB(112, Locators[0])],
         )
 
+    def test_a_null_lob_binds_as_oci_binds_it(self):
+        # OCI 11.2's array insert with a NULL CLOB and BLOB in every row: the
+        # descriptors a locator bind's, and each NULL a ub4 of 0 with no
+        # locator (NullLobBind). seerdb's descriptor flags are sqlplus 11.2's,
+        # as on every bind, where this program sent 1.
+        from seerdb.common.tns import NullLobBind
+
+        Captured = _capture('oci11_execute_array_null_lobs.hexdump')
+        Rows = [[N, NullLobBind(False), NullLobBind(True)] for N in (1, 2, 3)]
+        Mine = encode_oci11_execute(
+            Captured[2],
+            Native11BindRequestTest._sql_of(Captured),
+            2,
+            1,
+            Rows[0],
+            Rows[1:],
+        )
+        (Theirs, TheirValues) = self._binds(Captured, 3)
+        (Ours, OurValues) = self._binds(Mine, 3)
+        Fields = ('data_type', 'max_length', 'charset', 'csfrm')
+        self.assertEqual(
+            [[O[F] for F in Fields] for O in Ours],
+            [[T[F] for F in Fields] for T in Theirs],
+        )
+        self.assertEqual(OurValues, TheirValues)
+
+    def test_the_dialect_binds_an_unset_lob_var_in_a_dml_as_a_null(self):
+        # In a DML an unset LOB Var is a NULL bound IN; in a block, an OUT bind.
+        from seerdb.common.datatypes import DB_TYPE_BLOB, DB_TYPE_CLOB, Var
+        from seerdb.common.tns import O8I_STMT_BEGIN, NullLobBind
+
+        Bind = [1, Var(DB_TYPE_CLOB), Var(DB_TYPE_BLOB), 'x']
+        self.assertEqual(
+            Oci11Dialect._null_lobs(Bind),
+            [1, NullLobBind(False), NullLobBind(True), 'x'],
+        )
+        Dialect = Oci11Dialect(lambda: 7)
+        (BlockSql, DmlSql) = (b'begin :1 := null; end;', b'insert into t values (:1)')
+        self.assertEqual(
+            Dialect._encode_dml(DmlSql, 2, [Var(DB_TYPE_CLOB)]),
+            encode_oci11_execute(7, DmlSql, 2, 1, [NullLobBind(False)]),
+        )
+        self.assertEqual(
+            Dialect._encode_dml(BlockSql, O8I_STMT_BEGIN, [Var(DB_TYPE_CLOB)]),
+            encode_oci11_execute(7, BlockSql, O8I_STMT_BEGIN, 1, [Var(DB_TYPE_CLOB)]),
+        )
+
     def test_a_temporary_lob_can_be_made(self):
         from seerdb.client._conn_logic import temp_lobs_available
 

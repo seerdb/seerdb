@@ -37,6 +37,7 @@ from seerdb.common.tns import (
     O8I_STMT_SELECT,
     O8I_STMT_TXN,
     OCI11_LOB_CALLS,
+    NullLobBind,
     decode_8i_block_cursor,
     decode_8i_block_out,
     decode_8i_cursor_id,
@@ -1577,9 +1578,9 @@ class Oci11Dialect(Oall8Dialect):
     Served: queries over scalar, CLOB, NCLOB and BLOB columns, DML and array
     DML, DDL, COMMIT and ROLLBACK, and PL/SQL blocks, with scalar IN, OUT and
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
-    calls, temporary LOBs and LOB binds IN, OUT and IN OUT. Not yet, and
-    refused before anything is sent: an array DML's LOB Var, BFILE, and a REF
-    CURSOR bound IN or outside a block; an object
+    calls, temporary LOBs and LOB binds IN, OUT and IN OUT, a NULL one and
+    an array DML's too. Not yet, and refused before anything is sent: a
+    BFILE, and a REF CURSOR bound IN or outside a block; an object
     bind, as on every tier below 12.1. Every column type is read: a BFILE's
     with OCI's file calls, an object's or a collection's as the native 9.2
     form's image. LONG and LONG RAW
@@ -1819,10 +1820,31 @@ class Oci11Dialect(Oall8Dialect):
         finally:
             self._opened.discard(cursor)
 
+    @staticmethod
+    def _null_lobs(bind: list | None) -> list | None:
+        # In a DML an unset CLOB or BLOB Var is a NULL bound IN, which OCI 11.2
+        # sends as the LOB bind with no locator (NullLobBind); in a block it is
+        # an OUT bind, left as it is.
+        from seerdb.common.datatypes import Var
+
+        if not bind:
+            return bind
+        return [
+            NullLobBind(value.dbtype.tns_type == TNS_TYPE_BLOB)
+            if isinstance(value, Var)
+            and value.dbtype.tns_type in _OCI11_LOB_TYPES
+            and not value.has_value
+            else value
+            for value in bind
+        ]
+
     def _encode_dml(
         self, sql_text: bytes, stmt_type: int, bind: list | None = None
     ) -> bytes:
-        self._check_binds(bind, block=stmt_type in (O8I_STMT_BEGIN, O8I_STMT_DECLARE))
+        block = stmt_type in (O8I_STMT_BEGIN, O8I_STMT_DECLARE)
+        if not block:
+            bind = self._null_lobs(bind)
+        self._check_binds(bind, block=block)
         if stmt_type == O8I_STMT_TXN:
             # COMMIT and ROLLBACK, which 8i's table types as 0, have their own.
             stmt_type = oci11_stmt_type(
@@ -1850,6 +1872,8 @@ class Oci11Dialect(Oall8Dialect):
         # comes back in the result, as the other dialects return it, so the
         # cursor reports what the statement did.
         stmt_type = oci11_stmt_type(sql.strip().upper())
+        bind = self._null_lobs(bind)
+        batch = [self._null_lobs(row) or [] for row in batch] if batch else batch
         self._check_binds(bind)
         for row in batch or []:
             self._check_binds(row)

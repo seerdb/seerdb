@@ -1007,7 +1007,11 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   NCLOB's with charset 873 and form 1; the value a ub4 length and the locator
   as a value, its ub2 length in front, as a row's LOB cell carries it. A LOB
   Var's value and a value past 32,767 bytes into PL/SQL go through a temporary
-  LOB, as on 12c+.
+  LOB, as on 12c+, in every row of an array DML too. A NULL one bound IN (an
+  unset LOB Var in a DML, `NullLobBind`) keeps that descriptor, and its value is
+  a ub4 of 0 with no locator behind it, as OCI 11.2's `SQLT_CLOB` / `SQLT_BLOB`
+  bind with indicator -1 sends it. In a PL/SQL block an unset LOB Var is an OUT
+  bind, the empty 86-byte locator.
 - **An object or collection column** (XMLType among them) is described as
   type 109 with its type's schema and name, and its row cell is the native 9.2
   form's image (`_O9I_OBJECT_CELL`): the 9i native dialect's reader takes it as
