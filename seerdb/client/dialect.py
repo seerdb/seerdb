@@ -1581,9 +1581,9 @@ class Oci11Dialect(Oall8Dialect):
     IN OUT binds of any size, LONG and LONG RAW ones too, and a LOB object's
     calls, temporary LOBs and LOB binds IN, OUT and IN OUT, a NULL one and
     an array DML's too, a fetched BFILE bound IN, and an open cursor bound IN
-    to a block. Not yet, and refused before anything is sent: a REF CURSOR
-    bound outside a block; an object
-    bind, as on every tier below 12.1. Every column type is read: a BFILE's
+    to a block, and an object or a collection bound IN. Not yet, and refused
+    before anything is sent: a REF CURSOR bound outside a block, and an object
+    bound OUT. Every column type is read: a BFILE's
     with OCI's file calls, an object's or a collection's as the native 9.2
     form's image. LONG and LONG RAW
     columns are read a row a fetch, each value whole; a cursor the server opened

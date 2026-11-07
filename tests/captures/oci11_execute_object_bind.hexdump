@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 11.2's `declare o pyo_obj_t := :1; begin :2 := o.n || ':' || o.s; end;`
+# binding PYO.PYO_OBJ_T (n NUMBER, s VARCHAR2(20)) as (42, 'hello') IN (#2463):
+# the object's descriptor an ADT (109) of 2000 bytes, the type's 16-byte OID
+# 5fb718dacaedebe5e060a8c096004fdb and version 1, flags 0; its value the native
+# object cell, the constructed 36-byte toid, the TOP_LEVEL flags and the packed
+# image; then the VARCHAR2 OUT bind's descriptor and its empty value.
+# Captured 2026-11-07 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8, the object
+# cache on; OCITypeByName, OCIObjectNew and OCIObjectSetAttr, then OCIBindObject
+# of an SQLT_NTY bind, called through ctypes) on Oracle 11g XE 11.2.0.2, a
+# DEDICATED session, with a throwaway type dropped after. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column and the
+# |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  03 5e 0b 29 04 04 00 00  00 00 00 fe ff ff ff ff  |.^.)............|
+00000010  ff ff ff 3e 00 00 00 00  00 00 00 fe ff ff ff ff  |...>............|
+00000020  ff ff ff 0d 00 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000030  ff ff ff fe ff ff ff ff  ff ff ff 00 00 00 00 01  |................|
+00000040  00 00 00 00 00 00 00 00  00 00 00 fe ff ff ff ff  |................|
+00000050  ff ff ff 02 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000060  00 00 00 fe ff ff ff ff  ff ff ff 00 00 00 00 00  |................|
+00000070  00 00 00 fe ff ff ff ff  ff ff ff fe ff ff ff ff  |................|
+00000080  ff ff ff 80 9f db 53 48  56 00 00 00 00 00 00 00  |......SHV.......|
+00000090  00 00 00 fe ff ff ff ff  ff ff ff fe ff ff ff ff  |................|
+000000a0  ff ff ff 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000b0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+000000c0  00 00 00 3e 64 65 63 6c  61 72 65 20 6f 20 70 79  |...>declare o py|
+000000d0  6f 5f 6f 62 6a 5f 74 20  3a 3d 20 3a 31 3b 20 62  |o_obj_t := :1; b|
+000000e0  65 67 69 6e 20 3a 32 20  3a 3d 20 6f 2e 6e 20 7c  |egin :2 := o.n ||
+000000f0  7c 20 27 3a 27 20 7c 7c  20 6f 2e 73 3b 20 65 6e  || ':' || o.s; en|
+00000100  64 3b 01 00 00 00 01 00  00 00 00 00 00 00 00 00  |d;..............|
+00000110  00 00 00 00 00 00 00 00  00 00 00 00 00 00 09 00  |................|
+00000120  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000130  00 00 00 00 00 00 00 6d  00 00 00 d0 07 00 00 00  |.......m........|
+00000140  00 00 00 00 00 00 00 10  00 00 00 10 5f b7 18 da  |............_...|
+00000150  ca ed eb e5 e0 60 a8 c0  96 00 4f db 01 00 00 00  |.....`....O.....|
+00000160  00 00 00 00 00 01 01 00  00 00 3f 00 00 00 00 00  |..........?.....|
+00000170  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000180  00 00 69 03 01 00 00 00  00 00 00 00 00 00 07 24  |..i............$|
+00000190  00 00 00 24 00 22 02 08  5f b7 18 da ca ed eb e5  |...$.".._.......|
+000001a0  e0 60 a8 c0 96 00 4f db  00 00 00 00 00 00 00 00  |.`....O.........|
+000001b0  00 00 00 00 00 01 00 01  00 00 00 00 00 00 00 00  |................|
+000001c0  00 00 10 00 00 00 01 00  10 84 01 fe 00 00 00 10  |................|
+000001d0  02 c1 2b 05 68 65 6c 6c  6f 00                    |..+.hello.|
+000001da

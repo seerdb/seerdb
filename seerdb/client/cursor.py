@@ -1418,6 +1418,9 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
 
     if getattr(Connection, 'field_version', 0) >= FIELD_VERSION_12_1:
         return
+    # 11g's native form binds an object or a collection IN, as OCI 11.2 does
+    # (#2463); its dialect refuses what it does not serve yet (an object Var).
+    Native11 = bool(getattr(Connection, '_native11', False))
     Rows = [Bind] + (Batch or []) if Bind else (Batch or [])
     for Row in Rows:
         if isinstance(Row, dict):
@@ -1430,6 +1433,8 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
             # An object or collection Var -- the OUT bind -- is the same bind on
             # the wire as an object value, and pre-12c answers it with the same
             # fatal ORA-03106 (#2039).
+            if Native11 and isinstance(V, DbObject):
+                continue
             if isinstance(V, DbObject) or (
                 isinstance(V, Var) and isinstance(V.dbtype, DbObjectType)
             ):

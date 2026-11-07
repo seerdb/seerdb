@@ -1031,6 +1031,14 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   `SQLT_BFILE` bind of one: the descriptor a BFILE (114) of the same 72 bytes,
   no charset and no form, and the value a ub4 length and the locator as it was
   fetched, its ub2 length in front.
+- **An object or a collection bound IN** goes as OCI 11.2's `OCIBindObject`
+  (`SQLT_NTY`) binds one (#2463), measured on a dedicated session: the
+  descriptor an ADT (109) of 2000 bytes carrying the type's 16-byte OID and its
+  version, flags 0 and no charset; the value the native object cell a fetched
+  object column carries (`_O9I_OBJECT_CELL`): the constructed 36-byte toid, no
+  object OID or snapshot, version 0, the image's length, the TOP_LEVEL flags and
+  the packed image -- the toid and image the 12c+ thin bind sends, byte for
+  byte. An object bound OUT is not measured yet.
 - **An object or collection column** (XMLType among them) is described as
   type 109 with its type's schema and name, and its row cell is the native 9.2
   form's image (`_O9I_OBJECT_CELL`): the 9i native dialect's reader takes it as

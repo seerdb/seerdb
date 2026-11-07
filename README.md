@@ -524,7 +524,8 @@ objects, with their size, write, trim, open and close, temporary LOBs
 (`createlob()`) and LOB binds IN, OUT and IN OUT, LONG and LONG RAW
 columns, REF CURSOR OUT binds and an open cursor bound IN to a PL/SQL block,
 `CURSOR()` columns, BFILE columns and a fetched BFILE bound IN, object and
-collection columns (XMLType among them), server-side scrollable cursors, a
+collection columns (XMLType among them) and an object or a collection bound IN
+(not yet OUT), server-side scrollable cursors, a
 DML's RETURNING, an array DML's too, `ping()`, `cursor.parse()` and
 application contexts; `changepassword()` is refused with `NotSupportedError`,
 because the server refuses a password change on a DRCP session (ORA-56609). A

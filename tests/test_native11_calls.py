@@ -703,6 +703,40 @@ class Native11TempLobTest(_At11g):
         with self.assertRaises(NotSupportedError):
             Gen.send(None)
 
+    def test_an_object_binds_in_as_oci_binds_it(self):
+        # OCI 11.2's SQLT_NTY bind (OCIBindObject) of PYO_OBJ_T (42, 'hello'),
+        # on a dedicated 11g session (#2463): the descriptor an ADT of 2000
+        # bytes with the type's OID and version, flags 0; the value the native
+        # object cell, the constructed toid and the packed image. Both byte for
+        # byte from the type's OID and layout alone.
+        from seerdb.common.dbobject import DbObjectType
+        from seerdb.common.tns import (
+            _OAC_FROM_OCI,
+            _encode_oci11_bind_oac,
+            _encode_oci11_bind_value,
+        )
+
+        Captured = _capture('oci11_execute_object_bind.hexdump')
+        ([Theirs, _], Values) = self._binds(Captured, 2)
+        Typ = DbObjectType(
+            'PYO',
+            'PYO_OBJ_T',
+            bytes.fromhex('5fb718dacaedebe5e060a8c096004fdb'),
+            1,
+            [
+                {'name': 'N', 'data_type': 2},
+                {'name': 'S', 'data_type': 1, 'charset': None},
+            ],
+        )
+        Obj = Typ.newobject()
+        Obj.N = 42
+        Obj.S = 'hello'
+        (Ours, _) = _OAC_FROM_OCI(_encode_oci11_bind_oac(Obj), {'oci_12c': False})
+        self.assertEqual(Ours, Theirs)
+        self.assertEqual(Values[:1], b'\x07')
+        Cell = _encode_oci11_bind_value(Obj)
+        self.assertEqual(bytes(Values[1 : 1 + len(Cell)]), Cell)
+
     def test_a_fetched_bfile_binds_as_oci_binds_it(self):
         # OCI 11.2's SQLT_BFILE bind of a fetched locator: the descriptor a
         # BFILE (114) of the LOB bind's 72 bytes, no charset; the value a ub4

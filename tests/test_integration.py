@@ -284,6 +284,9 @@ class _Target(NamedTuple):
     # Whether the session binds an open cursor IN: 12.1+, and a pooled 11g one
     # in the native form (#2466).
     refcursor_in: bool = False
+    # Whether the session binds an object or a collection IN: 12.1+, and 11g's
+    # native form, pooled or dedicated with oall8 (#2463).
+    object_in: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -298,6 +301,8 @@ def _target_of(conn) -> _Target:
         getattr(conn, '_dialect', None) is not None,
         bool(getattr(conn, '_native11', False))
         and getattr(conn, 'server_type', None) == 'pooled',
+        conn.field_version >= FIELD_VERSION_12_1
+        or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
     )
@@ -345,6 +350,8 @@ class _Need(NamedTuple):
     password_change: bool = False
     # Whether it binds an open cursor IN.
     refcursor_in: bool = False
+    # Whether it binds an object or a collection IN.
+    object_in: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -355,6 +362,8 @@ class _Need(NamedTuple):
         if self.password_change and target.no_password_change:
             return True
         if self.refcursor_in and not target.refcursor_in:
+            return True
+        if self.object_in and not target.object_in:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -511,6 +520,10 @@ _PACKAGE_TYPE_BIND = _Need(
 _TYPED_BIND = _Need('a typed bind needs the 12c+ bind OAC', min_fv=_FV)
 _ASSOC_ARRAY_BIND = _Need('an associative-array bind needs 12.1+ (#122)', min_fv=_FV)
 _OBJECT_BIND = _Need('an object bind needs the 12.1+ OAC', min_fv=_FV)
+_OBJECT_IN_BIND = _Need(
+    "an object bound IN needs the 12.1+ OAC, or 11g's native form (#2463)",
+    object_in=True,
+)
 _ARRAY_DML_ROWCOUNTS = _Need('arraydmlrowcounts needs a 12.1+ server', min_fv=_FV)
 _TIME_ZONE_SYNC = _Need(
     'client time-zone sync is 12c+ (AUTH_ALTER_SESSION)', min_fv=_FV
@@ -10011,7 +10024,7 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         (value,) = self.cur.fetchone()
         self.assertEqual([e.read() for e in value.aslist()], ['a', 'bc'])
 
-    @_requires(_OBJECT_BIND)
+    @_requires(_OBJECT_IN_BIND)
     def test_a_lob_attribute_binds_from_str_and_bytes(self):
         typ = self.conn.gettype(self.TYPE)
         obj = typ.newobject({'ID': 3, 'C': 'bound text', 'B': b'\x07'})
@@ -10023,7 +10036,7 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         # The caller's object keeps what it was set to.
         self.assertEqual(obj.C, 'bound text')
 
-    @_requires(_OBJECT_BIND)
+    @_requires(_OBJECT_IN_BIND)
     def test_a_lob_attribute_binds_a_temporary_lob(self):
         typ = self.conn.gettype(self.TYPE)
         obj = typ.newobject({'ID': 4})
@@ -10031,7 +10044,7 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         self.cur.execute(f'INSERT INTO {self.TABLE} (k, o) VALUES (4, :1)', [obj])
         self.assertEqual(self._fetched(4).C.read(), 'temp lob')
 
-    @_requires(_OBJECT_BIND)
+    @_requires(_OBJECT_IN_BIND)
     def test_a_fetched_lob_attribute_binds_back(self):
         self.cur.execute(
             f"INSERT INTO {self.TABLE} (k, o) VALUES (5, {self.TYPE}(5, 'fetched', NULL))"
@@ -10547,7 +10560,7 @@ class CollectionTypeIntegration(_IntegrationBase):
             self._drop()
             self.cur.execute(f'DROP TYPE {words}')
 
-    @_requires(_OBJECT_BIND)
+    @_requires(_OBJECT_IN_BIND)
     def test_a_collection_value_binds(self):
         self.cur.execute(
             f'CREATE TABLE {self.TABLE} (id NUMBER, v {self.NUMS}, w {self.ELEMS}) '
@@ -10689,7 +10702,7 @@ class CollectionOfCollectionsIntegration(_IntegrationBase):
             (self._lists(tc), self._lists(vc)), ([[1, 2], [3], None, []], [[4]])
         )
 
-    @_requires(_OBJECT_BIND)
+    @_requires(_OBJECT_IN_BIND)
     def test_a_collection_of_collections_binds(self):
         inner = self.conn.gettype(self.INNER)
         tt = self.conn.gettype(self.TABLE_OF)
@@ -12314,7 +12327,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         except seerdb.DatabaseError:
                             pass  # a CREATE above failed, so nothing to drop
 
-    @_requires(_OBJECT_BIND)
+    @_requires(_OBJECT_IN_BIND)
     async def test_a_local_time_zone_attribute_round_trips(self):
         # Async twin of ObjectLocalTimeZoneAttributeIntegration's (#1270).
         import datetime
@@ -12590,7 +12603,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
-    @_requires(_OBJECT_BIND)
+    @_requires(_OBJECT_IN_BIND)
     async def test_a_collection_value_binds(self):
         # Async twin of CollectionTypeIntegration's.
         Elem, Nums, Elems = 'PYO_ACOLB_ELEM_T', 'PYO_ACOLB_NUMS_T', 'PYO_ACOLB_ELEMS_T'
