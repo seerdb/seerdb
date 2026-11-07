@@ -15148,6 +15148,10 @@ _OCI11_CURSOR_BIND_SIZE = 1
 def _encode_oci11_bind_value(Value: object) -> bytes:
     # A pooled 11g session's bind value: a REF CURSOR's, a LOB's locator, or
     # the native 9.2 form's value.
+    if isinstance(Value, RefCursorBind):
+        # An open cursor bound IN, as OCI 11.2's SQLT_RSET bind of a statement
+        # handle goes through the pool: its id, where the OUT form sends 0.
+        return _OCI.value((getattr(Value, 'id', 0) or 0).to_bytes(4, 'little'))
     if _is_oci11_cursor_var(Value):
         return _OCI.value(bytes(4))
     Lob = _oci11_lob_bind(Value)
@@ -15164,7 +15168,8 @@ def _encode_oci11_bind_oac(Value: object, Flags: int = _OCI11_BIND_FLAGS) -> byt
     # form declared -- the session's, or AL16UTF16 and form 2 for a national one.
     from seerdb.common.datatypes import Var
 
-    if _is_oci11_cursor_var(Value):
+    if _is_oci11_cursor_var(Value) or isinstance(Value, RefCursorBind):
+        # OUT or IN, the same descriptor, as OCI 11.2 binds either.
         return _native_bind_oac(
             TNS_TYPE_REFCURSOR, Flags, _OCI11_CURSOR_BIND_SIZE, 0, 0
         )
