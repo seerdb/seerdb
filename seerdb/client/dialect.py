@@ -1649,11 +1649,18 @@ class Oci11Dialect(Oall8Dialect):
         # holding a value here -- an array DML's row -- is not served, nor an
         # unset one outside a block, which has no OUT value to take. A REF
         # CURSOR Var is served OUT, in a block; an open cursor bound IN is not.
-        from seerdb.common.datatypes import RefCursorBind, Var
+        from seerdb.common.datatypes import BfileBind, RefCursorBind, Var
+        from seerdb.common.lob import LOB
 
         for value in bind or []:
             if isinstance(value, RefCursorBind):
                 raise _oci11_unsupported('a REF CURSOR IN bind')
+            if isinstance(value, BfileBind) or (
+                isinstance(value, LOB) and value.data_type == TNS_TYPE_BFILE
+            ):
+                # Its native form is not measured; sent as anything else, the
+                # pooled server process aborts (ORA-03137).
+                raise _oci11_unsupported('a BFILE bind')
             if isinstance(value, Var) and value.dbtype.tns_type == TNS_TYPE_REFCURSOR:
                 if not block:
                     raise _oci11_unsupported('a REF CURSOR bind outside a block')

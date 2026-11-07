@@ -5398,3 +5398,30 @@ def test_a_session_leaves_its_callers_context_alone() -> None:
         assert _ENCODE_OCI_CALL_SEQ.get() == 7
     finally:
         _ENCODE_OCI_CALL_SEQ.reset(token)
+
+
+def test_a_lob_the_mirror_did_not_mint_is_refused_not_bound_empty() -> None:
+    # A LOB a query returned, bound back by its locator: the Mirror minted no
+    # temporary LOB for it, so it has no content to resolve it to (#2505).
+    # Bound as empty content it stored a wrong value without a word; it is
+    # refused with ORA-22275, a BFILE too. A locator it did mint still resolves.
+    from seerdb.common.tns import BfileRef, ExecRequest, TempLobRef
+    from seerdb.server.backend import BackendError
+    from seerdb.server.session import _resolve_temp_lob_binds, _TempLobs
+
+    temp_lobs = _TempLobs()
+    minted = temp_lobs.mint(True)
+    temp_lobs.append(minted, b'\x01\x02')
+
+    def request(value: object) -> ExecRequest:
+        return ExecRequest('insert into t values (:1)', 0, 1, 0, [value], [[value]])
+
+    resolved = _resolve_temp_lob_binds(request(TempLobRef(minted, True)), temp_lobs)
+    assert bytes(resolved.binds[0]) == b'\x01\x02'
+    for foreign in (
+        TempLobRef(b'\x00' * 112, False),
+        BfileRef(b'\x00\x26' + bytes(38)),
+    ):
+        with pytest.raises(BackendError) as raised:
+            _resolve_temp_lob_binds(request(foreign), temp_lobs)
+        assert raised.value.ora_code == 22275

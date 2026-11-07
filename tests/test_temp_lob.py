@@ -194,9 +194,26 @@ class BindTempLobs(unittest.TestCase):
         )
         self.assertEqual((Out[2].locator, Out[2].is_blob), (LOCATOR, True))
 
-    def test_a_fetched_lob_is_left_alone(self):
+    def test_a_fetched_lob_binds_by_its_locator_on_a_thin_session(self):
+        # As python-oracledb binds one: a CLOB / BLOB by the temp-LOB marker, a
+        # BFILE by its own, its locator kept as fetched.
+        from seerdb.common.datatypes import BfileBind
+
+        Out = _bind_temp_lobs([LOB(0x70, LOCATOR), LOB(0x72, LOCATOR)])
+        self.assertIsInstance(Out[0], TempLob)
+        self.assertEqual((Out[0].locator, Out[0].is_blob), (LOCATOR[2:], False))
+        self.assertIsInstance(Out[1], BfileBind)
+        self.assertEqual(Out[1].locator, LOCATOR)
+
+    def test_a_dialects_session_keeps_a_fetched_lob(self):
+        # 8i, 9i and a pooled 11g session bind or refuse the LOB object
+        # themselves: a marker their codecs do not know aborted a pooled 11g
+        # server process (ORA-03137).
+        class _Dialect:
+            _dialect = object()
+
         Fetched = LOB(0x70, LOCATOR)
-        self.assertIs(_bind_temp_lobs([Fetched])[0], Fetched)
+        self.assertIs(_bind_temp_lobs([Fetched], _Dialect())[0], Fetched)
 
     def test_no_binds(self):
         self.assertEqual(_bind_temp_lobs([]), [])
