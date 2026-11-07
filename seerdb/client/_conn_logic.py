@@ -76,6 +76,12 @@ from seerdb.common.tns_consts import (
 # (ORA-01089, ORA-01092), the idle limit passed (ORA-02396), or the connection
 # is lost (ORA-03113, ORA-03114, ORA-03135).
 _SESSION_ENDED = frozenset({28, 1012, 1089, 1092, 2396, 3113, 3114, 3135})
+# The error a call ends with when the server ended the session with an EOF
+# DATA packet instead of a reply, as python-oracledb words its DPY-4011.
+SESSION_SHUTDOWN_MESSAGE = (
+    'the database or network closed the connection: the server ended the '
+    'session (TNS-12572)'
+)
 
 if TYPE_CHECKING:
     from seerdb.client.connection import Xid
@@ -564,6 +570,8 @@ class _ConnectionLogic:
         server-side without a word, by a firewall or a kill not yet reported,
         only shows on the next call: use ``ping()`` to find out for sure."""
         if self.conn_state != CONN_STATE_AUTHENTICATED:
+            return False
+        if getattr(self, '_session_shutdown', False):
             return False
         if self._call_status[1:2] and self._call_status[1] in _SESSION_ENDED:
             return False
