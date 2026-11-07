@@ -4730,10 +4730,21 @@ conversion"). seerdb handles it the way python-oracledb does, on 12c+:
 `Cursor.execute` / `AsyncCursor.execute` do this transparently: a PL/SQL block
 (detected by `_is_plsql`) with an over-limit str/bytes bind has that bind
 promoted to a `TempLob` marker before encoding. Plain DML keeps the
-streamed-LONG path. **11g is excluded** — it rejects `CREATE_TEMP` outright
+streamed-LONG path. **11g is excluded** — it rejects this `CREATE_TEMP` outright
 (immediate FIN, no error packet), there is no thin reference to crack it
 against, and a large PL/SQL LOB bind there keeps its prior ORA-01460 behaviour;
-the feature is gated on `field_version >= 12.1`.
+the feature is gated on `field_version >= 12.1`. On 11g the native form serves
+temporary LOBs (`oall8=True`, §4.1.4).
+
+Measured on 11g's converted form for #2463, and left there: the fields OCI 11.2's
+native `CREATE_TEMP` carries (`_OCI11_LOBOPS_CREATE_TEMP`), written at thin's
+widths, **are** answered with a real 38-byte temporary locator. Where the 12c
+body above has a 40-byte zero locator space, it has OCI's 86-byte empty locator,
+an SCN slot of 0, and the session duration (10) again as a ub8 amount. But the
+converted form's `WRITE` into that locator ends the server process with
+`ORA-03137 [12333] [120]`, where a `WRITE` into a fetched LOB works. Every guess
+past that point costs a server process, so the converted form gets no
+temporary LOB below 12.1.
 
 `Connection.createlob(lob_type, data=None)` / `AsyncConnection.createlob`
 (#1066) hand this temp LOB to the caller as a `LOB` object for
