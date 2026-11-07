@@ -377,7 +377,20 @@ does, with these differences:
 - **Validated on 9.2.0.4 only.**
 
 It stays an opt-in: the client has to choose the dialect before the server
-identifies its version (#799). The flag is ignored on other tiers.
+identifies its version (#799).
+
+**Experimental: 11g's native form on a dedicated session** (the same
+`oall8=True`). A pooled 11g session always speaks OCI 11.2's native form, the
+only one 11g's pool serves (#2466); with the flag a dedicated 11g session does
+too, in place of the converted form. It runs temporary LOBs, LOB Var binds and a
+REF CURSOR bound IN, which the converted form below 12.1 does not, with these
+differences (#2463):
+- **No cursor cache**, as on a pooled session, so a repeated statement is parsed
+  again.
+- **No `changepassword()`**: the native form's password change is not measured
+  yet.
+
+The flag is ignored on other tiers.
 
 **Oracle 8i** (8.1.7, the 9.2-era `OALL8` dialect) is the oldest and most limited
 tier. It runs connect (`O3LOGON`), SELECT, single-row DML / DDL, PL/SQL blocks

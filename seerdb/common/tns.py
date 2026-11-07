@@ -17466,6 +17466,22 @@ _SESSION_RELEASE_OCI = wire_schema.compile_encoder(_SESSION_RELEASE, _OCI)
 SESSION_RELEASE_MODE_EXIT = 3
 
 
+# The logoff (TTI_LOGOFF), as sqlplus 11.2 ends a dedicated 11g session in the
+# native form (#2463): the function and the sequence, no token, answered with a
+# bare TTI_STA. A pooled session ends with the session release above instead.
+_OCI_LOGOFF: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_LOGOFF])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+)
+_OCI_LOGOFF_OCI = wire_schema.compile_encoder(_OCI_LOGOFF, _OCI)
+
+
+def encode_logoff_oci(Seq: int) -> bytes:
+    """End a dedicated 11g session in the native form, as sqlplus 11.2 does."""
+    return _OCI_LOGOFF_OCI({'seq': Seq, 'token_number': None})
+
+
 def encode_session_release_oci(
     Seq: int, Mode: int = SESSION_RELEASE_MODE_EXIT
 ) -> bytes:

@@ -272,17 +272,19 @@ class _ConnectionLogic:
 
     def _native11_choose(self, AcceptVersion: int) -> None:
         # Decided at the ACCEPT, before the PRO, whose banner already differs:
-        # a pooled login to a server answering 11g's protocol version. The
-        # native form is the client machine's own, which seerdb takes to be
+        # a login to a server answering 11g's protocol version, pooled -- the
+        # pool serves no other form -- or dedicated and opted in by `oall8`,
+        # which asks for the native OALL8 form on 9i too (#2463). The native
+        # form is the client machine's own, which seerdb takes to be
         # little-endian; refuse rather than send a big-endian one.
         import sys
 
-        self._native11 = (
-            self.server_type == 'pooled' and AcceptVersion == TNS_VERSION_11_2
+        self._native11 = AcceptVersion == TNS_VERSION_11_2 and (
+            self.server_type == 'pooled' or bool(getattr(self, '_oall8', False))
         )
         if self._native11 and sys.byteorder != 'little':
             raise NotSupportedError(
-                'a pooled connection to Oracle 11g needs a little-endian client'
+                "Oracle 11g's native form needs a little-endian client"
             )
 
     def _native11_dty(self) -> bytes:
@@ -313,9 +315,21 @@ class _ConnectionLogic:
         self.session_id = SessionId
         self.serial_num = Serial
 
-    def _native11_call_status(self, Status: int) -> None:
-        # A pooled 11g reply's call status, which transaction_in_progress reads.
-        self._call_status[:] = [Status]
+    def _native11_call_status(self, Status: int, Code: int = 0) -> None:
+        # A native 11g reply's call status, which transaction_in_progress reads,
+        # and its error code, which is_healthy reads: a dedicated server answers
+        # a killed session with ORA-00028 (#2463).
+        self._call_status[:] = [Status, Code]
+
+    def _native11_close_call(self) -> bytes:
+        # How a native 11g session ends, as sqlplus 11.2 ends it: a pooled one
+        # with the DRCP session release; a dedicated one with the plain logoff
+        # -- the release there aborts the call (ORA-03137 [DRCP:kpplsSessRls_1]).
+        from seerdb.common.tns import encode_logoff_oci, encode_session_release_oci
+
+        if self.server_type == 'pooled':
+            return encode_session_release_oci(self._next_seq())
+        return encode_logoff_oci(self._next_seq())
 
     def _native11_refuse(self) -> None:
         # Called by send() for every DATA packet: once a native session has

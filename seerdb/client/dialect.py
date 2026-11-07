@@ -1596,7 +1596,7 @@ class Oci11Dialect(Oall8Dialect):
         self,
         next_seq: Callable[[], int],
         on_session: Callable[[int, int], None] | None = None,
-        on_call_status: Callable[[int], None] | None = None,
+        on_call_status: Callable[[int, int], None] | None = None,
         take_app_context: Callable[[], dict] | None = None,
     ) -> None:
         super().__init__(next_seq)
@@ -1739,7 +1739,7 @@ class Oci11Dialect(Oall8Dialect):
     def _status(self, reply: bytes, executed: bool = True) -> dict:
         status = decode_oci11_status(self._session_return(reply), executed)
         if self._on_call_status is not None:
-            self._on_call_status(status['status'])
+            self._on_call_status(status['status'], status.get('error_code', 0))
         return status
 
     def _cursor_id(self, reply: bytes) -> int:

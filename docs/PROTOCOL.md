@@ -923,6 +923,15 @@ constants, so the Mirror emits it verbatim.
 
 #### 4.1.4 DRCP on 11g needs the native form (client side, #2466)
 
+A dedicated 11g session takes the same native form, and with `oall8=True` the
+client speaks it there too (#2463). Only the close differs: sqlplus 11.2 ends a
+dedicated session with the plain logoff (`TTI_LOGOFF`, `03 09 <seq>`, answered
+with a bare `TTI_STA`), where a pooled one ends with the session release below.
+Sent to a dedicated server, the session release aborts the call
+(`ORA-03137 [DRCP:kpplsSessRls_1]`). A killed dedicated session is answered with
+ORA-00028, not the pool's EOF packet; the native call status carries the code,
+which `is_healthy()` reads.
+
 11g's connection pool serves a pooled session (`SERVER=POOLED`) only to a client
 speaking the native form above. Measured on 11g XE 11.2.0.2, its pool started,
 against sqlplus 11.2:

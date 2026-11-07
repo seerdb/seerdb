@@ -1494,13 +1494,20 @@ class Native11DialectTest(_At11g):
         self.assertEqual(len(Result[6]), 18)  # the touched row, lastrowid
 
     def test_each_reply_tells_its_call_status(self):
+        # The call status (transaction_in_progress reads it) and the error code
+        # (is_healthy reads it: a dedicated server answers a killed session with
+        # ORA-00028, #2463).
         Statuses = []
-        Dialect = Oci11Dialect(lambda: next(self.seq), None, Statuses.append)
+        Dialect = Oci11Dialect(
+            lambda: next(self.seq), None, lambda S, C: Statuses.append((S, C))
+        )
         _drive(
             Dialect.execute_dml("insert into t values (1, 'one')"),
             [_capture('oci11_dml_reply.hexdump')],
         )
-        self.assertTrue(Statuses[-1] & 0x02)  # TXN_IN_PROGRESS, a row inserted
+        (Status, Code) = Statuses[-1]
+        self.assertTrue(Status & 0x02)  # TXN_IN_PROGRESS, a row inserted
+        self.assertEqual(Code, 0)
 
     def test_a_failed_query_raises_with_its_position(self):
         with self.assertRaises(DatabaseError) as Raised:
