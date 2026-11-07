@@ -600,6 +600,9 @@ TNS_LOB_OP_FILE_ISOPEN = 0x0400
 TNS_LOB_OP_FILE_EXISTS = 0x0800
 TNS_LOB_OP_GET_CHUNK_SIZE = 0x4000
 TNS_LOB_OP_OPEN = 0x8000
+# FILE_OPEN's mode for a BFILE opened to read (OCI_FILE_READONLY, as the native
+# clients send it in the call's amount).
+TNS_LOB_FILE_READONLY = 0x0B
 TNS_LOB_OP_CLOSE = 0x10000
 # `lob.isopen()`. Unlike OPEN / CLOSE this one owes an ANSWER -- the ack reply
 # plus a trailing ub1, nonzero meaning open (§18.4). A server that acks it

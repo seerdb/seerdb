@@ -39,7 +39,6 @@ from seerdb.client._conn_logic import (
     dialect_pings,
     dialect_scrolls,
     dialect_temp_lobs,
-    fv2_lob_payload,
     native_returning,
     pre10_dml_applied,
     refuse_pre10_batch,
@@ -108,6 +107,7 @@ from seerdb.common.tns import (
     encode_dictionary,
     encode_dictionary_auth,
     encode_fast_auth,
+    encode_flush_echo,
     encode_packet,
     encode_pipeline_begin,
     encode_pipeline_end,
@@ -119,6 +119,7 @@ from seerdb.common.tns import (
     find_fast_auth_rpa,
     has_long_class_bind,
     max_string_size,
+    prefixed_locator,
     recording_session_keywords,
     return_bind_types,
     set_decode_dml_rowcounts,
@@ -1414,7 +1415,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 return Result
             # A flush-out-binds request, not a result: echo the token back and
             # read on for the response it is standing in front of (§6.9, #697).
-            await self.send(TNS_DATA, bytes([TTI_FOB]))
+            await self.send(TNS_DATA, encode_flush_echo())
         raise InterfaceError('server kept asking to flush out binds')
 
     # ----- execute / fetch (kept minimal for the first cut) -----
@@ -2353,16 +2354,23 @@ class AsyncOracleConnect(_ConnectionLogic):
             await lob.awrite(data)
         return lob
 
+    def _close_cursor_later(self, CursorId: int) -> None:
+        # Close a cursor kept open past its statement (a scrollable one, #181)
+        # with the next call: the #191 close-piggyback queue, or the dialect's
+        # own on a native session (#2466).
+        if dialect_scrolls(self._dialect):
+            self._dialect.close_cursor(CursorId)
+        else:
+            self._cursors_to_close.append(CursorId)
+
     async def create_temp_lob(self, is_blob: bool = False, *, csfrm: int = 1) -> bytes:
         """Async port of the sync `create_temp_lob` (#91). Allocates a
         session-duration temporary LOB and returns its locator. 12c+ only."""
         if dialect_temp_lobs(self._dialect):
-            # A pooled 11g session makes its own (#2466); the LOB object keeps
-            # the locator with its ub2 length, this returns it bare.
-            Prefixed = cast(
+            # A pooled 11g session makes its own (#2466).
+            return cast(
                 bytes, await self._drive(self._dialect.create_temp_lob(is_blob, csfrm))
             )
-            return Prefixed[2:]
         from seerdb.common.tns_consts import TTI_RPA
 
         Data = encode_dictionary(
@@ -2389,9 +2397,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         if dialect_temp_lobs(self._dialect):
             # Through the LOB object's write, a pooled 11g session's own form
             # (#2466): the text in UTF-16, counted in its code units.
-            await self.lob_write(
-                len(Locator).to_bytes(2, 'big') + Locator, Data, is_blob=is_blob
-            )
+            await self.lob_write(prefixed_locator(Locator), Data, is_blob=is_blob)
             return
         from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
 
@@ -2432,6 +2438,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             # In the charset the dialect reads the LOB's text in: UTF-16 on a
             # pooled 11g session (#2466), the 9i session's otherwise (#2383).
             from seerdb.client.dialect import lob_object_charset
+            from seerdb.common.types import fv2_lob_payload
 
             (Bytes, Amount) = fv2_lob_payload(
                 Data, is_blob, lob_object_charset(self._dialect, charset)

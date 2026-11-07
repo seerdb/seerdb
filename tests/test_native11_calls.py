@@ -533,8 +533,8 @@ class Native11LobCallTest(_At11g):
     def test_a_write_counts_utf_16_code_units(self):
         # A character past the BMP is two of them; counted as one, the pooled
         # server process died (ORA-03137).
-        from seerdb.client._conn_logic import fv2_lob_payload
         from seerdb.common.tns_consts import AL16UTF16_CHARSET
+        from seerdb.common.types import fv2_lob_payload
 
         self.assertEqual(
             fv2_lob_payload('\U0001f600!', False, AL16UTF16_CHARSET),
@@ -568,8 +568,9 @@ class Native11TempLobTest(_At11g):
             [_capture('oci11_create_temp_reply.hexdump')],
         )
         self.assertEqual(Sends, [encode_oci11_create_temp(7, 112, 1)])
-        self.assertEqual(len(Locator), 40)
-        self.assertEqual(int.from_bytes(Locator[:2], 'big'), 38)
+        # Bare, as every LOB call's reply answers with one: the reply's 40
+        # bytes are a ub2 of 38 and the locator.
+        self.assertEqual(len(Locator), 38)
 
     @staticmethod
     def _binds(Message, Count):
@@ -945,9 +946,9 @@ class Native11BfileTest(_At11g):
         self.assertEqual((Lob.data_type, len(Lob.raw)), (114, 59))
 
     def test_the_calls_are_oci_11_2s(self):
-        from seerdb.client.dialect import _BFILE_READ_ONLY
         from seerdb.common.tns import encode_oci11_lobop
         from seerdb.common.tns_consts import (
+            TNS_LOB_FILE_READONLY,
             TNS_LOB_OP_FILE_CLOSE,
             TNS_LOB_OP_FILE_EXISTS,
             TNS_LOB_OP_FILE_OPEN,
@@ -955,7 +956,11 @@ class Native11BfileTest(_At11g):
 
         for Name, Operation, Amount in (
             ('oci11_lobop_file_exists.hexdump', TNS_LOB_OP_FILE_EXISTS, 0),
-            ('oci11_lobop_file_open.hexdump', TNS_LOB_OP_FILE_OPEN, _BFILE_READ_ONLY),
+            (
+                'oci11_lobop_file_open.hexdump',
+                TNS_LOB_OP_FILE_OPEN,
+                TNS_LOB_FILE_READONLY,
+            ),
             ('oci11_lobop_file_close.hexdump', TNS_LOB_OP_FILE_CLOSE, 0),
         ):
             with self.subTest(Name):

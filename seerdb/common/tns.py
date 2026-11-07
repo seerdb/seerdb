@@ -7019,6 +7019,25 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
     )
 
 
+def encode_flush_echo() -> bytes:
+    """The client's answer to a bare TTI_FOB, the server asking it to flush out
+    a failed statement's binds before it sends the error: the same token back
+    (#697)."""
+    return bytes([TTI_FOB])
+
+
+def prefixed_locator(Locator: bytes) -> bytes:
+    """A LOB locator as a row carries it and a LOB object keeps it: a
+    big-endian ub2 of its length in front of the bare locator a LOB call's
+    reply answers with (measured on 23ai: reply == row[2:], #964)."""
+    return len(Locator).to_bytes(2, 'big') + bytes(Locator)
+
+
+def is_prefixed_locator(Locator: bytes) -> bool:
+    """Whether ``Locator`` is a row's (prefixed_locator), not a reply's."""
+    return len(Locator) >= 2 and int.from_bytes(Locator[:2], 'big') == len(Locator) - 2
+
+
 def decode_lobops_locator(Packet: bytes) -> bytes | None:
     """The UPDATED locator a TTI_LOBOPS reply leads with, or ``None``.
 
@@ -15047,11 +15066,10 @@ def _oci11_lob_bind(Value: object) -> tuple[bool, bytes] | None:
     ):
         return (
             Value.dbtype.tns_type == TNS_TYPE_BLOB,
-            (_OCI11_TEMP_LOCATOR_LENGTH - 2).to_bytes(2, 'big')
-            + bytes(_OCI11_TEMP_LOCATOR_LENGTH - 2),
+            _OCI11_EMPTY_LOCATOR,
         )
     if isinstance(Value, TempLob):
-        return (Value.is_blob, len(Value.locator).to_bytes(2, 'big') + Value.locator)
+        return (Value.is_blob, prefixed_locator(Value.locator))
     if isinstance(Value, LOB) and Value.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
         return (Value.data_type == TNS_TYPE_BLOB, bytes(Value.raw))
     return None
@@ -18033,6 +18051,7 @@ def decode_oci11_lobop(
 # BLOB), the one SCN slot and the duration again.
 _OCI11_LOB_DURATION_SESSION = 10
 _OCI11_TEMP_LOCATOR_LENGTH = 86
+_OCI11_EMPTY_LOCATOR = prefixed_locator(bytes(_OCI11_TEMP_LOCATOR_LENGTH - 2))
 _OCI11_LOBOPS_CREATE_TEMP: wire_schema.Schema = (
     *_LOBOPS_READ[:-1],
     ('n2', 'charset'),
@@ -18085,8 +18104,7 @@ def encode_oci11_create_temp(Seq: int, LobType: int, Csfrm: int) -> bytes:
             'array_length_2': 0,
             'array_slot_3': False,
             'array_length_3': 0,
-            'locator': (_OCI11_TEMP_LOCATOR_LENGTH - 2).to_bytes(2, 'big')
-            + bytes(_OCI11_TEMP_LOCATOR_LENGTH - 2),
+            'locator': _OCI11_EMPTY_LOCATOR,
             'charset': 0 if Blob else AL32UTF8_CHARSET,
             'scn': 0,
             'amount': _OCI11_LOB_DURATION_SESSION,
@@ -18095,9 +18113,9 @@ def encode_oci11_create_temp(Seq: int, LobType: int, Csfrm: int) -> bytes:
 
 
 def decode_oci11_create_temp(Data: bytes) -> tuple[bytes | None, bytes]:
-    """A temporary LOB's creation reply: (its locator as the LOB object keeps
-    it, its ub2 length in front, the status behind it). A failed call's reply
-    is its status alone: (None, the status). A reply cut short raises
+    """A temporary LOB's creation reply: (its locator, bare as every LOB call's
+    reply answers with one, the status behind it). A failed call's reply is
+    its status alone: (None, the status). A reply cut short raises
     Truncated."""
     if Data[:1] != bytes([TTI_RPA]):
         return (None, Data)
@@ -18111,7 +18129,7 @@ def decode_oci11_create_temp(Data: bytes) -> tuple[bytes | None, bytes]:
     Length = int.from_bytes(Space[:2], 'big')
     if Length + 2 > len(Space):
         raise DataError(f'11g CREATE_TEMP: a {Length}-byte locator in {len(Space)}')
-    return (Space[: 2 + Length], bytes(Rest))
+    return (Space[2 : 2 + Length], bytes(Rest))
 
 
 def decode_oci11_lob_read(Data: bytes, LocatorLength: int) -> tuple[bytes, bytes]:
@@ -18132,6 +18150,55 @@ def decode_oci11_lob_read(Data: bytes, LocatorLength: int) -> tuple[bytes, bytes
 
 
 _OCI11_OER_GIVEN = {'oci_12c': False, 'oci_pre12c': True}
+
+# A pooled 11g block's OUT value, each behind TTI_RXD in bind order (#2466): a
+# value and a ub2 indicator or return code; a NULL as a row cell's (a
+# RETURNING that matched no row: `ff 21 0c`) where a NULL assigned is an empty
+# value; a LOB's its locator as a bound one goes, a ub4 length and the
+# locator as a value (none for a NULL, its length 0); a REF CURSOR's the
+# cursor the block opened (_OCI11_CURSOR_CELL), then its indicator.
+_OCI11_OUT_VALUE: wire_schema.Schema = (
+    ('value', 'value'),
+    ('n2', 'indicator'),
+)
+_OCI11_OUT_VALUE_FROM_OCI = wire_schema.compile_decoder(_OCI11_OUT_VALUE, _OCI)
+_OCI11_OUT_NULL_CELL: wire_schema.Schema = (
+    ('const', b'\xff'),
+    ('n2', 'indicator'),
+)
+_OCI11_OUT_NULL_CELL_FROM_OCI = wire_schema.compile_decoder(_OCI11_OUT_NULL_CELL, _OCI)
+_OCI11_OUT_LOB: wire_schema.Schema = (
+    ('n4', 'length'),
+    ('when', 'length', (('value', 'locator'),)),
+    ('n2', 'indicator'),
+)
+_OCI11_OUT_LOB_FROM_OCI = wire_schema.compile_decoder(_OCI11_OUT_LOB, _OCI)
+_OCI11_INDICATOR: wire_schema.Schema = (('n2', 'indicator'),)
+_OCI11_INDICATOR_FROM_OCI = wire_schema.compile_decoder(_OCI11_INDICATOR, _OCI)
+
+# A pooled 11g DML RETURNING's iteration (#2466): TTI_RXD and, for each target
+# in bind order (``target_count``, given), a ub4 row count and the rows, each
+# the value (an empty one for a NULL), a ub2 indicator and a ub2 return code.
+_OCI11_RETURN_ITERATION: wire_schema.Schema = (
+    ('const', bytes([TTI_RXD])),
+    (
+        'each',
+        'targets',
+        'target_count',
+        (
+            ('n4', 'row_count'),
+            (
+                'each',
+                'rows',
+                'row_count',
+                (('value', 'value'), ('n2', 'indicator'), ('n2', 'code')),
+            ),
+        ),
+    ),
+)
+_OCI11_RETURN_ITERATION_FROM_OCI = wire_schema.compile_decoder(
+    _OCI11_RETURN_ITERATION, _OCI
+)
 
 
 def decode_oci11_block(
@@ -18169,19 +18236,18 @@ def decode_oci11_block(
                     continue
                 if Position in Cursors:
                     (Opened, Rest) = _oci11_cursor_cell(bytes(Rest))
-                    (_, Rest) = _OCI.read_n2(Rest)  # its indicator
+                    (_, Rest) = _OCI11_INDICATOR_FROM_OCI(Rest)
                     Values.append(Opened)
                     continue
                 if Position in Lobs:
-                    (Length, Rest) = _OCI.read_n4(Rest)
-                    (Value, Rest) = _OCI.read_value(Rest) if Length else (b'', Rest)
+                    (Cell, Rest) = _OCI11_OUT_LOB_FROM_OCI(Rest)
+                    Value = Cell.get('locator', b'')
                 elif Rest[:1] == b'\xff':
-                    # A NULL as a row cell's (a RETURNING that matched no row:
-                    # `ff 21 0c`), where a NULL assigned is an empty value.
-                    (Value, Rest) = (b'', Rest[1:])
+                    (_, Rest) = _OCI11_OUT_NULL_CELL_FROM_OCI(Rest)
+                    Value = b''
                 else:
-                    (Value, Rest) = _OCI.read_value(Rest)
-                (_, Rest) = _OCI.read_n2(Rest)  # its indicator or return code
+                    (Cell, Rest) = _OCI11_OUT_VALUE_FROM_OCI(Rest)
+                    Value = Cell['value']
                 Values.append(bytes(Value) if Value else None)
     except IndexError as Exc:
         raise Truncated(f'11g block reply: {Exc}') from Exc
@@ -18209,22 +18275,22 @@ def decode_oci11_returning(
         for _ in range(Iterations):
             if Rest[:1] != bytes([TTI_RXD]):
                 break
-            Rest = Rest[1:]
+            (Iteration, Rest) = _OCI11_RETURN_ITERATION_FROM_OCI(
+                Rest, {'target_count': len(Returning)}
+            )
             Values: list = []
             Lengths: list = []
-            for _ in Returning:
-                (Count, Rest) = _OCI.read_n4(Rest)
+            for Target in Iteration['targets']:
                 Got: list = []
                 Sizes: list = []
-                for _ in range(Count):
-                    (Value, Rest) = _OCI.read_value(Rest)
-                    (Indicator, Rest) = _OCI.read_n2(Rest)
-                    (Code, Rest) = _OCI.read_n2(Rest)
-                    if Code == _OCI11_RETURN_NULL:
+                for Row in Target['rows']:
+                    if Row['code'] == _OCI11_RETURN_NULL:
                         (Got, Sizes) = (Got + [None], Sizes + [-1])
                     else:
-                        Got.append(bytes(Value))
-                        Sizes.append(Indicator if Code == _OCI11_RETURN_CUT else 0)
+                        Got.append(bytes(Row['value']))
+                        Sizes.append(
+                            Row['indicator'] if Row['code'] == _OCI11_RETURN_CUT else 0
+                        )
                 Values.append(Got)
                 Lengths.append(Sizes)
             Records.append(

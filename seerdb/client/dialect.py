@@ -99,6 +99,7 @@ from seerdb.common.tns import (
     encode_9i_oall8_lobop,
     encode_9i_oall8_query,
     encode_9i_sql_text,
+    encode_flush_echo,
     encode_o7_bfile_close,
     encode_o7_bfile_open,
     encode_o7_block,
@@ -133,11 +134,13 @@ from seerdb.common.tns import (
     o8i_terminal_complete,
     o9i_oall8_terminal_complete,
     oci11_stmt_type,
+    prefixed_locator,
 )
 from seerdb.common.tns_consts import (
     ISO_LATIN_1_CHARSET,
     ORA_NO_DATA_FOUND,
     TNS_FETCH_ORIENTATION_LAST,
+    TNS_LOB_FILE_READONLY,
     TNS_LOB_OP_FILE_CLOSE,
     TNS_LOB_OP_FILE_OPEN,
     TNS_LOB_OP_GET_LENGTH,
@@ -159,9 +162,6 @@ from seerdb.common.tns_consts import (
 _O8I_LONG_TYPES = frozenset((8, 24))
 # The fetch's LONG cap that asks for a LONG / LONG RAW value whole (#377).
 _LONG_WHOLE = 0x7FFFFFFF
-# FILE_OPEN's mode for a BFILE opened to read (OCI_FILE_READONLY, as the native
-# clients send it).
-_BFILE_READ_ONLY = 0x0B
 
 
 class Send:
@@ -748,6 +748,11 @@ class Oall8Dialect:
         # statement the server refused at parse names cursor 0, having none.
         if cursor:
             self._to_close.append(cursor)
+
+    def close_cursor(self, cursor: int) -> None:
+        """Close a cursor the connection kept open (a scrollable one) with the
+        next call."""
+        self._finished(cursor)
 
     # 8i reads every LOB's content at fetch time whatever fetch_lobs says: its
     # dialect serves no LOB object calls (#2259).
@@ -1363,7 +1368,11 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # file is always closed.
         yield Send(
             encode_9i_oall8_lobop(
-                self._next_seq(), locator, TNS_LOB_OP_FILE_OPEN, 0, _BFILE_READ_ONLY
+                self._next_seq(),
+                locator,
+                TNS_LOB_OP_FILE_OPEN,
+                0,
+                TNS_LOB_FILE_READONLY,
             )
         )
         resp = yield RECV
@@ -2069,7 +2078,7 @@ class Oci11Dialect(Oall8Dialect):
                 # (as on 10g+, #697); unanswered, the server read the next
                 # call as a protocol violation and the pooled server process
                 # died (ORA-03137).
-                yield Send(bytes([TTI_FOB]))
+                yield Send(encode_flush_echo())
                 buf = b''
                 continue
             try:
@@ -2079,7 +2088,7 @@ class Oci11Dialect(Oall8Dialect):
                 if not records and not rest and buf[:1] == bytes([TTI_IOV]):
                     # Or sends its bind prompt alone, which OCI 11.2 answers
                     # with the same call.
-                    yield Send(bytes([TTI_FOB]))
+                    yield Send(encode_flush_echo())
                     buf = b''
                     continue
                 status = self._status(rest)
@@ -2155,7 +2164,7 @@ class Oci11Dialect(Oall8Dialect):
         # A temporary CLOB, NCLOB (csfrm 2) or BLOB of the session's duration,
         # as OCI 11.2's OCILobCreateTemporary makes one through the pool: one
         # native TTI_LOBOPS CREATE_TEMP (encode_oci11_create_temp), answered
-        # with the new locator, its ub2 length in front.
+        # with the new locator, bare as a LOB call's reply has one.
         from seerdb.common.exceptions import Truncated
 
         yield Send(
@@ -2256,11 +2265,9 @@ class Oci11Dialect(Oall8Dialect):
         # finally, so an opened file is always closed. A file or directory
         # that is not there fails the open (ORA-22285).
         (_, opened) = yield from self.lob_operation(
-            locator, TNS_LOB_OP_FILE_OPEN, _BFILE_READ_ONLY
+            locator, TNS_LOB_OP_FILE_OPEN, TNS_LOB_FILE_READONLY
         )
-        opened_locator = (
-            locator if not opened else len(opened).to_bytes(2, 'big') + opened
-        )
+        opened_locator = prefixed_locator(opened) if opened else locator
         try:
             (length, _) = yield from self.lob_operation(
                 opened_locator, TNS_LOB_OP_GET_LENGTH

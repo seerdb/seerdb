@@ -1150,32 +1150,6 @@ def temp_lobs_available(Conn) -> bool:
     )
 
 
-def fv2_lob_payload(
-    Data: str | bytes, is_blob: bool, charset: int | None
-) -> tuple[bytes, int]:
-    """A 9i LOB write's bytes and its amount (#2259): a BLOB's bytes, or a
-    CLOB's text in the session's charset (fv2_lob_charset) -- not the 10g+
-    UTF-16 -- counted in characters. Sent in the column's database charset, a
-    non-ASCII character was invalid UTF-8 to the server, which then found fewer
-    characters than the amount (ORA-22993, #2383)."""
-    from typing import cast
-
-    from seerdb.common.tns_consts import AL16UTF16_CHARSET
-    from seerdb.common.types import _CHARSET_PYTHON_NAME, fv2_lob_charset
-
-    if is_blob:
-        return (cast(bytes, Data), len(Data))
-    Text = cast(str, Data)
-    Charset = fv2_lob_charset(charset)
-    Bytes = Text.encode(_CHARSET_PYTHON_NAME[Charset])
-    if Charset == AL16UTF16_CHARSET:
-        # UTF-16's characters are its code units: a character past the BMP is
-        # two of them. Counted as one, a pooled 11g server process read the
-        # rest of the data as a protocol error and died (ORA-03137, #2466).
-        return (Bytes, len(Bytes) // 2)
-    return (Bytes, len(Text))
-
-
 def pre10_dml_applied(Result: object, BatchErrors: bool) -> bool:
     """Whether a pre-10g DML's result is one autocommit commits.
 

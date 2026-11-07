@@ -164,7 +164,13 @@ class _Values:
                 values[field[2]] = count
                 items = []
                 for _ in range(count):
-                    item: dict[str, Any] = {}
+                    # A count inside an item (a RETURNING target's row count,
+                    # #2466) is chosen ahead too; filled as a plain integer
+                    # it asked for billions of items.
+                    item: dict[str, Any] = {
+                        ahead: self._pick([0, 1, 2])
+                        for ahead in _needed_ahead(field[3])
+                    }
                     self.fill(field[3], item)
                     items.append(item)
                 values[field[1]] = items
