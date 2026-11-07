@@ -205,6 +205,33 @@ class Native11ChoiceTest(unittest.TestCase):
                 Conn._native11_choose(TNS_VERSION_11_2)
                 self.assertTrue(Conn._native11)
 
+    def test_a_password_change_is_oci_11_2s(self):
+        # OCIPasswordChange on an open dedicated session (#2463): an AUTH of
+        # mode 0x102, an empty AUTH_SESSKEY with flag 1, and the current and the
+        # new password encrypted, 64 hex digits each. The values are encrypted
+        # under each session's own key, so only their shape is compared; the
+        # server checking them is the live test.
+        from seerdb.common.tns import decode_auth_oci, encode_chgpwd_oci11
+
+        Theirs = decode_auth_oci(_capture('oci11_dedicated_password_change.hexdump'))
+        Mine = decode_auth_oci(
+            encode_chgpwd_oci11(
+                Theirs['seq'], Theirs['user'], bytes(32), 'old', 'new', []
+            )
+        )
+        self.assertEqual(
+            (Mine['subtype'], Mine['mode'], Mine['user']),
+            (Theirs['subtype'], Theirs['mode'], Theirs['user']),
+        )
+
+        def shape(Fields):
+            return [
+                (bytes(P['key']), P['flags'], len(bytes(P.get('value', b''))))
+                for P in Fields['pairs'][:3]
+            ]
+
+        self.assertEqual(shape(Mine), shape(Theirs))
+
     def test_a_dedicated_native_session_ends_with_the_logoff(self):
         # As sqlplus 11.2 ends one (`03 09 17`, captured on 11g XE): the plain
         # logoff; the DRCP session release aborted the dedicated server's call

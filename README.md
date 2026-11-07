@@ -383,12 +383,9 @@ identifies its version (#799).
 `oall8=True`). A pooled 11g session always speaks OCI 11.2's native form, the
 only one 11g's pool serves (#2466); with the flag a dedicated 11g session does
 too, in place of the converted form. It runs temporary LOBs, LOB Var binds and a
-REF CURSOR bound IN, which the converted form below 12.1 does not, with these
-differences (#2463):
-- **No cursor cache**, as on a pooled session, so a repeated statement is parsed
-  again.
-- **No `changepassword()`**: the native form's password change is not measured
-  yet.
+REF CURSOR bound IN, which the converted form below 12.1 does not. It keeps no
+cursor cache, as a pooled session doesn't, so a repeated statement is parsed
+again: about 0.3 ms an execute on the 11g bed (#2463).
 
 The flag is ignored on other tiers.
 

@@ -59,6 +59,7 @@ from seerdb.common.tns import (
     decode_9i_oall8_lob_value,
     decode_9i_oall8_terminal_error,
     decode_9i_oall8_warn_flags,
+    decode_chgpwd_reply_oci11,
     decode_fv2_batch_errors,
     decode_fv2_bind_directions,
     decode_fv2_block_out,
@@ -2167,6 +2168,28 @@ class Oci11Dialect(Oall8Dialect):
             [],
             None,
         )
+
+    def change_password(self, message: bytes):
+        # A dedicated session's password change (#2463), the message the
+        # connection built (encode_chgpwd_oci11): its reply's error, if any, is
+        # raised; a pooled session's server refuses one (ORA-56609).
+        from seerdb.common.exceptions import Truncated
+
+        yield Send(message)
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during an 11g password change')
+            buf += received[1]
+            try:
+                status = self._status(
+                    decode_chgpwd_reply_oci11(self._session_return(buf))
+                )
+            except Truncated:
+                continue
+            _raise_ora(status.get('error_code', 0), status.get('message'))
+            return
 
     def ping(self):
         # A round trip that runs nothing, as OCI 11.2's OCIPing makes one

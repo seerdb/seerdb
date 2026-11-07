@@ -930,7 +930,14 @@ with a bare `TTI_STA`), where a pooled one ends with the session release below.
 Sent to a dedicated server, the session release aborts the call
 (`ORA-03137 [DRCP:kpplsSessRls_1]`). A killed dedicated session is answered with
 ORA-00028, not the pool's EOF packet; the native call status carries the code,
-which `is_healthy()` reads.
+which `is_healthy()` reads. A dedicated session changes its password as OCI
+11.2's `OCIPasswordChange` on an open session does (`encode_chgpwd_oci11`): an
+AUTH of mode `0x102` (WITH_PASSWORD | CHANGE_PASSWORD), an empty `AUTH_SESSKEY`
+with flag 1, `AUTH_PASSWORD` and `AUTH_NEWPASSWORD` encrypted with the login's
+key as the converted form's are, and the session's own pairs. The reply is an
+RPA with no pairs and the status. OCI sends a `TTI_80SES` piggyback (107) naming
+the session ahead of it, which the server does not need. A pooled session's
+server refuses the change (ORA-56609).
 
 11g's connection pool serves a pooled session (`SERVER=POOLED`) only to a client
 speaking the native form above. Measured on 11g XE 11.2.0.2, its pool started,
