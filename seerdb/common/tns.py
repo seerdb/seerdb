@@ -15149,9 +15149,73 @@ def _is_oci11_cursor_var(Value: object) -> bool:
 _OCI11_CURSOR_BIND_SIZE = 1
 
 
+# An object or collection bound IN in 11g's native form, as OCI 11.2's
+# OCIBindObject (SQLT_NTY) binds one (#2463), measured on a dedicated session:
+# the descriptor an ADT (109) of 2000 bytes carrying the type's 16-byte OID and
+# its version, no charset; the value the native object cell a fetched object
+# column carries (_O9I_OBJECT_CELL at OCI's widths) -- the constructed toid, no
+# object OID or snapshot, version 0, the image's length, the TOP_LEVEL flags and
+# the packed image, the same toid and image as the 12c+ thin bind.
+_OCI11_OBJECT_BIND_SIZE = 2000
+# The descriptor's flags OCI 11.2 sends for one: 0, where sqlplus 11.2's other
+# binds carry 3 (sqlplus binds no object).
+_OCI11_OBJECT_BIND_FLAGS = 0
+_O9I_OBJECT_CELL_OCI = wire_schema.compile_encoder(_O9I_OBJECT_CELL, _OCI)
+
+
+def _is_oci11_object_bind(Value: object) -> bool:
+    from seerdb.common.dbobject import DbObject
+
+    return isinstance(Value, DbObject)
+
+
+def _oci11_object_bind_oac(Value: object, Flags: int) -> bytes:
+    Typ = object.__getattribute__(Value, '_dbtype')
+    return _OAC_OCI(
+        {
+            'lead': 0,
+            'data_type': TNS_TYPE_ADT,
+            'oci_plain': False,
+            'flags': _OCI11_OBJECT_BIND_FLAGS,
+            'precision': 0,
+            'scale': 0,
+            'max_length': _OCI11_OBJECT_BIND_SIZE,
+            'max_array': 0,
+            'oci_12c': False,
+            'cont_flags': 0,
+            'toid_length': len(Typ.oid),
+            'toid': Typ.oid,
+            'version': Typ.version,
+            'charset': 0,
+            'csfrm': 0,
+            'max_chars': 0,
+        }
+    )
+
+
+def _oci11_object_bind_value(Value: 'DbObject') -> bytes:
+    Typ = object.__getattribute__(Value, '_dbtype')
+    Toid = _OBJ_TOID_PREFIX + Typ.oid + _OBJ_EXTENT_OID
+    Image = encode_object_image(Value)
+    return _O9I_OBJECT_CELL_OCI(
+        {
+            'toid_length': len(Toid),
+            'toid': Toid,
+            'oid_length': 0,
+            'snapshot_length': 0,
+            'version': 0,
+            'image_length': len(Image),
+            'flags': _OBJ_TOP_LEVEL,
+            'image': Image,
+        }
+    )
+
+
 def _encode_oci11_bind_value(Value: object) -> bytes:
-    # A pooled 11g session's bind value: a REF CURSOR's, a LOB's locator, or
-    # the native 9.2 form's value.
+    # A pooled 11g session's bind value: a REF CURSOR's, a LOB's locator, an
+    # object's cell, or the native 9.2 form's value.
+    if _is_oci11_object_bind(Value):
+        return _oci11_object_bind_value(cast('DbObject', Value))
     if isinstance(Value, RefCursorBind):
         # An open cursor bound IN, as OCI 11.2's SQLT_RSET bind of a statement
         # handle goes through the pool: its id, where the OUT form sends 0.
@@ -15172,6 +15236,8 @@ def _encode_oci11_bind_oac(Value: object, Flags: int = _OCI11_BIND_FLAGS) -> byt
     # form declared -- the session's, or AL16UTF16 and form 2 for a national one.
     from seerdb.common.datatypes import Var
 
+    if _is_oci11_object_bind(Value):
+        return _oci11_object_bind_oac(Value, Flags)
     if _is_oci11_cursor_var(Value) or isinstance(Value, RefCursorBind):
         # OUT or IN, the same descriptor, as OCI 11.2 binds either.
         return _native_bind_oac(
