@@ -305,6 +305,8 @@ class _Target(NamedTuple):
     # Whether the session runs two-phase commit: 12.1+, and the native form on
     # 10g and 11g.
     tpc: bool = False
+    # Whether the session binds a REF: 12.1+, and the native form on 10g and 11g.
+    ref_binds: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -324,6 +326,8 @@ def _target_of(conn) -> _Target:
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
         conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
+        conn.field_version >= FIELD_VERSION_12_1
+        or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
@@ -383,6 +387,8 @@ class _Need(NamedTuple):
     assoc_arrays: bool = False
     # Whether it runs two-phase commit.
     tpc: bool = False
+    # Whether it binds a REF.
+    ref_binds: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -403,6 +409,8 @@ class _Need(NamedTuple):
         if self.assoc_arrays and not target.assoc_arrays:
             return True
         if self.tpc and not target.tpc:
+            return True
+        if self.ref_binds and not target.ref_binds:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -536,7 +544,9 @@ _LOB_MODIFY = _Need(
 )
 _FV = FIELD_VERSION_12_1
 _INVISIBLE_COLUMNS = _Need('INVISIBLE columns are 12.1+', min_fv=_FV)
-_REF_BIND = _Need('REF bind needs a 12.1+ server', min_fv=_FV)
+_REF_BIND = _Need(
+    'REF bind needs a 12.1+ server, or the native form on 10g and 11g', ref_binds=True
+)
 _ROWS_RETURNING = _Need(
     'a RETURNING over several rows runs as a PL/SQL block below 10g and on a pooled '
     '11g session, whose INTO targets take one row',

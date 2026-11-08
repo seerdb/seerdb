@@ -2003,5 +2003,57 @@ class Native11TpcTest(_At11g):
         self.assertIn(CAP_TPC, Oci11Dialect(lambda: 7).capabilities())
 
 
+class Native11RefBindTest(_At11g):
+    def _parts(self, Name):
+        # The descriptor, from its REF type byte to the next bind's, and the
+        # value: the whole message's tail behind TTI_RXD.
+        Captured = _capture(Name)
+        Start = Captured.index(bytes.fromhex('006f000000d0070000'))
+        Toid = Captured[Start + 22 : Start + 38]
+        Value = Captured[Captured.rindex(b'\x07\x2a') + 1 :]
+        return (Captured[Start : Start + 47], Toid, Value)
+
+    def test_the_bind_is_oci_11_2s(self):
+        from seerdb.common.dbobject import DbRef
+        from seerdb.common.tns import _encode_oci11_bind_oac, _encode_oci11_bind_value
+
+        for Name in ('oci11_ref_bind.hexdump', 'oci10_ref_bind.hexdump'):
+            with self.subTest(Name):
+                (Descriptor, Toid, Value) = self._parts(Name)
+                Ref = DbRef(Value[1:], type_oid=Toid)
+                self.assertEqual(_encode_oci11_bind_oac(Ref), Descriptor)
+                self.assertEqual(_encode_oci11_bind_value(Ref), Value)
+
+    def test_a_ref_column_keeps_its_type_identity(self):
+        from seerdb.common.tns import _o9i_oall8_columns
+        from seerdb.common.tns_consts import TNS_TYPE_REF
+
+        Column = {
+            'data_type': TNS_TYPE_REF,
+            'buffer_size': 2000,
+            'scale': 0,
+            'precision': 0,
+            'max_size': 2000,
+            'charset': 0,
+            'csfrm': 0,
+            'null_ok': 1,
+            'name': b'R',
+            'toid': b'0' * 16,
+            'type_schema': b'PYO',
+            'type_name': b'T',
+        }
+        (Shaped,) = _o9i_oall8_columns([Column])
+        self.assertEqual(Shaped['data_type'], TNS_TYPE_REF)
+        self.assertEqual(Shaped['type_oid'], b'0' * 16)
+        self.assertEqual(Shaped['type_name'], 'T')
+
+    def test_a_ref_without_its_type_is_refused(self):
+        from seerdb.common.dbobject import DbRef
+        from seerdb.common.tns import _encode_oci11_bind_oac
+
+        with self.assertRaises(NotSupportedError):
+            _encode_oci11_bind_oac(DbRef(b'x'))
+
+
 if __name__ == '__main__':
     unittest.main()

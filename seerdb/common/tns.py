@@ -15264,6 +15264,10 @@ def _encode_oci11_array_value(Value: Any) -> bytes:
 def _encode_oci11_bind_value(Value: object) -> bytes:
     # A pooled 11g session's bind value: a REF CURSOR's, a LOB's locator, an
     # object's cell, or the native 9.2 form's value.
+    from seerdb.common.dbobject import DbRef
+
+    if isinstance(Value, DbRef):
+        return _OCI.value(Value.bytes)
     if _is_oci11_array_var(Value):
         return _encode_oci11_array_value(Value)
     if _is_oci11_object_bind(Value):
@@ -15282,12 +15286,47 @@ def _encode_oci11_bind_value(Value: object) -> bytes:
     return _encode_9i_bind_value(Value)
 
 
+def _oci11_ref_bind_oac(Ref: Any) -> bytes:
+    # A REF, as OCI 11.2 binds one on 10g and 11g: an object's descriptor with
+    # the REF type, and the OID and version 1 of the type it refers to.
+    if Ref.type_oid is None:
+        from seerdb.common.exceptions import NotSupportedError
+
+        raise NotSupportedError(
+            'cannot bind a REF without its referenced type OID; the value must '
+            'come from a fetched DbRef whose describe carried the type identity'
+        )
+    return _OAC_OCI(
+        {
+            'lead': 0,
+            'data_type': TNS_TYPE_REF,
+            'oci_plain': False,
+            'flags': 0,
+            'precision': 0,
+            'scale': 0,
+            'max_length': _OCI11_OBJECT_BIND_SIZE,
+            'max_array': 0,
+            'oci_12c': False,
+            'cont_flags': 0,
+            'toid_length': len(Ref.type_oid),
+            'toid': Ref.type_oid,
+            'version': 1,
+            'charset': 0,
+            'csfrm': 0,
+            'max_chars': 0,
+        }
+    )
+
+
 def _encode_oci11_bind_oac(Value: object, Flags: int = _OCI11_BIND_FLAGS) -> bytes:
     # A pooled 11g session's bind descriptor (#2466): the native 9.2 form's type
     # and size, with sqlplus 11.2's flags, and a character bind's charset and
     # form declared -- the session's, or AL16UTF16 and form 2 for a national one.
     from seerdb.common.datatypes import Var
+    from seerdb.common.dbobject import DbRef
 
+    if isinstance(Value, DbRef):
+        return _oci11_ref_bind_oac(Value)
     if _is_oci11_object_bind(Value):
         return _oci11_object_bind_oac(Value, Flags)
     if _is_oci11_cursor_var(Value) or isinstance(Value, RefCursorBind):
@@ -15577,7 +15616,8 @@ _O9I_OALL8_TYPED = frozenset((58, 121, 122, 123))
 def _o9i_oall8_columns(Columns: list) -> list[dict]:
     # The describe's columns, shaped like decode_8i_dcb_describe's, so the shared
     # row and cursor machinery is unchanged. A typed column takes thin's type and
-    # carries its type's identity, for the cursor to describe the type with.
+    # carries its type's identity, for the cursor to describe the type with; a
+    # REF keeps its own type and carries the identity of the type it refers to.
     Out = []
     for Col in Columns:
         Typed = Col['data_type'] in _O9I_OALL8_TYPED
@@ -15594,7 +15634,7 @@ def _o9i_oall8_columns(Columns: list) -> list[dict]:
             'domain_name': None,
             'column_name': bytes(Col.get('name') or b'').decode('latin-1'),
         }
-        if Typed:
+        if Typed or Col['data_type'] == TNS_TYPE_REF:
             Shaped['type_oid'] = bytes(Col.get('toid') or b'')
             Shaped['type_schema'] = _fv2_type_name(Col.get('type_schema'))
             Shaped['type_name'] = _fv2_type_name(Col.get('type_name'))
