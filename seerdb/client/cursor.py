@@ -1445,8 +1445,12 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
                     'binding a SQL OBJECT value requires an Oracle 12.1+ server'
                 )
             if isinstance(V, DbRef):
+                # OCI 11.2's form serves it on the native session.
+                if Native11:
+                    continue
                 raise NotSupportedError(
-                    'binding a REF value requires an Oracle 12.1+ server'
+                    'binding a REF value requires an Oracle 12.1+ server, '
+                    'or a 10g or 11g session with oall8=True'
                 )
             if isinstance(V, Var) and getattr(V, 'is_array', False):
                 # OCI 11.2's form serves it on the native session.
