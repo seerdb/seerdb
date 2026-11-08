@@ -55,7 +55,6 @@ from seerdb.common.tns_consts import (
 # on fv2, not fixable fv2 bind gaps (those are #172 dates, #173 intervals,
 # #174 national charset).
 _FV2_UNSUPPORTED = (
-    ('methods_on_a_missing_directory', 'fileexists() has no pre-10g LOBOPS form'),
     ('binary_double', 'BINARY_DOUBLE is a 10g+ type; Oracle 9i lacks it'),
     ('binary_float', 'BINARY_FLOAT is a 10g+ type; Oracle 9i lacks it'),
     ('kib', '9i takes no bind over 4000 bytes into a LOB column (#2260)'),
@@ -154,6 +153,10 @@ def _fv2_skip_reason(test_method_name: str) -> str | None:
 #     fixed, so the 8i suite stays green *and* honest (milestone #25).
 _8I_UNSUPPORTED = (
     # Genuine 8i limitations (8.1.7 predates the feature).
+    (
+        'methods_on_a_missing_directory',
+        '8i has no LOB object calls, fileexists() included',
+    ),
     ('timestamp', 'TIMESTAMP is a 9i+ type; Oracle 8i has only DATE'),
     ('interval', 'INTERVAL is a 9i+ type; Oracle 8i lacks it'),
     ('multilevel', 'a collection of collections is a 9i+ type; Oracle 8i lacks it'),

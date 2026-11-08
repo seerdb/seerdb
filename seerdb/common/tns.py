@@ -14202,9 +14202,11 @@ def decode_fv2_opened_cursor(Packet: bytes) -> int:
 # How a 9i LOB operation's request differs from GET_LENGTH's, captured from
 # ojdbc14 on 9.2.0.4 (#2259): IS_OPEN and CLOSE ask no reply value, and
 # IS_OPEN sets the null-LOB flag its answer comes back in; FILE_CLOSE asks
-# none either.
+# none either. FILE_EXISTS is IS_OPEN's shape (a 9.2 OCI client's); without the
+# flag the server drops the session.
 _O7_LOBOP_FLAGS = {
     TNS_LOB_OP_IS_OPEN: {'short_amount_present': False, 'null_lob_present': True},
+    TNS_LOB_OP_FILE_EXISTS: {'short_amount_present': False, 'null_lob_present': True},
     TNS_LOB_OP_CLOSE: {'short_amount_present': False},
     TNS_LOB_OP_FILE_CLOSE: {'short_amount_present': False},
 }
@@ -15477,7 +15479,7 @@ def decode_9i_oall8_lob_value(Data: bytes, Operation: int) -> tuple[int | None, 
     Flags = {'short_amount_present': True, 'null_lob_present': False}
     Flags.update(_O7_LOBOP_FLAGS.get(Operation, {}))
     (Reply, _) = _O7_LOBOPS_REPLY_FROM_O9I(Data, Flags)
-    if Operation == TNS_LOB_OP_IS_OPEN:
+    if Operation in (TNS_LOB_OP_IS_OPEN, TNS_LOB_OP_FILE_EXISTS):
         return (Reply['flag'], bytes(Reply['locator']))
     return (Reply.get('short_amount'), bytes(Reply['locator']))
 

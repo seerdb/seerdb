@@ -4649,7 +4649,9 @@ reverse-engineered byte-for-byte and verified on 10g / 11g / 21c / 23ai:
 
   which names the field outright. A *directory* that does not exist is not a
   `False`: the server raises `ORA-22285` for it, because "there is no such
-  alias" and "the file is missing" are different answers.
+  alias" and "the file is missing" are different answers. 9.2 takes the same
+  pointer in its own LOBOPS forms, with no amount (a 9.2 OCI client's request);
+  with the pointer clear, the server drops the session.
 
 - **`FILE_EXISTS`** (op `0x0800`) and **`FILE_ISOPEN`** (`0x0400`) answer with
   the echoed locator **field** and then a ub1 flag. The field is what matters:
