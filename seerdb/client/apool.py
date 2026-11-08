@@ -26,18 +26,13 @@ import time
 from collections import deque
 
 from seerdb.client.aconnection import AsyncOracleConnect
-from seerdb.client.pool import apply_drcp_pool_defaults, drcp_pool_class
+from seerdb.client.pool import (
+    _PoolEntry,
+    _PoolPolicy,
+    apply_drcp_pool_defaults,
+    drcp_pool_class,
+)
 from seerdb.common.exceptions import InterfaceError
-
-
-class _AsyncPoolEntry:
-    """One pooled async connection plus its last-used timestamp."""
-
-    __slots__ = ('conn', 'released_at')
-
-    def __init__(self, conn: AsyncOracleConnect):
-        self.conn = conn
-        self.released_at = time.monotonic()
 
 
 class _AsyncPooledConnectionGuard:
@@ -78,21 +73,26 @@ class AsyncPool:
         timeout: float | None = 30.0,
         idle_timeout: float | None = 60.0,
         health_check: bool = True,
+        getmode: int | None = None,
+        wait_timeout: int = 0,
+        ping_interval: float | None = None,
+        max_lifetime_session: float = 0,
+        max_idle_session: float = 0,
         **connect_kwargs,
     ):
-        if min < 0 or max <= 0 or min > max:
-            raise ValueError(
-                f'invalid pool sizes: min={min}, max={max} '
-                f'(need 0 <= min <= max and max > 0)'
-            )
-        if increment <= 0:
-            raise ValueError(f'increment must be positive, got {increment}')
-        self._min = min
-        self._max = max
-        self._increment = increment
-        self._timeout = timeout
-        self._idle_timeout = idle_timeout
-        self._health_check = health_check
+        self._policy = _PoolPolicy(
+            min,
+            max,
+            increment,
+            timeout,
+            idle_timeout,
+            health_check,
+            getmode,
+            wait_timeout,
+            ping_interval,
+            max_lifetime_session,
+            max_idle_session,
+        )
         self._connect_kwargs = connect_kwargs
         # The connection class this pool's DRCP sessions share (#2006).
         self._drcp_class = drcp_pool_class()
@@ -102,8 +102,9 @@ class AsyncPool:
         # the pool can be constructed outside an event loop.
         self._lock: asyncio.Lock | None = None
         self._available: asyncio.Condition | None = None
-        self._free: deque[_AsyncPoolEntry] = deque()
-        self._in_use: set[int] = set()
+        self._free: deque[_PoolEntry] = deque()
+        self._in_use: dict[int, _PoolEntry] = {}
+        self._opening = 0
         self._closed = False
         self._prewarmed = False
 
@@ -118,9 +119,9 @@ class AsyncPool:
             if self._prewarmed or self._closed:
                 return
             self._prewarmed = True
-            for _ in range(self._min):
+            for _ in range(self._policy.min):
                 Conn = await self._open_connection()
-                self._free.append(_AsyncPoolEntry(Conn))
+                self._free.append(_PoolEntry(Conn))
 
     def acquire(self) -> '_AcquireContext':
         """Return an async context manager that yields a free
@@ -135,29 +136,32 @@ class AsyncPool:
         """Return a connection to the pool. Idempotent; releasing a
         connection not produced by this pool raises InterfaceError."""
         cond = self._ensure_sync_primitives()
+        Retired: list[AsyncOracleConnect] = []
         async with cond:
-            CheckoutId = id(conn)
-            if CheckoutId not in self._in_use:
+            Entry = self._in_use.pop(id(conn), None)
+            if Entry is None:
                 raise InterfaceError('connection was not acquired from this pool')
-            self._in_use.discard(CheckoutId)
             if self._closed:
+                Retired.append(conn)
+            else:
+                # End the pooled logical request (#464): flush REQUEST_END if
+                # open; a failure means the connection is dead, so discard it.
                 try:
-                    await conn.close()
+                    await conn._end_request()
                 except Exception:
-                    # Best-effort: the pool is closing, so there is nothing
-                    # to recover if this connection fails to close cleanly.
-                    pass
-                return
-            # End the pooled logical request (#464): flush REQUEST_END if open;
-            # a failure means the connection is dead, so discard it.
-            try:
-                await conn._end_request()
-            except Exception:
-                await self._discard_dead(conn)
+                    Retired.append(conn)
+                else:
+                    Now = time.monotonic()
+                    if self._policy.past_lifetime(Entry, Now) or (
+                        self._held() >= self._policy.max
+                    ):
+                        Retired.append(conn)
+                    else:
+                        Entry.released_at = Now
+                        self._free.append(Entry)
+                    Retired.extend(self._retire_idle(Now))
                 cond.notify()
-                return
-            self._free.append(_AsyncPoolEntry(conn))
-            cond.notify()
+        await self._discard_all(Retired)
 
     async def close(self) -> None:
         """Close every free connection and mark the pool closed.
@@ -192,61 +196,127 @@ class AsyncPool:
             self._available = asyncio.Condition(self._lock)
         return self._available
 
+    def _held(self) -> int:
+        """Connections held or being opened."""
+        return len(self._free) + len(self._in_use) + self._opening
+
+    def _retire_idle(self, now: float) -> list[AsyncOracleConnect]:
+        """Free connections past `max_idle_session`, down to `min`, for the
+        caller to close outside the lock. The oldest release is first, so the
+        scan stops at the first one still in time."""
+        Retired: list[AsyncOracleConnect] = []
+        while (
+            self._free
+            and self._held() > self._policy.min
+            and self._policy.past_idle(self._free[0], now)
+        ):
+            Retired.append(self._free.popleft().conn)
+        return Retired
+
     async def _acquire_one(self) -> AsyncOracleConnect:
         """The body of acquire(), refactored so the
         `_AcquireContext` can drive it explicitly."""
-        cond = self._ensure_sync_primitives()
         if not self._prewarmed:
             await self.prewarm()
-        Deadline = None if self._timeout is None else (time.monotonic() + self._timeout)
+        Deadline = self._policy.deadline(time.monotonic())
+        while True:
+            Entry, Reserved, Retired = await self._claim(Deadline)
+            await self._discard_all(Retired)
+            if Reserved:
+                Conn = await self._open_reserved()
+            elif Entry is not None and await self._alive(Entry):
+                Conn = Entry.conn
+            else:
+                continue
+            Conn._begin_request()  # request boundary (#464)
+            return Conn
+
+    async def _claim(
+        self, deadline: float | None
+    ) -> tuple[_PoolEntry | None, bool, list[AsyncOracleConnect]]:
+        """Under the lock, take a free connection or reserve a slot to open
+        one, waiting as `getmode` says. Returns the entry, whether a slot was
+        reserved, and the connections to close once the lock is let go."""
+        cond = self._ensure_sync_primitives()
+        Policy = self._policy
         async with cond:
             while True:
                 if self._closed:
                     raise InterfaceError('pool is closed')
+                Now = time.monotonic()
+                Retired = self._retire_idle(Now)
                 while self._free:
                     Entry = self._free.popleft()
-                    if self._needs_health_check(Entry):
-                        if not await self._ping(Entry.conn):
-                            await self._discard_dead(Entry.conn)
-                            continue
-                    self._in_use.add(id(Entry.conn))
-                    Entry.conn._begin_request()  # request boundary (#464)
-                    return Entry.conn
-                if len(self._in_use) < self._max:
-                    Conn = await self._open_connection()
-                    self._in_use.add(id(Conn))
-                    Conn._begin_request()  # request boundary (#464)
-                    return Conn
-                if Deadline is None:
+                    if Policy.past_lifetime(Entry, Now):
+                        Retired.append(Entry.conn)
+                        continue
+                    self._in_use[id(Entry.conn)] = Entry
+                    return Entry, False, Retired
+                Busy = len(self._in_use) + self._opening
+                if Policy.may_open(Busy):
+                    self._opening += 1
+                    return None, True, Retired
+                if Retired:
+                    return None, False, Retired  # close them, then look again
+                if deadline is None:
                     await cond.wait()
                 else:
-                    Remaining = Deadline - time.monotonic()
+                    Remaining = deadline - time.monotonic()
                     if Remaining <= 0:
-                        raise InterfaceError(
-                            f'pool acquire timed out after {self._timeout}s '
-                            f'(in_use={len(self._in_use)}, max={self._max})'
-                        )
+                        raise Policy.exhausted(Busy)
                     try:
-                        await asyncio.wait_for(
-                            cond.wait(),
-                            timeout=Remaining,
-                        )
+                        await asyncio.wait_for(cond.wait(), timeout=Remaining)
                     except asyncio.TimeoutError:
-                        raise InterfaceError(
-                            f'pool acquire timed out after {self._timeout}s '
-                            f'(in_use={len(self._in_use)}, max={self._max})'
-                        )
+                        raise Policy.exhausted(
+                            len(self._in_use) + self._opening
+                        ) from None
+
+    async def _open_reserved(self) -> AsyncOracleConnect:
+        """Open a connection into the slot `_claim` reserved."""
+        cond = self._ensure_sync_primitives()
+        try:
+            Conn = await self._open_connection()
+        except BaseException:
+            async with cond:
+                self._opening -= 1
+                cond.notify()
+            raise
+        async with cond:
+            self._opening -= 1
+            Closed = self._closed
+            if not Closed:
+                self._in_use[id(Conn)] = _PoolEntry(Conn)
+        if Closed:
+            await self._discard_dead(Conn)
+            raise InterfaceError('pool is closed')
+        return Conn
+
+    async def _alive(self, entry: _PoolEntry) -> bool:
+        """Ping a claimed entry if it is due one. A dead connection gives its
+        slot back."""
+        if not self._policy.needs_ping(entry, time.monotonic()):
+            return True
+        try:
+            Alive = await self._ping(entry.conn)
+        except BaseException:
+            await self._forget(entry.conn)
+            raise
+        if not Alive:
+            await self._forget(entry.conn)
+            await self._discard_dead(entry.conn)
+        return Alive
+
+    async def _forget(self, conn: AsyncOracleConnect) -> None:
+        cond = self._ensure_sync_primitives()
+        async with cond:
+            self._in_use.pop(id(conn), None)
+            cond.notify()
 
     async def _open_connection(self) -> AsyncOracleConnect:
         Conn = AsyncOracleConnect(**self._connect_kwargs)
         apply_drcp_pool_defaults(Conn, self._drcp_class)
         await Conn.connect()
         return Conn
-
-    def _needs_health_check(self, entry: _AsyncPoolEntry) -> bool:
-        if not self._health_check or self._idle_timeout is None:
-            return False
-        return (time.monotonic() - entry.released_at) >= self._idle_timeout
 
     async def _ping(self, conn: AsyncOracleConnect) -> bool:
         try:
@@ -272,6 +342,10 @@ class AsyncPool:
             # The connection is already known to be dead; closing it is
             # purely best-effort cleanup.
             pass
+
+    async def _discard_all(self, conns: list[AsyncOracleConnect]) -> None:
+        for Conn in conns:
+            await self._discard_dead(Conn)
 
 
 class _AcquireContext:

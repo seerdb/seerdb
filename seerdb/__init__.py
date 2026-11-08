@@ -22,7 +22,13 @@ from seerdb.client.pipeline import (
     PipelineOpType,
     create_pipeline,
 )
-from seerdb.client.pool import Pool
+from seerdb.client.pool import (
+    POOL_GETMODE_FORCEGET,
+    POOL_GETMODE_NOWAIT,
+    POOL_GETMODE_TIMEDWAIT,
+    POOL_GETMODE_WAIT,
+    Pool,
+)
 from seerdb.client.sqlnames import enquote_literal, enquote_name, is_simple_sql_name
 from seerdb.common.datatypes import (
     BINARY,
@@ -149,12 +155,25 @@ def create_pool(*args, **kwargs) -> Pool:
         one connection at a time on demand).
       - ``timeout`` (default 30s): how long `acquire()` blocks when the
         pool is at `max` before raising `InterfaceError`. `None` waits
-        forever.
-      - ``idle_timeout`` (default 60s): a free connection idle this
+        forever. Unlike python-oracledb's `timeout`, it is not about
+        idle connections; `max_idle_session` is.
+      - ``getmode``: what `acquire()` does at `max`, overriding `timeout`:
+        ``POOL_GETMODE_WAIT`` waits, ``POOL_GETMODE_NOWAIT`` raises at
+        once, ``POOL_GETMODE_TIMEDWAIT`` waits up to ``wait_timeout``
+        milliseconds, ``POOL_GETMODE_FORCEGET`` opens a connection past
+        `max`, closed again on release.
+      - ``ping_interval`` (default 60s): a free connection idle this
         long gets a ``SELECT 1 FROM DUAL`` health-check on the next
-        acquire. `None` disables the check.
-      - ``health_check`` (default True): set False to skip pings
-        entirely.
+        acquire. Negative disables it, 0 checks on every acquire.
+      - ``idle_timeout`` / ``health_check``: the older spelling of
+        ``ping_interval`` (`None` / `False` disable the check); give one
+        or the other.
+      - ``max_lifetime_session`` (default 0, no limit): seconds a
+        connection may live; an older one is closed on acquire or
+        release, never while in use.
+      - ``max_idle_session`` (default 0, no limit): seconds a free
+        connection above `min` may stay idle. Checked on acquire and
+        release; the pool has no background thread.
     """
     return Pool(*args, **kwargs)
 
@@ -180,6 +199,10 @@ __all__ = [
     'paramstyle',
     'connect',
     'connect_async',
+    'POOL_GETMODE_FORCEGET',
+    'POOL_GETMODE_NOWAIT',
+    'POOL_GETMODE_TIMEDWAIT',
+    'POOL_GETMODE_WAIT',
     'create_pool',
     'create_pool_async',
     'OracleConnect',

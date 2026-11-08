@@ -137,7 +137,7 @@ class TestStateMachine(unittest.TestCase):
 
 class TestPoolWiring(unittest.TestCase):
     def test_release_calls_end_request(self):
-        from seerdb.client.pool import Pool, _PoolEntry
+        from seerdb.client.pool import Pool, _PoolEntry, _PoolPolicy
 
         pool = object.__new__(Pool)
         import threading
@@ -145,6 +145,8 @@ class TestPoolWiring(unittest.TestCase):
         pool._available = threading.Condition()
         pool._closed = False
         pool._free = __import__('collections').deque()
+        pool._opening = 0
+        pool._policy = _PoolPolicy(1, 4, 1, 30.0, 60.0, True, None, 0, None, 0, 0)
 
         class FakeConn:
             def __init__(self):
@@ -154,7 +156,7 @@ class TestPoolWiring(unittest.TestCase):
                 self.ended = True
 
         conn = FakeConn()
-        pool._in_use = {id(conn)}
+        pool._in_use = {id(conn): _PoolEntry(conn)}
         pool.release(conn)
         self.assertTrue(conn.ended)
         self.assertEqual(len(pool._free), 1)
