@@ -18022,6 +18022,57 @@ _OCI11_APP_CONTEXT_FROM_OCI_WIDE = wire_schema.compile_decoder(
 )
 
 
+# A change to the end-to-end tracing attributes (func 135, #183), as OCI 11.2
+# sends one to 10g and 11g, piggybacked ahead of the next call and behind the
+# cursors' close: thin's fields at OCI's widths -- each attribute's pointer and
+# its length a ub8, the flags a ub8 -- then each changed value with its length.
+# OCI's length is the value's in the worst case, three bytes a byte. 11.2 has no
+# dbop field. The pads are fields seerdb doesn't set: the two ahead of the flags,
+# the execution context id and its sequence, the key and target of a Kerberos
+# forwarded ticket.
+_OCI11_END_TO_END: wire_schema.Schema = (
+    ('const', bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SET_END_TO_END_ATTR])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('pad', 16),
+    ('wn4', 'flags'),
+    ('ptr', 'client_identifier_present'),
+    ('wn4', 'client_identifier_length'),
+    ('ptr', 'module_present'),
+    ('wn4', 'module_length'),
+    ('ptr', 'action_present'),
+    ('wn4', 'action_length'),
+    ('pad', 16),
+    ('ptr', 'client_info_present'),
+    ('wn4', 'client_info_length'),
+    ('pad', 32),
+    ('when', 'client_identifier_present', (('value', 'client_identifier'),)),
+    ('when', 'module_present', (('value', 'module'),)),
+    ('when', 'action_present', (('value', 'action'),)),
+    ('when', 'client_info_present', (('value', 'client_info'),)),
+)
+_OCI11_END_TO_END_OCI_WIDE = wire_schema.compile_encoder(_OCI11_END_TO_END, _OCI_WIDE)
+
+
+def encode_oci11_end_to_end(Seq: int, Attrs: dict) -> bytes:
+    """The end-to-end tracing attributes in `Attrs` (name: value, None to clear)
+    as a native 10g or 11g session sends them ahead of its next call."""
+    Bits = {
+        'client_identifier': TNS_END_TO_END_CLIENT_IDENTIFIER,
+        'module': TNS_END_TO_END_MODULE,
+        'action': TNS_END_TO_END_ACTION,
+        'client_info': TNS_END_TO_END_CLIENT_INFO,
+    }
+    Fields: dict = {'seq': Seq, 'token_number': None, 'flags': 0}
+    for Name, Bit in Bits.items():
+        Value = (Attrs.get(Name) or '').encode('utf-8')
+        Fields['flags'] |= Bit if Name in Attrs else 0
+        Fields[f'{Name}_present'] = bool(Value)
+        Fields[f'{Name}_length'] = len(Value) * 3
+        Fields[Name] = Value
+    return _OCI11_END_TO_END_OCI_WIDE(Fields)
+
+
 def encode_oci11_app_context(Seq: int, Namespace: str, Entries: dict) -> bytes:
     """An application context namespace's change, piggybacked ahead of a pooled
     11g session's next call: its ``Entries`` (key: value) set, or the
