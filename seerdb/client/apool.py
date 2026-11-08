@@ -24,9 +24,11 @@ Usage:
 import asyncio
 import time
 from collections import deque
+from typing import Any
 
 from seerdb.client.aconnection import AsyncOracleConnect
 from seerdb.client.pool import (
+    _KEEP,
     _PoolEntry,
     _PoolPolicy,
     apply_drcp_pool_defaults,
@@ -163,6 +165,54 @@ class AsyncPool:
                 cond.notify()
         await self._discard_all(Retired)
 
+    async def reconfigure(
+        self,
+        min: int | None = None,
+        max: int | None = None,
+        increment: int | None = None,
+        getmode: int | None = None,
+        timeout: Any = _KEEP,
+        wait_timeout: int | None = None,
+        ping_interval: float | None = None,
+        max_lifetime_session: float | None = None,
+        max_idle_session: float | None = None,
+    ) -> None:
+        """Change the pool's settings while it is in use. What isn't given
+        keeps its value; `timeout=None` means wait forever, as at creation.
+        Every value is checked before any takes effect. Above a smaller `max`,
+        free connections close now and busy ones on release; below a larger
+        `min`, connections open now. An `acquire()` already waiting keeps the
+        deadline it started with."""
+        Changes: dict[str, Any] = {
+            Name: Value
+            for Name, Value in (
+                ('min', min),
+                ('max', max),
+                ('increment', increment),
+                ('getmode', getmode),
+                ('wait_timeout', wait_timeout),
+                ('ping_interval', ping_interval),
+                ('max_lifetime_session', max_lifetime_session),
+                ('max_idle_session', max_idle_session),
+            )
+            if Value is not None
+        }
+        if timeout is not _KEEP:
+            Changes['timeout'] = timeout
+        Policy = self._policy.replaced(**Changes)
+        cond = self._ensure_sync_primitives()
+        async with cond:
+            if self._closed:
+                raise InterfaceError('pool is closed')
+            self._policy = Policy
+            Retired = self._retire_above_max()
+            cond.notify_all()
+        await self._discard_all(Retired)
+        # Before the first acquire the pool holds nothing yet, and `prewarm()`
+        # opens the new `min` itself.
+        if self._prewarmed:
+            await self._grow_to_min()
+
     async def close(self) -> None:
         """Close every free connection and mark the pool closed.
         Connections still checked out get closed when their caller
@@ -213,6 +263,39 @@ class AsyncPool:
             Retired.append(self._free.popleft().conn)
         return Retired
 
+    def _retire_above_max(self) -> list[AsyncOracleConnect]:
+        """Free connections over `max`, oldest release first, for the caller
+        to close outside the lock."""
+        Retired: list[AsyncOracleConnect] = []
+        while self._free and self._held() > self._policy.max:
+            Retired.append(self._free.popleft().conn)
+        return Retired
+
+    async def _grow_to_min(self) -> None:
+        """Open connections until the pool holds `min`."""
+        cond = self._ensure_sync_primitives()
+        while True:
+            async with cond:
+                if self._closed or self._held() >= self._policy.min:
+                    return
+                self._opening += 1
+            try:
+                Conn = await self._open_connection()
+            except BaseException:
+                async with cond:
+                    self._opening -= 1
+                    cond.notify()
+                raise
+            async with cond:
+                self._opening -= 1
+                Closed = self._closed
+                if not Closed:
+                    self._free.append(_PoolEntry(Conn))
+                    cond.notify()
+            if Closed:
+                await self._discard_dead(Conn)
+                return
+
     async def _acquire_one(self) -> AsyncOracleConnect:
         """The body of acquire(), refactored so the
         `_AcquireContext` can drive it explicitly."""
@@ -238,11 +321,11 @@ class AsyncPool:
         one, waiting as `getmode` says. Returns the entry, whether a slot was
         reserved, and the connections to close once the lock is let go."""
         cond = self._ensure_sync_primitives()
-        Policy = self._policy
         async with cond:
             while True:
                 if self._closed:
                     raise InterfaceError('pool is closed')
+                Policy = self._policy  # `reconfigure()` may change it mid-wait
                 Now = time.monotonic()
                 Retired = self._retire_idle(Now)
                 while self._free:

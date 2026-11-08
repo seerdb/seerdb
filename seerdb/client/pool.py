@@ -49,6 +49,8 @@ _GETMODES = (
     POOL_GETMODE_TIMEDWAIT,
 )
 _DEFAULT_IDLE_TIMEOUT = 60.0
+# `reconfigure(timeout=...)` left out: None already means wait forever.
+_KEEP: Any = object()
 
 
 class _PoolEntry:
@@ -113,6 +115,24 @@ class _PoolPolicy:
         self.ping_interval: float = ping_interval  # type: ignore[assignment]
         self.max_lifetime_session = max_lifetime_session
         self.max_idle_session = max_idle_session
+
+    def replaced(self, **changes: Any) -> '_PoolPolicy':
+        """A copy with `changes` applied, validated as a new pool's would be."""
+        Values: dict[str, Any] = {
+            'min': self.min,
+            'max': self.max,
+            'increment': self.increment,
+            'timeout': self.timeout,
+            'getmode': self.getmode,
+            'wait_timeout': self.wait_timeout,
+            'ping_interval': self.ping_interval,
+            'max_lifetime_session': self.max_lifetime_session,
+            'max_idle_session': self.max_idle_session,
+        }
+        Values.update(changes)
+        return _PoolPolicy(
+            idle_timeout=_DEFAULT_IDLE_TIMEOUT, health_check=True, **Values
+        )
 
     def deadline(self, now: float) -> float | None:
         """When an acquire on a full pool gives up; None waits forever."""
@@ -299,6 +319,50 @@ class Pool:
                 self._available.notify()
         self._discard_all(Retired)
 
+    def reconfigure(
+        self,
+        min: int | None = None,
+        max: int | None = None,
+        increment: int | None = None,
+        getmode: int | None = None,
+        timeout: Any = _KEEP,
+        wait_timeout: int | None = None,
+        ping_interval: float | None = None,
+        max_lifetime_session: float | None = None,
+        max_idle_session: float | None = None,
+    ) -> None:
+        """Change the pool's settings while it is in use. What isn't given
+        keeps its value; `timeout=None` means wait forever, as at creation.
+        Every value is checked before any takes effect. Above a smaller `max`,
+        free connections close now and busy ones on release; below a larger
+        `min`, connections open now. An `acquire()` already waiting keeps the
+        deadline it started with."""
+        Changes: dict[str, Any] = {
+            Name: Value
+            for Name, Value in (
+                ('min', min),
+                ('max', max),
+                ('increment', increment),
+                ('getmode', getmode),
+                ('wait_timeout', wait_timeout),
+                ('ping_interval', ping_interval),
+                ('max_lifetime_session', max_lifetime_session),
+                ('max_idle_session', max_idle_session),
+            )
+            if Value is not None
+        }
+        if timeout is not _KEEP:
+            Changes['timeout'] = timeout
+        Policy = self._policy.replaced(**Changes)
+        with self._available:
+            if self._closed:
+                raise InterfaceError('pool is closed')
+            self._policy = Policy
+            Retired = self._retire_above_max()
+            self._available.notify_all()
+        self._discard_all(Retired)
+        self._grow_to_min()
+
     def close(self) -> None:
         """Close all connections (free + in-use). Subsequent `acquire`
         calls raise InterfaceError."""
@@ -347,17 +411,49 @@ class Pool:
             Retired.append(self._free.popleft().conn)
         return Retired
 
+    def _retire_above_max(self) -> list[OracleConnect]:
+        """Free connections over `max`, oldest release first; the caller holds
+        the lock, and closes what this returns outside it."""
+        Retired: list[OracleConnect] = []
+        while self._free and self._held() > self._policy.max:
+            Retired.append(self._free.popleft().conn)
+        return Retired
+
+    def _grow_to_min(self) -> None:
+        """Open connections until the pool holds `min`."""
+        while True:
+            with self._available:
+                if self._closed or self._held() >= self._policy.min:
+                    return
+                self._opening += 1
+            try:
+                Conn = self._open_connection()
+            except BaseException:
+                with self._available:
+                    self._opening -= 1
+                    self._available.notify()
+                raise
+            with self._available:
+                self._opening -= 1
+                Closed = self._closed
+                if not Closed:
+                    self._free.append(_PoolEntry(Conn))
+                    self._available.notify()
+            if Closed:
+                self._discard_dead(Conn)
+                return
+
     def _claim(
         self, deadline: float | None
     ) -> tuple[_PoolEntry | None, bool, list[OracleConnect]]:
         """Under the lock, take a free connection or reserve a slot to open
         one, waiting as `getmode` says. Returns the entry, whether a slot was
         reserved, and the connections to close once the lock is let go."""
-        Policy = self._policy
         with self._available:
             while True:
                 if self._closed:
                     raise InterfaceError('pool is closed')
+                Policy = self._policy  # `reconfigure()` may change it mid-wait
                 Now = time.monotonic()
                 Retired = self._retire_idle(Now)
                 while self._free:

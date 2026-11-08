@@ -8991,6 +8991,20 @@ class PoolIntegration(_ThrottleRetry, unittest.TestCase):
         finally:
             Pool.close()
 
+    def test_reconfigure_resizes_a_live_pool(self):
+        Pool = seerdb.create_pool(min=1, max=3, **self._kwargs())
+        try:
+            Pool.reconfigure(min=2)
+            self.assertEqual(Pool.opened, 2)
+            with Pool.acquire() as Conn:
+                Cur = Conn.cursor()
+                Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(Cur.fetchone(), (1,))
+            Pool.reconfigure(min=1, max=1)
+            self.assertEqual(Pool.opened, 1)
+        finally:
+            Pool.close()
+
     def test_acquire_after_close_raises(self):
         Pool = seerdb.create_pool(min=1, max=2, **self._kwargs())
         Pool.close()
@@ -14334,6 +14348,20 @@ class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 Cur = Second.cursor()
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchone(), (1,))
+        finally:
+            await Pool.close()
+
+    async def test_reconfigure_resizes_a_live_pool(self):
+        Pool = await seerdb.create_pool_async(min=1, max=3, **self._kwargs())
+        try:
+            await Pool.reconfigure(min=2)
+            self.assertEqual(Pool.opened, 2)
+            async with Pool.acquire() as Conn:
+                Cur = Conn.cursor()
+                await Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await Cur.fetchone(), (1,))
+            await Pool.reconfigure(min=1, max=1)
+            self.assertEqual(Pool.opened, 1)
         finally:
             await Pool.close()
 
