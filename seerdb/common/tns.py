@@ -18019,6 +18019,147 @@ def encode_oci11_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
     )
 
 
+# Two-phase commit (#131) as OCI 11.2 sends it to 10g and 11g: thin's two
+# functions at OCI's widths. Thin's operation is a ub8 here; the pointers are 8
+# bytes; the context the server returned rides ahead of the 128-byte XID. 11g's
+# switch has the internal and external names' two pointers and lengths, which
+# 10g's lacks; 11g's change of state has a ub8 operation and flags, and four
+# bytes no field is known for behind the state, all narrower on 10g.
+_OCI11_TPC_SWITCH: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TNS_FUNC_TPC_TXN_SWITCH])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('wn4', 'operation'),
+    ('ptr', 'context_present'),
+    ('n4', 'context_length'),
+    ('n4', 'format_id'),
+    ('n4', 'gtrid_length'),
+    ('n4', 'bqual_length'),
+    ('ptr', 'xid_present'),
+    ('n4', 'xid_length'),
+    ('n4', 'flags'),
+    ('n4', 'timeout'),
+    ('pad', 4),
+    ('ptr', 'app_value_present'),
+    ('ptr', 'return_context_present'),
+    ('ptr', 'return_length_present'),
+    ('when', 'has_names', (('pad', 32),)),
+    ('bytes', 'context', 'context_length'),
+    ('bytes', 'xid', 'xid_length'),
+    ('n4', 'app_value'),
+)
+_OCI11_TPC_SWITCH_OCI_WIDE = wire_schema.compile_encoder(_OCI11_TPC_SWITCH, _OCI_WIDE)
+_OCI11_TPC_CHANGE_STATE: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TNS_FUNC_TPC_TXN_CHANGE_STATE])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('wn4', 'operation'),
+    ('ptr', 'context_present'),
+    ('n4', 'context_length'),
+    ('n4', 'format_id'),
+    ('n4', 'gtrid_length'),
+    ('n4', 'bqual_length'),
+    ('ptr', 'xid_present'),
+    ('n4', 'xid_length'),
+    ('n4', 'timeout'),
+    ('n4', 'state'),
+    ('when', 'wide', (('pad', 4),)),
+    ('ptr', 'out_state_present'),
+    ('wn4', 'flags'),
+    ('bytes', 'context', 'context_length'),
+    ('bytes', 'xid', 'xid_length'),
+)
+_OCI11_TPC_CHANGE_STATE_OCI_WIDE = wire_schema.compile_encoder(
+    _OCI11_TPC_CHANGE_STATE, _OCI_WIDE
+)
+_OCI11_TPC_CHANGE_STATE_OCI = wire_schema.compile_encoder(_OCI11_TPC_CHANGE_STATE, _OCI)
+
+
+def _oci11_tpc_fields(Seq: int, Operation: int, Xid, Context: bytes | None) -> dict:
+    # What the two functions share.
+    Parts = _tpc_xid_bytes(Xid)
+    (FormatId, Gtrid, Bqual, XidBytes) = Parts or (0, b'', b'', b'')
+    return {
+        'seq': Seq,
+        'token_number': None,
+        'operation': Operation,
+        'context_present': Context is not None,
+        'context_length': len(Context or b''),
+        'format_id': FormatId,
+        'gtrid_length': len(Gtrid),
+        'bqual_length': len(Bqual),
+        'xid_present': Parts is not None,
+        'xid_length': len(XidBytes),
+        'context': Context or b'',
+        'xid': XidBytes,
+    }
+
+
+def encode_oci11_tpc_switch(
+    Seq: int,
+    Operation: int,
+    Xid,
+    Flags: int,
+    Timeout: int,
+    Context: bytes | None,
+    FieldVersion: int = FIELD_VERSION_11_2,
+) -> bytes:
+    """Start, resume or detach a global transaction branch on a native 10g or
+    11g session."""
+    return _OCI11_TPC_SWITCH_OCI_WIDE(
+        {
+            **_oci11_tpc_fields(Seq, Operation, Xid, Context),
+            'flags': Flags,
+            'timeout': Timeout,
+            'app_value_present': True,
+            'return_context_present': True,
+            'return_length_present': True,
+            'has_names': FieldVersion >= FIELD_VERSION_11_2,
+            'app_value': 0,
+        }
+    )
+
+
+def encode_oci11_tpc_change_state(
+    Seq: int,
+    Operation: int,
+    State: int,
+    Xid,
+    Context: bytes | None,
+    FieldVersion: int = FIELD_VERSION_11_2,
+) -> bytes:
+    """Prepare, commit or roll back a branch on a native 10g or 11g session."""
+    Wide = FieldVersion >= FIELD_VERSION_11_2
+    Encode = _OCI11_TPC_CHANGE_STATE_OCI_WIDE if Wide else _OCI11_TPC_CHANGE_STATE_OCI
+    return Encode(
+        {
+            **_oci11_tpc_fields(Seq, Operation, Xid, Context),
+            'timeout': 0,
+            'state': State,
+            'wide': Wide,
+            'out_state_present': True,
+            'flags': 0,
+        }
+    )
+
+
+def decode_oci11_tpc_context(Data: bytes) -> tuple[bytes | None, bytes]:
+    """The context a switch returned, and the status behind it; (None, Data)
+    for a reply that is a status alone, a failure's."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, Data)
+    Length = int.from_bytes(Data[5:7], 'little')
+    return (bytes(Data[7 : 7 + Length]), Data[7 + Length :])
+
+
+def decode_oci11_tpc_state(Data: bytes) -> tuple[int | None, bytes]:
+    """The state a change of state left the branch in, and the status behind
+    it; (None, Data) for a reply that is a status alone."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, Data)
+    return (int.from_bytes(Data[1:5], 'little'), Data[5:])
+
+
 # An application context's change (func 154, #1775), as OCI 11.2's
 # OCIAppCtxSet / OCIAppCtxClearAll send one through the pool (#2466),
 # piggybacked ahead of the next call, a ping's too: thin's fields at OCI's

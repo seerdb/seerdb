@@ -1151,6 +1151,14 @@ def dialect_parses(Dialect) -> 'TypeGuard[Oci11Dialect]':
     return Dialect is not None and CAP_PARSE in Dialect.capabilities()
 
 
+def dialect_tpc(Dialect) -> 'TypeGuard[Oci11Dialect]':
+    """Whether a pre-12c dialect serves two-phase commit in its own form (the
+    native form on 10g and 11g, #131)."""
+    from seerdb.client.dialect import CAP_TPC
+
+    return Dialect is not None and CAP_TPC in Dialect.capabilities()
+
+
 def dialect_pings(Dialect) -> 'TypeGuard[Oci11Dialect]':
     """Whether a pre-10g dialect serves connection.ping() in its own form (a
     pooled 11g session, #2466)."""

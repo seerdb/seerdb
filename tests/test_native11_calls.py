@@ -1895,5 +1895,113 @@ class Native11AssocArrayTest(_At11g):
             Oci11Dialect._check_binds([self._array()])
 
 
+class Native11TpcTest(_At11g):
+    XID = (1001, b'1tr', b'bql')
+
+    def _context(self):
+        from seerdb.common.tns import decode_oci11_tpc_context
+
+        return decode_oci11_tpc_context(_capture('oci11_tpc_start_reply.hexdump'))[0]
+
+    def test_a_start_is_oci_11_2s(self):
+        from seerdb.common.tns import encode_oci11_tpc_switch
+
+        Captured = _capture('oci11_tpc_start.hexdump')
+        self.assertEqual(
+            encode_oci11_tpc_switch(Captured[2], 1, self.XID, 1, 60, None), Captured
+        )
+
+    def test_a_detach_carries_the_context(self):
+        from seerdb.common.tns import encode_oci11_tpc_switch
+
+        Captured = _capture('oci11_tpc_detach.hexdump')
+        Context = bytes(Captured[115:283])
+        self.assertEqual(len(Context), 168)
+        self.assertEqual(
+            encode_oci11_tpc_switch(
+                Captured[2], 2, (1003, b'3tr', b'bql'), 0, 0, Context
+            ),
+            Captured,
+        )
+
+    def test_a_prepare_and_a_commit_are_oci_11_2s(self):
+        from seerdb.common.tns import encode_oci11_tpc_change_state
+
+        Context = self._context()
+        for Name, Operation, State in (
+            ('oci11_tpc_prepare.hexdump', 3, 0),
+            ('oci11_tpc_commit.hexdump', 1, 2),
+        ):
+            with self.subTest(Name):
+                Captured = _capture(Name)
+                self.assertEqual(
+                    encode_oci11_tpc_change_state(
+                        Captured[2], Operation, State, self.XID, Context
+                    ),
+                    Captured,
+                )
+
+    def test_10g_is_narrower(self):
+        from seerdb.common.tns import (
+            encode_oci11_tpc_change_state,
+            encode_oci11_tpc_switch,
+        )
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        Start = _capture('oci10_tpc_start.hexdump')
+        self.assertEqual(
+            encode_oci11_tpc_switch(
+                Start[2], 1, self.XID, 1, 60, None, FIELD_VERSION_10_2
+            ),
+            Start,
+        )
+        Prepare = _capture('oci10_tpc_prepare.hexdump')
+        Context = bytes(Prepare[63:231])
+        self.assertEqual(
+            encode_oci11_tpc_change_state(
+                Prepare[2], 3, 0, self.XID, Context, FIELD_VERSION_10_2
+            ),
+            Prepare,
+        )
+
+    def test_the_replies_are_read(self):
+        from seerdb.common.tns import decode_oci11_tpc_context, decode_oci11_tpc_state
+
+        (Context, Rest) = decode_oci11_tpc_context(
+            _capture('oci11_tpc_start_reply.hexdump')
+        )
+        self.assertEqual(len(Context), 168)
+        self.assertEqual(Rest[:1], b'\x09')
+        (State, Rest) = decode_oci11_tpc_state(
+            _capture('oci11_tpc_prepare_reply.hexdump')
+        )
+        self.assertEqual(State, 1)
+        self.assertEqual(Rest[:1], b'\x09')
+
+    def test_a_read_only_prepare_is_a_state_not_an_error(self):
+        from seerdb.common.tns_consts import TNS_TPC_TXN_STATE_READ_ONLY
+
+        (_, State) = _drive(
+            Oci11Dialect(lambda: 5).tpc_change_state(3, 0, self.XID, self._context()),
+            [_capture('oci11_tpc_read_only_reply.hexdump')],
+        )
+        self.assertEqual(State, TNS_TPC_TXN_STATE_READ_ONLY)
+
+    def test_a_failure_is_raised(self):
+        with self.assertRaises(DatabaseError) as Caught:
+            _drive(
+                Oci11Dialect(lambda: 5).tpc_change_state(
+                    2, 3, self.XID, self._context()
+                ),
+                [_capture('oci11_tpc_no_transaction_reply.hexdump')],
+            )
+        self.assertEqual(Caught.exception.code, 24756)
+
+    def test_the_dialect_takes_two_phase_commit(self):
+        from seerdb.client.dialect import CAP_TPC
+
+        self.assertIn(CAP_TPC, Oci11Dialect(lambda: 7).capabilities())
+
+
 if __name__ == '__main__':
     unittest.main()
