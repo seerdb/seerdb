@@ -744,6 +744,52 @@ class Native11TempLobTest(_At11g):
         self.assertEqual((Image.type_name, Image.image), ('PYO_OBJ_T', b'\x84\x01'))
         self.assertIsNone(Dialect._object_out_value(Var(Typ), None))
 
+    def test_a_binary_integer_binds_out_as_oci_binds_it(self):
+        # OCI 11.2's SQLT_INT bind on 11g declares a NUMBER of 22 bytes, not the
+        # integer type: before 12.1 the integer is the client's alone (#2463).
+        from seerdb import DB_TYPE_BINARY_INTEGER
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _OAC_FROM_OCI, _encode_oci11_bind_oac
+
+        Captured = _capture('oci11_execute_binary_integer_out.hexdump')
+        ([Theirs], _) = self._binds(Captured, 1)
+        (Ours, _) = _OAC_FROM_OCI(
+            _encode_oci11_bind_oac(Var(DB_TYPE_BINARY_INTEGER)), {'oci_12c': False}
+        )
+        for Field in ('data_type', 'max_length', 'charset', 'csfrm'):
+            self.assertEqual(Ours[Field], Theirs[Field], Field)
+        self.assertEqual(Theirs['data_type'], 2)
+
+    def test_a_binary_integer_comes_back_a_number_and_truncates(self):
+        # 11g returns the NUMBER 2.9; the declared BINARY_INTEGER makes it 2.
+        from seerdb.common.tns import decode_oci11_block
+        from seerdb.common.tns_consts import TNS_TYPE_INT
+        from seerdb.common.types import decode_value
+
+        (_, Values, Rest, _) = decode_oci11_block(
+            _capture('oci11_binary_integer_out_reply.hexdump'), 1
+        )
+        self.assertEqual(Values, [bytes.fromhex('c1035b')])
+        self.assertEqual(decode_value({'data_type': TNS_TYPE_INT}, Values[0]), 2)
+        self.assertEqual(decode_oci11_status(Rest)['error_code'], 0)
+
+    def test_before_12_1_the_thin_bind_declares_a_number(self):
+        # The converted form, and every pre-12.1 thin session, declares a
+        # BINARY_INTEGER Var as OCI 11.2 does; from 12.1 on, as the integer.
+        from seerdb import DB_TYPE_BINARY_INTEGER, DB_TYPE_NUMBER
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION, encode_token_oac
+        from seerdb.common.tns_consts import FIELD_VERSION_11_2, FIELD_VERSION_12_1
+
+        for Version, Same in ((FIELD_VERSION_11_2, True), (FIELD_VERSION_12_1, False)):
+            Token = _ENCODE_FIELD_VERSION.set(Version)
+            try:
+                Int = encode_token_oac(Var(DB_TYPE_BINARY_INTEGER))
+                Number = encode_token_oac(Var(DB_TYPE_NUMBER))
+            finally:
+                _ENCODE_FIELD_VERSION.reset(Token)
+            self.assertEqual(Int == Number, Same, Version)
+
     def test_an_object_binds_in_as_oci_binds_it(self):
         # OCI 11.2's SQLT_NTY bind (OCIBindObject) of PYO_OBJ_T (42, 'hello'),
         # on a dedicated 11g session (#2463): the descriptor an ADT of 2000

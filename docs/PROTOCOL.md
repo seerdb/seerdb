@@ -7284,6 +7284,10 @@ Keyed by `(owner, package_name, type_name)` rather than `(owner, type_name)` —
 two packages may each declare a `UDT_RECORD`, so the package is part of the
 identity and belongs in the type's full name.
 
+The three views, and a package-level type as a bindable type with an OID, are
+12.1's: 11g XE has `ALL_TYPES` and none of the `ALL_PLSQL_*` (checked on
+11.2.0.2, #2463), so before 12.1 no client resolves or binds one by name.
+
 Three consequences worth stating:
 
 - **`coll_type` has a third value here**, `'PL/SQL INDEX TABLE'`, alongside
@@ -7375,6 +7379,13 @@ object read, each of which desyncs the client if wrong:
   run them through `decode_number`. Left with no branch of its own the raw bytes
   came back as a `DB_TYPE_RAW` value — `select :1 from dual` on a
   `DB_TYPE_BINARY_INTEGER` bind yielded `b'\xc1 '` instead of `31` (seerdb#826).
+- **Before 12.1 the bind declares a NUMBER.** OCI 11.2's `SQLT_INT` bind on 11g
+  sends the descriptor of a NUMBER of 22 bytes, never type 3; the server returns
+  the NUMBER (`:v := 2.9` comes back as 2.9) and OCI truncates it toward zero.
+  So a `DB_TYPE_BINARY_INTEGER` Var declares type 2 below field version 12.1, in
+  the thin and the native forms alike, and `decode_value` truncates by the Var's
+  declared type as from 12.1 on (#2463). From 12.1 on the declared type 3 also
+  picks a call overloaded on NUMBER and BINARY_INTEGER; before it no client can.
 - **The `attrs_rc` REF CURSOR is drained by re-execute.** The client re-executes
   the nested cursor id with an empty statement rather than a `TTI_FETCH`; the
   Mirror serves its parked rows with a full describe + rows reply (§6.5). The

@@ -515,9 +515,10 @@ _REFCURSOR_IN_BIND = _Need(
 )
 _VECTOR_BIND = _Need('a VECTOR bind needs a 12.1+ session (#1762)', min_fv=_FV)
 _PACKAGE_TYPE_BIND = _Need(
-    'a package-level type needs the 12.1+ bind support', min_fv=_FV
+    'a package-level type is 12.1+: before it the server has no ALL_PLSQL_TYPES'
+    ' and no OID for one, OCI included (#2463)',
+    min_fv=_FV,
 )
-_TYPED_BIND = _Need('a typed bind needs the 12c+ bind OAC', min_fv=_FV)
 _ASSOC_ARRAY_BIND = _Need('an associative-array bind needs 12.1+ (#122)', min_fv=_FV)
 _OBJECT_BIND = _Need(
     "an object bind needs the 12.1+ OAC, or 11g's native form (#2463)",
@@ -4237,7 +4238,6 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (7,))
 
-    @_requires(_TYPED_BIND)
     def test_binary_integer_out_bind_is_an_int(self):
         # BINARY_INTEGER / PLS_INTEGER travels as an Oracle NUMBER, so the bytes
         # for `:v := 2.9` are the same either way -- the DECLARED type is what
@@ -4250,7 +4250,6 @@ class CursorIntegration(_IntegrationBase):
                 self.assertIsInstance(value, int)
                 self.assertEqual(value, want)
 
-    @_requires(_TYPED_BIND)
     def test_a_number_out_bind_is_still_not_truncated(self):
         # The companion: the same statement through a NUMBER var keeps its
         # fraction, so the coercion belongs to the declared type and not to the
