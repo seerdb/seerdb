@@ -236,7 +236,8 @@ What works:
   `getmode` / `wait_timeout` choose what `acquire()` does at `max`;
   `max_lifetime_session` and `max_idle_session` retire old and idle
   connections. `timeout` is how long `acquire()` waits, not
-  python-oracledb's idle timeout
+  python-oracledb's idle timeout. `pool.reconfigure()` changes any
+  of these, and the pool's size, while it is in use
 - Async (asyncio) API: `await seerdb.connect_async(...)` returns
   an `AsyncOracleConnect`; `conn.cursor()` returns an
   `AsyncCursor` with `await cur.execute(...)`, `await cur.fetchone()`,

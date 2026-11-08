@@ -115,7 +115,10 @@ class TestGetmode(unittest.TestCase):
         pool = FakePool(min=1, max=1, timeout=0, getmode=seerdb.POOL_GETMODE_WAIT)
         guard = pool.acquire()
         got = []
-        waiter = threading.Thread(target=lambda: got.append(pool.acquire()))
+        # A daemon: if this test fails, nothing releases the waiter.
+        waiter = threading.Thread(
+            target=lambda: got.append(pool.acquire()), daemon=True
+        )
         waiter.start()
         waiter.join(0.1)
         self.assertTrue(waiter.is_alive())
@@ -218,6 +221,81 @@ class TestRetirement(unittest.TestCase):
         with pool.acquire():
             # One was idle too long and sat above `min`; the other is in use.
             self.assertEqual(pool.opened, 1)
+
+
+class TestReconfigure(unittest.TestCase):
+    def test_what_is_not_given_keeps_its_value(self):
+        pool = FakePool(min=1, max=2, timeout=5, ping_interval=7)
+        pool.reconfigure(getmode=seerdb.POOL_GETMODE_NOWAIT)
+        policy = pool._policy
+        self.assertEqual(policy.getmode, seerdb.POOL_GETMODE_NOWAIT)
+        self.assertEqual((policy.min, policy.max), (1, 2))
+        self.assertEqual((policy.timeout, policy.ping_interval), (5, 7))
+
+    def test_timeout_none_is_a_value(self):
+        pool = FakePool(min=0, max=1, timeout=5)
+        pool.reconfigure(timeout=None)
+        self.assertIsNone(pool._policy.timeout)
+
+    def test_a_disabled_ping_stays_disabled(self):
+        pool = FakePool(min=0, max=1, health_check=False)
+        pool.reconfigure(max=2)
+        self.assertEqual(pool._policy.ping_interval, -1)
+
+    def test_a_bad_value_changes_nothing(self):
+        pool = FakePool(min=1, max=2)
+        before = pool._policy
+        for kwargs in (
+            {'max': 3, 'wait_timeout': -1},
+            {'max': 0},
+            {'min': 3},
+            {'getmode': 9},
+        ):
+            with self.subTest(kwargs), self.assertRaises(ValueError):
+                pool.reconfigure(**kwargs)
+            self.assertIs(pool._policy, before)
+            self.assertEqual(pool.opened, 1)
+
+    def test_growing_min_opens_now(self):
+        pool = FakePool(min=1, max=4)
+        pool.reconfigure(min=3)
+        self.assertEqual(pool.opened, 3)
+        self.assertEqual(pool.busy, 0)
+
+    def test_shrinking_max_closes_free_now_and_busy_on_release(self):
+        pool = FakePool(min=0, max=3, ping_interval=-1)
+        first, second, third = pool.acquire(), pool.acquire(), pool.acquire()
+        pool.release(third._conn)
+        pool.reconfigure(max=1)
+        self.assertTrue(third._conn.closed)
+        self.assertEqual(pool.opened, 2)
+        pool.release(first._conn)
+        self.assertTrue(first._conn.closed)
+        pool.release(second._conn)
+        self.assertFalse(second._conn.closed)
+        self.assertEqual(pool.opened, 1)
+
+    def test_a_larger_max_wakes_a_waiter(self):
+        pool = FakePool(min=1, max=1, getmode=seerdb.POOL_GETMODE_WAIT)
+        held = pool.acquire()
+        got = []
+        # A daemon: if this test fails, nothing releases the waiter.
+        waiter = threading.Thread(
+            target=lambda: got.append(pool.acquire()), daemon=True
+        )
+        waiter.start()
+        waiter.join(0.1)
+        self.assertTrue(waiter.is_alive())
+        pool.reconfigure(max=2)
+        waiter.join(5)
+        self.assertEqual(len(got), 1)
+        self.assertIsNot(got[0]._conn, held._conn)
+
+    def test_a_closed_pool_is_refused(self):
+        pool = FakePool(min=0, max=1)
+        pool.close()
+        with self.assertRaisesRegex(InterfaceError, 'closed'):
+            pool.reconfigure(max=2)
 
 
 class TestLock(unittest.TestCase):
@@ -328,6 +406,37 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
             age(entry, 11)
         async with pool.acquire():
             self.assertEqual(pool.opened, 1)
+
+    async def test_reconfigure_grows_and_shrinks(self):
+        pool = AsyncFakePool(min=1, max=4, ping_interval=-1)
+        await pool.prewarm()
+        await pool.reconfigure(min=3)
+        self.assertEqual(pool.opened, 3)
+        await pool.reconfigure(min=1, max=2)
+        self.assertEqual(pool.opened, 2)
+
+    async def test_reconfigure_before_the_first_acquire(self):
+        pool = AsyncFakePool(min=1, max=4)
+        await pool.reconfigure(min=2)
+        self.assertEqual(pool.opened, 0)
+        await pool.prewarm()
+        self.assertEqual(pool.opened, 2)
+
+    async def test_a_larger_max_wakes_a_waiter(self):
+        pool = await self.full(getmode=seerdb.POOL_GETMODE_WAIT)
+        held = await pool._acquire_one()
+        waiter = asyncio.create_task(pool._acquire_one())
+        await asyncio.sleep(0.05)
+        self.assertFalse(waiter.done())
+        await pool.reconfigure(max=2)
+        self.assertIsNot(await asyncio.wait_for(waiter, 5), held)
+
+    async def test_reconfigure_refuses_a_bad_value(self):
+        pool = await self.full()
+        before = pool._policy
+        with self.assertRaises(ValueError):
+            await pool.reconfigure(max=3, wait_timeout=-1)
+        self.assertIs(pool._policy, before)
 
     async def test_a_slow_open_does_not_block_a_release(self):
         opening, proceed = asyncio.Event(), asyncio.Event()
