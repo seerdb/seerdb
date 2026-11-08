@@ -1666,6 +1666,8 @@ class Oci11Dialect(Oall8Dialect):
         from seerdb.common.dbobject import DbObjectType
 
         for value in bind or []:
+            if isinstance(value, Var) and value.is_array and not block:
+                raise _oci11_unsupported('an associative array outside a block')
             if isinstance(value, RefCursorBind):
                 # An open cursor bound IN to a block, as OCI 11.2 binds one
                 # (SQLT_RSET); anywhere else its form is not measured.
@@ -1691,6 +1693,15 @@ class Oci11Dialect(Oall8Dialect):
             if value.dbtype.tns_type in _OCI11_UNREAD_BINDS:
                 name = _OCI11_UNREAD_BINDS[value.dbtype.tns_type]
                 raise _oci11_unsupported(f'a {name} bind')
+
+    @staticmethod
+    def _array_outs(bind: list) -> frozenset[int]:
+        # The positions bound as a PL/SQL associative array.
+        from seerdb.common.datatypes import Var
+
+        return frozenset(
+            i for (i, v) in enumerate(bind) if isinstance(v, Var) and v.is_array
+        )
 
     @staticmethod
     def _object_outs(bind: list) -> frozenset[int]:
@@ -2378,9 +2389,10 @@ class Oci11Dialect(Oall8Dialect):
         lobs = self._lob_outs(bind)
         cursors = self._cursor_outs(bind)
         objects = self._object_outs(bind)
-        buf = yield from self._recv_block(len(bind), lobs, cursors, objects)
+        arrays = self._array_outs(bind)
+        buf = yield from self._recv_block(len(bind), lobs, cursors, objects, arrays)
         (directions, out_values, rest, session) = decode_oci11_block(
-            buf, len(bind), lobs, cursors, objects
+            buf, len(bind), lobs, cursors, objects, arrays
         )
         if session is not None and self._on_session is not None:
             self._on_session(session['session_id'], session['serial'])
@@ -2419,6 +2431,7 @@ class Oci11Dialect(Oall8Dialect):
         lobs: frozenset[int] = frozenset(),
         cursors: frozenset[int] = frozenset(),
         objects: frozenset[int] = frozenset(),
+        arrays: frozenset[int] = frozenset(),
     ):
         # A block's reply, read on across packets until it holds its prompt, its
         # OUT values and a whole status: a long OUT value spans packets.
@@ -2432,7 +2445,7 @@ class Oci11Dialect(Oall8Dialect):
             buf += received[1]
             try:
                 (_, _, rest, _) = decode_oci11_block(
-                    buf, num_binds, lobs, cursors, objects
+                    buf, num_binds, lobs, cursors, objects, arrays
                 )
                 decode_oci11_status(self._session_return(rest))
             except Truncated:

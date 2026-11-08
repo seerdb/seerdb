@@ -14,6 +14,7 @@ import os
 import sys
 import unittest
 
+import seerdb
 from seerdb.client.dialect import RECV, Oci11Dialect, Send
 from seerdb.common import oci
 from seerdb.common.exceptions import DatabaseError, NotSupportedError
@@ -1836,6 +1837,62 @@ class Native11EndToEndTest(_At11g):
         Conn = self._session(True)
         with self.assertRaises(NotSupportedError):
             Conn.dbop = 'OP'
+
+
+class Native11AssocArrayTest(_At11g):
+    # OCI 11.2's own bind of :s, a VARCHAR2 array: its descriptor is the second
+    # of three, 41 bytes each, and its value follows the first array's.
+    DESCRIPTORS = 310
+
+    def _array(self):
+        from seerdb.common.datatypes import Var
+
+        Bind = Var(seerdb.DB_TYPE_VARCHAR, 11, is_array=True, num_elements=4)
+        Bind._value = ['ab', 'cde']
+        return Bind
+
+    def test_the_descriptor_is_oci_11_2s(self):
+        from seerdb.common.tns import _encode_oci11_bind_oac
+
+        Captured = _capture('oci11_assoc_array_execute.hexdump')
+        self.assertEqual(
+            _encode_oci11_bind_oac(self._array()),
+            Captured[self.DESCRIPTORS + 41 : self.DESCRIPTORS + 82],
+        )
+
+    def test_the_value_is_oci_11_2s(self):
+        from seerdb.common.tns import _encode_oci11_bind_value
+
+        Captured = _capture('oci11_assoc_array_execute.hexdump')
+        Value = _encode_oci11_bind_value(self._array())
+        self.assertEqual(Value, bytes.fromhex('02000000') + b'\x02ab\x03cde')
+        self.assertIn(Value, Captured)
+
+    def test_a_pure_out_array_sends_its_zero_count(self):
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _encode_oci11_bind_value
+
+        Bind = Var(seerdb.DB_TYPE_VARCHAR, 11, is_array=True, num_elements=4)
+        self.assertEqual(_encode_oci11_bind_value(Bind), bytes(4))
+
+    def test_the_reply_is_read(self):
+        from seerdb.common.tns import decode_oci11_block
+
+        Reply = _capture('oci11_assoc_array_reply.hexdump')
+        # The scalar was bound without an indicator variable, which seerdb's
+        # binds always have: give it the indicator they'd bring back.
+        Value = bytes.fromhex('02c13d')
+        Reply = Reply.replace(Value, Value + bytes(2), 1)
+        (Directions, Values, _, _) = decode_oci11_block(Reply, 3, Arrays=frozenset({1}))
+        self.assertEqual(Directions, [0x20, 0x30, 0x10])
+        self.assertEqual(
+            Values,
+            [{'_array': True, 'values': [b'abZ', b'cdeZ', b'new']}, Value[1:]],
+        )
+
+    def test_outside_a_block_is_refused(self):
+        with self.assertRaises(NotSupportedError):
+            Oci11Dialect._check_binds([self._array()])
 
 
 if __name__ == '__main__':

@@ -8193,6 +8193,11 @@ and max-array-size field of the 12.1+ layout, the second flag word and trailing
 field of the 11g one), the value as its count and elements, and it answers an
 OUT array with the count and one value plus return code per element.
 
+OCI 11.2 binds one the same way on 10g and 11g: flag `0x40` and the capacity in
+its descriptor's max-array field, the value as a ub4 count and the elements. An
+OUT array comes back as a ub4 count and each element's value, then a ub2
+indicator when the bind's flags ask for one.
+
 ## 27. Proxy authentication (#126)
 
 Connecting as `proxy_user[schema]` authenticates as `proxy_user` (with its own
