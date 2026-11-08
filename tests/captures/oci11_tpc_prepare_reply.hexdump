@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 11.2's answer to OCITransPrepare, to Oracle 11g XE 11.2.0.2, the piggybacks ahead of it left out.
+# Captured 2026-11-08 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux; OCITransStart and the rest, with an
+# XID of format 1001, gtrid '1tr' or its digit's, bqual 'bql'). The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column and the
+# |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  08 01 00 00 00 09 01 00  00 00 09 00              |............|
+0000000c

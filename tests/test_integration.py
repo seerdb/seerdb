@@ -302,6 +302,9 @@ class _Target(NamedTuple):
     # Whether the session binds a PL/SQL associative array: 12.1+, and the
     # native form on 10g and 11g.
     assoc_arrays: bool = False
+    # Whether the session runs two-phase commit: 12.1+, and the native form on
+    # 10g and 11g.
+    tpc: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -321,6 +324,8 @@ def _target_of(conn) -> _Target:
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
         conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
+        conn.field_version >= FIELD_VERSION_12_1
+        or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
@@ -376,6 +381,8 @@ class _Need(NamedTuple):
     end_to_end: bool = False
     # Whether it binds a PL/SQL associative array.
     assoc_arrays: bool = False
+    # Whether it runs two-phase commit.
+    tpc: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -394,6 +401,8 @@ class _Need(NamedTuple):
         if self.end_to_end and not target.end_to_end:
             return True
         if self.assoc_arrays and not target.assoc_arrays:
+            return True
+        if self.tpc and not target.tpc:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -5945,8 +5954,9 @@ class PingKilledSessionIntegration(_ThrottleRetry, unittest.TestCase):
 # Two-phase commit (#131, #2457): a 12.1+ server, and no Mirror, which doesn't
 # serve XA (docs/MIRROR.md, "Not served").
 _TPC = _Need(
-    'two-phase commit needs a 12.1+ server, and the Mirror does not serve XA',
-    min_fv=FIELD_VERSION_12_1,
+    'two-phase commit needs a 12.1+ server or the native form on 10g and 11g, '
+    'and the Mirror does not serve XA',
+    tpc=True,
     not_mirror=('*',),
 )
 _TPC_FORMAT = 0x5EED

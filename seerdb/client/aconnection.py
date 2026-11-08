@@ -40,6 +40,7 @@ from seerdb.client._conn_logic import (
     dialect_pings,
     dialect_scrolls,
     dialect_temp_lobs,
+    dialect_tpc,
     native_returning,
     pre10_dml_applied,
     refuse_pre10_batch,
@@ -2794,6 +2795,28 @@ class AsyncOracleConnect(_ConnectionLogic):
 
     # --- Two-phase commit / XA (#131), async port of OracleConnect ---
 
+    async def _tpc_state(self, Operation: int, State: int, Branch) -> int | None:
+        # The state a prepare, commit or rollback left the branch in.
+        if dialect_tpc(self._dialect):
+            return cast(
+                'int | None',
+                await self._drive(
+                    self._dialect.tpc_change_state(
+                        Operation, State, Branch, self._transaction_context
+                    )
+                ),
+            )
+        Data = encode_tpc_change_state(
+            self._next_seq(),
+            self.field_version,
+            Operation,
+            State,
+            Branch,
+            0,
+            self._transaction_context,
+        )
+        return _decode_tpc_state(await self._tpc_request(Data))
+
     async def _tpc_request(self, Data: bytes) -> bytes:
         await self.send(TNS_DATA, Data)
         Received = await self._next_data_packet(b'', b'')
@@ -2805,11 +2828,22 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def tpc_begin(
         self, xid: Xid, flags: int = TPC_BEGIN_NEW, timeout: int = 0
     ) -> None:
+        if dialect_tpc(self._dialect):
+            self._transaction_context = cast(
+                'bytes | None',
+                await self._drive(
+                    self._dialect.tpc_switch(
+                        TNS_TPC_TXN_START, xid, flags, timeout, None
+                    )
+                ),
+            )
+            return
         if self.field_version < FIELD_VERSION_12_1:
             from seerdb.common.exceptions import NotSupportedError
 
             raise NotSupportedError(
-                'two-phase commit (TPC/XA) requires an Oracle 12.1+ server'
+                'two-phase commit (TPC/XA) requires an Oracle 12.1+ server, or a '
+                '10g or 11g session with oall8=True'
             )
         Data = encode_tpc_switch(
             self._next_seq(),
@@ -2823,6 +2857,14 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._transaction_context = _decode_tpc_context(await self._tpc_request(Data))
 
     async def tpc_end(self, xid: Xid, flags: int = TPC_END_NORMAL) -> None:
+        if dialect_tpc(self._dialect):
+            await self._drive(
+                self._dialect.tpc_switch(
+                    TNS_TPC_TXN_DETACH, xid, flags, 0, self._transaction_context
+                )
+            )
+            self._transaction_context = None
+            return
         Data = encode_tpc_switch(
             self._next_seq(),
             self.field_version,
@@ -2836,16 +2878,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._transaction_context = None
 
     async def tpc_prepare(self, xid: Xid) -> bool:
-        Data = encode_tpc_change_state(
-            self._next_seq(),
-            self.field_version,
-            TNS_TPC_TXN_PREPARE,
-            0,
-            xid,
-            0,
-            self._transaction_context,
-        )
-        State = _decode_tpc_state(await self._tpc_request(Data))
+        State = await self._tpc_state(TNS_TPC_TXN_PREPARE, 0, xid)
         if State == TNS_TPC_TXN_STATE_REQUIRES_COMMIT:
             return True
         if State == TNS_TPC_TXN_STATE_READ_ONLY:
@@ -2856,16 +2889,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         State = (
             TNS_TPC_TXN_STATE_READ_ONLY if one_phase else TNS_TPC_TXN_STATE_COMMITTED
         )
-        Data = encode_tpc_change_state(
-            self._next_seq(),
-            self.field_version,
-            TNS_TPC_TXN_COMMIT,
-            State,
-            xid,
-            0,
-            self._transaction_context,
-        )
-        Result = _decode_tpc_state(await self._tpc_request(Data))
+        Result = await self._tpc_state(TNS_TPC_TXN_COMMIT, State, xid)
         self._transaction_context = None
         Ok = (
             Result in (TNS_TPC_TXN_STATE_READ_ONLY, TNS_TPC_TXN_STATE_COMMITTED)
@@ -2876,16 +2900,9 @@ class AsyncOracleConnect(_ConnectionLogic):
             raise DatabaseError(f'unexpected TPC commit state {Result}')
 
     async def tpc_rollback(self, xid: Xid) -> None:
-        Data = encode_tpc_change_state(
-            self._next_seq(),
-            self.field_version,
-            TNS_TPC_TXN_ABORT,
-            TNS_TPC_TXN_STATE_ABORTED,
-            xid,
-            0,
-            self._transaction_context,
+        Result = await self._tpc_state(
+            TNS_TPC_TXN_ABORT, TNS_TPC_TXN_STATE_ABORTED, xid
         )
-        Result = _decode_tpc_state(await self._tpc_request(Data))
         self._transaction_context = None
         if Result != TNS_TPC_TXN_STATE_ABORTED:
             raise DatabaseError(f'unexpected TPC rollback state {Result}')

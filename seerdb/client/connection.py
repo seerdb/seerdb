@@ -27,6 +27,7 @@ from seerdb.client._conn_logic import (
     dialect_pings,
     dialect_scrolls,
     dialect_temp_lobs,
+    dialect_tpc,
     native_returning,
     pre10_dml_applied,
     refuse_pre10_batch,
@@ -3804,6 +3805,28 @@ class OracleConnect(_ConnectionLogic):
 
     # --- Two-phase commit / XA (#131) ---
 
+    def _tpc_state(self, Operation: int, State: int, Branch) -> int | None:
+        # The state a prepare, commit or rollback left the branch in.
+        if dialect_tpc(self._dialect):
+            return cast(
+                'int | None',
+                self._drive(
+                    self._dialect.tpc_change_state(
+                        Operation, State, Branch, self._transaction_context
+                    )
+                ),
+            )
+        Data = encode_tpc_change_state(
+            self._next_seq(),
+            self.field_version,
+            Operation,
+            State,
+            Branch,
+            0,
+            self._transaction_context,
+        )
+        return _decode_tpc_state(self._tpc_request(Data))
+
     def _tpc_request(self, Data: bytes) -> bytes:
         # Send a TPC function message and return the assembled response body
         # (the bytes after the leading token). The return parameters (context /
@@ -3817,11 +3840,22 @@ class OracleConnect(_ConnectionLogic):
 
     def tpc_begin(self, xid: Xid, flags: int = TPC_BEGIN_NEW, timeout: int = 0) -> None:
         """Begin a TPC (global) transaction branch identified by `xid`."""
+        if dialect_tpc(self._dialect):
+            self._transaction_context = cast(
+                'bytes | None',
+                self._drive(
+                    self._dialect.tpc_switch(
+                        TNS_TPC_TXN_START, xid, flags, timeout, None
+                    )
+                ),
+            )
+            return
         if self.field_version < FIELD_VERSION_12_1:
             from seerdb.common.exceptions import NotSupportedError
 
             raise NotSupportedError(
-                'two-phase commit (TPC/XA) requires an Oracle 12.1+ server'
+                'two-phase commit (TPC/XA) requires an Oracle 12.1+ server, or a '
+                '10g or 11g session with oall8=True'
             )
         Data = encode_tpc_switch(
             self._next_seq(),
@@ -3836,6 +3870,14 @@ class OracleConnect(_ConnectionLogic):
 
     def tpc_end(self, xid: Xid, flags: int = TPC_END_NORMAL) -> None:
         """Detach from the TPC transaction branch (end the local work)."""
+        if dialect_tpc(self._dialect):
+            self._drive(
+                self._dialect.tpc_switch(
+                    TNS_TPC_TXN_DETACH, xid, flags, 0, self._transaction_context
+                )
+            )
+            self._transaction_context = None
+            return
         Data = encode_tpc_switch(
             self._next_seq(),
             self.field_version,
@@ -3851,16 +3893,7 @@ class OracleConnect(_ConnectionLogic):
     def tpc_prepare(self, xid: Xid) -> bool:
         """Prepare the branch. Returns True if a commit is needed, False if the
         branch was read-only (nothing to commit)."""
-        Data = encode_tpc_change_state(
-            self._next_seq(),
-            self.field_version,
-            TNS_TPC_TXN_PREPARE,
-            0,
-            xid,
-            0,
-            self._transaction_context,
-        )
-        State = _decode_tpc_state(self._tpc_request(Data))
+        State = self._tpc_state(TNS_TPC_TXN_PREPARE, 0, xid)
         if State == TNS_TPC_TXN_STATE_REQUIRES_COMMIT:
             return True
         if State == TNS_TPC_TXN_STATE_READ_ONLY:
@@ -3872,16 +3905,7 @@ class OracleConnect(_ConnectionLogic):
         State = (
             TNS_TPC_TXN_STATE_READ_ONLY if one_phase else TNS_TPC_TXN_STATE_COMMITTED
         )
-        Data = encode_tpc_change_state(
-            self._next_seq(),
-            self.field_version,
-            TNS_TPC_TXN_COMMIT,
-            State,
-            xid,
-            0,
-            self._transaction_context,
-        )
-        Result = _decode_tpc_state(self._tpc_request(Data))
+        Result = self._tpc_state(TNS_TPC_TXN_COMMIT, State, xid)
         self._transaction_context = None
         Ok = (
             Result in (TNS_TPC_TXN_STATE_READ_ONLY, TNS_TPC_TXN_STATE_COMMITTED)
@@ -3893,16 +3917,7 @@ class OracleConnect(_ConnectionLogic):
 
     def tpc_rollback(self, xid: Xid) -> None:
         """Roll back the branch."""
-        Data = encode_tpc_change_state(
-            self._next_seq(),
-            self.field_version,
-            TNS_TPC_TXN_ABORT,
-            TNS_TPC_TXN_STATE_ABORTED,
-            xid,
-            0,
-            self._transaction_context,
-        )
-        Result = _decode_tpc_state(self._tpc_request(Data))
+        Result = self._tpc_state(TNS_TPC_TXN_ABORT, TNS_TPC_TXN_STATE_ABORTED, xid)
         self._transaction_context = None
         if Result != TNS_TPC_TXN_STATE_ABORTED:
             raise DatabaseError(f'unexpected TPC rollback state {Result}')

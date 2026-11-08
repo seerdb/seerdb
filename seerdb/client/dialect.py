@@ -87,6 +87,8 @@ from seerdb.common.tns import (
     decode_oci11_returning,
     decode_oci11_rows,
     decode_oci11_status,
+    decode_oci11_tpc_context,
+    decode_oci11_tpc_state,
     decode_ub4,
     encode_8i_close_cursors,
     encode_8i_lob_read,
@@ -130,6 +132,8 @@ from seerdb.common.tns import (
     encode_oci11_long_fetch,
     encode_oci11_ping,
     encode_oci11_scroll_fetch,
+    encode_oci11_tpc_change_state,
+    encode_oci11_tpc_switch,
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
@@ -260,6 +264,7 @@ CAP_APP_CONTEXT = 'app_context'
 # its own form (#2466).
 CAP_PARSE = 'parse'
 CAP_PING = 'ping'
+CAP_TPC = 'tpc'
 # The dialect serves a server-side scrollable cursor -- its open and its
 # positioned fetches -- in its own form (#2466).
 CAP_SCROLL = 'scroll'
@@ -1648,6 +1653,7 @@ class Oci11Dialect(Oall8Dialect):
                 CAP_APP_CONTEXT,
                 CAP_PARSE,
                 CAP_PING,
+                CAP_TPC,
                 CAP_SCROLL,
                 CAP_RETURNING,
             }
@@ -2288,6 +2294,45 @@ class Oci11Dialect(Oall8Dialect):
                 continue
             _raise_ora(status.get('error_code', 0), status.get('message'))
             return
+
+    def _tpc_call(self, message: bytes):
+        yield Send(self._closing() + message)
+        received = yield RECV
+        if received is False:
+            raise Exception('Connection closed during a two-phase commit call')
+        return self._session_return(received[1])
+
+    def _tpc_status(self, rest: bytes) -> tuple[int, str | None]:
+        # A success ends in a bare TTI_STA, a failure in the full status.
+        sta = decode_oci11_ping(rest)
+        if sta is not None:
+            if self._on_call_status is not None:
+                self._on_call_status(sta['call_status'], 0)
+            return (0, None)
+        status = self._status(rest)
+        return (status.get('error_code', 0), status.get('message'))
+
+    def tpc_switch(self, operation, xid, flags, timeout, context):
+        # Start, resume or detach a branch (#131); returns the server's context.
+        reply = yield from self._tpc_call(
+            encode_oci11_tpc_switch(
+                self._next_seq(), operation, xid, flags, timeout, context, self._fv
+            )
+        )
+        (returned, rest) = decode_oci11_tpc_context(reply)
+        _raise_ora(*self._tpc_status(rest))
+        return returned
+
+    def tpc_change_state(self, operation, state, xid, context):
+        # Prepare, commit or roll back a branch (#131); returns its new state.
+        reply = yield from self._tpc_call(
+            encode_oci11_tpc_change_state(
+                self._next_seq(), operation, state, xid, context, self._fv
+            )
+        )
+        (new_state, rest) = decode_oci11_tpc_state(reply)
+        _raise_ora(*self._tpc_status(rest))
+        return new_state
 
     def ping(self):
         # A round trip that runs nothing, as OCI 11.2's OCIPing makes one
