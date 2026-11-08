@@ -14977,7 +14977,7 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
 
 
 def _native_bind_oac(
-    DType: int, Flag: int, Size: int, Charset: int, Csfrm: int
+    DType: int, Flag: int, Size: int, Charset: int, Csfrm: int, MaxArray: int = 0
 ) -> bytes:
     # A bind descriptor at OCI's widths before 12c (_OAC), as a native client
     # writes one.
@@ -14990,7 +14990,7 @@ def _native_bind_oac(
             'precision': 0,
             'scale': 0,
             'max_length': Size,
-            'max_array': 0,
+            'max_array': MaxArray,
             'oci_12c': False,
             'cont_flags': 0,
             'toid_length': 0,
@@ -15236,9 +15236,36 @@ def _oci11_object_bind_value(Value: object) -> bytes:
     )
 
 
+_OCI11_BIND_ARRAY = 0x40
+
+
+def _is_oci11_array_var(Value: object) -> bool:
+    # A PL/SQL associative array, bound through cursor.arrayvar().
+    from seerdb.common.datatypes import Var
+
+    return isinstance(Value, Var) and Value.is_array
+
+
+def _encode_oci11_array_value(Value: Any) -> bytes:
+    # An associative array's value, as OCI 11.2 binds one: a ub4 count of its
+    # elements, then each element's value, none for a pure OUT array. A national
+    # array's elements go as AL16UTF16, the form the descriptor declares.
+    Elements = cast(list, Value._value or [])
+    National = _is_national_var(Value)
+    Out = _OCI.n4(len(Elements))
+    for Element in Elements:
+        if National and isinstance(Element, str):
+            Out += _OCI.value(Element.encode('utf-16-be'))
+        else:
+            Out += _encode_9i_bind_value(Element)
+    return Out
+
+
 def _encode_oci11_bind_value(Value: object) -> bytes:
     # A pooled 11g session's bind value: a REF CURSOR's, a LOB's locator, an
     # object's cell, or the native 9.2 form's value.
+    if _is_oci11_array_var(Value):
+        return _encode_oci11_array_value(Value)
     if _is_oci11_object_bind(Value):
         return _oci11_object_bind_value(Value)
     if isinstance(Value, RefCursorBind):
@@ -15301,6 +15328,16 @@ def _encode_oci11_bind_oac(Value: object, Flags: int = _OCI11_BIND_FLAGS) -> byt
         (Charset, Csfrm) = (AL32UTF8_CHARSET, 1)
     else:
         (Charset, Csfrm) = (0, 0)
+    if _is_oci11_array_var(Value):
+        # An associative array: the array bit and how many elements it may hold.
+        return _native_bind_oac(
+            DType,
+            Flags | _OCI11_BIND_ARRAY,
+            Size,
+            Charset,
+            Csfrm,
+            cast(Any, Value).num_elements,
+        )
     return _native_bind_oac(DType, Flags, Size, Charset, Csfrm)
 
 
@@ -18659,8 +18696,12 @@ def decode_oci11_block(
     Lobs: frozenset[int] = frozenset(),
     Cursors: frozenset[int] = frozenset(),
     Objects: frozenset[int] = frozenset(),
+    Arrays: frozenset[int] = frozenset(),
 ) -> tuple[list[int] | None, list, bytes, dict | None]:
-    """A pooled 11g block's reply (#2466). An object's or a collection's value,
+    """A pooled 11g block's reply (#2466). An associative array's value, at a
+    position in ``Arrays``, is a ub4 count and each element as a value and its
+    indicator: {'_array': True, 'values': the elements' bytes}, an empty one for
+    a NULL, as the thin path hands the cursor. An object's or a collection's value,
     at a position in ``Objects``, is the native object cell it went out in
     (_O9I_OBJECT_CELL), with no indicator behind it: its image, None for a NULL
     object (#2463). The rest, its bind prompt (TTI_IOV, the native
@@ -18695,6 +18736,18 @@ def decode_oci11_block(
                     Values.append(
                         bytes(Cell['image']) if Cell['image_length'] else None
                     )
+                    continue
+                if Position in Arrays:
+                    (Count, Rest) = _OCI.read_n4(Rest)
+                    Elements = []
+                    for _ in range(Count):
+                        if Rest[:1] == b'\xff':
+                            (_, Rest) = _OCI11_OUT_NULL_CELL_FROM_OCI(Rest)
+                            Elements.append(b'')
+                        else:
+                            (Cell, Rest) = _OCI11_OUT_VALUE_FROM_OCI(Rest)
+                            Elements.append(bytes(Cell['value']))
+                    Values.append({'_array': True, 'values': Elements})
                     continue
                 if Position in Cursors:
                     (Opened, Rest) = _oci11_cursor_cell(bytes(Rest))

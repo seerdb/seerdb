@@ -299,6 +299,9 @@ class _Target(NamedTuple):
     # Whether the session sends the end-to-end tracing attributes: 12.1+, and
     # the native form on 10g and 11g.
     end_to_end: bool = False
+    # Whether the session binds a PL/SQL associative array: 12.1+, and the
+    # native form on 10g and 11g.
+    assoc_arrays: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -318,6 +321,8 @@ def _target_of(conn) -> _Target:
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
         conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
+        conn.field_version >= FIELD_VERSION_12_1
+        or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
     )
@@ -369,6 +374,8 @@ class _Need(NamedTuple):
     lob_modify: bool = False
     # Whether it sends the end-to-end tracing attributes.
     end_to_end: bool = False
+    # Whether it binds a PL/SQL associative array.
+    assoc_arrays: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -385,6 +392,8 @@ class _Need(NamedTuple):
         if self.lob_modify and not target.lob_modify:
             return True
         if self.end_to_end and not target.end_to_end:
+            return True
+        if self.assoc_arrays and not target.assoc_arrays:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -539,7 +548,10 @@ _PACKAGE_TYPE_BIND = _Need(
     ' and no OID for one, OCI included (#2463)',
     min_fv=_FV,
 )
-_ASSOC_ARRAY_BIND = _Need('an associative-array bind needs 12.1+ (#122)', min_fv=_FV)
+_ASSOC_ARRAY_BIND = _Need(
+    'an associative-array bind needs 12.1+ (#122), or the native form on 10g and 11g',
+    assoc_arrays=True,
+)
 _OBJECT_BIND = _Need(
     "an object bind needs the 12.1+ OAC, or 11g's native form (#2463)",
     object_binds=True,
@@ -5112,6 +5124,52 @@ class BindIntegration(_IntegrationBase):
         Var = self.cur.var(seerdb.DB_TYPE_NVARCHAR)
         self.cur.execute("BEGIN :v := N'nat \u00fcn\u00ee \u4e2d'; END;", [Var])
         self.assertEqual(Var.getvalue(), 'nat ünî 中')
+
+    @_requires(_ASSOC_ARRAY_BIND)
+    def test_array_binds_in_and_out(self):
+        # Numbers in, strings in and out with one the block adds, and a NULL
+        # element each way.
+        Proc = 'PYORACLE_AARR'
+        self.cur.execute(
+            f"""CREATE OR REPLACE PACKAGE {Proc} AS
+                    TYPE n IS TABLE OF NUMBER INDEX BY BINARY_INTEGER;
+                    TYPE s IS TABLE OF VARCHAR2(20) INDEX BY BINARY_INTEGER;
+                    PROCEDURE go(a IN n, x IN OUT s, t OUT NUMBER);
+                    PROCEDURE fill(x OUT s);
+                END;"""
+        )
+        self.cur.execute(
+            f"""CREATE OR REPLACE PACKAGE BODY {Proc} AS
+                    PROCEDURE go(a IN n, x IN OUT s, t OUT NUMBER) IS
+                    BEGIN
+                        t := 0;
+                        FOR i IN 1 .. a.COUNT LOOP t := t + NVL(a(i), 100); END LOOP;
+                        FOR i IN 1 .. x.COUNT LOOP
+                            IF x(i) IS NOT NULL THEN x(i) := x(i) || 'Z'; END IF;
+                        END LOOP;
+                        x(x.COUNT + 1) := 'new';
+                        x(x.COUNT + 1) := NULL;
+                    END;
+                    PROCEDURE fill(x OUT s) IS
+                    BEGIN
+                        x(1) := 'one';
+                        x(2) := 'two';
+                    END;
+                END;"""
+        )
+        try:
+            Nums = self.cur.arrayvar(seerdb.DB_TYPE_NUMBER, [10, 20, None])
+            Strs = self.cur.arrayvar(seerdb.DB_TYPE_VARCHAR, 6, 20)
+            Strs.setvalue(0, ['ab', None, 'cde'])
+            Total = self.cur.var(seerdb.DB_TYPE_NUMBER)
+            self.cur.execute(f'BEGIN {Proc}.go(:1, :2, :3); END;', [Nums, Strs, Total])
+            self.assertEqual(Total.getvalue(), 130)
+            self.assertEqual(Strs.getvalue(), ['abZ', None, 'cdeZ', 'new', None])
+            Out = self.cur.arrayvar(seerdb.DB_TYPE_VARCHAR, 4, 20)
+            self.cur.execute(f'BEGIN {Proc}.fill(:1); END;', [Out])
+            self.assertEqual(Out.getvalue(), ['one', 'two'])
+        finally:
+            self.cur.execute(f'DROP PACKAGE {Proc}')
 
     @_requires(_ASSOC_ARRAY_BIND)
     def test_national_array_bind_round_trip(self):
