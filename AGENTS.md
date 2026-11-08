@@ -76,15 +76,16 @@ not the whole matrix (a PR touching several rows runs the union):
 | `seerdb/server/backends/postgres.py` (the Mirror-over-PG backend) or `examples/` | `tests/test_postgres_backend.py` before pushing, then python-oracledb's suite (`tools/run_oracledb_suite.py`) against a Mirror-over-PG |
 | the rest of `seerdb/server` | python-oracledb's suite against a passthrough Mirror over 23ai, on the branch and on its `master` base, and against a Mirror-over-PG |
 | the Mirror's OCI (sqlplus) dialect: the OCI code in `seerdb/server/session.py`, `seerdb/common/oci.py` or the OCI codec in `seerdb/common/tns.py` | `tools/sqlplus_survey.py` with sqlplus 23.26, direct to 23ai and through a passthrough Mirror over it, compared on the branch and on its `master` base |
-| `seerdb/client` | the integration suite on 8i, 9i and 10g |
-| `seerdb/common` | the integration suite on 8i, 9i and 10g, on the 26ai bed under required native encryption, and through a passthrough Mirror over 23ai; and both python-oracledb suite runs |
+| `seerdb/client` | the integration suite on 8i, 9i and 10g, and with `SEERDB_TEST_OALL8=1` on 9i, 10g and 11g |
+| `seerdb/common` | the integration suite on 8i, 9i and 10g, with `SEERDB_TEST_OALL8=1` on 9i, 10g and 11g, on the 26ai bed under required native encryption, and through a passthrough Mirror over 23ai; and both python-oracledb suite runs |
 
 Run these while the PR is a draft, and put the legs you ran and their numbers
 in the PR. CI covers the rest for those paths, and the nightly run covers every CI
 leg whatever changed; 8i, 9i and 10g run nowhere but locally, which is why a
 client change still needs them. Don't repeat a CI leg locally (#2046): the 11g,
 18c, 21c and 23ai beds, 23ai at 12.1 and both Mirror-over-PG legs all run once
-the PR is ready. A leg on its own bed or database can run alongside the others;
+the PR is ready, though never with `SEERDB_TEST_OALL8=1`, so 11g's run with it
+stays local. A leg on its own bed or database can run alongside the others;
 two on one bed cannot.
 
 CI minutes are a limited quota and local runs are free, and every push to a PR
