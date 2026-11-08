@@ -30,7 +30,9 @@ from seerdb.common.tns import (
 )
 from seerdb.common.tns_consts import (
     CONN_STATE_AUTHENTICATED,
+    FIELD_VERSION_10_2,
     TNS_DATA,
+    TNS_VERSION_10_2,
     TNS_VERSION_11_2,
     TNS_VERSION_12_1,
     TTI_AUTH,
@@ -259,6 +261,50 @@ class Native11ChoiceTest(unittest.TestCase):
                 Conn = self._conn(**kw)
                 Conn._native11_choose(version)
                 self.assertFalse(Conn._native11)
+
+    def test_a_10g_login_is_native_when_opted_in(self):
+        # 10g has no pool: `oall8` alone asks for the native form there, at
+        # 10.2's widths (#2518). The data-type request then has no
+        # timezone-file version, which 10g reads as its next message.
+        from seerdb.client.dialect import Oci11Dialect
+
+        Conn = self._conn(oall8=True)
+        Conn._native11_choose(TNS_VERSION_10_2)
+        self.assertTrue(Conn._native11)
+        Conn.field_version = FIELD_VERSION_10_2
+        self.assertEqual(len(Conn._native11_dty()), 67)
+        Conn._select_dialect(False)
+        self.assertIsInstance(Conn._dialect, Oci11Dialect)
+        self.assertEqual(Conn._dialect._fv, FIELD_VERSION_10_2)
+        for kw in ({'server_type': 'pooled'}, {}):
+            with self.subTest(kw=kw):
+                Other = self._conn(**kw)
+                Other._native11_choose(TNS_VERSION_10_2)
+                self.assertFalse(Other._native11)
+
+    def test_a_password_change_to_10g_is_oci_11_2s(self):
+        # OCI 11.2 changes it on 10g as on 11g (#2518): the same keys, flags and
+        # lengths.
+        from seerdb.common.tns import decode_auth_oci, encode_chgpwd_oci11
+
+        Theirs = decode_auth_oci(_capture('oci10_password_change.hexdump'))
+        Mine = decode_auth_oci(
+            encode_chgpwd_oci11(
+                Theirs['seq'], Theirs['user'], bytes(32), 'old', 'new', []
+            )
+        )
+        self.assertEqual(
+            (Mine['subtype'], Mine['mode'], Mine['user']),
+            (Theirs['subtype'], Theirs['mode'], Theirs['user']),
+        )
+
+        def shape(Fields):
+            return [
+                (bytes(P['key']), P['flags'], len(bytes(P.get('value', b''))))
+                for P in Fields['pairs'][:3]
+            ]
+
+        self.assertEqual(shape(Mine), shape(Theirs))
 
     def test_a_big_endian_client_is_refused(self):
         Conn = self._conn(server_type='pooled')

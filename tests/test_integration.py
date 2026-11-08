@@ -287,6 +287,10 @@ class _Target(NamedTuple):
     # Whether the session binds an object or a collection, IN and OUT: 12.1+,
     # and 11g's native form, pooled or dedicated with oall8 (#2463).
     object_binds: bool = False
+    # Whether the session writes to a persistent LOB: 10g closes the
+    # connection on the converted form's write (#964), not on the native
+    # form's (oall8, #2518).
+    lob_modify: bool = True
 
 
 def _target_of(conn) -> _Target:
@@ -305,6 +309,7 @@ def _target_of(conn) -> _Target:
         or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
+        conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
     )
 
 
@@ -332,10 +337,8 @@ class _Need(NamedTuple):
     # behaviour the test is about).
     min_fv: int = 0
     below_fv: int = 0
-    # The server's major release it needs at least, or the one release that
-    # lacks it.
+    # The server's major release it needs at least.
     min_server: int = 0
-    not_server: int = 0
     # Whether 8i lacks it, or only 8i has it.
     not_8i: bool = False
     only_8i: bool = False
@@ -352,6 +355,8 @@ class _Need(NamedTuple):
     refcursor_in: bool = False
     # Whether it binds an object or a collection.
     object_binds: bool = False
+    # Whether it writes to a persistent LOB.
+    lob_modify: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -365,13 +370,13 @@ class _Need(NamedTuple):
             return True
         if self.object_binds and not target.object_binds:
             return True
+        if self.lob_modify and not target.lob_modify:
+            return True
         if self.min_fv and fv < self.min_fv:
             return True
         if self.below_fv and fv >= self.below_fv:
             return True
         if self.min_server and target.server_major < self.min_server:
-            return True
-        if self.not_server and target.server_major == self.not_server:
             return True
         if (self.not_8i and target.is_8i) or (self.only_8i and not target.is_8i):
             return True
@@ -489,11 +494,12 @@ _PRE10_RETURNING = _Need(
 )
 _FV = FIELD_VERSION_11_2
 _EDITIONS = _Need('editions need 11g or later', min_fv=_FV)
-# 10g closes the connection on a persistent-LOB write (#964), and 8i's dialect
-# serves no LOB object calls; 9i writes through its own LOBOPS form (#2259).
+# 10g closes the connection on the converted form's persistent-LOB write (#964),
+# not on the native form's (oall8, #2518), and 8i's dialect serves no LOB
+# object calls; 9i writes through its own LOBOPS form (#2259).
 _LOB_MODIFY = _Need(
-    'modifying a LOB: 10g closes the connection, 8i has no LOB calls',
-    not_server=10,
+    'modifying a LOB: 10g closes the connection without oall8, 8i has no LOB calls',
+    lob_modify=True,
     not_8i=True,
 )
 _FV = FIELD_VERSION_12_1

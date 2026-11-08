@@ -4,7 +4,7 @@
 import base64
 import datetime
 import platform
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -17412,17 +17412,22 @@ _OCI11_RUNTIME_CAPS = bytes.fromhex('02010000180003')
 # block (11 bytes, its h/m/s at 4..6 biased by 60: UTC here), the timezone-file
 # version as a big-endian ub4 (14, instant client 11.2's), and the national
 # charset as a little-endian ub2 (AL16UTF16).
+_OCI11_DTY_TIME_ZONE = bytes.fromhex('800000003c3c3c80000000')
 _OCI11_DTY_TRAILER = (
-    bytes.fromhex('800000003c3c3c80000000')
-    + struct.pack('>I', 14)
-    + struct.pack('<H', AL16UTF16_CHARSET)
+    _OCI11_DTY_TIME_ZONE + struct.pack('>I', 14) + struct.pack('<H', AL16UTF16_CHARSET)
 )
+# To a 10g server OCI 11.2 sends no timezone-file version (#2518). 10g takes
+# those four bytes for the next message: ORA-00600 [12333] ends its process.
+_OCI10_DTY_TRAILER = _OCI11_DTY_TIME_ZONE + struct.pack('<H', AL16UTF16_CHARSET)
 
 
-def encode_dty_oci11(Charset: int = AL32UTF8_CHARSET) -> bytes:
+def encode_dty_oci11(
+    Charset: int = AL32UTF8_CHARSET, FieldVersion: int = FIELD_VERSION_11_2
+) -> bytes:
     """The data-type request of the 11g native login (#2466): the charset twice,
-    flag 2 (no type table), sqlplus 11.2's capability vectors and its trailer.
-    The server answers with a short TTI_DTY, the reply
+    flag 2 (no type table), sqlplus 11.2's capability vectors and its trailer,
+    without the timezone-file version below 11.2's ``FieldVersion`` (10g's,
+    #2518). The server answers with a short TTI_DTY, the reply
     ``build_oci_dty_reply`` makes on the Mirror's side."""
     Cs = struct.pack('<H', Charset)
     return (
@@ -17434,7 +17439,11 @@ def encode_dty_oci11(Charset: int = AL32UTF8_CHARSET) -> bytes:
         + _OCI11_COMPILE_CAPS
         + bytes([len(_OCI11_RUNTIME_CAPS)])
         + _OCI11_RUNTIME_CAPS
-        + _OCI11_DTY_TRAILER
+        + (
+            _OCI11_DTY_TRAILER
+            if FieldVersion >= FIELD_VERSION_11_2
+            else _OCI10_DTY_TRAILER
+        )
     )
 
 
@@ -17646,6 +17655,24 @@ _FETCH_OCI = wire_schema.compile_encoder(_FETCH, _OCI)
 _CLOSE_CURSORS_OCI = wire_schema.compile_encoder(_CLOSE_CURSORS, _OCI)
 _DESCRIBE_TRAILER_FROM_OCI = wire_schema.compile_decoder(_DESCRIBE_TRAILER, _OCI)
 _OCI11_EXEC_MIDDLE = oci.OCI_INDICATOR + oci.OCI_INDICATOR + bytes(32)
+# To a 10g server (#2518) OCI 11.2 sends the narrow head, its lengths 4 bytes,
+# then 4 zeros and the two indicators: the form sqlplus 10.2 sends
+# (_OCI_ALL8_10_2). It declares the SQL's length in bytes, as it does to 11g
+# too; the three bytes a character above are sqlplus 11.2's.
+_ALL8_HEAD_OCI_NARROW = wire_schema.compile_encoder(_ALL8_HEAD, _OCI)
+_OCI10_EXEC_MIDDLE = bytes(4) + oci.OCI_INDICATOR + oci.OCI_INDICATOR
+
+
+def _oci11_all8_form(
+    FieldVersion: int,
+) -> tuple[Callable[[dict], bytes], bytes, int]:
+    # (the head's encoder, the bytes between it and the SQL, the bytes a
+    # character the SQL's length declares) for a server at ``FieldVersion``.
+    if FieldVersion >= FIELD_VERSION_11_2:
+        return (_ALL8_HEAD_OCI_WIDE, _OCI11_EXEC_MIDDLE, 3)
+    return (_ALL8_HEAD_OCI_NARROW, _OCI10_EXEC_MIDDLE, 1)
+
+
 # The statement types sqlplus 11.2 sends that 8i's table lacks: 8i sends COMMIT
 # and ROLLBACK as type 0.
 OCI11_STMT_ROLLBACK = 17
@@ -17679,6 +17706,7 @@ def encode_oci11_execute(
     ParseOnly: bool = False,
     Scrollable: bool = False,
     Returning: frozenset[int] = frozenset(),
+    FieldVersion: int = FIELD_VERSION_11_2,
 ) -> bytes:
     """A pooled 11g session's execute (#2466): parse and execute ``Sql`` with
     ``Binds``, and for a query fetch up to ``Rows`` rows with it. The binds are
@@ -17701,7 +17729,10 @@ def encode_oci11_execute(
     sent as OCI 11.2 sends them through the pool: the statement as it is, with
     a block's options (BIND, PLSQL_BIND and the block bit, no NOT_PLSQL), each
     target's descriptor with flags 5 and its value the unset placeholder in
-    every row, whatever the Var holds."""
+    every row, whatever the Var holds.
+
+    ``FieldVersion`` is the session's: below 11.2 (10g, #2518) the head is
+    the narrow one (_oci11_all8_form)."""
     Binds = Binds or []
     # An executemany's rows: each its own TTI_RXD and values behind the one set
     # of descriptors, as the native 9.2 form sends them (_encode_9i_oall8),
@@ -17726,16 +17757,17 @@ def encode_oci11_execute(
         Options |= _OCI11_EXEC_NOT_PLSQL
     if BatchErrors:
         Options |= TNS_EXEC_OPTION_BATCH_ERRORS
+    (HeadForm, Middle, CharWidth) = _oci11_all8_form(FieldVersion)
     Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
     try:
-        Head = _ALL8_HEAD_OCI_WIDE(
+        Head = HeadForm(
             {
                 'seq': Seq,
                 'token_number': None,
                 'options': Options,
                 'cursor': 0,
                 'sql_present': True,
-                'sql_length': 3 * len(Sql),
+                'sql_length': CharWidth * len(Sql),
                 'al8i4_present': True,
                 'al8i4_length': 13,
                 'al8o4': True,
@@ -17758,12 +17790,7 @@ def encode_oci11_execute(
         Al8i4 += [0] * 5
         if Scrollable and Query:
             Al8i4[9:12] = _oci11_scroll_al8i4(TNS_FETCH_ORIENTATION_CURRENT, 1)
-        Message = (
-            Head
-            + _OCI11_EXEC_MIDDLE
-            + _OCI.chr(Sql)
-            + b''.join(_OCI.n4(V) for V in Al8i4)
-        )
+        Message = Head + Middle + _OCI.chr(Sql) + b''.join(_OCI.n4(V) for V in Al8i4)
         if Binds:
             Oacs = [
                 _encode_oci11_bind_oac(
@@ -17810,16 +17837,28 @@ def encode_oci11_fetch(Seq: int, Cursor: int, Rows: int) -> bytes:
 _OCI11_LONG_FETCH_OPTIONS = TNS_EXEC_OPTION_FETCH | 0x40000
 
 
-def encode_oci11_long_fetch(Seq: int, Cursor: int, MaxLong: int) -> bytes:
+def encode_oci11_long_fetch(
+    Seq: int, Cursor: int, MaxLong: int, FieldVersion: int = FIELD_VERSION_11_2
+) -> bytes:
     """A pooled 11g session's fetch of the next row from ``Cursor``, its LONG
     or LONG RAW value read up to ``MaxLong`` bytes."""
-    return _oci11_fetch_all8(Seq, Cursor, 1, MaxLong, _OCI11_LONG_FETCH_OPTIONS)
+    return _oci11_fetch_all8(
+        Seq, Cursor, 1, MaxLong, _OCI11_LONG_FETCH_OPTIONS, FieldVersion=FieldVersion
+    )
 
 
-def encode_oci11_cursor_fetch(Seq: int, Cursor: int, Rows: int, MaxLong: int) -> bytes:
+def encode_oci11_cursor_fetch(
+    Seq: int,
+    Cursor: int,
+    Rows: int,
+    MaxLong: int,
+    FieldVersion: int = FIELD_VERSION_11_2,
+) -> bytes:
     """A pooled 11g session's fetch of up to ``Rows`` rows from a cursor the
     server opened, each column's value up to ``MaxLong`` bytes."""
-    return _oci11_fetch_all8(Seq, Cursor, Rows, MaxLong, TNS_EXEC_OPTION_FETCH)
+    return _oci11_fetch_all8(
+        Seq, Cursor, Rows, MaxLong, TNS_EXEC_OPTION_FETCH, FieldVersion=FieldVersion
+    )
 
 
 # A scrollable cursor's al8i4[9:12], as OCI 11.2 sends them through the pool:
@@ -17835,7 +17874,13 @@ def _oci11_scroll_al8i4(Orientation: int, Position: int) -> list[int]:
 
 
 def encode_oci11_scroll_fetch(
-    Seq: int, Cursor: int, Rows: int, MaxLong: int, Last: bool, Position: int = 1
+    Seq: int,
+    Cursor: int,
+    Rows: int,
+    MaxLong: int,
+    Last: bool,
+    Position: int = 1,
+    FieldVersion: int = FIELD_VERSION_11_2,
 ) -> bytes:
     """A pooled 11g session's fetch of up to ``Rows`` rows from a scrollable
     ``Cursor``, as OCI 11.2's OCIStmtFetch2 makes it: the LONG fetch's call
@@ -17846,7 +17891,7 @@ def encode_oci11_scroll_fetch(
     else:
         Scroll = _oci11_scroll_al8i4(TNS_FETCH_ORIENTATION_CURRENT, Position)
     return _oci11_fetch_all8(
-        Seq, Cursor, Rows, MaxLong, _OCI11_LONG_FETCH_OPTIONS, Scroll
+        Seq, Cursor, Rows, MaxLong, _OCI11_LONG_FETCH_OPTIONS, Scroll, FieldVersion
     )
 
 
@@ -17857,10 +17902,12 @@ def _oci11_fetch_all8(
     MaxLong: int,
     Options: int,
     Scroll: list[int] | None = None,
+    FieldVersion: int = FIELD_VERSION_11_2,
 ) -> bytes:
+    (HeadForm, Middle, _) = _oci11_all8_form(FieldVersion)
     Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
     try:
-        Head = _ALL8_HEAD_OCI_WIDE(
+        Head = HeadForm(
             {
                 'seq': Seq,
                 'token_number': None,
@@ -17891,7 +17938,7 @@ def _oci11_fetch_all8(
     Al8i4 = [0, Rows, 0, 0, 0, 0, 0, O8I_STMT_SELECT] + [0] * 5
     if Scroll:
         Al8i4[9:12] = Scroll
-    return Head + _OCI11_EXEC_MIDDLE + b''.join(_OCI.n4(V) for V in Al8i4)
+    return Head + Middle + b''.join(_OCI.n4(V) for V in Al8i4)
 
 
 # A ping, as OCI 11.2's OCIPing makes it through the pool (#2466): TTI_PING
@@ -18055,6 +18102,11 @@ def decode_oci11_piggybacks(Data: bytes) -> tuple[dict | None, bytes]:
 
 
 _OCI11_DESCRIBE_GIVEN = {'oci_12c': False, 'has_uds': True}
+# 10g answers OCI 11.2 (#2518) with no uds_flags in a column and no query key
+# in the trailer; the describe's opaque leading field has a ub1 length, not
+# a ub4. A one-column describe hides the first: the trailer's date length then
+# reads as the column's uds_flags.
+_OCI10_DESCRIBE_GIVEN = {**_OCI11_DESCRIBE_GIVEN, 'has_uds': False}
 # A cursor the server opened, as 11g hands it to a pooled session (#2466): a
 # REF CURSOR OUT bind's value and a CURSOR(...) column's cell, measured against
 # sqlplus 11.2. A lead byte (0x4c, as the Mirror's _REFCURSOR_OUT has it), the
@@ -18091,36 +18143,55 @@ _OCI11_UNOPENED_CURSOR_CELL: wire_schema.Schema = (
 _OCI11_UNOPENED_CURSOR_CELL_FROM_OCI = wire_schema.compile_decoder(
     _OCI11_UNOPENED_CURSOR_CELL, _OCI
 )
+_OCI10_CURSOR_GIVEN = {**_OCI10_DESCRIBE_GIVEN, 'has_query_key': False}
+_OCI10_UNOPENED_CURSOR_CELL_FROM_OCI = wire_schema.compile_decoder(
+    tuple(F for F in _OCI11_UNOPENED_CURSOR_CELL if F != ('n4', 'query_key_length')),
+    _OCI,
+)
 
 
 def _oci11_cursor_cell(Data: bytes) -> tuple[tuple[int, list] | None, bytes]:
     # ((the cursor's id, its columns), the bytes after it), its rows for the
     # dialect to fetch by that id; None for one with no columns, which was
-    # never opened or is closed.
+    # never opened or is closed. Read at the session's field version: 10g's
+    # has no query key and its columns no uds_flags (#2518).
+    Eleven = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2
     if Data[5:9] == bytes(4):
-        (_, Rest) = _OCI11_UNOPENED_CURSOR_CELL_FROM_OCI(Data)
+        Unopened = (
+            _OCI11_UNOPENED_CURSOR_CELL_FROM_OCI
+            if Eleven
+            else _OCI10_UNOPENED_CURSOR_CELL_FROM_OCI
+        )
+        (_, Rest) = Unopened(Data)
         return (None, bytes(Rest))
-    (Cell, Rest) = _OCI11_CURSOR_CELL_FROM_OCI(Data, _OCI11_CURSOR_GIVEN)
+    (Cell, Rest) = _OCI11_CURSOR_CELL_FROM_OCI(
+        Data, _OCI11_CURSOR_GIVEN if Eleven else _OCI10_CURSOR_GIVEN
+    )
     return ((Cell['cursor'], _o9i_oall8_columns(Cell['columns'])), bytes(Rest))
 
 
 def decode_oci11_describe(Data: bytes) -> tuple[list[dict], bytes]:
     """11g's describe of a query in the native form (TTI_DCB) and its trailer,
     as the 9i native dialect's columns, and the bytes after it: the row stream.
-    A describe that runs off the end raises Truncated, for the reader to read
-    on."""
+    Read at the session's field version, 10g's below 11.2 (#2518). A describe
+    that runs off the end raises Truncated, for the reader to read on."""
     (_, Data) = decode_oci11_piggybacks(Data)
     if Data[:1] != bytes([TTI_DCB]):
         raise DataError('not an 11g native describe')
+    Eleven = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2
     try:
-        Body = Data[5 + int.from_bytes(Data[1:5], 'little') :]
+        if Eleven:
+            Body = Data[5 + int.from_bytes(_oci_fixed(Data[1:5], 4, 'n4'), 'little') :]
+        else:
+            Body = Data[2 + _oci_fixed(Data[1:2], 1, 'u8')[0] :]
         Count = int.from_bytes(_oci_fixed(Body[4:8], 4, 'n4'), 'little')
         Rest = Body[8:]
         Columns = []
+        Given = _OCI11_DESCRIBE_GIVEN if Eleven else _OCI10_DESCRIBE_GIVEN
         for _ in range(Count):
-            (Column, Rest) = _DCB_COLUMN_FROM_OCI(Rest, _OCI11_DESCRIBE_GIVEN)
+            (Column, Rest) = _DCB_COLUMN_FROM_OCI(Rest, Given)
             Columns.append(Column)
-        (_, Rest) = _DESCRIBE_TRAILER_FROM_OCI(Rest, {'has_query_key': True})
+        (_, Rest) = _DESCRIBE_TRAILER_FROM_OCI(Rest, {'has_query_key': Eleven})
     except IndexError as Exc:
         raise Truncated(f'11g native describe: {Exc}') from Exc
     return (_o9i_oall8_columns(Columns), Rest)
@@ -18240,6 +18311,9 @@ _OCI11_LOBOPS_WRITE: wire_schema.Schema = (
 _OCI11_LOBOPS_WRITE_OCI_WIDE = wire_schema.compile_encoder(
     _OCI11_LOBOPS_WRITE, _OCI_WIDE
 )
+# To a 10g server (#2518) OCI 11.2's LOB calls are narrow, its lengths 4 bytes.
+_LOBOPS_READ_OCI_NARROW = wire_schema.compile_encoder(_LOBOPS_READ, _OCI)
+_OCI11_LOBOPS_WRITE_OCI_NARROW = wire_schema.compile_encoder(_OCI11_LOBOPS_WRITE, _OCI)
 # The reply to a LOB call other than READ: TTI_RPA, the locator as the server
 # now sees it (a WRITE or TRIM changes it), then the call's value -- a ub8 when
 # the request carried an amount (the size, the chunk size, OPEN's mode, TRIM's
@@ -18281,10 +18355,11 @@ def encode_oci11_lobop(
     Offset: int = 0,
     Amount: int = 0,
     Data: bytes | None = None,
+    FieldVersion: int = FIELD_VERSION_11_2,
 ) -> bytes:
     """One of a LOB's calls (`OCI11_LOB_CALLS`) in the native form: ``Offset``
     (1-based) for a READ or a WRITE, ``Amount`` the call's value, ``Data`` a
-    WRITE's bytes."""
+    WRITE's bytes; narrow below 11.2's ``FieldVersion`` (10g's, #2518)."""
     Values = {
         'seq': Seq,
         'token_number': None,
@@ -18315,15 +18390,25 @@ def encode_oci11_lobop(
         'amount': Amount,
     }
     Values.update(OCI11_LOB_CALLS[Operation])
+    Wide = FieldVersion >= FIELD_VERSION_11_2
     if Operation == TNS_LOB_OP_WRITE:
-        return _OCI11_LOBOPS_WRITE_OCI_WIDE({**Values, 'data': Data or b''})
-    return _LOBOPS_READ_OCI_WIDE(Values)
+        Write = _OCI11_LOBOPS_WRITE_OCI_WIDE if Wide else _OCI11_LOBOPS_WRITE_OCI_NARROW
+        return Write({**Values, 'data': Data or b''})
+    return (_LOBOPS_READ_OCI_WIDE if Wide else _LOBOPS_READ_OCI_NARROW)(Values)
 
 
-def encode_oci11_lob_read(Seq: int, Locator: bytes, Offset: int, Amount: int) -> bytes:
+def encode_oci11_lob_read(
+    Seq: int,
+    Locator: bytes,
+    Offset: int,
+    Amount: int,
+    FieldVersion: int = FIELD_VERSION_11_2,
+) -> bytes:
     """Read ``Amount`` (characters for a CLOB, bytes for a BLOB) of a LOB from
     ``Offset`` (1-based), in the native form."""
-    return encode_oci11_lobop(Seq, Locator, TNS_LOB_OP_READ, Offset, Amount)
+    return encode_oci11_lobop(
+        Seq, Locator, TNS_LOB_OP_READ, Offset, Amount, FieldVersion=FieldVersion
+    )
 
 
 def decode_oci11_lobop(
@@ -18364,6 +18449,9 @@ _OCI11_LOBOPS_CREATE_TEMP: wire_schema.Schema = (
 _OCI11_LOBOPS_CREATE_TEMP_OCI_WIDE = wire_schema.compile_encoder(
     _OCI11_LOBOPS_CREATE_TEMP, _OCI_WIDE
 )
+_OCI11_LOBOPS_CREATE_TEMP_OCI_NARROW = wire_schema.compile_encoder(
+    _OCI11_LOBOPS_CREATE_TEMP, _OCI
+)
 # Its reply: TTI_RPA, the new locator (a ub2 length and the body, 40 bytes in
 # all) in the 86 bytes the request's took, the rest zero, the charset again
 # and a ub8 of 1, then the status.
@@ -18378,11 +18466,19 @@ _OCI11_CREATE_TEMP_REPLY_FROM_OCI = wire_schema.compile_decoder(
 )
 
 
-def encode_oci11_create_temp(Seq: int, LobType: int, Csfrm: int) -> bytes:
+def encode_oci11_create_temp(
+    Seq: int, LobType: int, Csfrm: int, FieldVersion: int = FIELD_VERSION_11_2
+) -> bytes:
     """A temporary CLOB (``LobType`` 112, ``Csfrm`` 1), NCLOB (112, 2) or BLOB
-    (113, 0) of the session's duration, in the native form."""
+    (113, 0) of the session's duration, in the native form; narrow below
+    11.2's ``FieldVersion`` (10g's, #2518)."""
     Blob = LobType == TNS_TYPE_BLOB
-    return _OCI11_LOBOPS_CREATE_TEMP_OCI_WIDE(
+    Create = (
+        _OCI11_LOBOPS_CREATE_TEMP_OCI_WIDE
+        if FieldVersion >= FIELD_VERSION_11_2
+        else _OCI11_LOBOPS_CREATE_TEMP_OCI_NARROW
+    )
+    return Create(
         {
             'seq': Seq,
             'token_number': None,

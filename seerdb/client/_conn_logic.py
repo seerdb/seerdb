@@ -67,6 +67,7 @@ from seerdb.common.tns_consts import (
     TNS_EOCS_FLAGS_TXN_IN_PROGRESS,
     TNS_KEYWORD_NUM_TXN_PRIORITY,
     TNS_SESSION_STATE_REQUEST_BEGIN,
+    TNS_VERSION_10_2,
     TNS_VERSION_11_2,
     DictionaryType,
 )
@@ -274,14 +275,17 @@ class _ConnectionLogic:
         # Decided at the ACCEPT, before the PRO, whose banner already differs:
         # a login to a server answering 11g's protocol version, pooled -- the
         # pool serves no other form -- or dedicated and opted in by `oall8`,
-        # which asks for the native OALL8 form on 9i too (#2463). The native
-        # form is the client machine's own, which seerdb takes to be
-        # little-endian; refuse rather than send a big-endian one.
+        # which asks for the native OALL8 form on 9i too (#2463). A 10g server
+        # has no pool, and takes the form, at 10.2's widths, by `oall8` alone
+        # (#2518). The native form is the client machine's own, which seerdb
+        # takes to be little-endian; refuse rather than send a big-endian one.
         import sys
 
-        self._native11 = AcceptVersion == TNS_VERSION_11_2 and (
-            self.server_type == 'pooled' or bool(getattr(self, '_oall8', False))
-        )
+        Oall8 = bool(getattr(self, '_oall8', False))
+        self._native11 = (
+            AcceptVersion == TNS_VERSION_11_2
+            and (self.server_type == 'pooled' or Oall8)
+        ) or (AcceptVersion == TNS_VERSION_10_2 and Oall8)
         if self._native11 and sys.byteorder != 'little':
             raise NotSupportedError(
                 "Oracle 11g's native form needs a little-endian client"
@@ -290,7 +294,9 @@ class _ConnectionLogic:
     def _native11_dty(self) -> bytes:
         from seerdb.common.tns import CharsetDict, encode_dty_oci11
 
-        return encode_dty_oci11(CharsetDict.get(self.charset, AL32UTF8_CHARSET))
+        return encode_dty_oci11(
+            CharsetDict.get(self.charset, AL32UTF8_CHARSET), self.field_version
+        )
 
     def _native11_osesskey(self) -> bytes:
         from seerdb.common.tns import encode_osesskey_oci11
@@ -923,12 +929,14 @@ class _ConnectionLogic:
         if is_8i:
             self._dialect = O8iDialect(self._next_seq)
         elif getattr(self, '_native11', False):
-            # A pooled 11g session speaks the native form throughout (#2466).
+            # A pooled 11g session speaks the native form throughout (#2466),
+            # as a dedicated 11g or 10g one does with `oall8` (#2463, #2518).
             self._dialect = Oci11Dialect(
                 self._next_seq,
                 self._native11_session,
                 self._native11_call_status,
                 self._take_app_context,
+                self.field_version,
             )
         elif self.field_version < FIELD_VERSION_10_2:
             # The 9i OALL8 opt-in (#716) speaks the native 64-bit request form;
