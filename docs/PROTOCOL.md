@@ -1259,6 +1259,51 @@ fetches, DDL, DML, `COMMIT`, `ROLLBACK` and a failing statement.
   value). The session return in the converted form (§4.1.4's first point) is the
   one-`ub2` layout; in the native form it is this one.
 
+#### 4.1.5 The native form on 10g (client side, #2518)
+
+OCI 11.2 speaks the same native form to a 10g server (an ACCEPT at version
+313), at 10.2's widths. Measured with OCI 11.2 programs on 10.2.0.5, each run
+against 11g too and the two compared message by message, the form differs only
+in these places. With `oall8=True` seerdb speaks it there; 10g has no pool, so
+the flag alone chooses it. The session's field version (10.2, from the PRO)
+says which widths apply.
+
+- **The data-type request has no timezone-file version.** It is 67 bytes,
+  without the big-endian `ub4` 14 behind the time-zone block. 10g reads those
+  four bytes as the next message and ends the server process with
+  `ORA-00600 [12333], [0], [14], [208]`.
+- **The OALL8 is narrow.** The head's five lengths are 4 bytes, not 8
+  (`_ALL8_HEAD` at `_OCI`). The head is followed by 20 bytes, not 48: 4 zeros
+  and the two indicators, the form sqlplus 10.2 sends (`_OCI_ALL8_10_2`). This
+  holds for the execute and for the OALL8 fetches (LONG, a server-opened
+  cursor's, a scrollable cursor's). OCI declares the SQL's length in bytes, to
+  11g as well; the three bytes a character of §4.1.4 are sqlplus 11.2's. To
+  10g seerdb sends OCI's bytes.
+- **The LOB calls are narrow too.** Each `TTI_LOBOPS` is 28 bytes shorter:
+  seven lengths at 4 bytes. That covers READ, WRITE, GET_LENGTH,
+  GET_CHUNK_SIZE, OPEN, CLOSE, IS_OPEN, TRIM and CREATE_TEMP.
+- **The describe** (`TTI_DCB`, a query's and a REF CURSOR's) has three
+  changes:
+  - its leading opaque field has a `ub1` length, not a `ub4`;
+  - each column has no `uds_flags` `ub4`;
+  - the trailer has no query-key length.
+
+  A one-column describe hides the second: the trailer's date length then
+  reads as the column's `uds_flags`, and only a second column shows it. An
+  unopened REF CURSOR's cell has no query key either.
+
+The rest is as to 11g:
+
+- the OSESSKEY and AUTH (with 10g's shorter verifier key and proof);
+- the bind descriptors and values, objects and RETURNING;
+- the application-context piggyback and the close-cursors piggyback;
+- `TTI_PING`, the logoff and the password change;
+- the rows, the bit vector included.
+
+Only per-database identifiers differ: LOB locators and type OIDs. 10g closes
+the connection on the converted form's persistent-LOB write (#964), but not
+on this one's.
+
 ### 4.2 Data Type Negotiation (TTI_DTY)
 
 TTI_DTY (message type `2`, `TNS_MSG_TYPE_DATA_TYPES`) advertises the client's

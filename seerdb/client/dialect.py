@@ -140,6 +140,7 @@ from seerdb.common.tns import (
     prefixed_locator,
 )
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_11_2,
     ISO_LATIN_1_CHARSET,
     ORA_NO_DATA_FOUND,
     TNS_FETCH_ORIENTATION_LAST,
@@ -1599,8 +1600,12 @@ class Oci11Dialect(Oall8Dialect):
         on_session: Callable[[int, int], None] | None = None,
         on_call_status: Callable[[int, int], None] | None = None,
         take_app_context: Callable[[], dict] | None = None,
+        field_version: int = FIELD_VERSION_11_2,
     ) -> None:
         super().__init__(next_seq)
+        # The session's field version: a 10g server's (10.2) takes the native
+        # form at 10.2's widths (#2518), the OALL8 and the LOB calls narrow.
+        self._fv = field_version
         # Hands over the application context changed since the last call (one
         # {key: value} a namespace, {} to clear it), and forgets it.
         self._take_app_context = take_app_context
@@ -1840,7 +1845,12 @@ class Oci11Dialect(Oall8Dialect):
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
         self._check_binds(bind)
         return encode_oci11_execute(
-            self._next_seq(), sql_text, O8I_STMT_SELECT, self._rows, bind
+            self._next_seq(),
+            sql_text,
+            O8I_STMT_SELECT,
+            self._rows,
+            bind,
+            FieldVersion=self._fv,
         )
 
     def _encode_fetch(self, cursor: int, count: int, long_size: int) -> bytes:
@@ -1849,12 +1859,16 @@ class Oci11Dialect(Oall8Dialect):
         # none (encode_oci11_long_fetch, sqlplus 11.2's). Any other, the plain
         # fetch.
         if long_size == _LONG_WHOLE:
-            return encode_oci11_long_fetch(self._next_seq(), cursor, long_size)
+            return encode_oci11_long_fetch(
+                self._next_seq(), cursor, long_size, self._fv
+            )
         if cursor in self._opened:
             # A cursor the server opened -- a REF CURSOR's, a CURSOR(...)
             # column's -- fetched as sqlplus 11.2 fetches one: the OALL8 that
             # says how wide its values are (encode_oci11_cursor_fetch).
-            return encode_oci11_cursor_fetch(self._next_seq(), cursor, count, long_size)
+            return encode_oci11_cursor_fetch(
+                self._next_seq(), cursor, count, long_size, self._fv
+            )
         return encode_oci11_fetch(self._next_seq(), cursor, count)
 
     def _long_size(self, columns: list, fetch: int) -> int:
@@ -1900,7 +1914,9 @@ class Oci11Dialect(Oall8Dialect):
             stmt_type = oci11_stmt_type(
                 sql_text.decode('utf-8', 'replace').strip().upper()
             )
-        return encode_oci11_execute(self._next_seq(), sql_text, stmt_type, 1, bind)
+        return encode_oci11_execute(
+            self._next_seq(), sql_text, stmt_type, 1, bind, FieldVersion=self._fv
+        )
 
     # --- the calls
 
@@ -1937,6 +1953,7 @@ class Oci11Dialect(Oall8Dialect):
                 bind,
                 batch,
                 batcherrors,
+                FieldVersion=self._fv,
             )
         )
         buf = yield from self._recv_terminal('DML')
@@ -1995,6 +2012,7 @@ class Oci11Dialect(Oall8Dialect):
                 locator,
                 offset,
                 (1 << 30) if amount is None else amount,
+                self._fv,
             )
         )
         buf = b''
@@ -2030,7 +2048,13 @@ class Oci11Dialect(Oall8Dialect):
             raise _oci11_unsupported('this LOB call')
         yield Send(
             encode_oci11_lobop(
-                self._next_seq(), locator, operation, offset, amount, data
+                self._next_seq(),
+                locator,
+                operation,
+                offset,
+                amount,
+                data,
+                FieldVersion=self._fv,
             )
         )
         buf = b''
@@ -2065,6 +2089,7 @@ class Oci11Dialect(Oall8Dialect):
                 max(prefetch, 1),
                 bind,
                 Scrollable=True,
+                FieldVersion=self._fv,
             )
         )
         received = yield RECV
@@ -2118,6 +2143,7 @@ class Oci11Dialect(Oall8Dialect):
                 self._long_size(columns, fetch),
                 orientation == TNS_FETCH_ORIENTATION_LAST,
                 position,
+                FieldVersion=self._fv,
             )
         )
         (rows, terminal, _) = yield from self.recv_rows(b'', columns, last_row)
@@ -2167,6 +2193,7 @@ class Oci11Dialect(Oall8Dialect):
                 bind,
                 batch,
                 Returning=returning,
+                FieldVersion=self._fv,
             )
         )
         from seerdb.common.exceptions import Truncated
@@ -2264,7 +2291,12 @@ class Oci11Dialect(Oall8Dialect):
         yield Send(
             self._closing()
             + encode_oci11_execute(
-                self._next_seq(), self._sql_text(sql), stmt_type, 1, ParseOnly=True
+                self._next_seq(),
+                self._sql_text(sql),
+                stmt_type,
+                1,
+                ParseOnly=True,
+                FieldVersion=self._fv,
             )
         )
         received = yield RECV
@@ -2301,6 +2333,7 @@ class Oci11Dialect(Oall8Dialect):
                 self._next_seq(),
                 TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB,
                 0 if is_blob else csfrm,
+                self._fv,
             )
         )
         buf = b''

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 11.2's OCIPing on 10g after freeing a statement (#2518): the close of cursor
+# 1 piggybacked ahead of TTI_PING, as to 11g.
+# Captured 2026-11-08 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux, the client charset AL32UTF8, called
+# through ctypes) on Oracle 10g 10.2.0.5, a dedicated session. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column and the
+# |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  11 69 08 fe ff ff ff ff  ff ff ff 01 00 00 00 00  |.i..............|
+00000010  00 00 00 01 00 00 00 03  93 09                    |..........|
+0000001a

@@ -35,6 +35,7 @@ TNS_GSO_CAN_RECV_ATTENTION = 0x0400
 # The TNS protocol version each Oracle release answers with. A server reports one
 # of these in its ACCEPT, and a client refuses a server below the version it
 # needs -- python-oracledb will not talk to anything under 315 at all.
+TNS_VERSION_10_2 = 313
 TNS_VERSION_11_2 = 314
 TNS_VERSION_12_1 = 315
 TNS_VERSION_12_2 = 316
