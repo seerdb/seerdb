@@ -296,6 +296,9 @@ class _Target(NamedTuple):
     # connection on the converted form's write (#964), not on the native
     # form's (oall8, #2518).
     lob_modify: bool = True
+    # Whether the session sends the end-to-end tracing attributes: 12.1+, and
+    # the native form on 10g and 11g.
+    end_to_end: bool = False
 
 
 def _target_of(conn) -> _Target:
@@ -315,6 +318,8 @@ def _target_of(conn) -> _Target:
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
         conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
+        conn.field_version >= FIELD_VERSION_12_1
+        or bool(getattr(conn, '_native11', False)),
     )
 
 
@@ -362,6 +367,8 @@ class _Need(NamedTuple):
     object_binds: bool = False
     # Whether it writes to a persistent LOB.
     lob_modify: bool = False
+    # Whether it sends the end-to-end tracing attributes.
+    end_to_end: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -376,6 +383,8 @@ class _Need(NamedTuple):
         if self.object_binds and not target.object_binds:
             return True
         if self.lob_modify and not target.lob_modify:
+            return True
+        if self.end_to_end and not target.end_to_end:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -543,7 +552,10 @@ _TEMP_LOB = _Need(
     'a temporary LOB needs a 12c+ server (CREATE_TEMP), or a pooled 11g one',
     temp_lobs=True,
 )
-_END_TO_END = _Need('end-to-end tracing requires 12c+', min_fv=_FV)
+_END_TO_END = _Need(
+    'end-to-end tracing requires 12c+, or the native form on 10g and 11g',
+    end_to_end=True,
+)
 _IMPLICIT_RESULTS = _Need('DBMS_SQL.RETURN_RESULT is 12c+', min_server=12)
 _PRE12_VECTOR_REFUSAL = _Need('a 12.1+ session binds a VECTOR', below_fv=_FV)
 _CURSOR_CACHE = _Need(
@@ -7300,9 +7312,10 @@ class FetchFlowIntegration(_IntegrationBase):
     def test_end_to_end_tracing(self):
         # End-to-end application tracing (#183): set module / action /
         # client_identifier; the change flushes with the next execute and shows
-        # up in SYS_CONTEXT('USERENV', ...). 12c+ only (the piggyback closes a
-        # pre-12c connection), so pre-12c must raise NotSupportedError instead.
-        if self.conn.field_version < FIELD_VERSION_12_1:
+        # up in SYS_CONTEXT('USERENV', ...). 12c+ and the native form on 10g and
+        # 11g (thin's piggyback closes a pre-12c connection); elsewhere it must
+        # raise NotSupportedError instead.
+        if not _target_of(self.conn).end_to_end:
             with self.assertRaises(seerdb.NotSupportedError):
                 self.conn.module = 'M'
             return
@@ -7329,7 +7342,12 @@ class FetchFlowIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchone(), ('PYOINFO',))
         self.assertEqual(self.conn.clientinfo, 'PYOINFO')
         # dbop (#184) is monitored via V$SQL_MONITOR (not USERENV); just confirm
-        # the piggyback is accepted and the connection stays usable.
+        # the piggyback is accepted and the connection stays usable. OCI 11.2's
+        # form has no field for it.
+        if self.conn.field_version < FIELD_VERSION_12_1:
+            with self.assertRaises(seerdb.NotSupportedError):
+                self.conn.dbop = 'PYODBOP'
+            return
         self.conn.dbop = 'PYODBOP'
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchone(), (1,))
@@ -7339,10 +7357,25 @@ class FetchFlowIntegration(_IntegrationBase):
     def test_module_alone(self):
         # Setting module without action must not malform the piggyback — Oracle
         # requires both together, so a module-only flush carries action too
-        # (#184). 12c+ only.
+        # (#184).
         self.conn.module = 'SOLOMOD'
         self.cur.execute("SELECT SYS_CONTEXT('USERENV','MODULE') FROM dual")
         self.assertEqual(self.cur.fetchone(), ('SOLOMOD',))
+
+    @_requires(_END_TO_END)
+    def test_clearing_a_tracing_attribute(self):
+        self.conn.client_identifier = 'TOCLEAR'
+        self.cur.execute("SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') FROM dual")
+        self.assertEqual(self.cur.fetchone(), ('TOCLEAR',))
+        self.conn.client_identifier = None
+        self.cur.execute("SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') FROM dual")
+        self.assertEqual(self.cur.fetchone(), (None,))
+
+    @_requires(_END_TO_END)
+    def test_a_non_ascii_tracing_attribute(self):
+        self.conn.clientinfo = 'caf\u00e9'
+        self.cur.execute("SELECT SYS_CONTEXT('USERENV','CLIENT_INFO') FROM dual")
+        self.assertEqual(self.cur.fetchone(), ('caf\u00e9',))
 
     @_requires(_FV2_EXECUTE_PATH)
     def test_repeated_execute_no_cursor_leak(self):
@@ -13732,9 +13765,9 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             self.assertFalse(await col.drop())
 
     async def test_async_end_to_end_tracing(self):
-        # End-to-end tracing (#183) on the async path; 12c+ only.
+        # End-to-end tracing (#183) on the async path.
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_12_1:
+            if not _target_of(Conn).end_to_end:
                 with self.assertRaises(seerdb.NotSupportedError):
                     Conn.module = 'M'
                 return

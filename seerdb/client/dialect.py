@@ -122,6 +122,7 @@ from seerdb.common.tns import (
     encode_oci11_close_cursors,
     encode_oci11_create_temp,
     encode_oci11_cursor_fetch,
+    encode_oci11_end_to_end,
     encode_oci11_execute,
     encode_oci11_fetch,
     encode_oci11_lob_read,
@@ -1601,8 +1602,12 @@ class Oci11Dialect(Oall8Dialect):
         on_call_status: Callable[[int, int], None] | None = None,
         take_app_context: Callable[[], dict] | None = None,
         field_version: int = FIELD_VERSION_11_2,
+        take_end_to_end: Callable[[], dict] | None = None,
     ) -> None:
         super().__init__(next_seq)
+        # Hands over the end-to-end tracing attributes changed since the last
+        # call, and forgets them.
+        self._take_end_to_end = take_end_to_end
         # The session's field version: a 10g server's (10.2) takes the native
         # form at 10.2's widths (#2518), the OALL8 and the LOB calls narrow.
         self._fv = field_version
@@ -1771,13 +1776,19 @@ class Oci11Dialect(Oall8Dialect):
 
     def _closing(self) -> bytes:
         # OCI 11.2 sends an application context's change ahead of the cursors'
-        # close, each piggyback taking its sequence number in that order. A call
-        # that takes no piggybacks (a LOB call) leaves it for the next one.
+        # close and the tracing attributes behind it, each piggyback taking its
+        # sequence number in that order. A call that takes no piggybacks (a LOB
+        # call) leaves them for the next one.
         frames = b''
         if self._take_app_context is not None:
             for namespace, entries in self._take_app_context().items():
                 frames += encode_oci11_app_context(self._next_seq(), namespace, entries)
-        return frames + super()._closing()
+        frames += super()._closing()
+        if self._take_end_to_end is not None:
+            attrs = self._take_end_to_end()
+            if attrs:
+                frames += encode_oci11_end_to_end(self._next_seq(), attrs)
+        return frames
 
     def _status(self, reply: bytes, executed: bool = True) -> dict:
         status = decode_oci11_status(self._session_return(reply), executed)

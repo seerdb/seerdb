@@ -402,13 +402,17 @@ class _ConnectionLogic:
     def _set_e2e(self, name: str, value) -> None:
         # Record a new end-to-end attribute value and mark it to flush before
         # the next execute (oracledb sends only what changed). The
-        # SET_END_TO_END_ATTR piggyback (func 135) is a 12c+ message — a pre-12c
-        # server closes the connection on it — so gate it (oracledb thin is
-        # itself 12.1+ only). #183.
+        # SET_END_TO_END_ATTR piggyback (func 135) in thin's form is a 12c+
+        # message -- a pre-12c server closes the connection on it -- so gate it
+        # (#183). A native 10g or 11g session sends OCI's form, which has no dbop.
         if self.field_version < FIELD_VERSION_12_1:
-            raise NotSupportedError(
-                'end-to-end tracing attributes require an Oracle 12.1+ server'
-            )
+            if not getattr(self, '_native11', False):
+                raise NotSupportedError(
+                    'end-to-end tracing attributes require an Oracle 12.1+ server, '
+                    'or a 10g or 11g session with oall8=True'
+                )
+            if name == 'dbop':
+                raise NotSupportedError('dbop requires an Oracle 12.1+ server')
         self._e2e_values[name] = value
         self._e2e_pending[name] = value
 
@@ -420,6 +424,15 @@ class _ConnectionLogic:
         Pending = dict(self._e2e_pending)
         if 'module' in Pending and 'action' not in Pending:
             Pending['action'] = self._e2e_values.get('action')
+        return Pending
+
+    def _take_end_to_end(self) -> dict:
+        # What changed since the last call, for a dialect that sends it itself,
+        # and forgotten as it is sent.
+        if not self._e2e_pending:
+            return {}
+        Pending = self._pending_e2e_with_module_action()
+        self._e2e_pending = {}
         return Pending
 
     def _flush_end_to_end_bytes(self) -> bytes:
@@ -937,6 +950,7 @@ class _ConnectionLogic:
                 self._native11_call_status,
                 self._take_app_context,
                 self.field_version,
+                self._take_end_to_end,
             )
         elif self.field_version < FIELD_VERSION_10_2:
             # The 9i OALL8 opt-in (#716) speaks the native 64-bit request form;

@@ -1750,5 +1750,93 @@ class Native11AppContextTest(_At11g):
         self.assertIn(CAP_APP_CONTEXT, Oci11Dialect(lambda: 7).capabilities())
 
 
+class Native11EndToEndTest(_At11g):
+    # Where a captured piggyback holds what the server ignores: the client heap
+    # addresses of the attributes the call didn't change, and OCI's execution
+    # context sequence.
+    POINTERS = (
+        (27, 'client_identifier'),
+        (43, 'module'),
+        (59, 'action'),
+        (91, 'client_info'),
+    )
+    SEQUENCE = range(89, 91)
+
+    def _normalized(self, Name, Attrs):
+        Captured = bytearray(_capture(Name))
+        Captured[self.SEQUENCE.start : self.SEQUENCE.stop] = bytes(2)
+        for At, Attr in self.POINTERS:
+            if Attr not in Attrs:
+                Captured[At : At + 8] = bytes(8)
+        return bytes(Captured)
+
+    def test_each_attribute_is_oci_11_2s(self):
+        from seerdb.common.tns import encode_oci11_end_to_end
+
+        for Name, Attrs in (
+            ('oci11_end_to_end_module.hexdump', {'module': 'SOLOMOD', 'action': None}),
+            ('oci11_end_to_end_action.hexdump', {'action': 'ACT1'}),
+            ('oci11_end_to_end_client_info.hexdump', {'client_info': 'INFO1'}),
+            (
+                'oci11_end_to_end_client_identifier.hexdump',
+                {'client_identifier': 'CID1'},
+            ),
+        ):
+            with self.subTest(Name):
+                Captured = self._normalized(Name, Attrs)
+                self.assertEqual(encode_oci11_end_to_end(Captured[2], Attrs), Captured)
+
+    def test_the_attributes_ride_behind_the_close(self):
+        # OCI 11.2's order: the close of the last cursor, then the attributes,
+        # each its sequence number; the change sent once.
+        from seerdb.common.tns import (
+            encode_oci11_close_cursors,
+            encode_oci11_end_to_end,
+        )
+
+        Changed = [{'client_identifier': 'CID1'}]
+        Seq = iter(range(20, 30))
+        Dialect = Oci11Dialect(
+            lambda: next(Seq),
+            take_end_to_end=lambda: Changed.pop() if Changed else {},
+        )
+        Dialect.close_cursor(1)
+        self.assertEqual(
+            Dialect._closing(),
+            encode_oci11_close_cursors(20, [1])
+            + encode_oci11_end_to_end(21, {'client_identifier': 'CID1'}),
+        )
+        self.assertEqual(Dialect._closing(), b'')
+
+    def _session(self, Native):
+        from seerdb.client._conn_logic import _ConnectionLogic
+
+        class Session(_ConnectionLogic):
+            pass
+
+        Conn = Session.__new__(Session)
+        Conn.field_version = FIELD_VERSION_11_2
+        Conn._native11 = Native
+        Conn._e2e_values = {}
+        Conn._e2e_pending = {}
+        return Conn
+
+    def test_a_module_change_takes_the_action_along_once(self):
+        Conn = self._session(True)
+        Conn.module = 'M'
+        self.assertEqual(Conn._take_end_to_end(), {'module': 'M', 'action': None})
+        self.assertEqual(Conn._take_end_to_end(), {})
+
+    def test_the_thin_form_still_refuses(self):
+        Conn = self._session(False)
+        with self.assertRaises(NotSupportedError):
+            Conn.module = 'M'
+
+    def test_dbop_has_no_field_in_oci_11_2s_form(self):
+        Conn = self._session(True)
+        with self.assertRaises(NotSupportedError):
+            Conn.dbop = 'OP'
+
+
 if __name__ == '__main__':
     unittest.main()
