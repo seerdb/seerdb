@@ -8006,3 +8006,58 @@ class ArrayDmlRowCountsGate(unittest.TestCase):
         # refusing too means a caller that bypasses the cursor cannot send a
         # flag an 11.2 server would reject the whole execute over.
         self.assertFalse(self._server_sees_request(FIELD_VERSION_11_2, True))
+
+
+class FileExists9iTest(unittest.TestCase):
+    # OCILobFileExists on 9.2.0.4, from a client net trace: the same request for
+    # a file that is there and one that is not, the answer in the byte after the
+    # echoed locator. Without the null-LOB pointer the server drops the session.
+    REQUEST = bytes.fromhex(
+        '036006f8be5100000000003b000000000000000000000000000000000000000000'
+        '00000000000000000000000000000000000000000000000000000bd1ffbf7f0000'
+        '000008000000000000000000000000000000000000000000000039000108080000'
+        '000100000000000000105345455244425f4246494c455f444952001770796f7261'
+        '636c655f6266696c655f746573742e747874'
+    )
+    LOCATOR = REQUEST[-59:]
+    # The two client heap addresses, which the server ignores.
+    SOURCE_POINTER = range(3, 11)
+    NULL_LOB_POINTER = range(59, 67)
+
+    def test_the_native_form_matches_oci(self) -> None:
+        from seerdb.common.tns import encode_9i_oall8_lobop
+        from seerdb.common.tns_consts import TNS_LOB_OP_FILE_EXISTS
+
+        ours = encode_9i_oall8_lobop(6, self.LOCATOR, TNS_LOB_OP_FILE_EXISTS)
+        self.assertEqual(len(ours), len(self.REQUEST))
+        Masked = {*self.SOURCE_POINTER, *self.NULL_LOB_POINTER}
+        for At, (Theirs, Mine) in enumerate(zip(self.REQUEST, ours)):
+            if At not in Masked:
+                self.assertEqual(Mine, Theirs, f'byte {At}')
+        self.assertNotEqual(bytes(ours[59:67]), bytes(8))
+
+    def test_the_native_reply_is_the_flag_after_the_locator(self) -> None:
+        from seerdb.common.tns import decode_9i_oall8_lob_value
+        from seerdb.common.tns_consts import TNS_LOB_OP_FILE_EXISTS
+
+        for Flag in (1, 0):
+            Reply = b'\x08' + self.LOCATOR + bytes([Flag]) + bytes.fromhex('0401000000')
+            (Got, _) = decode_9i_oall8_lob_value(Reply, TNS_LOB_OP_FILE_EXISTS)
+            self.assertEqual(Got, Flag)
+
+    def test_the_compact_form_sets_the_pointer_and_sends_no_amount(self) -> None:
+        from seerdb.common.tns import encode_o7_lobop
+        from seerdb.common.tns_consts import (
+            TNS_LOB_OP_FILE_CLOSE,
+            TNS_LOB_OP_FILE_EXISTS,
+        )
+
+        # FILE_CLOSE, as captured from ojdbc14, also sends no amount, and its
+        # operation is as wide: only the null-LOB pointer and the operation differ.
+        Exists = encode_o7_lobop(0, self.LOCATOR, TNS_LOB_OP_FILE_EXISTS)
+        Close = encode_o7_lobop(0, self.LOCATOR, TNS_LOB_OP_FILE_CLOSE)
+        self.assertTrue(Exists.endswith(self.LOCATOR))
+        self.assertEqual(len(Exists), len(Close))
+        Differ = [At for At, (A, B) in enumerate(zip(Exists, Close)) if A != B]
+        self.assertEqual(len(Differ), 2)
+        self.assertEqual((Close[Differ[0]], Exists[Differ[0]]), (0, 1))
