@@ -28,21 +28,127 @@ import secrets
 import threading
 import time
 from collections import deque
+from typing import Any
 
 from seerdb.client._conn_logic import _ConnectionLogic
 from seerdb.client.connection import OracleConnect
 from seerdb.common.exceptions import InterfaceError
 from seerdb.common.tns_consts import PURITY_DEFAULT, PURITY_SELF
 
+# What `acquire()` does when every connection is busy and the pool is at `max`,
+# numbered as in python-oracledb so its constants compare equal.
+POOL_GETMODE_WAIT = 0  # wait for one, however long
+POOL_GETMODE_NOWAIT = 1  # raise at once
+POOL_GETMODE_FORCEGET = 2  # open one past `max`, closed again on release
+POOL_GETMODE_TIMEDWAIT = 3  # wait up to `wait_timeout` milliseconds
+
+_GETMODES = (
+    POOL_GETMODE_WAIT,
+    POOL_GETMODE_NOWAIT,
+    POOL_GETMODE_FORCEGET,
+    POOL_GETMODE_TIMEDWAIT,
+)
+_DEFAULT_IDLE_TIMEOUT = 60.0
+
 
 class _PoolEntry:
-    """One pooled connection plus its last-used timestamp."""
+    """One pooled connection, with when it was opened and last released."""
 
-    __slots__ = ('conn', 'released_at')
+    __slots__ = ('conn', 'created_at', 'released_at')
 
-    def __init__(self, conn: OracleConnect):
+    def __init__(self, conn: Any):
         self.conn = conn
-        self.released_at = time.monotonic()
+        self.created_at = self.released_at = time.monotonic()
+
+
+class _PoolPolicy:
+    """A pool's settings and what follows from them, shared by `Pool` and
+    `AsyncPool`. Nothing here touches a connection or a lock."""
+
+    def __init__(
+        self,
+        min: int,
+        max: int,
+        increment: int,
+        timeout: float | None,
+        idle_timeout: float | None,
+        health_check: bool,
+        getmode: int | None,
+        wait_timeout: int,
+        ping_interval: float | None,
+        max_lifetime_session: float,
+        max_idle_session: float,
+    ):
+        if min < 0 or max <= 0 or min > max:
+            raise ValueError(
+                f'invalid pool sizes: min={min}, max={max} '
+                f'(need 0 <= min <= max and max > 0)'
+            )
+        if increment <= 0:
+            raise ValueError(f'increment must be positive, got {increment}')
+        if getmode is not None and getmode not in _GETMODES:
+            raise ValueError(f'invalid getmode: {getmode}')
+        for Name, Value in (
+            ('wait_timeout', wait_timeout),
+            ('max_lifetime_session', max_lifetime_session),
+            ('max_idle_session', max_idle_session),
+        ):
+            if Value < 0:
+                raise ValueError(f'{Name} must not be negative, got {Value}')
+        if ping_interval is None:
+            # `idle_timeout` and `health_check`, the older spelling.
+            Off = idle_timeout is None or not health_check
+            ping_interval = -1 if Off else idle_timeout
+        elif idle_timeout != _DEFAULT_IDLE_TIMEOUT or not health_check:
+            raise ValueError(
+                'ping_interval replaces idle_timeout and health_check: '
+                'give one or the other'
+            )
+        self.min = min
+        self.max = max
+        self.increment = increment
+        self.timeout = timeout
+        self.getmode = getmode
+        self.wait_timeout = wait_timeout
+        self.ping_interval: float = ping_interval  # type: ignore[assignment]
+        self.max_lifetime_session = max_lifetime_session
+        self.max_idle_session = max_idle_session
+
+    def deadline(self, now: float) -> float | None:
+        """When an acquire on a full pool gives up; None waits forever."""
+        if self.getmode is None:
+            return None if self.timeout is None else now + self.timeout
+        if self.getmode == POOL_GETMODE_WAIT:
+            return None
+        if self.getmode == POOL_GETMODE_TIMEDWAIT:
+            return now + self.wait_timeout / 1000
+        return now
+
+    def may_open(self, busy: int) -> bool:
+        return busy < self.max or self.getmode == POOL_GETMODE_FORCEGET
+
+    def exhausted(self, busy: int) -> InterfaceError:
+        State = f'(in_use={busy}, max={self.max})'
+        if self.getmode == POOL_GETMODE_NOWAIT:
+            return InterfaceError(f'pool has no free connection {State}')
+        if self.getmode == POOL_GETMODE_TIMEDWAIT:
+            return InterfaceError(
+                f'pool acquire timed out after {self.wait_timeout}ms {State}'
+            )
+        return InterfaceError(f'pool acquire timed out after {self.timeout}s {State}')
+
+    def needs_ping(self, entry: _PoolEntry, now: float) -> bool:
+        return self.ping_interval >= 0 and (
+            now - entry.released_at >= self.ping_interval
+        )
+
+    def past_lifetime(self, entry: _PoolEntry, now: float) -> bool:
+        Limit = self.max_lifetime_session
+        return Limit > 0 and now - entry.created_at >= Limit
+
+    def past_idle(self, entry: _PoolEntry, now: float) -> bool:
+        Limit = self.max_idle_session
+        return Limit > 0 and now - entry.released_at >= Limit
 
 
 class _PooledConnectionGuard:
@@ -90,9 +196,9 @@ class Pool:
     """Thread-safe pool of authenticated `OracleConnect` instances.
 
     Construction is lazy: only `min` connections are opened up front;
-    the rest are created on demand and capped at `max`. When the
-    caller would exceed `max`, `acquire()` blocks (up to `timeout`
-    seconds) until another caller releases.
+    the rest are created on demand and capped at `max`. What `acquire()`
+    does at `max` follows `getmode`; left out, it blocks up to `timeout`
+    seconds until another caller releases.
     """
 
     def __init__(
@@ -103,39 +209,43 @@ class Pool:
         timeout: float | None = 30.0,
         idle_timeout: float | None = 60.0,
         health_check: bool = True,
+        getmode: int | None = None,
+        wait_timeout: int = 0,
+        ping_interval: float | None = None,
+        max_lifetime_session: float = 0,
+        max_idle_session: float = 0,
         **connect_kwargs,
     ):
-        if min < 0 or max <= 0 or min > max:
-            raise ValueError(
-                f'invalid pool sizes: min={min}, max={max} '
-                f'(need 0 <= min <= max and max > 0)'
-            )
-        if increment <= 0:
-            raise ValueError(f'increment must be positive, got {increment}')
-        self._min = min
-        self._max = max
-        self._increment = increment
-        self._timeout = timeout
-        # `idle_timeout` is how long a free connection can sit unused
-        # before the next acquire health-checks it. `None` disables the
-        # check; pool consumers happy with stale connections can opt out.
-        self._idle_timeout = idle_timeout
-        self._health_check = health_check
+        self._policy = _PoolPolicy(
+            min,
+            max,
+            increment,
+            timeout,
+            idle_timeout,
+            health_check,
+            getmode,
+            wait_timeout,
+            ping_interval,
+            max_lifetime_session,
+            max_idle_session,
+        )
         self._connect_kwargs = connect_kwargs
         # The connection class this pool's DRCP sessions share (#2006).
         self._drcp_class = drcp_pool_class()
 
-        # `_free` holds available entries; `_in_use` tracks acquired ones
-        # so close() can finalise them.
+        # `_free` holds available entries, oldest release first; `_in_use` the
+        # checked-out ones by id(conn). `_opening` counts the slots reserved
+        # for connections being opened, which happens outside the lock.
         self._lock = threading.Lock()
         self._available = threading.Condition(self._lock)
         self._free: deque[_PoolEntry] = deque()
-        self._in_use: set[int] = set()  # id(conn) → connection is checked out
+        self._in_use: dict[int, _PoolEntry] = {}
+        self._opening = 0
         self._closed = False
 
         # Pre-warm to `min`. Failures here surface immediately rather than
         # later when the caller acquires.
-        for _ in range(self._min):
+        for _ in range(self._policy.min):
             self._free.append(_PoolEntry(self._open_connection()))
 
     # ----- public API -----
@@ -143,69 +253,51 @@ class Pool:
     def acquire(self) -> _PooledConnectionGuard:
         """Get a connection from the pool. Returns a context manager
         that releases on __exit__."""
-        Deadline = None if self._timeout is None else (time.monotonic() + self._timeout)
-        with self._available:
-            while True:
-                if self._closed:
-                    raise InterfaceError('pool is closed')
-                # Fast path: hand out a free entry, health-check if stale.
-                while self._free:
-                    Entry = self._free.popleft()
-                    if self._needs_health_check(Entry):
-                        if not self._ping(Entry.conn):
-                            # Connection is dead — discard and try again.
-                            self._discard_dead(Entry.conn)
-                            continue
-                    self._in_use.add(id(Entry.conn))
-                    Entry.conn._begin_request()  # request boundary (#464)
-                    return _PooledConnectionGuard(self, Entry.conn)
-                # Room to grow? Open a fresh one.
-                if len(self._in_use) < self._max:
-                    Conn = self._open_connection()
-                    self._in_use.add(id(Conn))
-                    Conn._begin_request()  # request boundary (#464)
-                    return _PooledConnectionGuard(self, Conn)
-                # At capacity — wait for a release.
-                if Deadline is None:
-                    self._available.wait()
-                else:
-                    Remaining = Deadline - time.monotonic()
-                    if Remaining <= 0:
-                        raise InterfaceError(
-                            f'pool acquire timed out after {self._timeout}s '
-                            f'(in_use={len(self._in_use)}, max={self._max})'
-                        )
-                    self._available.wait(Remaining)
+        Deadline = self._policy.deadline(time.monotonic())
+        while True:
+            Entry, Reserved, Retired = self._claim(Deadline)
+            self._discard_all(Retired)
+            if Reserved:
+                Conn = self._open_reserved()
+            elif Entry is not None and self._alive(Entry):
+                Conn = Entry.conn
+            else:
+                continue
+            Conn._begin_request()  # request boundary (#464)
+            return _PooledConnectionGuard(self, Conn)
 
     def release(self, conn: OracleConnect) -> None:
         """Return a connection to the pool. Idempotent on already-released
         connections (a misbehaving caller releasing twice doesn't break
         accounting). Connections not produced by this pool are rejected."""
+        Retired: list[OracleConnect] = []
         with self._available:
-            CheckoutId = id(conn)
-            if CheckoutId not in self._in_use:
+            Entry = self._in_use.pop(id(conn), None)
+            if Entry is None:
                 raise InterfaceError('connection was not acquired from this pool')
-            self._in_use.discard(CheckoutId)
             if self._closed:
-                # Pool closed while held — just close this one ourselves.
+                # Pool closed while held -- just close this one ourselves.
+                Retired.append(conn)
+            else:
+                # End the pooled logical request (#464): flush REQUEST_END if
+                # one is open. A failure here means the connection is dead --
+                # discard it rather than return a broken connection.
                 try:
-                    conn.close()
+                    conn._end_request()
                 except Exception:
-                    # Best-effort: the pool is closing, so there is nothing
-                    # to recover if this connection fails to close cleanly.
-                    pass
-                return
-            # End the pooled logical request (#464): flush REQUEST_END if one is
-            # open. A failure here means the connection is dead — discard it
-            # rather than return a broken connection to the pool.
-            try:
-                conn._end_request()
-            except Exception:
-                self._discard_dead(conn)
+                    Retired.append(conn)
+                else:
+                    Now = time.monotonic()
+                    if self._policy.past_lifetime(Entry, Now) or (
+                        self._held() >= self._policy.max
+                    ):
+                        Retired.append(conn)
+                    else:
+                        Entry.released_at = Now
+                        self._free.append(Entry)
+                    Retired.extend(self._retire_idle(Now))
                 self._available.notify()
-                return
-            self._free.append(_PoolEntry(conn))
-            self._available.notify()
+        self._discard_all(Retired)
 
     def close(self) -> None:
         """Close all connections (free + in-use). Subsequent `acquire`
@@ -238,16 +330,101 @@ class Pool:
 
     # ----- internals -----
 
+    def _held(self) -> int:
+        """Connections held or being opened; the caller holds the lock."""
+        return len(self._free) + len(self._in_use) + self._opening
+
+    def _retire_idle(self, now: float) -> list[OracleConnect]:
+        """Free connections past `max_idle_session`, down to `min`. The oldest
+        release is first, so the scan stops at the first one still in time.
+        The caller holds the lock, and closes what this returns outside it."""
+        Retired: list[OracleConnect] = []
+        while (
+            self._free
+            and self._held() > self._policy.min
+            and self._policy.past_idle(self._free[0], now)
+        ):
+            Retired.append(self._free.popleft().conn)
+        return Retired
+
+    def _claim(
+        self, deadline: float | None
+    ) -> tuple[_PoolEntry | None, bool, list[OracleConnect]]:
+        """Under the lock, take a free connection or reserve a slot to open
+        one, waiting as `getmode` says. Returns the entry, whether a slot was
+        reserved, and the connections to close once the lock is let go."""
+        Policy = self._policy
+        with self._available:
+            while True:
+                if self._closed:
+                    raise InterfaceError('pool is closed')
+                Now = time.monotonic()
+                Retired = self._retire_idle(Now)
+                while self._free:
+                    Entry = self._free.popleft()
+                    if Policy.past_lifetime(Entry, Now):
+                        Retired.append(Entry.conn)
+                        continue
+                    self._in_use[id(Entry.conn)] = Entry
+                    return Entry, False, Retired
+                Busy = len(self._in_use) + self._opening
+                if Policy.may_open(Busy):
+                    self._opening += 1
+                    return None, True, Retired
+                if Retired:
+                    return None, False, Retired  # close them, then look again
+                if deadline is None:
+                    self._available.wait()
+                else:
+                    Remaining = deadline - time.monotonic()
+                    if Remaining <= 0:
+                        raise Policy.exhausted(Busy)
+                    self._available.wait(Remaining)
+
+    def _open_reserved(self) -> OracleConnect:
+        """Open a connection into the slot `_claim` reserved."""
+        try:
+            Conn = self._open_connection()
+        except BaseException:
+            with self._available:
+                self._opening -= 1
+                self._available.notify()
+            raise
+        with self._available:
+            self._opening -= 1
+            Closed = self._closed
+            if not Closed:
+                self._in_use[id(Conn)] = _PoolEntry(Conn)
+        if Closed:
+            self._discard_dead(Conn)
+            raise InterfaceError('pool is closed')
+        return Conn
+
+    def _alive(self, entry: _PoolEntry) -> bool:
+        """Ping a claimed entry if it is due one. A dead connection gives its
+        slot back."""
+        if not self._policy.needs_ping(entry, time.monotonic()):
+            return True
+        try:
+            Alive = self._ping(entry.conn)
+        except BaseException:
+            self._forget(entry.conn)
+            raise
+        if not Alive:
+            self._forget(entry.conn)
+            self._discard_dead(entry.conn)
+        return Alive
+
+    def _forget(self, conn: OracleConnect) -> None:
+        with self._available:
+            self._in_use.pop(id(conn), None)
+            self._available.notify()
+
     def _open_connection(self) -> OracleConnect:
         Conn = OracleConnect(**self._connect_kwargs)
         apply_drcp_pool_defaults(Conn, self._drcp_class)
         Conn.connect()
         return Conn
-
-    def _needs_health_check(self, entry: _PoolEntry) -> bool:
-        if not self._health_check or self._idle_timeout is None:
-            return False
-        return (time.monotonic() - entry.released_at) >= self._idle_timeout
 
     def _ping(self, conn: OracleConnect) -> bool:
         # `SELECT 1 FROM DUAL` is the cheapest round-trip that confirms
@@ -276,3 +453,7 @@ class Pool:
             # The connection is already known to be dead; closing it is
             # purely best-effort cleanup.
             pass
+
+    def _discard_all(self, conns: list[OracleConnect]) -> None:
+        for Conn in conns:
+            self._discard_dead(Conn)

@@ -232,8 +232,11 @@ What works:
   password=..., service_name=..., min=2, max=10)` returns a
   thread-safe pool of warm authenticated connections. `pool.acquire()`
   returns a context manager that releases on `__exit__`. Idle
-  connections health-check on next acquire (configurable via
-  `idle_timeout`)
+  connections health-check on next acquire (`ping_interval`).
+  `getmode` / `wait_timeout` choose what `acquire()` does at `max`;
+  `max_lifetime_session` and `max_idle_session` retire old and idle
+  connections. `timeout` is how long `acquire()` waits, not
+  python-oracledb's idle timeout
 - Async (asyncio) API: `await seerdb.connect_async(...)` returns
   an `AsyncOracleConnect`; `conn.cursor()` returns an
   `AsyncCursor` with `await cur.execute(...)`, `await cur.fetchone()`,

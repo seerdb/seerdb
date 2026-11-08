@@ -21,6 +21,7 @@
 #   SEERDB_TEST_ADMIN_PASSWORD
 
 import array
+import asyncio
 import datetime
 import functools
 import inspect
@@ -30,6 +31,7 @@ import re
 import socket
 import ssl
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from typing import Any, NamedTuple
@@ -605,8 +607,8 @@ _SERVICE = os.environ.get('SEERDB_TEST_SERVICE', 'XE')
 _FIELD_VERSION = int(os.environ.get('SEERDB_TEST_FIELD_VERSION', '0'))
 _FV_KW: dict[str, Any] = {'field_version': _FIELD_VERSION} if _FIELD_VERSION else {}
 # Run the suite over the experimental native OALL8 form: the 9i dialect on a 9.2
-# bed (#798), 11g's native form on a dedicated 11g session (#2463); every other
-# server ignores the option.
+# bed (#798), 10g's and 11g's native form on a dedicated session (#2463, #2518);
+# every other server ignores the option.
 if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
     _FV_KW['oall8'] = True
 # Run the suite over pooled sessions, as DRCP serves them (#2466): on 11g that
@@ -8947,6 +8949,48 @@ class PoolIntegration(_ThrottleRetry, unittest.TestCase):
         finally:
             Pool.close()
 
+    def test_getmode_nowait_raises_when_full(self):
+        Pool = seerdb.create_pool(
+            min=1, max=1, getmode=seerdb.POOL_GETMODE_NOWAIT, **self._kwargs()
+        )
+        try:
+            with Pool.acquire():
+                with self.assertRaises(seerdb.InterfaceError):
+                    Pool.acquire()
+        finally:
+            Pool.close()
+
+    def test_getmode_forceget_opens_past_max(self):
+        Pool = seerdb.create_pool(
+            min=1, max=1, getmode=seerdb.POOL_GETMODE_FORCEGET, **self._kwargs()
+        )
+        try:
+            with Pool.acquire():
+                with Pool.acquire() as Extra:
+                    self.assertEqual(Pool.opened, 2)
+                    Cur = Extra.cursor()
+                    Cur.execute('SELECT 1 FROM dual')
+                    self.assertEqual(Cur.fetchone(), (1,))
+                self.assertEqual(Pool.opened, 1)
+        finally:
+            Pool.close()
+
+    def test_max_lifetime_session_replaces_a_connection(self):
+        Pool = seerdb.create_pool(
+            min=1, max=1, max_lifetime_session=1, **self._kwargs()
+        )
+        try:
+            with Pool.acquire() as First:
+                pass
+            time.sleep(1.1)
+            with Pool.acquire() as Second:
+                self.assertIsNot(Second, First)
+                Cur = Second.cursor()
+                Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(Cur.fetchone(), (1,))
+        finally:
+            Pool.close()
+
     def test_acquire_after_close_raises(self):
         Pool = seerdb.create_pool(min=1, max=2, **self._kwargs())
         Pool.close()
@@ -14264,6 +14308,34 @@ class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(seerdb.InterfaceError):
             async with Pool.acquire():
                 pass
+
+    async def test_getmode_nowait_raises_when_full(self):
+        Pool = await seerdb.create_pool_async(
+            min=1, max=1, getmode=seerdb.POOL_GETMODE_NOWAIT, **self._kwargs()
+        )
+        try:
+            async with Pool.acquire():
+                with self.assertRaises(seerdb.InterfaceError):
+                    async with Pool.acquire():
+                        pass
+        finally:
+            await Pool.close()
+
+    async def test_max_lifetime_session_replaces_a_connection(self):
+        Pool = await seerdb.create_pool_async(
+            min=1, max=1, max_lifetime_session=1, **self._kwargs()
+        )
+        try:
+            async with Pool.acquire() as First:
+                pass
+            await asyncio.sleep(1.1)
+            async with Pool.acquire() as Second:
+                self.assertIsNot(Second, First)
+                Cur = Second.cursor()
+                await Cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await Cur.fetchone(), (1,))
+        finally:
+            await Pool.close()
 
     async def test_health_check_replaces_dead_connection(self):
         Pool = await seerdb.create_pool_async(
