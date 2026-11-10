@@ -50,6 +50,7 @@ from seerdb.common.tns import (
     decode_9i_oall8_bind_directions,
     decode_9i_oall8_block_cursor,
     decode_9i_oall8_block_out,
+    decode_9i_oall8_create_temp,
     decode_9i_oall8_cursor_id,
     decode_9i_oall8_describe,
     decode_9i_oall8_dml_response,
@@ -97,6 +98,7 @@ from seerdb.common.tns import (
     encode_8i_oall8_query,
     encode_8i_sql_text,
     encode_9i_oall8_close_cursors,
+    encode_9i_oall8_create_temp,
     encode_9i_oall8_dml,
     encode_9i_oall8_fetch,
     encode_9i_oall8_lob_read,
@@ -1295,12 +1297,45 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 CAP_OWN_TXN,
                 CAP_ARRAY_DML,
                 CAP_LOB_OBJECT,
+                CAP_TEMP_LOB,
             }
         )
 
+    def create_temp_lob(self, is_blob: bool, csfrm: int = 1):
+        # A temporary CLOB, NCLOB (csfrm 2) or BLOB of the session's duration,
+        # as OCI 9.2's OCILobCreateTemporary makes one.
+        from seerdb.common.exceptions import Truncated
+
+        yield Send(
+            encode_9i_oall8_create_temp(
+                self._next_seq(),
+                TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB,
+                0 if is_blob else csfrm,
+            )
+        )
+        buf = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise Exception('Connection closed during a 9i CREATE_TEMP')
+            buf += received[1]
+            try:
+                (locator, rest) = decode_9i_oall8_create_temp(buf)
+            except Truncated:
+                continue
+            if not o9i_oall8_terminal_complete(rest):
+                continue
+            _raise_ora(*self._terminal_error(rest))
+            if locator is None:
+                raise Exception('A 9i CREATE_TEMP answered without a locator')
+            return locator
+
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
         # Native 64-bit OALL8 SELECT execute (FETCH option, byte-verified #792).
-        return encode_9i_oall8_query(self._next_seq(), sql_text, bind)
+        # An unset CLOB or BLOB Var is a NULL bound IN, as on 11g.
+        return encode_9i_oall8_query(
+            self._next_seq(), sql_text, Oci11Dialect._null_lobs(bind)
+        )
 
     def _encode_fetch(self, cursor: int, count: int, long_size: int) -> bytes:
         # Native 64-bit OALL8 array fetch (byte-verified #792). `long_size` caps a
@@ -1419,7 +1454,11 @@ class Fv2Oall8Dialect(Oall8Dialect):
     def _encode_dml(
         self, sql_text: bytes, stmt_type: int, bind: list | None = None
     ) -> bytes:
-        # Native 64-bit OALL8 DML / DDL / txn request (byte-verified #716).
+        # Native 64-bit OALL8 DML / DDL / txn request (byte-verified #716). Out
+        # of a block an unset CLOB or BLOB Var is a NULL bound IN, as on 11g; in
+        # one it is an OUT bind.
+        if stmt_type not in (O8I_STMT_BEGIN, O8I_STMT_DECLARE):
+            bind = Oci11Dialect._null_lobs(bind)
         return encode_9i_oall8_dml(self._next_seq(), sql_text, stmt_type, bind)
 
     def execute_dml(
@@ -1445,8 +1484,10 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 self._next_seq(),
                 encode_9i_sql_text(sql),
                 stmt_type,
-                bind,
-                batch,
+                Oci11Dialect._null_lobs(bind),
+                [Oci11Dialect._null_lobs(row) or [] for row in batch]
+                if batch
+                else batch,
                 batcherrors,
             )
         )
@@ -1505,16 +1546,27 @@ class Fv2Oall8Dialect(Oall8Dialect):
         cursors = frozenset(
             i for (i, pos) in enumerate(out_positions) if _is_cursor_var(bind[pos])
         )
+        lobs = frozenset(
+            i
+            for (i, pos) in enumerate(out_positions)
+            if pos in Oci11Dialect._lob_outs(bind)
+        )
         # The block's own cursor, closed with the next call, read from its status
         # past the IOV and the OUT values (#798).
         self._finished(
-            decode_9i_oall8_block_cursor(buf, len(bind), len(out_positions), cursors)
+            decode_9i_oall8_block_cursor(
+                buf, len(bind), len(out_positions), cursors, lobs
+            )
         )
         if out_positions:
             (out_values, _row_count, err_code, message) = decode_9i_oall8_block_out(
-                buf, len(bind), len(out_positions), cursors
+                buf, len(bind), len(out_positions), cursors, lobs
             )
             _raise_ora(err_code, message)
+            for i in lobs:
+                out_values[i] = Oci11Dialect._lob_out_value(
+                    bind[out_positions[i]], out_values[i]
+                )
             # A REF CURSOR comes back opened and described, its rows unread: fetch
             # them by its id now, into the marker the cursor wraps, as the compact
             # path does (#2246).

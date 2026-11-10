@@ -6,7 +6,7 @@
 
 from typing import Any
 
-from seerdb.client._conn_logic import temp_lobs_available
+from seerdb.client._conn_logic import plsql_inline_limit, temp_lobs_available
 from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
 from seerdb.client.cursor import (
     _assign_out_binds,
@@ -146,13 +146,14 @@ class AsyncCursor(_CursorLogic):
         Conn = self._connection
         if not temp_lobs_available(Conn) or not is_plsql(operation) or not Bind:
             return Bind
+        Limit = plsql_inline_limit(Conn)
         Promoted = []
         for Value in Bind:
-            if isinstance(Value, str) and len(Value.encode('utf-8')) > 32767:
+            if isinstance(Value, str) and len(Value.encode('utf-8')) > Limit:
                 Locator = await Conn.create_temp_lob()
                 await Conn.write_temp_lob(Locator, Value)
                 Promoted.append(TempLob(Locator, False))
-            elif isinstance(Value, (bytes, bytearray)) and len(Value) > 32767:
+            elif isinstance(Value, (bytes, bytearray)) and len(Value) > Limit:
                 Locator = await Conn.create_temp_lob(is_blob=True)
                 await Conn.write_temp_lob(Locator, bytes(Value), is_blob=True)
                 Promoted.append(TempLob(Locator, True))
