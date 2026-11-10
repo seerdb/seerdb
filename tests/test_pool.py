@@ -10,7 +10,7 @@ import unittest
 import seerdb
 from seerdb.client.apool import AsyncPool
 from seerdb.client.pool import Pool
-from seerdb.common.exceptions import InterfaceError
+from seerdb.common.exceptions import InterfaceError, ProgrammingError
 
 
 class FakeCursor:
@@ -526,6 +526,94 @@ class TestAsyncSessionCallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.busy, 0)
         conn = await pool._acquire_one()
         self.assertEqual(calls, [conn, conn])
+
+
+class TestNamedPools(unittest.TestCase):
+    def setUp(self):
+        self.pools = []
+
+    def tearDown(self):
+        for pool in self.pools:
+            pool.close()
+
+    def _named(self, alias, cls=None):
+        # A stand-in pool registered as seerdb.create_pool registers one.
+        from seerdb.client.pool import settle_pool_alias, take_pool_alias
+
+        take_pool_alias(alias)
+        pool = (cls or FakePool)(min=0, max=2)
+        settle_pool_alias(alias, pool)
+        self.pools.append(pool)
+        return pool
+
+    def test_a_pool_is_found_by_its_alias(self):
+        pool = seerdb.create_pool(min=0, max=1, pool_alias='named')
+        self.pools.append(pool)
+        self.assertIs(seerdb.get_pool('named'), pool)
+        self.assertIsNone(seerdb.get_pool('NAMED'))
+        self.assertIsNone(seerdb.get_pool('other'))
+
+    def test_an_alias_is_taken_once_and_freed_by_close(self):
+        pool = seerdb.create_pool(min=0, max=1, pool_alias='once')
+        with self.assertRaisesRegex(ProgrammingError, 'already exists'):
+            seerdb.create_pool(min=0, max=1, pool_alias='once')
+        pool.close()
+        self.assertIsNone(seerdb.get_pool('once'))
+        again = seerdb.create_pool(min=0, max=1, pool_alias='once')
+        self.pools.append(again)
+        self.assertIs(seerdb.get_pool('once'), again)
+
+    def test_a_pool_that_fails_to_be_made_frees_its_alias(self):
+        with self.assertRaises(ValueError):
+            seerdb.create_pool(min=0, max=1, getmode=99, pool_alias='broken')
+        self.assertIsNone(seerdb.get_pool('broken'))
+
+    def test_an_alias_is_a_string(self):
+        with self.assertRaisesRegex(TypeError, 'pool_alias'):
+            seerdb.create_pool(min=0, max=1, pool_alias=5)
+
+    def test_connect_takes_a_connection_that_close_hands_back(self):
+        pool = self._named('connect')
+        conn = seerdb.connect(pool_alias='connect')
+        self.assertEqual(pool.busy, 1)
+        self.assertIsInstance(conn.cursor(), FakeCursor)
+        conn.close()
+        conn.close()
+        self.assertEqual(pool.busy, 0)
+        with self.assertRaises(InterfaceError):
+            conn.cursor()
+        with seerdb.connect(pool_alias='connect'):
+            self.assertEqual(pool.busy, 1)
+        self.assertEqual(pool.busy, 0)
+
+    def test_connect_by_alias_takes_nothing_else(self):
+        self._named('only')
+        with self.assertRaisesRegex(ProgrammingError, 'no other arguments'):
+            seerdb.connect(pool_alias='only', user='someone')
+        with self.assertRaisesRegex(ProgrammingError, 'does not exist'):
+            seerdb.connect(pool_alias='missing')
+
+
+class TestAsyncNamedPools(unittest.IsolatedAsyncioTestCase):
+    async def test_an_async_pool_is_named_and_connected_to(self):
+        from seerdb.client.pool import settle_pool_alias, take_pool_alias
+
+        made = await seerdb.create_pool_async(min=0, max=1, pool_alias='async-made')
+        self.assertIs(seerdb.get_pool('async-made'), made)
+        await made.close()
+        self.assertIsNone(seerdb.get_pool('async-made'))
+        take_pool_alias('async')
+        pool = AsyncFakePool(min=0, max=1)
+        settle_pool_alias('async', pool)
+        try:
+            async with await seerdb.connect_async(pool_alias='async') as conn:
+                self.assertEqual(pool.busy, 1)
+                self.assertIsInstance(conn.cursor(), AsyncFakeCursor)
+            self.assertEqual(pool.busy, 0)
+            with self.assertRaisesRegex(ProgrammingError, 'is not a Pool'):
+                seerdb.connect(pool_alias='async')
+        finally:
+            await pool.close()
 
 
 if __name__ == '__main__':

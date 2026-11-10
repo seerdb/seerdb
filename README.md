@@ -240,7 +240,9 @@ What works:
   python-oracledb's idle timeout. `pool.reconfigure()` changes any
   of these, and the pool's size, while it is in use.
   `session_callback` sets each connection up the first time it is
-  handed out
+  handed out. A pool created with `pool_alias` is found again by
+  `seerdb.get_pool()`, and `seerdb.connect(pool_alias=...)` takes a
+  connection from it that `close()` hands back
 - Async (asyncio) API: `await seerdb.connect_async(...)` returns
   an `AsyncOracleConnect`; `conn.cursor()` returns an
   `AsyncCursor` with `await cur.execute(...)`, `await cur.fetchone()`,

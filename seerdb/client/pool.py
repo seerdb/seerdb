@@ -32,7 +32,7 @@ from typing import Any, Callable
 
 from seerdb.client._conn_logic import _ConnectionLogic
 from seerdb.client.connection import OracleConnect
-from seerdb.common.exceptions import InterfaceError
+from seerdb.common.exceptions import InterfaceError, ProgrammingError
 from seerdb.common.tns_consts import PURITY_DEFAULT, PURITY_SELF
 
 # What `acquire()` does when every connection is busy and the pool is at `max`,
@@ -202,6 +202,98 @@ class _PooledConnectionGuard:
         # connection got into a bad state the next acquire's health-check
         # will catch it and discard the entry.
         self._pool.release(self._conn)
+
+
+class PooledConnection:
+    """A connection `seerdb.connect(pool_alias=...)` took from a named pool.
+
+    It is the connection to use, and `close()`, or leaving a `with` block,
+    hands it back to the pool rather than closing it, as python-oracledb's
+    pooled connection does."""
+
+    __slots__ = ('_pool', '_conn')
+
+    def __init__(self, pool: 'Pool', conn: OracleConnect):
+        object.__setattr__(self, '_pool', pool)
+        object.__setattr__(self, '_conn', conn)
+
+    def _connection(self) -> OracleConnect:
+        Conn = object.__getattribute__(self, '_conn')
+        if Conn is None:
+            raise InterfaceError('connection was returned to its pool')
+        return Conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._connection(), name, value)
+
+    def close(self) -> None:
+        Conn = object.__getattribute__(self, '_conn')
+        if Conn is not None:
+            object.__setattr__(self, '_conn', None)
+            object.__getattribute__(self, '_pool').release(Conn)
+
+    def __enter__(self) -> 'PooledConnection':
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+# The pools created with a `pool_alias`, by it (#2459). A name is taken while
+# its pool is being made, so two at once cannot both have it.
+_NAMED_POOLS: dict[str, Any] = {}
+_NAMED_LOCK = threading.Lock()
+_BEING_MADE = object()
+
+
+def take_pool_alias(alias: Any) -> None:
+    """Reserve `alias` for a pool being made: a str, not taken yet."""
+    if not isinstance(alias, str):
+        raise TypeError('pool_alias must be a string')
+    with _NAMED_LOCK:
+        if alias in _NAMED_POOLS:
+            raise ProgrammingError(
+                f'a connection pool with alias "{alias}" already exists'
+            )
+        _NAMED_POOLS[alias] = _BEING_MADE
+
+
+def settle_pool_alias(alias: str, pool: Any) -> None:
+    """Name the pool made under `alias`, or free the name when it was not
+    made (`pool` None)."""
+    with _NAMED_LOCK:
+        if pool is None:
+            _NAMED_POOLS.pop(alias, None)
+        else:
+            _NAMED_POOLS[alias] = pool
+
+
+def forget_pool(pool: Any) -> None:
+    """Free the names a closed pool had."""
+    with _NAMED_LOCK:
+        for Alias in [A for (A, P) in _NAMED_POOLS.items() if P is pool]:
+            del _NAMED_POOLS[Alias]
+
+
+def get_pool(alias: str) -> Any:
+    """The open pool created with `pool_alias=alias`, or None."""
+    Pool_ = _NAMED_POOLS.get(alias)
+    return None if Pool_ is _BEING_MADE else Pool_
+
+
+def named_pool(alias: str, kind: type) -> Any:
+    """The pool `seerdb.connect(pool_alias=alias)` takes a connection from."""
+    Pool_ = get_pool(alias)
+    if Pool_ is None:
+        raise ProgrammingError(f'a connection pool with alias "{alias}" does not exist')
+    if not isinstance(Pool_, kind):
+        raise ProgrammingError(
+            f'the connection pool with alias "{alias}" is not a {kind.__name__}'
+        )
+    return Pool_
 
 
 def drcp_pool_class() -> str:
@@ -383,6 +475,7 @@ class Pool:
     def close(self) -> None:
         """Close all connections (free + in-use). Subsequent `acquire`
         calls raise InterfaceError."""
+        forget_pool(self)
         with self._available:
             self._closed = True
             # Free entries close immediately; in-use entries will close
