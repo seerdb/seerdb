@@ -7776,6 +7776,24 @@ class LOBIntegration(_IntegrationBase):
             self.cur.execute(f'SELECT nc FROM {self.TABLE} WHERE id=:i', {'i': Id})
             self.assertEqual(self.cur.fetchone()[0], Text)
 
+    @_requires(_Need('8i has no UNISTR', not_8i=True))
+    def test_a_server_built_national_lob_reads_back(self):
+        # Built on the server from UNISTR, so no client text goes through any
+        # charset on the way in: what comes back is how the client reads the
+        # national form. A native 9i session read its UTF-16 as UTF-8 (#174).
+        # As a LOB object (fetch_lobs, the default), whose read takes its charset
+        # from the column, and as its content.
+        for FetchLobs in (True, False):
+            Conn = _connect(fetch_lobs=FetchLobs)
+            try:
+                Cur = Conn.cursor()
+                Cur.execute("SELECT TO_NCLOB(UNISTR('\\0041\\00e9\\4e2d')) FROM dual")
+                Value = Cur.fetchone()[0]
+                Text = Value.read() if hasattr(Value, 'read') else Value
+                self.assertEqual(Text, 'A\u00e9\u4e2d', f'fetch_lobs={FetchLobs}')
+            finally:
+                Conn.close()
+
     def test_an_nclob_column_describes_as_nclob(self):
         # An NCLOB column describes as NCLOB, not CLOB, with rows or without,
         # its content still reads back, and USER_TAB_COLUMNS lists it as NCLOB.

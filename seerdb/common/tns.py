@@ -15818,20 +15818,23 @@ def _o9i_oall8_object_cell(Col: dict, Data: bytes) -> tuple[object, bytes]:
 _O9I_OALL8_LOB_TYPES = frozenset((TNS_TYPE_CLOB, TNS_TYPE_BLOB, TNS_TYPE_BFILE))
 
 
-def _o9i_oall8_lob_cell(Type: int, Data: bytes) -> tuple[object, bytes]:
+def _o9i_oall8_lob_cell(
+    Type: int, Data: bytes, Charset: int | None = None
+) -> tuple[object, bytes]:
     # A LOB column's cell in a 9i OALL8 row (#795): 8i's without its trailer
     # (_O9I_LOB_CELL) -- a ub4 locator size, then, when it is not zero, the
     # locator as a ub1-length value (a ub2 length and the body, 86 bytes for a
     # CLOB / BLOB). A NULL LOB is the zero size alone (reading a length byte after
     # it took the next row's token as one and desynced the stream); EMPTY_CLOB /
     # EMPTY_BLOB carry a real locator that reads back empty. Returns a LOB carrying
-    # the locator, for the dialect to read (resolve_lobs) or hand back.
+    # the locator, for the dialect to read (resolve_lobs) or hand back, with the
+    # column's charset: an NCLOB's AL16UTF16 says how its text comes (#174).
     from seerdb.common.lob import LOB
 
     (Cell, Rest) = _O9I_LOB_CELL_FROM_O9I(Data)
     if not Cell['length']:
         return (None, Rest)
-    return (LOB(Type, bytes(Cell['locator'])), Rest)
+    return (LOB(Type, bytes(Cell['locator']), charset=Charset), Rest)
 
 
 def _o9i_oall8_rowid_cell(Data: bytes) -> tuple[str, bytes]:
@@ -15915,7 +15918,9 @@ def decode_9i_oall8_exec_response(
                         )
                         continue
                     if Col.get('data_type') in _O9I_OALL8_LOB_TYPES:
-                        (Lob, Rest) = _o9i_oall8_lob_cell(Col['data_type'], Rest)
+                        (Lob, Rest) = _o9i_oall8_lob_cell(
+                            Col['data_type'], Rest, Col.get('charset')
+                        )
                         Row.append(Lob)
                         continue
                     if Col.get('data_type') in _LONG_DATA_TYPES:
