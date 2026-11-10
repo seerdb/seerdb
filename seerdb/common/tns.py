@@ -244,6 +244,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_END_USER_SECURITY_CTX,
     TNS_FUNC_PIPELINE_BEGIN,
     TNS_FUNC_PIPELINE_END,
+    TNS_FUNC_REEXECUTE,
     TNS_FUNC_SESSION_RELEASE,
     TNS_FUNC_SESSION_STATE,
     TNS_FUNC_SET_END_TO_END_ATTR,
@@ -15463,6 +15464,54 @@ def encode_9i_oall8_dml(
     # (decode_9i_oall8_dml_response). `Batch` holds an array DML's further rows
     # (#798).
     return _encode_9i_oall8(Seq, Sql, StmtType, Binds or [], Batch, BatchErrors)
+
+
+# A cached cursor's re-execute on the native form (#2535), as OCI 9.2 and 11.2
+# re-execute a statement handle: TTI function 4, the cursor, the iteration count
+# and the options, then the bind values behind TTI_RXD -- no SQL, no bind
+# descriptors, and nothing behind the head for a statement without binds. OCI
+# 11.2 adds a second option word, to 10g as to 11g; OCI 9.2 has none.
+_NATIVE_REEXECUTE: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TNS_FUNC_REEXECUTE])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('n4', 'cursor'),
+    ('n4', 'iterations'),
+    ('n4', 'options'),
+    ('when', 'has_options_2', (('n4', 'options_2'),)),
+)
+_NATIVE_REEXECUTE_OCI = wire_schema.compile_encoder(_NATIVE_REEXECUTE, _OCI)
+
+
+def _native_reexecute(Seq: int, Cursor: int, Values: list[bytes], Wide: bool) -> bytes:
+    Head = _NATIVE_REEXECUTE_OCI(
+        {
+            'seq': Seq & 0xFF,
+            'token_number': None,
+            'cursor': Cursor,
+            'iterations': 1,
+            'options': 0,
+            'has_options_2': Wide,
+            'options_2': 0,
+        }
+    )
+    return Head + (bytes([TTI_RXD]) + b''.join(Values) if Values else b'')
+
+
+def encode_9i_oall8_reexecute(
+    Seq: int, Cursor: int, Binds: list | None = None
+) -> bytes:
+    """A cached DML cursor's re-execute on a native 9i session (#2535)."""
+    return _native_reexecute(
+        Seq, Cursor, [_encode_9i_bind_value(V) for V in Binds or []], False
+    )
+
+
+def encode_oci11_reexecute(Seq: int, Cursor: int, Binds: list | None = None) -> bytes:
+    """A cached DML cursor's re-execute on a native 10g or 11g session (#2535)."""
+    return _native_reexecute(
+        Seq, Cursor, [_encode_oci11_bind_value(V) for V in Binds or []], True
+    )
 
 
 def encode_9i_oall8_query(Seq: int, Sql: bytes, Binds: list | None = None) -> bytes:

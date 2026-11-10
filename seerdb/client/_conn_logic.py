@@ -951,6 +951,7 @@ class _ConnectionLogic:
                 self._take_app_context,
                 self.field_version,
                 self._take_end_to_end,
+                getattr(self, 'server_type', None) != 'pooled',
             )
         elif self.field_version < FIELD_VERSION_10_2:
             # The 9i OALL8 opt-in (#716) speaks the native 64-bit request form;

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 11.2's re-execute, the second execute of INSERT INTO zz_reexec VALUES (:1, 2 bound)
+# prepared once on one statement handle: TTI function 4, re-executing cursor 1.
+# Captured 2026-11-10 through tools/capture_proxy.py: an OCI 11.2 program
+# (instant client 11.2, x86-64 Linux) on Oracle 11g XE 11.2.0.2.
+# The TTC payload, without the packet's header, as `hexdump -C` output; the
+# offset column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  03 04 08 01 00 00 00 01  00 00 00 00 00 00 00 00  |................|
+00000010  00 00 00 07 02 c1 03                              |.......|
+00000017

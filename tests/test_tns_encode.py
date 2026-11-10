@@ -8243,3 +8243,79 @@ class Oall8NineObjectBindTest(unittest.TestCase):
             field_version=FIELD_VERSION_9_2, _dialect=Fv2Oall8Dialect(lambda: 5)
         )
         _check_object_bind_support(Conn, [Bind])
+
+
+class NativeReexecuteTest(unittest.TestCase):
+    # A cached cursor's re-execute on the native form, against OCI's own: the
+    # second execute of one INSERT on one statement handle (#2535).
+    @staticmethod
+    def _capture(name):
+        sys.path.insert(0, os.path.dirname(__file__))
+        from replay import load_capture
+
+        return load_capture(name)
+
+    def test_it_is_oci_s_own(self):
+        from seerdb.common.tns import encode_9i_oall8_reexecute, encode_oci11_reexecute
+
+        for Name, Encode, Cursor, Binds in (
+            ('oci11_reexecute.hexdump', encode_oci11_reexecute, 1, [2]),
+            ('oci11_reexecute_unbound.hexdump', encode_oci11_reexecute, 1, []),
+            ('oci10_reexecute.hexdump', encode_oci11_reexecute, 3, [2]),
+            ('oci92_reexecute.hexdump', encode_9i_oall8_reexecute, 1, [2]),
+            ('oci92_reexecute_unbound.hexdump', encode_9i_oall8_reexecute, 1, []),
+        ):
+            with self.subTest(Name):
+                Captured = self._capture(Name)
+                self.assertEqual(Encode(Captured[2], Cursor, Binds), Captured)
+
+    def _dialect(self, cls, **kwargs):
+        from itertools import count
+
+        Seq = count(10)
+        return cls(lambda: next(Seq), **kwargs)
+
+    def test_a_9i_session_caches_and_re_executes(self):
+        from seerdb.client.dialect import Fv2Oall8Dialect
+
+        dialect = self._dialect(Fv2Oall8Dialect)
+        cache: dict = {}
+        sql = 'INSERT INTO t VALUES (:1)'
+        dialect._cache_keep(cache, ('k',), 0, failed=False)
+        self.assertEqual(cache, {})
+        key = dialect._cache_key(sql, [1], None, False, cache)
+        dialect._cache_keep(cache, key, 5, failed=False)
+        self.assertEqual(cache, {key: 5})
+        # A failure forgets the cursor and closes it with the next call.
+        dialect._cache_keep(cache, key, 5, failed=True)
+        self.assertEqual((cache, dialect._to_close), ({}, [5]))
+
+    def test_ddl_and_blocks_close_every_cached_cursor(self):
+        from seerdb.client.dialect import Fv2Oall8Dialect
+
+        dialect = self._dialect(Fv2Oall8Dialect)
+        cache = {('a',): 3, ('b',): 4}
+        self.assertIsNone(dialect._cache_key('DROP TABLE t', None, None, False, cache))
+        self.assertEqual((cache, dialect._to_close), ({}, [3, 4]))
+        cache = {('c',): 7}
+        list(dialect.flush_cursors(cache))
+        self.assertEqual((cache, dialect._to_close), ({}, [3, 4, 7]))
+
+    def test_the_cache_is_capped_oldest_first(self):
+        from seerdb.client.dialect import _FV2_CURSOR_CACHE_MAX, Fv2Oall8Dialect
+
+        dialect = self._dialect(Fv2Oall8Dialect)
+        cache: dict = {}
+        for n in range(_FV2_CURSOR_CACHE_MAX + 2):
+            dialect._cache_keep(cache, (n,), n + 1, failed=False)
+        self.assertEqual(len(cache), _FV2_CURSOR_CACHE_MAX)
+        self.assertEqual(dialect._to_close, [1, 2])
+
+    def test_a_pooled_11g_session_keeps_none(self):
+        from seerdb.client.dialect import Oci11Dialect
+
+        pooled = self._dialect(Oci11Dialect)
+        dedicated = self._dialect(Oci11Dialect, caches_cursors=True)
+        sql = 'INSERT INTO t VALUES (:1)'
+        self.assertIsNone(pooled._cache_key(sql, [1], None, False, {}))
+        self.assertIsNotNone(dedicated._cache_key(sql, [1], None, False, {}))
