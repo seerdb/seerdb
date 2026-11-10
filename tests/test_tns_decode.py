@@ -8946,3 +8946,20 @@ class TestFv2ChunkedErrorMessage(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Oall8NineLobCellCharsetTest(unittest.TestCase):
+    def test_a_fetched_lob_keeps_its_column_s_charset(self):
+        # An NCLOB's text comes as AL16UTF16, which its column's charset says;
+        # without it the LOB read the UTF-16 as UTF-8 (#174).
+        from seerdb.common.tns import _OCI, _o9i_oall8_lob_cell
+        from seerdb.common.tns_consts import AL16UTF16_CHARSET, TNS_TYPE_CLOB
+
+        Locator = bytes.fromhex('0054') + bytes(84)
+        Cell = _OCI.n4(len(Locator)) + _OCI.value(Locator)
+        (Lob, Rest) = _o9i_oall8_lob_cell(
+            TNS_TYPE_CLOB, Cell + b'rest', AL16UTF16_CHARSET
+        )
+        self.assertEqual((Lob.charset, Rest), (AL16UTF16_CHARSET, b'rest'))
+        (Plain, _) = _o9i_oall8_lob_cell(TNS_TYPE_CLOB, Cell)
+        self.assertIsNone(Plain.charset)
