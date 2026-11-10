@@ -28,7 +28,7 @@ import secrets
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 from seerdb.client._conn_logic import _ConnectionLogic
 from seerdb.client.connection import OracleConnect
@@ -54,13 +54,27 @@ _KEEP: Any = object()
 
 
 class _PoolEntry:
-    """One pooled connection, with when it was opened and last released."""
+    """One pooled connection, with when it was opened and last released, and
+    whether the pool's session callback has yet to succeed on it."""
 
-    __slots__ = ('conn', 'created_at', 'released_at')
+    __slots__ = ('conn', 'created_at', 'released_at', 'needs_callback')
 
     def __init__(self, conn: Any):
         self.conn = conn
         self.created_at = self.released_at = time.monotonic()
+        self.needs_callback = True
+
+
+def check_session_callback(callback: Any) -> Any:
+    """A pool's session callback: a callable, or None for none. python-oracledb
+    takes a PL/SQL procedure's name here too, for DRCP's tags; seerdb has
+    no tags."""
+    if callback is not None and not callable(callback):
+        raise TypeError(
+            'session_callback must be a callable taking the connection and the '
+            f'requested tag, not {type(callback).__name__}'
+        )
+    return callback
 
 
 class _PoolPolicy:
@@ -234,6 +248,7 @@ class Pool:
         ping_interval: float | None = None,
         max_lifetime_session: float = 0,
         max_idle_session: float = 0,
+        session_callback: Callable[..., Any] | None = None,
         **connect_kwargs,
     ):
         self._policy = _PoolPolicy(
@@ -249,6 +264,7 @@ class Pool:
             max_lifetime_session,
             max_idle_session,
         )
+        self._session_callback = check_session_callback(session_callback)
         self._connect_kwargs = connect_kwargs
         # The connection class this pool's DRCP sessions share (#2006).
         self._drcp_class = drcp_pool_class()
@@ -284,6 +300,7 @@ class Pool:
             else:
                 continue
             Conn._begin_request()  # request boundary (#464)
+            self._run_session_callback(Conn)
             return _PooledConnectionGuard(self, Conn)
 
     def release(self, conn: OracleConnect) -> None:
@@ -442,6 +459,24 @@ class Pool:
             if Closed:
                 self._discard_dead(Conn)
                 return
+
+    def _run_session_callback(self, Conn: OracleConnect) -> None:
+        """Run the session callback the first time `Conn` is handed out, as
+        python-oracledb does, with no tag requested. If it raises, the
+        connection goes back and the next caller to get it runs it again."""
+        Callback = self._session_callback
+        if Callback is None:
+            return
+        with self._lock:
+            Entry = self._in_use.get(id(Conn))
+        if Entry is None or not Entry.needs_callback:
+            return
+        try:
+            Callback(Conn, None)
+        except BaseException:
+            self.release(Conn)
+            raise
+        Entry.needs_callback = False
 
     def _claim(
         self, deadline: float | None

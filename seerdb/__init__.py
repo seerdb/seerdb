@@ -174,6 +174,12 @@ def create_pool(*args, **kwargs) -> Pool:
       - ``max_idle_session`` (default 0, no limit): seconds a free
         connection above `min` may stay idle. Checked on acquire and
         release; the pool has no background thread.
+      - ``session_callback``: called as ``callback(connection, None)`` the
+        first time each connection is handed out, to set its session up
+        once; awaited on an `AsyncPool` when it returns an awaitable. If it
+        raises, the connection goes back to the pool and the next caller to
+        get it runs the callback again. The second argument is the requested
+        tag, which seerdb does not have.
     """
     return Pool(*args, **kwargs)
 

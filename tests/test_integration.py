@@ -9105,6 +9105,31 @@ class PoolIntegration(_ThrottleRetry, unittest.TestCase):
         finally:
             Pool.close()
 
+    def test_session_callback_sets_each_connection_up_once(self):
+        # The callback sets the session up the first time a connection is handed
+        # out; reused, the connection keeps it and the callback does not run.
+        calls = []
+
+        def setup(conn, tag):
+            calls.append(tag)
+            with conn.cursor() as cur:
+                cur.execute("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'")
+
+        pool = seerdb.create_pool(
+            min=1, max=1, session_callback=setup, **self._kwargs()
+        )
+        try:
+            for _ in range(2):
+                with pool.acquire() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        'SELECT value FROM nls_session_parameters '
+                        "WHERE parameter = 'NLS_DATE_FORMAT'"
+                    )
+                    self.assertEqual(cur.fetchone(), ('YYYY-MM-DD',))
+            self.assertEqual(calls, [None])
+        finally:
+            pool.close()
+
     def test_reconfigure_resizes_a_live_pool(self):
         Pool = seerdb.create_pool(min=1, max=3, **self._kwargs())
         try:
@@ -14464,6 +14489,31 @@ class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await Cur.fetchone(), (1,))
         finally:
             await Pool.close()
+
+    async def test_session_callback_sets_each_connection_up_once(self):
+        # Async twin: a coroutine callback, awaited the first time only.
+        calls = []
+
+        async def setup(conn, tag):
+            calls.append(tag)
+            async with conn.cursor() as cur:
+                await cur.execute("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'")
+
+        pool = await seerdb.create_pool_async(
+            min=1, max=1, session_callback=setup, **self._kwargs()
+        )
+        try:
+            for _ in range(2):
+                async with pool.acquire() as conn:
+                    cur = conn.cursor()
+                    await cur.execute(
+                        'SELECT value FROM nls_session_parameters '
+                        "WHERE parameter = 'NLS_DATE_FORMAT'"
+                    )
+                    self.assertEqual(await cur.fetchone(), ('YYYY-MM-DD',))
+            self.assertEqual(calls, [None])
+        finally:
+            await pool.close()
 
     async def test_reconfigure_resizes_a_live_pool(self):
         Pool = await seerdb.create_pool_async(min=1, max=3, **self._kwargs())
