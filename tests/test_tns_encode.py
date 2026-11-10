@@ -8169,3 +8169,77 @@ class Oall8NineTempLobTest(unittest.TestCase):
         self.assertEqual(
             plsql_inline_limit(SimpleNamespace(field_version=FIELD_VERSION_12_1)), 32767
         )
+
+
+class Oall8NineObjectBindTest(unittest.TestCase):
+    # An object or a collection bound on a native 9i session, against OCI 9.2's.
+    DESCRIPTOR_HEAD = bytes.fromhex('006d000000d007')
+
+    @staticmethod
+    def _capture(name):
+        sys.path.insert(0, os.path.dirname(__file__))
+        from replay import load_capture
+
+        return load_capture(name)
+
+    def _var_of(self, Captured, Collection=False):
+        # A Var of the captured bind's type: its OID and version from the
+        # descriptor OCI sent.
+        from seerdb.common.datatypes import Var
+        from seerdb.common.dbobject import DbObjectType
+
+        At = Captured.index(self.DESCRIPTOR_HEAD)
+        Oid = Captured[At + 22 : At + 38]
+        Version = int.from_bytes(Captured[At + 38 : At + 40], 'little')
+        Typ = DbObjectType(
+            'PYO',
+            'ZZ_T9' if Collection else 'ZZ_O9',
+            Oid,
+            Version,
+            [],
+            is_collection=Collection,
+        )
+        return (Var(Typ), At)
+
+    def test_the_descriptor_is_oci_9_2s(self):
+        from seerdb.common.tns import _encode_9i_bind_oac
+
+        for Name, Collection in (
+            ('oci92_object_out_execute.hexdump', False),
+            ('oci92_collection_execute.hexdump', True),
+        ):
+            with self.subTest(Name):
+                Captured = self._capture(Name)
+                (Bind, At) = self._var_of(Captured, Collection)
+                Ours = _encode_9i_bind_oac(Bind)
+                self.assertEqual(Ours, Captured[At : At + len(Ours)])
+
+    def test_an_object_out_is_read(self):
+        from seerdb.common.tns import decode_9i_oall8_block_out
+
+        (Values, _, Code, _) = decode_9i_oall8_block_out(
+            self._capture('oci92_object_out_reply.hexdump'),
+            1,
+            1,
+            Objects=frozenset({0}),
+        )
+        self.assertEqual(Code, 0)
+        self.assertEqual(Values, [bytes.fromhex('84010a02c109036f7574')])
+
+    def test_the_dialect_binds_objects(self):
+        from seerdb.client.dialect import CAP_OBJECT_BIND, Fv2Oall8Dialect
+
+        self.assertIn(CAP_OBJECT_BIND, Fv2Oall8Dialect(lambda: 5).capabilities())
+
+    def test_the_cursor_lets_one_through(self):
+        from types import SimpleNamespace
+
+        from seerdb.client.cursor import _check_object_bind_support
+        from seerdb.client.dialect import Fv2Oall8Dialect
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2
+
+        (Bind, _) = self._var_of(self._capture('oci92_object_out_execute.hexdump'))
+        Conn = SimpleNamespace(
+            field_version=FIELD_VERSION_9_2, _dialect=Fv2Oall8Dialect(lambda: 5)
+        )
+        _check_object_bind_support(Conn, [Bind])

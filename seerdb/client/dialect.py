@@ -267,6 +267,8 @@ CAP_APP_CONTEXT = 'app_context'
 CAP_PARSE = 'parse'
 CAP_PING = 'ping'
 CAP_TPC = 'tpc'
+# The dialect binds an object or a collection, IN and OUT, itself.
+CAP_OBJECT_BIND = 'object_bind'
 # The dialect serves a server-side scrollable cursor -- its open and its
 # positioned fetches -- in its own form (#2466).
 CAP_SCROLL = 'scroll'
@@ -1298,6 +1300,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 CAP_ARRAY_DML,
                 CAP_LOB_OBJECT,
                 CAP_TEMP_LOB,
+                CAP_OBJECT_BIND,
             }
         )
 
@@ -1551,20 +1554,29 @@ class Fv2Oall8Dialect(Oall8Dialect):
             for (i, pos) in enumerate(out_positions)
             if pos in Oci11Dialect._lob_outs(bind)
         )
+        objects = frozenset(
+            i
+            for (i, pos) in enumerate(out_positions)
+            if pos in Oci11Dialect._object_outs(bind)
+        )
         # The block's own cursor, closed with the next call, read from its status
         # past the IOV and the OUT values (#798).
         self._finished(
             decode_9i_oall8_block_cursor(
-                buf, len(bind), len(out_positions), cursors, lobs
+                buf, len(bind), len(out_positions), cursors, lobs, objects
             )
         )
         if out_positions:
             (out_values, _row_count, err_code, message) = decode_9i_oall8_block_out(
-                buf, len(bind), len(out_positions), cursors, lobs
+                buf, len(bind), len(out_positions), cursors, lobs, objects
             )
             _raise_ora(err_code, message)
             for i in lobs:
                 out_values[i] = Oci11Dialect._lob_out_value(
+                    bind[out_positions[i]], out_values[i]
+                )
+            for i in objects:
+                out_values[i] = Oci11Dialect._object_out_value(
                     bind[out_positions[i]], out_values[i]
                 )
             # A REF CURSOR comes back opened and described, its rows unread: fetch
@@ -1706,6 +1718,7 @@ class Oci11Dialect(Oall8Dialect):
                 CAP_PARSE,
                 CAP_PING,
                 CAP_TPC,
+                CAP_OBJECT_BIND,
                 CAP_SCROLL,
                 CAP_RETURNING,
             }

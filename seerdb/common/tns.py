@@ -14964,6 +14964,9 @@ _O9I_LOB_BIND_SIZE = 32
 
 
 def _encode_9i_bind_oac(Value: object) -> bytes:
+    if _is_oci11_object_bind(Value):
+        # An object or a collection, as OCI 9.2 binds one (SQLT_NTY).
+        return _oci11_object_bind_oac(Value, _OCI11_OBJECT_BIND_FLAGS)
     Lob = _oci11_lob_bind(Value)
     if Lob is not None:
         # A LOB bound by its locator, as OCI 9.2 binds one with an indicator:
@@ -15415,6 +15418,8 @@ def _encode_9i_bind_value(Value: object) -> bytes:
     # as invalid UTF-8 and a bound 'é' arrived as NULL (#797).
     from seerdb.common.datatypes import Var
 
+    if _is_oci11_object_bind(Value):
+        return _oci11_object_bind_value(Value)
     Lob = _oci11_lob_bind(Value)
     if Lob is not None:
         # A LOB bound by its locator, the length ahead of it as a ub4; a NULL
@@ -16078,6 +16083,7 @@ def decode_9i_oall8_block_out(
     NumOut: int,
     Cursors: frozenset[int] = frozenset(),
     Lobs: frozenset[int] = frozenset(),
+    Objects: frozenset[int] = frozenset(),
 ) -> tuple[list, int, int, str | None]:
     # The OUT / IN OUT values a 9i OALL8 PL/SQL block returns (#794). The reply is
     # the IOV bind prompt, then (when the block writes binds) a TTI_RXD carrying one
@@ -16090,7 +16096,9 @@ def decode_9i_oall8_block_out(
     # A block that fails at run time (a SELECT ... INTO matching nothing) answers
     # with the bare status, no IOV: skipping the IOV's length there landed past the
     # status and read the error as success.
-    (OutValues, Rest) = _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors, Lobs)
+    (OutValues, Rest) = _o9i_oall8_block_parts(
+        Data, NumBinds, NumOut, Cursors, Lobs, Objects
+    )
     # `Rest` now sits on the RPA + OER, so read the status from there rather than
     # rescanning `Data` from the start -- the IOV and the OUT RXD hold value bytes
     # that collide with the OER token, which a from-the-start scan can land on
@@ -16105,6 +16113,7 @@ def decode_9i_oall8_block_cursor(
     NumOut: int = 0,
     Cursors: frozenset[int] = frozenset(),
     Lobs: frozenset[int] = frozenset(),
+    Objects: frozenset[int] = frozenset(),
 ) -> int:
     # The cursor a 9i OALL8 block reply's status names, for the close that follows
     # (#798), read past the IOV and the OUT values as decode_9i_oall8_block_out
@@ -16112,7 +16121,7 @@ def decode_9i_oall8_block_cursor(
     # IOV, and closing that bogus cursor (256) drew ORA-00600 [12209] and lost the
     # session.
     return decode_9i_oall8_cursor_id(
-        _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors, Lobs)[1]
+        _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors, Lobs, Objects)[1]
     )
 
 
@@ -16134,6 +16143,7 @@ def _o9i_oall8_block_parts(
     NumOut: int,
     Cursors: frozenset[int],
     Lobs: frozenset[int] = frozenset(),
+    Objects: frozenset[int] = frozenset(),
 ) -> tuple[list, bytes]:
     # A 9i OALL8 block reply's OUT values, and the bytes after them -- the RPA and
     # the status (decode_9i_oall8_block_out).
@@ -16145,6 +16155,12 @@ def _o9i_oall8_block_parts(
         Rest = Rest[1:]
         for Index in range(NumOut):
             Length = Rest[0]
+            if Index in Objects:
+                # An object's or a collection's cell, as it went out: its image,
+                # none for a NULL object.
+                (Cell, Rest) = _O9I_OBJECT_CELL_FROM_O9I(Rest)
+                OutValues.append(bytes(Cell['image']) if Cell['image_length'] else None)
+                continue
             if Index in Lobs and Length != 0xFF:
                 # A NULL comes back as the empty locator, its body all zero.
                 (Cell, Rest) = _O9I_OUT_LOB_FROM_O9I(Rest)

@@ -117,6 +117,14 @@ _FV2_UNSUPPORTED = (
     ('nclob', '9i national-charset LOB handling deferred (#174)'),
     ('each_lob_type_round_trips', '9i national-charset LOB handling deferred (#174)'),
     ('createlob_binds_as_a_lob', '9i national-charset LOB handling deferred (#174)'),
+    (
+        'lob_attribute_binds_from_str_and_bytes',
+        '9i national-charset LOB handling deferred (#174)',
+    ),
+    (
+        'fetched_lob_attribute_binds_back',
+        "9i takes no CHAR for a CLOB attribute in an object's constructor (ORA-00932)",
+    ),
     ('large_clob_into_xmltype', 'XMLSERIALIZE is a 10g function'),
     # The fixture SELECT ... CONNECT BY LEVEL <= 200 returns only 10 rows on 9i
     # (a 9i CONNECT-BY-against-dual quirk, like the 8i "returns one row"), so it
@@ -312,6 +320,14 @@ class _Target(NamedTuple):
     ref_binds: bool = False
 
 
+def _dialect_binds_objects(conn) -> bool:
+    # A pre-12c dialect that binds objects itself: the native form on 9i too.
+    from seerdb.client.dialect import CAP_OBJECT_BIND
+
+    Dialect = getattr(conn, '_dialect', None)
+    return Dialect is not None and CAP_OBJECT_BIND in Dialect.capabilities()
+
+
 def _target_of(conn) -> _Target:
     from seerdb.client._conn_logic import temp_lobs_available
 
@@ -327,7 +343,8 @@ def _target_of(conn) -> _Target:
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
-        or bool(getattr(conn, '_native11', False)),
+        or bool(getattr(conn, '_native11', False))
+        or _dialect_binds_objects(conn),
         conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
