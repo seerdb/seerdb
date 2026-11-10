@@ -115,6 +115,9 @@ _FV2_UNSUPPORTED = (
     ),
     ('nchar', 'plain str -> NCHAR via 9i DB charset; use DB_TYPE_NCHAR (#174)'),
     ('nclob', '9i national-charset LOB handling deferred (#174)'),
+    ('each_lob_type_round_trips', '9i national-charset LOB handling deferred (#174)'),
+    ('createlob_binds_as_a_lob', '9i national-charset LOB handling deferred (#174)'),
+    ('large_clob_into_xmltype', 'XMLSERIALIZE is a 10g function'),
     # The fixture SELECT ... CONNECT BY LEVEL <= 200 returns only 10 rows on 9i
     # (a 9i CONNECT-BY-against-dual quirk, like the 8i "returns one row"), so it
     # never crosses a fetch boundary here. The fv2 fetch loop itself is fine — a
@@ -553,8 +556,7 @@ _ROWS_RETURNING = _Need(
     rows_returning=True,
 )
 _LOB_VAR_BIND = _Need(
-    'a LOB Var bind needs the 12.1+ OAC and temp-LOB path (#902), or a pooled 11g '
-    'session',
+    'a LOB Var bind needs the 12.1+ OAC and temp-LOB path (#902), or the native form',
     temp_lobs=True,
 )
 _REFCURSOR_IN_BIND = _Need(
@@ -580,7 +582,7 @@ _TIME_ZONE_SYNC = _Need(
     'client time-zone sync is 12c+ (AUTH_ALTER_SESSION)', min_fv=_FV
 )
 _TEMP_LOB = _Need(
-    'a temporary LOB needs a 12c+ server (CREATE_TEMP), or a pooled 11g one',
+    'a temporary LOB needs a 12c+ server (CREATE_TEMP), or the native form',
     temp_lobs=True,
 )
 _END_TO_END = _Need(

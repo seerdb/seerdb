@@ -4652,6 +4652,14 @@ reverse-engineered byte-for-byte and verified on 10g / 11g / 21c / 23ai:
   alias" and "the file is missing" are different answers. 9.2 takes the same
   pointer in its own LOBOPS forms, with no amount (a 9.2 OCI client's request);
   with the pointer clear, the server drops the session.
+- **`CREATE_TEMP`** on 9.2's native form (OCI 9.2's `OCILobCreateTemporary`) is
+  the 9i LOB call at 9.2's widths: the LOB's charset form where a read has its
+  source offset and its type where it has the destination's, the session
+  duration (10) in the destination length, the charset, amount and SCN
+  pointers set, the 86-byte empty locator, then the charset, the duration and a
+  ub4 87. The reply is the new locator in those 86 bytes, the charset and a ub4.
+  A LOB bound by its locator declares flag 1, size 32: without the flag, a NULL
+  one's zero length is taken for a locator (ORA-22275).
 
 - **`FILE_EXISTS`** (op `0x0800`) and **`FILE_ISOPEN`** (`0x0400`) answer with
   the echoed locator **field** and then a ub1 flag. The field is what matters:

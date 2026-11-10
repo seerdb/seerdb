@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
+import os
+import sys
 import unittest
 from functools import reduce
 from unittest.mock import patch
@@ -8061,3 +8063,109 @@ class FileExists9iTest(unittest.TestCase):
         Differ = [At for At, (A, B) in enumerate(zip(Exists, Close)) if A != B]
         self.assertEqual(len(Differ), 2)
         self.assertEqual((Close[Differ[0]], Exists[Differ[0]]), (0, 1))
+
+
+class Oall8NineTempLobTest(unittest.TestCase):
+    # A temporary LOB on a native 9i session, against OCI 9.2's own calls and
+    # the server's answers. The heap addresses a native client writes into its
+    # pointer fields are its own; the server only reads whether they are null.
+    CREATE_POINTERS = ((3, 11), (43, 51), (51, 59), (75, 83))
+
+    @staticmethod
+    def _capture(name):
+        sys.path.insert(0, os.path.dirname(__file__))
+        from replay import load_capture
+
+        return load_capture(name)
+
+    def _masked(self, Data, Spans):
+        Out = bytearray(Data)
+        for Start, End in Spans:
+            Out[Start:End] = b'\xff' * (End - Start)
+        return bytes(Out)
+
+    def test_a_create_is_oci_9_2s(self):
+        from seerdb.common.tns import encode_9i_oall8_create_temp
+
+        Theirs = self._capture('oci92_create_temp.hexdump')
+        Ours = encode_9i_oall8_create_temp(Theirs[2], 112, 1)
+        for Start, End in self.CREATE_POINTERS:
+            self.assertNotEqual(Ours[Start:End], bytes(End - Start))
+        self.assertEqual(
+            self._masked(Ours, self.CREATE_POINTERS),
+            self._masked(Theirs, self.CREATE_POINTERS),
+        )
+
+    def test_its_reply_gives_the_locator(self):
+        from seerdb.common.tns import decode_9i_oall8_create_temp
+
+        (Locator, Rest) = decode_9i_oall8_create_temp(
+            self._capture('oci92_create_temp_reply.hexdump')
+        )
+        self.assertEqual(len(Locator), 84)
+        self.assertEqual(Rest[:1], b'\x04')
+
+    def test_a_null_lob_goes_as_oci_9_2_binds_one(self):
+        # The descriptor's flag 1 and the zero length: without the flag the
+        # server takes the length for a locator and answers ORA-22275. OCI
+        # declares the database's charset, seerdb the session's.
+        from seerdb.common.tns import (
+            O8I_STMT_INSERT,
+            NullLobBind,
+            _encode_9i_bind_oac,
+            encode_9i_oall8_dml,
+            encode_9i_sql_text,
+        )
+
+        Theirs = self._capture('oci92_null_clob_insert.hexdump')
+        Ours = encode_9i_oall8_dml(
+            Theirs[2],
+            encode_9i_sql_text('INSERT INTO zz_null9 VALUES (:1)'),
+            O8I_STMT_INSERT,
+            [NullLobBind(False)],
+        )
+        Descriptor = _encode_9i_bind_oac(NullLobBind(False))
+        At = Theirs.index(bytes.fromhex('01700100'))
+        Expected = bytearray(Theirs[At : At + len(Descriptor)])
+        Expected[29:31] = Descriptor[29:31]  # the charset
+        self.assertEqual(Descriptor, bytes(Expected))
+        self.assertEqual(Ours[-5:], Theirs[-5:])
+        self.assertEqual(Ours[-5:], bytes.fromhex('0700000000'))
+
+    def test_a_lob_out_is_read(self):
+        from seerdb.common.tns import decode_9i_oall8_block_out
+
+        (Values, _, Code, _) = decode_9i_oall8_block_out(
+            self._capture('o9i_clob_out_reply.hexdump'), 1, 1, Lobs=frozenset({0})
+        )
+        self.assertEqual(Code, 0)
+        self.assertEqual(len(Values[0]), 86)
+        (Values, _, Code, _) = decode_9i_oall8_block_out(
+            self._capture('o9i_null_clob_out_reply.hexdump'), 1, 1, Lobs=frozenset({0})
+        )
+        self.assertEqual((Values, Code), ([None], 0))
+
+    def test_an_unset_lob_var_outside_a_block_is_a_null(self):
+        import seerdb
+        from seerdb.client.dialect import Fv2Oall8Dialect
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import O8I_STMT_INSERT
+
+        Dialect = Fv2Oall8Dialect(lambda: 5)
+        Sent = Dialect._encode_dml(
+            b'INSERT INTO t VALUES (:1)', O8I_STMT_INSERT, [Var(seerdb.DB_TYPE_CLOB)]
+        )
+        self.assertEqual(Sent[-5:], bytes.fromhex('0700000000'))
+
+    def test_9i_binds_4000_bytes_into_pl_sql(self):
+        from types import SimpleNamespace
+
+        from seerdb.client._conn_logic import plsql_inline_limit
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2, FIELD_VERSION_12_1
+
+        self.assertEqual(
+            plsql_inline_limit(SimpleNamespace(field_version=FIELD_VERSION_9_2)), 4000
+        )
+        self.assertEqual(
+            plsql_inline_limit(SimpleNamespace(field_version=FIELD_VERSION_12_1)), 32767
+        )

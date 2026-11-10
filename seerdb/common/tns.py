@@ -14960,7 +14960,19 @@ def _encode_9i_oall8(
     return Message
 
 
+_O9I_LOB_BIND_SIZE = 32
+
+
 def _encode_9i_bind_oac(Value: object) -> bytes:
+    Lob = _oci11_lob_bind(Value)
+    if Lob is not None:
+        # A LOB bound by its locator, as OCI 9.2 binds one with an indicator:
+        # flag 1, without which a NULL one's zero length is ORA-22275.
+        if Lob[0] in (TNS_TYPE_BLOB, TNS_TYPE_BFILE):
+            return _native_bind_oac(Lob[0], 1, _O9I_LOB_BIND_SIZE, 0, 0)
+        return _native_bind_oac(
+            TNS_TYPE_CLOB, 1, _O9I_LOB_BIND_SIZE, AL32UTF8_CHARSET, 1
+        )
     (DType, Size, Flag) = _native_bind_type(Value)
     # A national bind declares AL16UTF16 and charset form 2 -- where a native
     # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and its
@@ -15403,6 +15415,11 @@ def _encode_9i_bind_value(Value: object) -> bytes:
     # as invalid UTF-8 and a bound 'é' arrived as NULL (#797).
     from seerdb.common.datatypes import Var
 
+    Lob = _oci11_lob_bind(Value)
+    if Lob is not None:
+        # A LOB bound by its locator, the length ahead of it as a ub4; a NULL
+        # one, the zero length alone.
+        return _OCI.n4(len(Lob[1])) + (_OCI.value(Lob[1]) if Lob[1] else b'')
     if isinstance(Value, Var):
         if not Value.has_value:
             return _O8I_OUT_PLACEHOLDER
@@ -15538,6 +15555,64 @@ def encode_9i_oall8_lobop(
     if Data is not None:
         Out += bytes([TTI_LOB]) + _o7_lob_value(Data)
     return Out
+
+
+# A temporary LOB's creation on a native 9i session, as OCI 9.2's
+# OCILobCreateTemporary makes one: _O7_LOBOPS at 9.2's widths, the LOB's form and
+# type where a read has its offsets, the 86-byte empty locator, then the charset,
+# the duration and a count. Its reply is the new locator in those 86 bytes, the
+# charset, a ub4 and the status.
+_O9I_CREATE_TEMP: wire_schema.Schema = (
+    *_O7_LOBOPS[: _O7_LOBOPS.index(('bytes', 'locator', 'source_length')) + 1],
+    ('n2', 'charset'),
+    ('n4', 'duration'),
+    ('n4', 'count'),
+)
+_O9I_CREATE_TEMP_O9I = wire_schema.compile_encoder(_O9I_CREATE_TEMP, _O9I)
+_O9I_LOCATOR_SPACE = 86
+_O9I_CREATE_TEMP_COUNT = 87
+
+
+def encode_9i_oall8_create_temp(Seq: int, LobType: int, Csfrm: int) -> bytes:
+    """A temporary CLOB (112, form 1), NCLOB (112, 2) or BLOB (113, 0) of the
+    session's duration, on a native 9i session."""
+    Blob = LobType == TNS_TYPE_BLOB
+    return _O9I_CREATE_TEMP_O9I(
+        {
+            'seq': Seq & 0xFF,
+            'token_number': None,
+            'source_present': True,
+            'source_length': _O9I_LOCATOR_SPACE,
+            'dest_present': False,
+            'dest_length': _OCI11_LOB_DURATION_SESSION,
+            'short_source_offset': 0 if Blob else Csfrm,
+            'short_dest_offset': LobType,
+            'charset_present': True,
+            'short_amount_present': True,
+            'null_lob_present': False,
+            'operation': TNS_LOB_OP_CREATE_TEMP,
+            'scn_present': True,
+            'scn_length': 1,
+            'locator': _OCI11_EMPTY_LOCATOR,
+            'charset': 0 if Blob else AL32UTF8_CHARSET,
+            'duration': _OCI11_LOB_DURATION_SESSION,
+            'count': _O9I_CREATE_TEMP_COUNT,
+        }
+    )
+
+
+def decode_9i_oall8_create_temp(Data: bytes) -> tuple[bytes | None, bytes]:
+    """A temporary LOB's creation reply on a native 9i session: (its locator,
+    bare, the status behind it), or (None, the status) for a failure."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, Data)
+    Space = bytes(Data[1 : 1 + _O9I_LOCATOR_SPACE])
+    if len(Space) < _O9I_LOCATOR_SPACE:
+        raise Truncated('9i CREATE_TEMP')
+    Length = int.from_bytes(Space[:2], 'big')
+    if Length + 2 > len(Space):
+        raise DataError(f'9i CREATE_TEMP: a {Length}-byte locator in {len(Space)}')
+    return (Space[2 : 2 + Length], Data[1 + _O9I_LOCATOR_SPACE + 6 :])
 
 
 def decode_9i_oall8_lob_value(Data: bytes, Operation: int) -> tuple[int | None, bytes]:
@@ -15998,7 +16073,11 @@ def _o9i_oall8_refcursor_cell(Data: bytes) -> tuple[tuple[int, list], bytes]:
 
 
 def decode_9i_oall8_block_out(
-    Data: bytes, NumBinds: int, NumOut: int, Cursors: frozenset[int] = frozenset()
+    Data: bytes,
+    NumBinds: int,
+    NumOut: int,
+    Cursors: frozenset[int] = frozenset(),
+    Lobs: frozenset[int] = frozenset(),
 ) -> tuple[list, int, int, str | None]:
     # The OUT / IN OUT values a 9i OALL8 PL/SQL block returns (#794). The reply is
     # the IOV bind prompt, then (when the block writes binds) a TTI_RXD carrying one
@@ -16011,7 +16090,7 @@ def decode_9i_oall8_block_out(
     # A block that fails at run time (a SELECT ... INTO matching nothing) answers
     # with the bare status, no IOV: skipping the IOV's length there landed past the
     # status and read the error as success.
-    (OutValues, Rest) = _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors)
+    (OutValues, Rest) = _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors, Lobs)
     # `Rest` now sits on the RPA + OER, so read the status from there rather than
     # rescanning `Data` from the start -- the IOV and the OUT RXD hold value bytes
     # that collide with the OER token, which a from-the-start scan can land on
@@ -16021,7 +16100,11 @@ def decode_9i_oall8_block_out(
 
 
 def decode_9i_oall8_block_cursor(
-    Data: bytes, NumBinds: int, NumOut: int = 0, Cursors: frozenset[int] = frozenset()
+    Data: bytes,
+    NumBinds: int,
+    NumOut: int = 0,
+    Cursors: frozenset[int] = frozenset(),
+    Lobs: frozenset[int] = frozenset(),
 ) -> int:
     # The cursor a 9i OALL8 block reply's status names, for the close that follows
     # (#798), read past the IOV and the OUT values as decode_9i_oall8_block_out
@@ -16029,12 +16112,28 @@ def decode_9i_oall8_block_cursor(
     # IOV, and closing that bogus cursor (256) drew ORA-00600 [12209] and lost the
     # session.
     return decode_9i_oall8_cursor_id(
-        _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors)[1]
+        _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors, Lobs)[1]
     )
 
 
+# A LOB's OUT value on a native 9i session: the locator's length as a ub4, the
+# locator as a value (none for a NULL, its length 0), then the indicator and the
+# return code.
+_O9I_OUT_LOB: wire_schema.Schema = (
+    ('n4', 'length'),
+    ('when', 'length', (('value', 'locator'),)),
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
+_O9I_OUT_LOB_FROM_O9I = wire_schema.compile_decoder(_O9I_OUT_LOB, _O9I)
+
+
 def _o9i_oall8_block_parts(
-    Data: bytes, NumBinds: int, NumOut: int, Cursors: frozenset[int]
+    Data: bytes,
+    NumBinds: int,
+    NumOut: int,
+    Cursors: frozenset[int],
+    Lobs: frozenset[int] = frozenset(),
 ) -> tuple[list, bytes]:
     # A 9i OALL8 block reply's OUT values, and the bytes after them -- the RPA and
     # the status (decode_9i_oall8_block_out).
@@ -16046,6 +16145,12 @@ def _o9i_oall8_block_parts(
         Rest = Rest[1:]
         for Index in range(NumOut):
             Length = Rest[0]
+            if Index in Lobs and Length != 0xFF:
+                # A NULL comes back as the empty locator, its body all zero.
+                (Cell, Rest) = _O9I_OUT_LOB_FROM_O9I(Rest)
+                Locator = bytes(Cell['locator']) if Cell['length'] else b''
+                OutValues.append(Locator if any(Locator[2:]) else None)
+                continue
             if Index in Cursors and Length not in (0, 0xFF):
                 # A REF CURSOR: (cursor id, columns), its rows still to fetch.
                 (Opened, Rest) = _o9i_oall8_refcursor_cell(Rest)

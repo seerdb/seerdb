@@ -1199,6 +1199,14 @@ def dialect_scrolls(Dialect) -> 'TypeGuard[Oci11Dialect]':
     return Dialect is not None and CAP_SCROLL in Dialect.capabilities()
 
 
+def plsql_inline_limit(Conn) -> int:
+    """The most bytes of a str or bytes bound into PL/SQL as itself; past it a
+    session that can make one binds a temporary LOB (#91). 9i binds 4000."""
+    from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+    return 4000 if getattr(Conn, 'field_version', 0) < FIELD_VERSION_10_2 else 32767
+
+
 def temp_lobs_available(Conn) -> bool:
     """Whether the connection can make a temporary LOB to bind: 12c+, or a
     dialect that makes one itself."""
