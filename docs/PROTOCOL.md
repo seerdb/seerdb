@@ -2127,6 +2127,13 @@ call as malformed (`ORA-03137 [12316]`):
    other 12c+ execute carries real SQL (the statement cache is disabled on 12c+,
    so there are no empty-query re-executes elsewhere).
 
+**The native form's re-execute** (#2535) is no OALL8 at all. OCI 9.2 and 11.2
+re-execute a statement handle with TTI function 4: the cursor, the iteration
+count (1) and the options (0) as ub4s, then TTI_RXD and the bind values, with no
+SQL and no bind descriptors, and nothing behind the head for a statement
+without binds. OCI 11.2 adds a second option word, to 10g as to 11g; 9.2 has
+none. The reply is the status alone, its row count the call's.
+
 The response echoes the cursor's **cumulative row position** in the OER
 `rowcount` field — the absolute row number of the last row in the batch. The
 client places its buffer window from it: `buffer_min = rowcount − batch_len + 1`

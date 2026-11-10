@@ -104,6 +104,7 @@ from seerdb.common.tns import (
     encode_9i_oall8_lob_read,
     encode_9i_oall8_lobop,
     encode_9i_oall8_query,
+    encode_9i_oall8_reexecute,
     encode_9i_sql_text,
     encode_flush_echo,
     encode_o7_bfile_close,
@@ -133,6 +134,7 @@ from seerdb.common.tns import (
     encode_oci11_lobop,
     encode_oci11_long_fetch,
     encode_oci11_ping,
+    encode_oci11_reexecute,
     encode_oci11_scroll_fetch,
     encode_oci11_tpc_change_state,
     encode_oci11_tpc_switch,
@@ -783,6 +785,41 @@ class Oall8Dialect:
         return
         yield  # unreachable -- makes this a generator, as the protocol has it
 
+    # --- the native form's cursor cache (#2535), for the dialects that keep one:
+    # a reusable DML's cursor stays open, keyed as the other forms key it, and
+    # is re-executed by id; DDL and a PL/SQL block close them all, a failed
+    # execute closes its own, and past the cap the oldest is closed.
+    _caches_cursors = False
+
+    def _cache_key(self, sql, bind, batch, batcherrors, cache):
+        if cache is None or not self._caches_cursors:
+            return None
+        if not is_reusable_dml(sql):
+            self._close_cached(cache)
+            return None
+        return _fv2_cache_key(sql, bind, batch, batcherrors)
+
+    def _close_cached(self, cache: dict) -> None:
+        self._to_close.extend(cache.values())
+        cache.clear()
+
+    def _cache_keep(self, cache, key, cursor: int, failed: bool) -> None:
+        cache.pop(key, None)
+        if failed or not cursor:
+            self._finished(cursor)
+            return
+        cache[key] = cursor
+        while len(cache) > _FV2_CURSOR_CACHE_MAX:
+            self._finished(cache.pop(next(iter(cache))))
+
+    def _flush_native_cache(self, cache: dict):
+        # Close every cached cursor with the next call: a PL/SQL block may
+        # invalidate them, as DDL does (#720).
+        if self._caches_cursors and cache:
+            self._close_cached(cache)
+        return
+        yield  # unreachable -- makes this a generator, as the protocol has it
+
     # --- the per-version hooks (#798): 8i's here, 9.2's in Fv2Oall8Dialect. The
     # call sequences below are shared; only what goes on the wire differs.
     _wire = '8i'
@@ -1229,6 +1266,11 @@ class Fv2Oall8Dialect(Oall8Dialect):
     Synchronous only, and no cursor cache. Not yet: nested cursors (CURSOR()
     columns) and object / collection types."""
 
+    _caches_cursors = True
+
+    def flush_cursors(self, cache: dict):
+        return self._flush_native_cache(cache)
+
     def _clob_charset(self, column: dict) -> int:
         # The native OALL8 session is AL32UTF8 like the compact 9i one, so its
         # CLOB text is too (#2383), not the 8i base's Latin-1.
@@ -1478,24 +1520,31 @@ class Fv2Oall8Dialect(Oall8Dialect):
         # count a ub4 at offset 6). Scalar binds ride the request (byte-verified).
         # An executemany's further rows ride the same call (#798), and the count
         # is then the whole batch's; in `batcherrors` mode the server applies the
-        # good rows and lists the failures. No cursor cache. (Autocommit is applied
-        # by the caller.)
+        # good rows and lists the failures. A reusable DML's cursor is cached and
+        # re-executed by id, as OCI 9.2 re-executes a statement handle (#2535).
+        # (Autocommit is applied by the caller.)
         stmt_type = o8i_stmt_type(sql.strip().upper())
-        yield Send(
-            self._closing()
-            + encode_9i_oall8_dml(
+        key = self._cache_key(sql, bind, batch, batcherrors, cache)
+        cached = cache.get(key, 0) if cache is not None and key is not None else 0
+        bind = Oci11Dialect._null_lobs(bind)
+        # The close piggyback takes its sequence number before the call does.
+        closing = self._closing()
+        if cached:
+            request = encode_9i_oall8_reexecute(self._next_seq(), cached, bind)
+        else:
+            request = encode_9i_oall8_dml(
                 self._next_seq(),
                 encode_9i_sql_text(sql),
                 stmt_type,
-                Oci11Dialect._null_lobs(bind),
+                bind,
                 [Oci11Dialect._null_lobs(row) or [] for row in batch]
                 if batch
                 else batch,
                 batcherrors,
             )
-        )
+        yield Send(closing + request)
         buf = yield from self._recv_terminal('DML')
-        self._finished(decode_9i_oall8_cursor_id(buf))  # closed with the next call
+        cursor = cached or decode_9i_oall8_cursor_id(buf)
         # The error comes back in the result, as on the compact path, so the
         # cursor reports what the call managed: the rows a batch applied before a
         # failing one, and none for a statement that failed outright -- raised
@@ -1504,6 +1553,10 @@ class Fv2Oall8Dialect(Oall8Dialect):
         (row_count, err_code, message) = decode_9i_oall8_dml_response(
             buf, Applied=bool(batch)
         )
+        if key is not None and cache is not None:
+            self._cache_keep(cache, key, cursor, failed=bool(err_code))
+        else:
+            self._finished(cursor)  # closed with the next call
         rowid = None if err_code else decode_9i_oall8_dml_rowid(buf)  # #1079
         batch_errors = decode_9i_oall8_batch_errors(buf) if batcherrors else []
         # Where the error is (#2263), and the warning a CREATE that compiled with
@@ -1672,8 +1725,12 @@ class Oci11Dialect(Oall8Dialect):
         take_app_context: Callable[[], dict] | None = None,
         field_version: int = FIELD_VERSION_11_2,
         take_end_to_end: Callable[[], dict] | None = None,
+        caches_cursors: bool = False,
     ) -> None:
         super().__init__(next_seq)
+        # A dedicated session caches its DML cursors (#2535); a pooled one
+        # does not, the server session behind it changing between calls.
+        self._caches_cursors = caches_cursors
         # Hands over the end-to-end tracing attributes changed since the last
         # call, and forgets them.
         self._take_end_to_end = take_end_to_end
@@ -1872,6 +1929,9 @@ class Oci11Dialect(Oall8Dialect):
                 frames += encode_oci11_end_to_end(self._next_seq(), attrs)
         return frames
 
+    def flush_cursors(self, cache: dict):
+        return self._flush_native_cache(cache)
+
     def _status(self, reply: bytes, executed: bool = True) -> dict:
         status = decode_oci11_status(self._session_return(reply), executed)
         if self._on_call_status is not None:
@@ -2036,9 +2096,16 @@ class Oci11Dialect(Oall8Dialect):
         self._check_binds(bind)
         for row in batch or []:
             self._check_binds(row)
-        yield Send(
-            self._closing()
-            + encode_oci11_execute(
+        # A reusable DML's cursor is cached and re-executed by id, as OCI 11.2
+        # re-executes a statement handle (#2535).
+        key = self._cache_key(sql, bind, batch, batcherrors, cache)
+        cached = cache.get(key, 0) if cache is not None and key is not None else 0
+        # The close piggyback takes its sequence number before the call does.
+        closing = self._closing()
+        if cached:
+            request = encode_oci11_reexecute(self._next_seq(), cached, bind)
+        else:
+            request = encode_oci11_execute(
                 self._next_seq(),
                 self._sql_text(sql),
                 stmt_type,
@@ -2048,11 +2115,15 @@ class Oci11Dialect(Oall8Dialect):
                 batcherrors,
                 FieldVersion=self._fv,
             )
-        )
+        yield Send(closing + request)
         buf = yield from self._recv_terminal('DML')
         status = self._status(buf)
-        self._finished(status.get('cursor', 0))
+        cursor = cached or status.get('cursor', 0)
         err_code = status.get('error_code', 0)
+        if key is not None and cache is not None:
+            self._cache_keep(cache, key, cursor, failed=bool(err_code))
+        else:
+            self._finished(cursor)
         applied = status.get('row_kind', 0)
         # A batch's count is the rows it applied, a failing one's too, and the
         # row it failed at is its error's offset, as python-oracledb reports it;

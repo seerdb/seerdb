@@ -217,22 +217,16 @@ _8I_UNSUPPORTED = (
 
 # What the experimental 9i OALL8 opt-in (SEERDB_TEST_OALL8, #798) lacks by design,
 # as 8i does: a cursor cache. Its open gaps are left to fail.
-_OALL8_UNSUPPORTED = tuple(
-    (Pattern, 'the 9i OALL8 opt-in keeps no cursor cache, as 8i (#2261)')
+# What a pooled 11g session in the native form (#2466) lacks by design: a cursor
+# cache, the server session behind it changing between calls (#2535).
+_NATIVE11_UNSUPPORTED = tuple(
+    (Pattern, 'a pooled 11g session keeps no cursor cache (#2535)')
     for Pattern in (
         'cache_evicts',
         'reuses_cursor',
         'forgets_the_cached',
         'never_cached',
     )
-)
-
-
-# What a pooled 11g session in the native form (#2466) lacks by design, as the
-# 9i OALL8 opt-in and 8i do: a cursor cache. Its open gaps are left to fail.
-_NATIVE11_UNSUPPORTED = tuple(
-    (Pattern, 'a pooled 11g session keeps no cursor cache, as 8i and 9i OALL8 (#2466)')
-    for (Pattern, _) in _OALL8_UNSUPPORTED
 )
 
 
@@ -1048,9 +1042,17 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
         # not run, so we must not leak the connection (a leak on the slow 9i VM
         # piles up sessions).
         if getattr(self.conn, '_native11', False):
-            Reason = next(
-                (R for (P, R) in _NATIVE11_UNSUPPORTED if P in self._testMethodName),
-                None,
+            Reason = (
+                next(
+                    (
+                        R
+                        for (P, R) in _NATIVE11_UNSUPPORTED
+                        if P in self._testMethodName
+                    ),
+                    None,
+                )
+                if getattr(self.conn, 'server_type', None) == 'pooled'
+                else None
             )
             if Reason is not None:
                 self.conn.close()
@@ -1062,10 +1064,6 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
         if Reason is None and _conn_is_8i(self.conn):
             # 8i is fv2 too but lacks more than 9i; layer its extra skips on top.
             Reason = _8i_skip_reason(self._testMethodName)
-        if Reason is None and _FV_KW.get('oall8'):
-            Reason = next(
-                (R for (P, R) in _OALL8_UNSUPPORTED if P in self._testMethodName), None
-            )
         if Reason is not None:
             self.conn.close()
             self.skipTest(Reason)
