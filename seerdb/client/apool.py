@@ -22,9 +22,10 @@ Usage:
 """
 
 import asyncio
+import inspect
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 from seerdb.client.aconnection import AsyncOracleConnect
 from seerdb.client.pool import (
@@ -32,6 +33,7 @@ from seerdb.client.pool import (
     _PoolEntry,
     _PoolPolicy,
     apply_drcp_pool_defaults,
+    check_session_callback,
     drcp_pool_class,
 )
 from seerdb.common.exceptions import InterfaceError
@@ -80,6 +82,7 @@ class AsyncPool:
         ping_interval: float | None = None,
         max_lifetime_session: float = 0,
         max_idle_session: float = 0,
+        session_callback: Callable[..., Any] | None = None,
         **connect_kwargs,
     ):
         self._policy = _PoolPolicy(
@@ -95,6 +98,7 @@ class AsyncPool:
             max_lifetime_session,
             max_idle_session,
         )
+        self._session_callback = check_session_callback(session_callback)
         self._connect_kwargs = connect_kwargs
         # The connection class this pool's DRCP sessions share (#2006).
         self._drcp_class = drcp_pool_class()
@@ -312,7 +316,28 @@ class AsyncPool:
             else:
                 continue
             Conn._begin_request()  # request boundary (#464)
+            await self._run_session_callback(Conn)
             return Conn
+
+    async def _run_session_callback(self, Conn: AsyncOracleConnect) -> None:
+        """Run the session callback the first time `Conn` is handed out, as
+        python-oracledb does, with no tag requested; awaited when it returns an
+        awaitable. If it raises, the connection goes back and the next caller
+        to get it runs the callback again."""
+        Callback = self._session_callback
+        if Callback is None:
+            return
+        Entry = self._in_use.get(id(Conn))
+        if Entry is None or not Entry.needs_callback:
+            return
+        try:
+            Result = Callback(Conn, None)
+            if inspect.isawaitable(Result):
+                await Result
+        except BaseException:
+            await self.release(Conn)
+            raise
+        Entry.needs_callback = False
 
     async def _claim(
         self, deadline: float | None

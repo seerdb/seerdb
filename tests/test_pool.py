@@ -460,5 +460,73 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(slow, 5)
 
 
+class TestSessionCallback(unittest.TestCase):
+    def test_it_runs_once_a_connection_when_first_handed_out(self):
+        calls = []
+        pool = FakePool(
+            min=2, max=2, session_callback=lambda c, t: calls.append((c, t))
+        )
+        self.assertEqual(calls, [])  # not when the pool opens them
+        first = pool.acquire()
+        self.assertEqual(calls, [(first._conn, None)])
+        pool.release(first._conn)
+        again = pool.acquire()
+        other = pool.acquire()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({c for (c, _) in calls}, {again._conn, other._conn})
+
+    def test_a_failure_hands_the_connection_back_and_runs_again(self):
+        calls = []
+
+        def callback(conn, tag):
+            calls.append(conn)
+            if len(calls) == 1:
+                raise RuntimeError('boom')
+
+        pool = FakePool(min=1, max=1, session_callback=callback)
+        with self.assertRaisesRegex(RuntimeError, 'boom'):
+            pool.acquire()
+        self.assertEqual(pool.busy, 0)
+        guard = pool.acquire()
+        self.assertEqual(calls, [guard._conn, guard._conn])
+        pool.release(guard._conn)
+        pool.acquire()
+        self.assertEqual(len(calls), 2)
+
+    def test_it_must_be_callable(self):
+        with self.assertRaisesRegex(TypeError, 'session_callback'):
+            FakePool(min=0, max=1, session_callback='PKG.SETUP')
+
+
+class TestAsyncSessionCallback(unittest.IsolatedAsyncioTestCase):
+    async def test_a_coroutine_is_awaited_once_a_connection(self):
+        calls = []
+
+        async def callback(conn, tag):
+            calls.append((conn, tag))
+
+        pool = AsyncFakePool(min=1, max=1, session_callback=callback)
+        first = await pool._acquire_one()
+        self.assertEqual(calls, [(first, None)])
+        await pool.release(first)
+        await pool.release(await pool._acquire_one())
+        self.assertEqual(len(calls), 1)
+
+    async def test_a_plain_function_runs_too_and_a_failure_hands_it_back(self):
+        calls = []
+
+        def callback(conn, tag):
+            calls.append(conn)
+            if len(calls) == 1:
+                raise RuntimeError('boom')
+
+        pool = AsyncFakePool(min=1, max=1, session_callback=callback)
+        with self.assertRaisesRegex(RuntimeError, 'boom'):
+            await pool._acquire_one()
+        self.assertEqual(pool.busy, 0)
+        conn = await pool._acquire_one()
+        self.assertEqual(calls, [conn, conn])
+
+
 if __name__ == '__main__':
     unittest.main()
