@@ -9132,6 +9132,20 @@ class PoolIntegration(_ThrottleRetry, unittest.TestCase):
         finally:
             pool.close()
 
+    def test_a_named_pool_hands_out_by_its_alias(self):
+        pool = seerdb.create_pool(min=1, max=1, pool_alias='live', **self._kwargs())
+        try:
+            self.assertIs(seerdb.get_pool('live'), pool)
+            with seerdb.connect(pool_alias='live') as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(cur.fetchone(), (1,))
+                self.assertEqual(pool.busy, 1)
+            self.assertEqual(pool.busy, 0)
+        finally:
+            pool.close()
+        self.assertIsNone(seerdb.get_pool('live'))
+
     def test_reconfigure_resizes_a_live_pool(self):
         Pool = seerdb.create_pool(min=1, max=3, **self._kwargs())
         try:
@@ -14516,6 +14530,21 @@ class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls, [None])
         finally:
             await pool.close()
+
+    async def test_a_named_pool_hands_out_by_its_alias(self):
+        pool = await seerdb.create_pool_async(
+            min=1, max=1, pool_alias='alive', **self._kwargs()
+        )
+        try:
+            async with await seerdb.connect_async(pool_alias='alive') as conn:
+                cur = conn.cursor()
+                await cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(await cur.fetchone(), (1,))
+                self.assertEqual(pool.busy, 1)
+            self.assertEqual(pool.busy, 0)
+        finally:
+            await pool.close()
+        self.assertIsNone(seerdb.get_pool('alive'))
 
     async def test_reconfigure_resizes_a_live_pool(self):
         Pool = await seerdb.create_pool_async(min=1, max=3, **self._kwargs())

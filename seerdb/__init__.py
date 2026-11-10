@@ -9,7 +9,7 @@ paramstyle = 'named'  # bind variables not yet wired through Cursor
 from typing import TYPE_CHECKING
 
 from seerdb.client.aconnection import AsyncOracleConnect
-from seerdb.client.apool import AsyncPool
+from seerdb.client.apool import AsyncPool, AsyncPooledConnection
 from seerdb.client.aq import DeqOptions, EnqOptions, MessageProperties, Queue
 from seerdb.client.connection import OracleConnect, Xid
 from seerdb.client.cursor import FetchInfo
@@ -28,6 +28,11 @@ from seerdb.client.pool import (
     POOL_GETMODE_TIMEDWAIT,
     POOL_GETMODE_WAIT,
     Pool,
+    PooledConnection,
+    get_pool,
+    named_pool,
+    settle_pool_alias,
+    take_pool_alias,
 )
 from seerdb.client.sqlnames import enquote_literal, enquote_name, is_simple_sql_name
 from seerdb.common.datatypes import (
@@ -117,33 +122,66 @@ if TYPE_CHECKING:
     from seerdb.server import Server, serve  # noqa: F401 (runtime: __getattr__)
 
 
-def connect(*args, **kwargs) -> OracleConnect:
-    """PEP 249 connect() factory. Returns a connected OracleConnect."""
+def _alias_only(pool_alias: str, args: tuple, kwargs: dict) -> None:
+    # A connection from a named pool takes the pool's settings: anything else
+    # given would be ignored, so it is refused. python-oracledb ignores it.
+    if args or kwargs:
+        raise ProgrammingError(
+            'connect(pool_alias=...) takes no other arguments: the pool '
+            f'"{pool_alias}" sets them'
+        )
+
+
+def connect(*args, pool_alias: str | None = None, **kwargs):
+    """PEP 249 connect() factory. Returns a connected OracleConnect.
+
+    With ``pool_alias``, takes a connection from the pool created with that
+    alias instead (#2459): its `close()` hands it back to the pool."""
+    if pool_alias is not None:
+        _alias_only(pool_alias, args, kwargs)
+        Named = named_pool(pool_alias, Pool)
+        return PooledConnection(Named, Named.acquire()._conn)
     Conn = OracleConnect(*args, **kwargs)
     Conn.connect()
     return Conn
 
 
-async def connect_async(*args, **kwargs) -> AsyncOracleConnect:
+async def connect_async(*args, pool_alias: str | None = None, **kwargs):
     """Async counterpart to `connect()`. Returns a connected
-    `AsyncOracleConnect`. Same constructor arguments as `connect`."""
+    `AsyncOracleConnect`. Same constructor arguments as `connect`, and
+    ``pool_alias`` takes a connection from a named `AsyncPool`."""
+    if pool_alias is not None:
+        _alias_only(pool_alias, args, kwargs)
+        Named = named_pool(pool_alias, AsyncPool)
+        return AsyncPooledConnection(Named, await Named._acquire_one())
     Conn = AsyncOracleConnect(*args, **kwargs)
     await Conn.connect()
     return Conn
 
 
-async def create_pool_async(*args, **kwargs) -> AsyncPool:
+async def create_pool_async(
+    *args, pool_alias: str | None = None, **kwargs
+) -> AsyncPool:
     """Create an `AsyncPool` and pre-warm `min` connections.
 
     Same keyword arguments as `create_pool` (plus the regular
     `seerdb.connect()` kwargs forwarded to each pooled connection).
     """
-    Pool_ = AsyncPool(*args, **kwargs)
-    await Pool_.prewarm()
+    if pool_alias is not None:
+        take_pool_alias(pool_alias)
+    try:
+        Pool_ = AsyncPool(*args, **kwargs)
+        await Pool_.prewarm()
+    except BaseException:
+        if pool_alias is not None:
+            settle_pool_alias(pool_alias, None)
+        raise
+    if pool_alias is not None:
+        settle_pool_alias(pool_alias, Pool_)
     return Pool_
 
 
-def create_pool(*args, **kwargs) -> Pool:
+def create_pool(*args, pool_alias: str | None = None, **kwargs) -> Pool:
     """Create a `Pool` of authenticated connections.
 
     All `seerdb.connect()` keyword arguments are accepted and forwarded
@@ -180,8 +218,21 @@ def create_pool(*args, **kwargs) -> Pool:
         raises, the connection goes back to the pool and the next caller to
         get it runs the callback again. The second argument is the requested
         tag, which seerdb does not have.
+      - ``pool_alias``: a name `seerdb.get_pool()` returns the pool by, and
+        `seerdb.connect(pool_alias=...)` takes a connection from it with.
+        Closing the pool frees the name.
     """
-    return Pool(*args, **kwargs)
+    if pool_alias is not None:
+        take_pool_alias(pool_alias)
+    try:
+        Pool_ = Pool(*args, **kwargs)
+    except BaseException:
+        if pool_alias is not None:
+            settle_pool_alias(pool_alias, None)
+        raise
+    if pool_alias is not None:
+        settle_pool_alias(pool_alias, Pool_)
+    return Pool_
 
 
 # The Mirror server API (`seerdb.serve` / `seerdb.Server`) is resolved on first
@@ -211,6 +262,7 @@ __all__ = [
     'POOL_GETMODE_WAIT',
     'create_pool',
     'create_pool_async',
+    'get_pool',
     'OracleConnect',
     'AsyncOracleConnect',
     'Pool',

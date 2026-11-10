@@ -35,6 +35,7 @@ from seerdb.client.pool import (
     apply_drcp_pool_defaults,
     check_session_callback,
     drcp_pool_class,
+    forget_pool,
 )
 from seerdb.common.exceptions import InterfaceError
 
@@ -221,6 +222,7 @@ class AsyncPool:
         """Close every free connection and mark the pool closed.
         Connections still checked out get closed when their caller
         releases them."""
+        forget_pool(self)
         cond = self._ensure_sync_primitives()
         async with cond:
             self._closed = True
@@ -454,6 +456,42 @@ class AsyncPool:
     async def _discard_all(self, conns: list[AsyncOracleConnect]) -> None:
         for Conn in conns:
             await self._discard_dead(Conn)
+
+
+class AsyncPooledConnection:
+    """A connection `seerdb.connect_async(pool_alias=...)` took from a named
+    pool: the connection to use, and `close()`, or leaving an `async with`
+    block, hands it back to the pool."""
+
+    __slots__ = ('_pool', '_conn')
+
+    def __init__(self, pool: AsyncPool, conn: AsyncOracleConnect):
+        object.__setattr__(self, '_pool', pool)
+        object.__setattr__(self, '_conn', conn)
+
+    def _connection(self) -> AsyncOracleConnect:
+        Conn = object.__getattribute__(self, '_conn')
+        if Conn is None:
+            raise InterfaceError('connection was returned to its pool')
+        return Conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._connection(), name, value)
+
+    async def close(self) -> None:
+        Conn = object.__getattribute__(self, '_conn')
+        if Conn is not None:
+            object.__setattr__(self, '_conn', None)
+            await object.__getattribute__(self, '_pool').release(Conn)
+
+    async def __aenter__(self) -> 'AsyncPooledConnection':
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
 
 
 class _AcquireContext:
