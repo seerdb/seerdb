@@ -4188,6 +4188,17 @@ def _bind_vars(request: ExecRequest) -> list:
         return request.binds
     block = is_plsql(request.sql)
     arrays = request.bind_arrays or [0] * len(request.binds)
+    values = list(request.binds)
+    if block:
+        # A bind the block only writes is OUT, and Oracle never reads what the
+        # client sent for it: one the block leaves unassigned comes back NULL,
+        # not as it went in (#2453). Every use being a write, the backend loses
+        # nothing by getting NULL. A PL/SQL array keeps its value.
+        for at, direction in enumerate(
+            plsql_bind_directions(request.sql, len(values)) or ()
+        ):
+            if direction == 'OUT' and not arrays[at]:
+                values[at] = None
     # The per-bind type OID (an object / REF bind carries it in the OAC) rides on
     # bind_types as the 4th field; thread it so an object OUT / typed-NULL bind
     # keeps its type identity even when its value is None (#888).
@@ -4213,7 +4224,7 @@ def _bind_vars(request: ExecRequest) -> list:
         if type(value) is str and tns_type in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR)
         else value
         for value, (tns_type, size), capacity, csfrm, toid in zip(
-            request.binds, request.bind_meta, arrays, forms, toids
+            values, request.bind_meta, arrays, forms, toids
         )
     ]
 
