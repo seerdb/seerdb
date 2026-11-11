@@ -28,7 +28,6 @@ from seerdb.client.pool import (
     POOL_GETMODE_TIMEDWAIT,
     POOL_GETMODE_WAIT,
     Pool,
-    PooledConnection,
     get_pool,
     named_pool,
     settle_pool_alias,
@@ -140,7 +139,7 @@ def connect(*args, pool_alias: str | None = None, **kwargs):
     if pool_alias is not None:
         _alias_only(pool_alias, args, kwargs)
         Named = named_pool(pool_alias, Pool)
-        return PooledConnection(Named, Named.acquire()._conn)
+        return Named.acquire()
     Conn = OracleConnect(*args, **kwargs)
     Conn.connect()
     return Conn

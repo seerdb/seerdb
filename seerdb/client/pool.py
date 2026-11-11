@@ -185,31 +185,15 @@ class _PoolPolicy:
         return Limit > 0 and now - entry.released_at >= Limit
 
 
-class _PooledConnectionGuard:
-    """Context manager returned by Pool.acquire(). Releases on exit."""
-
-    __slots__ = ('_pool', '_conn')
-
-    def __init__(self, pool: 'Pool', conn: OracleConnect):
-        self._pool = pool
-        self._conn = conn
-
-    def __enter__(self) -> OracleConnect:
-        return self._conn
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        # Release whether or not the user's block raised; if the underlying
-        # connection got into a bad state the next acquire's health-check
-        # will catch it and discard the entry.
-        self._pool.release(self._conn)
-
-
 class PooledConnection:
-    """A connection `seerdb.connect(pool_alias=...)` took from a named pool.
+    """A connection taken from a pool, by `Pool.acquire()` or by
+    `seerdb.connect(pool_alias=...)`.
 
-    It is the connection to use, and `close()`, or leaving a `with` block,
-    hands it back to the pool rather than closing it, as python-oracledb's
-    pooled connection does."""
+    It is the connection to use, and `close()`, `Pool.release()`, or leaving a
+    `with` block hands it back to the pool rather than closing it, as
+    python-oracledb's pooled connection does (#2555). Leaving the block
+    releases it whether or not the block raised; a connection left in a bad
+    state is caught by the next acquire's health check."""
 
     __slots__ = ('_pool', '_conn')
 
@@ -378,9 +362,9 @@ class Pool:
 
     # ----- public API -----
 
-    def acquire(self) -> _PooledConnectionGuard:
-        """Get a connection from the pool. Returns a context manager
-        that releases on __exit__."""
+    def acquire(self) -> PooledConnection:
+        """Get a connection from the pool: the connection itself, which
+        `close()`, `release()` or leaving a `with` block hands back."""
         Deadline = self._policy.deadline(time.monotonic())
         while True:
             Entry, Reserved, Retired = self._claim(Deadline)
@@ -393,12 +377,17 @@ class Pool:
                 continue
             Conn._begin_request()  # request boundary (#464)
             self._run_session_callback(Conn)
-            return _PooledConnectionGuard(self, Conn)
+            return PooledConnection(self, Conn)
 
-    def release(self, conn: OracleConnect) -> None:
+    def release(self, conn: 'OracleConnect | PooledConnection') -> None:
         """Return a connection to the pool. Idempotent on already-released
         connections (a misbehaving caller releasing twice doesn't break
         accounting). Connections not produced by this pool are rejected."""
+        if isinstance(conn, PooledConnection):
+            if object.__getattribute__(conn, '_pool') is not self:
+                raise InterfaceError('connection was not acquired from this pool')
+            conn.close()
+            return
         Retired: list[OracleConnect] = []
         with self._available:
             Entry = self._in_use.pop(id(conn), None)

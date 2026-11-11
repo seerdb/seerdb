@@ -25,6 +25,7 @@ import asyncio
 import inspect
 import time
 from collections import deque
+from collections.abc import Generator
 from typing import Any, Callable
 
 from seerdb.client.aconnection import AsyncOracleConnect
@@ -38,23 +39,6 @@ from seerdb.client.pool import (
     forget_pool,
 )
 from seerdb.common.exceptions import InterfaceError
-
-
-class _AsyncPooledConnectionGuard:
-    """Async context manager returned by `AsyncPool.acquire()`.
-    Releases on `__aexit__` even if the user's block raised."""
-
-    __slots__ = ('_pool', '_conn')
-
-    def __init__(self, pool: 'AsyncPool', conn: AsyncOracleConnect):
-        self._pool = pool
-        self._conn = conn
-
-    async def __aenter__(self) -> AsyncOracleConnect:
-        return self._conn
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self._pool.release(self._conn)
 
 
 class AsyncPool:
@@ -131,17 +115,26 @@ class AsyncPool:
                 self._free.append(_PoolEntry(Conn))
 
     def acquire(self) -> '_AcquireContext':
-        """Return an async context manager that yields a free
-        connection (or opens a fresh one, up to `max`). Use as:
+        """A free connection (or a fresh one, up to `max`), awaited or
+        entered, as python-oracledb's (#2555):
+
+            conn = await pool.acquire()
+            ...
+            await conn.close()          # or: await pool.release(conn)
 
             async with pool.acquire() as conn:
                 ...
         """
         return _AcquireContext(self)
 
-    async def release(self, conn: AsyncOracleConnect) -> None:
+    async def release(self, conn: 'AsyncOracleConnect | AsyncPooledConnection') -> None:
         """Return a connection to the pool. Idempotent; releasing a
         connection not produced by this pool raises InterfaceError."""
+        if isinstance(conn, AsyncPooledConnection):
+            if object.__getattribute__(conn, '_pool') is not self:
+                raise InterfaceError('connection was not acquired from this pool')
+            await conn.close()
+            return
         cond = self._ensure_sync_primitives()
         Retired: list[AsyncOracleConnect] = []
         async with cond:
@@ -459,9 +452,10 @@ class AsyncPool:
 
 
 class AsyncPooledConnection:
-    """A connection `seerdb.connect_async(pool_alias=...)` took from a named
-    pool: the connection to use, and `close()`, or leaving an `async with`
-    block, hands it back to the pool."""
+    """A connection taken from a pool, by `AsyncPool.acquire()` or by
+    `seerdb.connect_async(pool_alias=...)`: the connection to use, and
+    `close()`, `AsyncPool.release()`, or leaving an `async with` block hands
+    it back to the pool (#2555)."""
 
     __slots__ = ('_pool', '_conn')
 
@@ -508,13 +502,19 @@ class _AcquireContext:
 
     def __init__(self, pool: AsyncPool):
         self._pool = pool
-        self._conn: AsyncOracleConnect | None = None
+        self._conn: AsyncPooledConnection | None = None
 
-    async def __aenter__(self) -> AsyncOracleConnect:
-        self._conn = await self._pool._acquire_one()
+    async def _take(self) -> AsyncPooledConnection:
+        return AsyncPooledConnection(self._pool, await self._pool._acquire_one())
+
+    def __await__(self) -> Generator[Any, None, AsyncPooledConnection]:
+        return self._take().__await__()
+
+    async def __aenter__(self) -> AsyncPooledConnection:
+        self._conn = await self._take()
         return self._conn
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._conn is not None:
-            await self._pool.release(self._conn)
+            await self._conn.close()
             self._conn = None
