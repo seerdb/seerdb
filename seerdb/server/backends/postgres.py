@@ -21961,22 +21961,19 @@ class PostgresBackend:
                 values[slot] = (
                     None if text is None else _block_bind_value(pg_type, text)
                 )
-            elif (
-                text
-                and self._conn.execute(
-                    'SELECT 1 FROM pg_cursors WHERE name = %s', (text,)
-                ).fetchone()
-            ):
-                values[slot] = self._drain_refcursor(text)
             else:
-                values[slot] = None  # the block never opened it
+                # None when the block never opened it, or closed it.
+                values[slot] = self._drain_refcursor(text) if text else None
         return Result(out_binds=values)
 
-    def _drain_refcursor(self, portal: str) -> CursorResult:
+    def _drain_refcursor(self, portal: str) -> CursorResult | None:
         # A REF CURSOR OUT bind: the routine OPENed a portal, whose name the CALL
         # returned. Fetch all its rows (still inside this transaction) and hand them
         # back as a CursorResult the Mirror parks and serves as a nested cursor —
         # re-tagging any ora_tstz cells the same way the top-level read path does.
+        # A portal no longer open is a cursor the routine closed -- an IN OUT one
+        # it was handed and drained (#2452), say -- and goes back as None, the
+        # closed cursor a routine leaves (#1048).
         # Its columns are described as a query's are, from the statement the
         # portal runs: a CLOB, BLOB, DATE or NVARCHAR2 table column, a
         # TO_CLOB(...) item, read through its domain or its call, where the bare
@@ -21986,9 +21983,11 @@ class PostgresBackend:
         opened = self._conn.execute(
             'SELECT statement FROM pg_cursors WHERE name = %s', (portal,)
         ).fetchone()
+        if opened is None:
+            return None
         fetch = self._conn.cursor()
         fetch.execute(sql.SQL('FETCH ALL FROM {}').format(sql.Identifier(portal)))
-        result = self._build_result(fetch, opened[0] if opened else '')
+        result = self._build_result(fetch, opened[0])
         # Drained, so close it: an open portal holds its tables, and PostgreSQL
         # refuses DDL on them in this session ("being used by active queries").
         self._conn.execute(sql.SQL('CLOSE {}').format(sql.Identifier(portal)))
