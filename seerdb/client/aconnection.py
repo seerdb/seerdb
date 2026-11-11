@@ -1991,7 +1991,9 @@ class AsyncOracleConnect(_ConnectionLogic):
             )
         )
         await self.send(TNS_DATA, Data)
-        Content = await self._read_lob_response()
+        Content = await self._read_lob_response(
+            len(Locator) + 2 if prefixed else len(Locator)
+        )
         if DataType == TNS_TYPE_CLOB:
             return Content.decode('utf-16-be', errors='replace')
         return Content
@@ -2572,7 +2574,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                     )
                 ),
             )
-            Content = await self._read_lob_response()
+            Content = await self._read_lob_response(len(Opened) + 2)
         finally:
             await self.send(
                 TNS_DATA,
@@ -2598,7 +2600,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         Row = await Cur.fetchone()
         return Row[0]
 
-    async def _read_lob_response(self) -> bytes:
+    async def _read_lob_response(self, LocatorLen: int) -> bytes:
         """Async port of the sync `_read_lob_response`: the reply walked over
         the bytes received so far and carried on packet by packet (#1845)."""
         from seerdb.client.connection import _lob_reply_step
@@ -2616,7 +2618,12 @@ class AsyncOracleConnect(_ConnectionLogic):
                 raise Exception('Unexpected LOBOPS response type', Type)
             Data = Data[Pos:] + Packet
             (Pos, Chunked, Done) = _lob_reply_step(
-                Data, 0, Out, Chunked, self.field_version >= FIELD_VERSION_12_1
+                Data,
+                0,
+                Out,
+                Chunked,
+                self.field_version >= FIELD_VERSION_12_1,
+                LocatorLen,
             )
             if Done:
                 return bytes(Out)

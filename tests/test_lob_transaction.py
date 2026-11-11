@@ -44,7 +44,8 @@ def _drained(rows, cursor_id=7):
 _LOB_REPLY_IN_TRANSACTION = (
     bytes([TTI_LOB, 5])
     + b'hello'
-    + bytes([TTI_RPA, 0, 0])
+    # the locator (3 bytes here) and the amount read, 5
+    + bytes([TTI_RPA, 0, 1, 0, 1, 5])
     + bytes([TTI_OER, 1, IN_TRANSACTION, 2, 0x0D, 0xBA, 0, 0])
 )
 
@@ -99,7 +100,7 @@ class TestTheLobReaderFindsTheEndOfCallInATransaction(unittest.TestCase):
             return (TNS_DATA, _LOB_REPLY_IN_TRANSACTION)
 
         with patch.object(OracleConnect, '_next_data_packet', one_packet):
-            self.assertEqual(conn._read_lob_response(), b'hello')
+            self.assertEqual(conn._read_lob_response(3), b'hello')
 
 
 class TestTheAsyncTwins(unittest.IsolatedAsyncioTestCase):
@@ -124,4 +125,4 @@ class TestTheAsyncTwins(unittest.IsolatedAsyncioTestCase):
             ]
         )
         with patch.object(AsyncOracleConnect, '_next_data_packet', packets):
-            self.assertEqual(await conn._read_lob_response(), b'hello')
+            self.assertEqual(await conn._read_lob_response(3), b'hello')

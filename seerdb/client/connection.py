@@ -887,7 +887,12 @@ def _type_attr(row: 'Sequence[Any]') -> dict:
 
 
 def _lob_reply_step(
-    Data: bytes, Pos: int, Out: bytearray, Chunked: bool, Ub4Chunks: bool
+    Data: bytes,
+    Pos: int,
+    Out: bytearray,
+    Chunked: bool,
+    Ub4Chunks: bool,
+    LocatorLen: int,
 ) -> tuple[int, bool, bool]:
     """Walk a LOBOPS READ reply from ``Pos`` as far as ``Data`` allows (#1845).
 
@@ -897,11 +902,18 @@ def _lob_reply_step(
     TTI_OER. Content goes to ``Out``. Stops before an item ``Data`` does not
     hold whole, so the caller can append the next packet and go on from the
     returned position: the reply spans packets, and a chunk may straddle them.
+    ``LocatorLen`` is the source-locator length the READ declared, the length
+    the return parameters echo the locator at.
 
     Returns ``(Pos, Chunked, Done)``: where to resume, whether that is inside a
     chunk run, and whether the OER was reached.
     """
-    from seerdb.common.tns_consts import TNS_LONG_LENGTH_INDICATOR, TTI_LOB, TTI_OER
+    from seerdb.common.tns_consts import (
+        TNS_LONG_LENGTH_INDICATOR,
+        TTI_LOB,
+        TTI_OER,
+        TTI_RPA,
+    )
 
     End = len(Data)
     while Pos < End:
@@ -944,22 +956,21 @@ def _lob_reply_step(
             continue
         if Token == TTI_OER:
             return (Pos, Chunked, True)
-        # Return parameters (TTI_RPA: the updated locator, the amount read),
-        # not decoded: scan to the OER, which opens with TTI_OER + call_status
-        # (ub4 length 1, then a flag word that is not always 1 -- 2 while a
-        # transaction is open, #712) and the end-to-end sequence.
-        for I in range(Pos, End - 3):
-            if (
-                Data[I] == TTI_OER
-                and Data[I + 1] == 0x01
-                and (Data[I + 2] < 0x10 or Data[I + 3] == 0x01)
-            ):
-                Pos = I
+        if Token == TTI_RPA:
+            # Return parameters: the locator, echoed at the length the request
+            # declared, then the amount read, <ub1 n><n bytes>. Decoded by
+            # length, not scanned for an OER: the call status that opens the
+            # OER is not always one byte wide (0x4001 under implicit pooling).
+            At = Pos + 1 + LocatorLen
+            if At >= End:
                 break
-        else:
-            # No OER yet: keep the last bytes, which may open one the next
-            # packet completes.
-            return (max(Pos, End - 3), Chunked, False)
+            if At + 1 + Data[At] > End:
+                break
+            Pos = At + 1 + Data[At]
+            continue
+        raise InterfaceError(
+            f'unexpected message 0x{Token:02x} in a LOB read reply at offset {Pos}'
+        )
     return (Pos, Chunked, False)
 
 
@@ -2777,7 +2788,9 @@ class OracleConnect(_ConnectionLogic):
             )
         )
         self.send(TNS_DATA, Data)
-        Content = self._read_lob_response()
+        Content = self._read_lob_response(
+            len(Locator) + 2 if prefixed else len(Locator)
+        )
         if DataType == TNS_TYPE_CLOB:
             return Content.decode('utf-16-be', errors='replace')
         return Content
@@ -3386,7 +3399,7 @@ class OracleConnect(_ConnectionLogic):
                     )
                 ),
             )
-            Content = self._read_lob_response()
+            Content = self._read_lob_response(len(Opened) + 2)
         finally:
             self.send(
                 TNS_DATA,
@@ -3414,7 +3427,7 @@ class OracleConnect(_ConnectionLogic):
         )
         return Cur.fetchone()[0]
 
-    def _read_lob_response(self) -> bytes:
+    def _read_lob_response(self, LocatorLen: int) -> bytes:
         # A LOBOPS READ reply: TTI_LOB content, return parameters, the closing
         # TTI_OER (see _lob_reply_step). It spans packets, so it is walked over
         # the bytes received so far and carried on as each packet comes (#1845),
@@ -3432,7 +3445,12 @@ class OracleConnect(_ConnectionLogic):
                 raise Exception('Unexpected LOBOPS response type', Type)
             Data = Data[Pos:] + Packet
             (Pos, Chunked, Done) = _lob_reply_step(
-                Data, 0, Out, Chunked, self.field_version >= FIELD_VERSION_12_1
+                Data,
+                0,
+                Out,
+                Chunked,
+                self.field_version >= FIELD_VERSION_12_1,
+                LocatorLen,
             )
             if Done:
                 return bytes(Out)

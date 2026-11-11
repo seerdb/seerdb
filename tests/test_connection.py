@@ -484,8 +484,17 @@ class TestLobReplyAcrossPackets(unittest.TestCase):
     from seerdb.common.tns_consts import TTI_LOB as _LOB
     from seerdb.common.tns_consts import TTI_OER as _OER
 
-    OER = bytes([_OER, 0x01, 0x01, 0x01, 0x00])
-    RPA = bytes([0x08, 0x02, 0x00, 0x10])
+    # The return parameters as 23ai sends them (#2540): TTI_RPA, the 40-byte
+    # locator the READ declared, then the amount read, 4000 as <02><0f a0>.
+    LOCATOR = bytes.fromhex(
+        '00260000c2088000000265260000'
+        '00ea000000010369000a00000000'
+        '00021aab82f1000000010000'
+    )
+    RPA = bytes([0x08]) + LOCATOR + bytes([0x02, 0x0F, 0xA0])
+    OER = bytes([_OER, 0x01, 0x01, 0x02, 0x38, 0x77, 0x00])
+    # The same OER under implicit pooling: the call status is 0x4001.
+    OER_POOLED = bytes([_OER, 0x02, 0x40, 0x01, 0x02, 0x38, 0x52, 0x00])
 
     def _walk(self, reply: bytes, split: int, ub4: bool) -> bytes:
         from seerdb.client.connection import _lob_reply_step
@@ -494,7 +503,9 @@ class TestLobReplyAcrossPackets(unittest.TestCase):
         data, pos, chunked = b'', 0, False
         for packet in (reply[:split], reply[split:]):
             data = data[pos:] + packet
-            pos, chunked, done = _lob_reply_step(data, 0, out, chunked, ub4)
+            pos, chunked, done = _lob_reply_step(
+                data, 0, out, chunked, ub4, len(self.LOCATOR)
+            )
             if done:
                 return bytes(out)
         raise AssertionError('no OER reached')
@@ -520,6 +531,20 @@ class TestLobReplyAcrossPackets(unittest.TestCase):
         ):
             for split in range(1, len(reply)):
                 self.assertEqual(self._walk(reply, split, False), want, split)
+
+    def test_a_two_byte_call_status_ends_the_reply(self):
+        # Under implicit pooling the OER's call status is 0x4001, written in
+        # two bytes; the reply ends there all the same (#2540).
+        reply = bytes([self._LOB, 5]) + b'hello' + self.RPA + self.OER_POOLED
+        for split in range(1, len(reply)):
+            self.assertEqual(self._walk(reply, split, True), b'hello', split)
+
+    def test_an_unknown_message_raises_rather_than_waits(self):
+        from seerdb.common.exceptions import InterfaceError
+
+        reply = bytes([self._LOB, 5]) + b'hello' + self.RPA + b'\x55' + self.OER
+        with self.assertRaises(InterfaceError):
+            self._walk(reply, len(reply), True)
 
 
 class TestReplyContinuation(unittest.TestCase):
