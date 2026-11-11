@@ -7323,7 +7323,21 @@ def decode_token_pro(Data: bytes) -> dict:
         'banner': Fields['banner'],
         'compile_caps': Fields['compile_caps'],
         'runtime_caps': Fields['runtime_caps'],
+        'charset_id': Fields['charset_id'],
+        'ncharset_id': _fdo_ncharset(bytes(Fields['fdo'])),
     }
+
+
+def _fdo_ncharset(Fdo: bytes) -> int | None:
+    # The database's national charset, which the PRO reply's FDO carries as a
+    # big-endian ub2 three bytes past two variable-length runs, as python-oracledb
+    # reads it; 2000 (AL16UTF16) on a 9.2 bed. None when the FDO is too short.
+    if len(Fdo) < 7:
+        return None
+    At = 6 + Fdo[5] + Fdo[6] + 3
+    if len(Fdo) < At + 2:
+        return None
+    return int.from_bytes(Fdo[At : At + 2], 'big')
 
 
 _KNOWN_TTI_TOKENS = frozenset(
@@ -14964,6 +14978,21 @@ def _encode_9i_oall8(
 _O9I_LOB_BIND_SIZE = 32
 
 
+def _lob_bind_csfrm(Value: object) -> int:
+    # The charset form of a LOB bound by its locator: a temporary one's
+    # marker's, a LOB object's, a LOB Var's type's; 1 when none says.
+    from seerdb.common.datatypes import Var
+    from seerdb.common.lob import LOB
+
+    if isinstance(Value, TempLob):
+        return Value.csfrm
+    if isinstance(Value, LOB):
+        return Value._csfrm
+    if isinstance(Value, Var):
+        return getattr(Value.dbtype, 'csfrm', 1)
+    return 1
+
+
 def _encode_9i_bind_oac(Value: object) -> bytes:
     if _is_oci11_object_bind(Value):
         # An object or a collection, as OCI 9.2 binds one (SQLT_NTY).
@@ -14974,6 +15003,12 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
         # flag 1, without which a NULL one's zero length is ORA-22275.
         if Lob[0] in (TNS_TYPE_BLOB, TNS_TYPE_BFILE):
             return _native_bind_oac(Lob[0], 1, _O9I_LOB_BIND_SIZE, 0, 0)
+        # An NCLOB declares AL16UTF16 and form 2; as a CLOB, an NCLOB column
+        # refused it (ORA-12704, #2537).
+        if _lob_bind_csfrm(Value) == 2:
+            return _native_bind_oac(
+                TNS_TYPE_CLOB, 1, _O9I_LOB_BIND_SIZE, AL16UTF16_CHARSET, 2
+            )
         return _native_bind_oac(
             TNS_TYPE_CLOB, 1, _O9I_LOB_BIND_SIZE, AL32UTF8_CHARSET, 1
         )
@@ -15627,9 +15662,15 @@ _O9I_LOCATOR_SPACE = 86
 _O9I_CREATE_TEMP_COUNT = 87
 
 
-def encode_9i_oall8_create_temp(Seq: int, LobType: int, Csfrm: int) -> bytes:
+def encode_9i_oall8_create_temp(
+    Seq: int, LobType: int, Csfrm: int, Charset: int | None = None
+) -> bytes:
     """A temporary CLOB (112, form 1), NCLOB (112, 2) or BLOB (113, 0) of the
-    session's duration, on a native 9i session."""
+    session's duration, on a native 9i session. ``Charset`` is the LOB's own,
+    as a column of it has: the database's for a CLOB, the national one for an
+    NCLOB (#2537). Made in the session's AL32UTF8, a CLOB counted UTF-8 bytes as
+    characters and an NCLOB read its text wrong, and past a few characters the
+    server dropped the session; made in 0, the server raised ORA-00600."""
     Blob = LobType == TNS_TYPE_BLOB
     return _O9I_CREATE_TEMP_O9I(
         {
@@ -15648,7 +15689,7 @@ def encode_9i_oall8_create_temp(Seq: int, LobType: int, Csfrm: int) -> bytes:
             'scn_present': True,
             'scn_length': 1,
             'locator': _OCI11_EMPTY_LOCATOR,
-            'charset': 0 if Blob else AL32UTF8_CHARSET,
+            'charset': 0 if Blob else (Charset or AL32UTF8_CHARSET),
             'duration': _OCI11_LOB_DURATION_SESSION,
             'count': _O9I_CREATE_TEMP_COUNT,
         }

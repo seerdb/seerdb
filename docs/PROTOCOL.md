@@ -4665,8 +4665,16 @@ reverse-engineered byte-for-byte and verified on 10g / 11g / 21c / 23ai:
   duration (10) in the destination length, the charset, amount and SCN
   pointers set, the 86-byte empty locator, then the charset, the duration and a
   ub4 87. The reply is the new locator in those 86 bytes, the charset and a ub4.
+  The charset is the LOB's own, as a column of it has: the database's for a
+  CLOB, the national one for an NCLOB, both from the TTI_PRO reply (its charset
+  id; the FDO's ub2 at `6 + fdo[5] + fdo[6] + 3`, big-endian). Made in the
+  session's AL32UTF8, a CLOB counted UTF-8 bytes as characters, an NCLOB read
+  its text wrong, and past a few characters the server dropped the session;
+  made in 0, the server raised ORA-00600 [ttcgcs] (#2537).
   A LOB bound by its locator declares flag 1, size 32: without the flag, a NULL
-  one's zero length is taken for a locator (ORA-22275).
+  one's zero length is taken for a locator (ORA-22275). An NCLOB declares
+  AL16UTF16 and form 2; declared a CLOB, an NCLOB column refused it
+  (ORA-12704).
 
 - **`FILE_EXISTS`** (op `0x0800`) and **`FILE_ISOPEN`** (`0x0400`) answer with
   the echoed locator **field** and then a ub1 flag. The field is what matters:

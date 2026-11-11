@@ -1268,6 +1268,18 @@ class Fv2Oall8Dialect(Oall8Dialect):
 
     _caches_cursors = True
 
+    def __init__(
+        self,
+        next_seq: Callable[[], int],
+        charset: int | None = None,
+        ncharset: int | None = None,
+    ) -> None:
+        super().__init__(next_seq)
+        # The database's charset and its national one, from the login's TTI_PRO:
+        # a temporary LOB is made in the one its type has (#2537).
+        self._db_charset = charset
+        self._db_ncharset = ncharset
+
     def flush_cursors(self, cache: dict):
         return self._flush_native_cache(cache)
 
@@ -1356,6 +1368,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 self._next_seq(),
                 TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB,
                 0 if is_blob else csfrm,
+                self._db_ncharset if csfrm == 2 else self._db_charset,
             )
         )
         buf = b''

@@ -114,12 +114,10 @@ _FV2_UNSUPPORTED = (
         'plain str -> NVARCHAR2 via 9i DB charset; use DB_TYPE_NVARCHAR (#174)',
     ),
     ('nchar', 'plain str -> NCHAR via 9i DB charset; use DB_TYPE_NCHAR (#174)'),
-    ('nclob', '9i national-charset LOB handling deferred (#174)'),
-    ('each_lob_type_round_trips', '9i national-charset LOB handling deferred (#174)'),
-    ('createlob_binds_as_a_lob', '9i national-charset LOB handling deferred (#174)'),
+    ('nclob', "the 9i bed's database cannot hold the national text (#174)"),
     (
-        'lob_attribute_binds_from_str_and_bytes',
-        '9i national-charset LOB handling deferred (#174)',
+        'each_lob_type_round_trips',
+        "the 9i bed's database cannot hold the national text (#174)",
     ),
     (
         'fetched_lob_attribute_binds_back',

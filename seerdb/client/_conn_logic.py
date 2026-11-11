@@ -957,7 +957,11 @@ class _ConnectionLogic:
             # The 9i OALL8 opt-in (#716) speaks the native 64-bit request form;
             # the default 9i path speaks the compact TTI_ALL7.
             self._dialect = (
-                Fv2Oall8Dialect(self._next_seq)
+                Fv2Oall8Dialect(
+                    self._next_seq,
+                    getattr(self, '_server_charset', None),
+                    getattr(self, '_server_ncharset', None),
+                )
                 if getattr(self, '_oall8', False)
                 else Fv2Dialect()
             )
