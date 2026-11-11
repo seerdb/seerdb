@@ -1211,6 +1211,12 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   ([#2444](https://github.com/seerdb/seerdb/issues/2444)).
 - **Object types** have no methods. A collection computed in a query fetches as
   a plain array.
+- **A nested table has no gaps.** In PL/SQL, `DELETE(n)` of one element is
+  refused with ORA-03001 when it runs: a PostgreSQL array holds no gap, and
+  renumbering the elements after it would change what the code reads. A
+  VARRAY's and a nested table's other methods and elements behave as Oracle's,
+  their errors included
+  ([#2547](https://github.com/seerdb/seerdb/issues/2547)).
 - **Privileges.** Object grants are enforced with per-user roles only. In
   single-role mode they are recorded, and decide only who sees a type (*One
   tenant per database*). System privileges and roles are accepted and do
