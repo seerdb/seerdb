@@ -48,8 +48,9 @@ _DEFAULT_PG = 'host=127.0.0.1 port=5433 user=pyo password=pyo123 dbname=mirror'
 
 
 def _launcher_args(backend: str, port: int) -> list[str]:
-    # The seerdb-mirror command line for this leg (#1835).
-    args = ['--port', str(port), backend]
+    # The seerdb-mirror command line for this leg (#1835). The suite connects
+    # as service XE, which neither backend serves by its own name (#2471).
+    args = ['--port', str(port), '--service', 'XE', backend]
     if backend == 'postgres':
         args.append(os.environ.get('MIRROR_PG', _DEFAULT_PG))
         if os.environ.get('MIRROR_PRESENTS'):

@@ -54,7 +54,7 @@ def _wait_for(port: int, process: subprocess.Popen, seconds: float = 30.0) -> bo
 
 def _mirror_args(target: str, port: int) -> list[str]:
     encryption = 'requested' if target.endswith('-ano') else 'accepted'
-    args = ['--port', str(port), '--encryption', encryption]
+    args = ['--port', str(port), '--service', 'XE', '--encryption', encryption]
     if target.startswith('pg'):
         return [*args, 'postgres', os.environ['MIRROR_PG']]
     upstream = (

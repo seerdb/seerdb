@@ -48,12 +48,17 @@ def test_targets_side_by_side_with_the_ratio_to_direct() -> None:
 def test_each_mirror_target_runs_the_launcher_it_names() -> None:
     mod = _load()
     os.environ.setdefault('MIRROR_PG', 'dbname=mirror')
-    assert mod._mirror_args('pg-ano', 1)[2:5] == [
+    # The benchmark connects as XE, served besides the backend's own (#2471).
+    assert mod._mirror_args('pg-ano', 1)[2:7] == [
+        '--service',
+        'XE',
         '--encryption',
         'requested',
         'postgres',
     ]
-    assert mod._mirror_args('passthrough', 1)[2:5] == [
+    assert mod._mirror_args('passthrough', 1)[2:7] == [
+        '--service',
+        'XE',
         '--encryption',
         'accepted',
         'passthrough',

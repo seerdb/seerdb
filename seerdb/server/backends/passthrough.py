@@ -62,6 +62,7 @@ from seerdb.server.accounts import (
     _user_name,
 )
 from seerdb.server.backend import (
+    ORA_UNKNOWN_SERVICE,
     BackendError,
     BindVar,
     BlobValue,
@@ -238,6 +239,7 @@ class OraclePassthroughBackend:
         field_version: int | None = None,
         tns_version: int | None = None,
         auth_conninfo: str | None = None,
+        services: Sequence[str] = (),
     ) -> None:
         # The Oracle release this passthrough presents to its own clients — set
         # it to match the target so the Mirror advertises what the real server
@@ -248,6 +250,11 @@ class OraclePassthroughBackend:
         self._host = host
         self._port = port
         self._service = service
+        # The service names served: the upstream's, and those given (#2471).
+        self._services = frozenset({service.upper(), *(n.upper() for n in services)})
+        # The instance the client asked for, which the upstream's own listener
+        # decides on, as it would for a client connected straight to it.
+        self._instance_name: str | None = None
         # Held by reference (not copied) so a changepassword updates the same map
         # every session's backend authenticates against — a fresh connection then
         # sees the new password (#21/#486). Keys are upper-cased in place.
@@ -323,6 +330,7 @@ class OraclePassthroughBackend:
             user=f'{username}[{proxy}]' if proxy else username,
             password=password,
             service_name=self._service,
+            instance_name=self._instance_name,
             autocommit=False,
             # The backend wants LOB VALUES, not LOB objects: it reads each LOB's
             # content to queue for the Mirror's own read path. seerdb defaults
@@ -463,6 +471,17 @@ class OraclePassthroughBackend:
                 'begin dbms_session.set_context(:1, :2, :3); end;',
                 [namespace, attribute, value],
             )
+
+    def refuse_connect(
+        self, service_name: str | None, instance_name: str | None
+    ) -> int | None:
+        """A service other than the upstream's or one given is refused with
+        ORA-12514, as a listener refuses it (#2471). The instance named goes
+        upstream with the login, where the upstream's listener answers it."""
+        if service_name is not None and service_name.upper() not in self._services:
+            return ORA_UNKNOWN_SERVICE
+        self._instance_name = instance_name
+        return None
 
     def session_info(self) -> SessionInfo:
         """The upstream session's real identity, for the Mirror's login reply.

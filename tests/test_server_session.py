@@ -5489,3 +5489,30 @@ def test_a_column_lob_the_mirror_served_resolves_when_bound_back() -> None:
         assert b'ORA-22275' in b''.join(stream.packets)
     finally:
         _LOB_EMIT_LOG.reset(token)
+
+
+def test_a_connect_the_backend_refuses_is_refused_as_by_a_listener() -> None:
+    # The backend says which services and instance it serves (#2471): one it
+    # doesn't is answered with the listener's REFUSE, not an ACCEPT, and the
+    # session ends there. A backend with no refuse_connect serves any name.
+    import handshake_11g as fx
+
+    from seerdb.server.handshake import encode_refuse
+
+    class _Refusing(_DualBackend):
+        def refuse_connect(self, service, instance):
+            self.asked = (service, instance)
+            return 12514
+
+    backend = _Refusing()
+    server, client = socket.socketpair()
+    client.sendall(fx.CONNECT)
+    try:
+        with pytest.raises(InterfaceError, match='ORA-12514'):
+            handle_login(PacketStream(server), backend)
+        client.settimeout(5)
+        assert client.recv(4096) == encode_refuse(12514, 0x0B200200)
+    finally:
+        server.close()
+        client.close()
+    assert backend.asked == ('XE', None)

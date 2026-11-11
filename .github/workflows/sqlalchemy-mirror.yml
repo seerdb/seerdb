@@ -112,7 +112,8 @@ jobs:
           # The packaged launcher of the seerdb installed above from this
           # checkout. PYO is the suite's account (#1835).
           REPO="${GITHUB_WORKSPACE}"
-          MIRROR_USERS=pyo:pyo123 seerdb-mirror --port 1521 postgres "$MIRROR_PG" > "$REPO/mirror.log" 2>&1 &
+          # The suite connects as service XE, which the database isn't named.
+          MIRROR_USERS=pyo:pyo123 seerdb-mirror --port 1521 --service XE postgres "$MIRROR_PG" > "$REPO/mirror.log" 2>&1 &
           MIRROR_PID=$!
           for i in $(seq 1 30); do
             python -c "import socket; socket.create_connection(('127.0.0.1', 1521), timeout=1).close()" 2>/dev/null && break

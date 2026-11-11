@@ -51,6 +51,12 @@ def credential_lookup(credentials: Credentials, username: str) -> str | None:
     return None
 
 
+# What a listener refuses a connect with (#2471), the answers a backend's
+# ``refuse_connect`` gives: a service it doesn't serve, an instance it isn't.
+ORA_UNKNOWN_SERVICE = 12514
+ORA_UNKNOWN_INSTANCE = 12521
+
+
 class Capability(Enum):
     """A feature a backend may support. Absent → the Mirror answers a request
     that needs it with an ORA error instead of pretending."""
@@ -380,6 +386,14 @@ class Backend(Protocol):
         fills. Those carry no value from the client, and the BindVar says what
         type is wanted there. Without it such a statement is refused with an ORA
         error rather than breaking the connection.
+
+    ``refuse_connect(service_name, instance_name) -> int | None``
+        Asked once per connection, before anything else, with the
+        ``SERVICE_NAME`` (or ``SID``) and ``INSTANCE_NAME`` the client's connect
+        descriptor names, either ``None`` when it names none. Answer the ORA
+        code a listener refuses the connect with -- 12514 for a service this
+        backend doesn't serve, 12521 for an instance -- or None to serve it
+        (#2471). Without it every name is served.
 
     ``session_info() -> SessionInfo``
         The session's real identity -- id, serial number, instance / database /

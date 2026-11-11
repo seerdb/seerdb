@@ -367,7 +367,8 @@ jobs:
           fi
           # The packaged launcher, as a user runs it: `pip install ".[mirror]"`
           # installed this checkout. PYO is the suite's account (#1835).
-          MIRROR_USERS=pyo:pyo123 seerdb-mirror --port 1521 \
+          # The suite connects as service XE, which the database isn't named.
+          MIRROR_USERS=pyo:pyo123 seerdb-mirror --port 1521 --service XE \
             postgres "$MIRROR_PG" --presents "$MIRROR_PRESENTS" > mirror.log 2>&1 &
           MIRROR_PID=$!
           for i in $(seq 1 30); do

@@ -271,10 +271,17 @@ Then point a client at it:
 
 ```python
 import oracledb
-conn = oracledb.connect(user='scott', password='tiger', dsn='127.0.0.1:1521/ANY')
+conn = oracledb.connect(user='scott', password='tiger', dsn='127.0.0.1:1521/app')
 ```
 
-Any service name is accepted.
+The Mirror answers to the service names a listener in front of that database
+would. Over PostgreSQL that is the database's name (`app` above); as a
+passthrough, the upstream's service (`FREEPDB1`). Names compare whatever their
+case, and `--service` adds more. A client naming any other service is refused
+with ORA-12514, as by a listener. An `INSTANCE_NAME` is checked as well: over
+PostgreSQL the instance is the database's name, the one the login reports,
+and anything else is refused with ORA-12521. A passthrough hands the instance
+to its upstream, whose own listener decides.
 
 ### Options
 
@@ -290,6 +297,7 @@ Any service name is accepted.
 | `--profile FILE` | | record per-statement statistics to FILE (see *Migration profile*) |
 | `--max-sessions` | no limit | serve at most this many connections at once; one more is closed as it arrives (see *Resource limits*) |
 | `--failed-login-attempts` | `10` | lock a user name after this many failed logins in a row; `0` never locks (see *Accounts*) |
+| `--service NAME` | the backend's own | a service name served besides the database's or the upstream's; repeatable (see *Starting one*) |
 | `--ws-port` | | also serve the seerdb WebSocket transport on this port (see *The WebSocket listener*) |
 | `--ws-origin` | | a browser origin the WebSocket listeners admit; repeatable |
 | `--query-ws-port` | | also serve the JSON query endpoint on this port (see *The JSON query endpoint*) |
@@ -339,6 +347,7 @@ log_level = INFO
 ; ws_port = 1531
 ; ws_origins = https://app.example.com, https://admin.example.com
 ; query_ws_port = 1532
+; services = XE, ORCL
 
 [clients]
 SCOTT = tiger

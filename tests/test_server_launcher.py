@@ -393,3 +393,46 @@ def test_query_ws_port_from_the_config_file(tmp_path: Path) -> None:
     )
     launch = build(['--config', config], env={})
     assert launch.query_ws_port == 1523
+
+
+def test_services_reach_the_backend() -> None:
+    # --service, repeatable, or `services` in the config file (#2471): the
+    # names the Mirror serves besides its backend's own.
+    launch = build(
+        [
+            '--service',
+            'XE',
+            '--service',
+            'app',
+            'passthrough',
+            'db.example.com:1521/FREEPDB1',
+            '--field-version',
+            '24',
+        ],
+        env=_USERS,
+    )
+    assert launch.backend_factory is not None
+    backend = cast(Any, launch.backend_factory())
+    assert backend.refuse_connect('APP', None) is None
+    assert backend.refuse_connect('XE', None) is None
+    assert backend.refuse_connect('OTHER', None) == 12514
+
+
+def test_services_come_from_the_config_file(tmp_path: Path) -> None:
+    config = _ini(tmp_path, '[server]\nservices = XE, app\n')
+    launch = build(
+        [
+            '--config',
+            str(config),
+            'passthrough',
+            'db:1521/ORCL',
+            '--field-version',
+            '24',
+        ],
+        env=_USERS,
+    )
+    assert launch.backend_factory is not None
+    backend = cast(Any, launch.backend_factory())
+    assert backend.refuse_connect('app', None) is None
+    assert backend.refuse_connect('ORCL', None) is None
+    assert backend.refuse_connect('OTHER', None) == 12514

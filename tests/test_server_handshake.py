@@ -538,3 +538,44 @@ def test_a_fast_auth_client_is_served_at_the_version_its_bundle_names() -> None:
     assert fast_auth_field_version(_FAST_AUTH_FV18) == 18
     assert fast_auth_field_version(_FAST_AUTH_FV18[:20]) is None
     assert fast_auth_field_version(_SQLPLUS_11_DTY) is None
+
+
+# A listener's refusals (#2471), captured from 10g, 11g, 18c, 21c and 23ai Free
+# for an unknown SERVICE_NAME (12514) and an unknown INSTANCE_NAME (12521).
+@pytest.mark.parametrize(
+    ('version_no', 'vsnnum'),
+    [
+        (0x0A200500, 169870592),  # 10.2.0.5: its release
+        (0x0B200200, 186647040),  # 11.2.0.2: its release
+        (0x12400000, 301989888),  # 18.4: 18.0 alone
+        (0x15300000, 352321536),  # 21.3: 21.0 alone
+        (0x171A2000, 0),  # 23.26.2: none
+    ],
+)
+@pytest.mark.parametrize('code', [12514, 12521])
+def test_a_refuse_is_the_listeners(version_no: int, vsnnum: int, code: int) -> None:
+    from seerdb.server.handshake import encode_refuse
+
+    text = (
+        f'(DESCRIPTION=(TMP=)(VSNNUM={vsnnum})(ERR={code})'
+        f'(ERROR_STACK=(ERROR=(CODE={code})(EMFI=4))))'
+    ).encode()
+    packet = encode_refuse(code, version_no)
+    assert packet[4] == 4  # TNS_REFUSE
+    assert int.from_bytes(packet[:2], 'big') == len(packet)
+    assert packet[8:] == b'\x22\x00' + len(text).to_bytes(2, 'big') + text
+
+
+def test_a_connect_names_its_instance() -> None:
+    # (INSTANCE_NAME=...) is read from the descriptor, as SERVICE_NAME is.
+    req = parse_connect(fx.CONNECT[8:])
+    assert req.instance_name is None
+    descriptor = req.descriptor.replace(
+        b'(SERVICE_NAME=XE)', b'(SERVICE_NAME=XE)(INSTANCE_NAME=xe1)'
+    )
+    assert descriptor != req.descriptor
+    body = bytearray(fx.CONNECT[8:])
+    start = struct.unpack('>H', body[18:20])[0] - 8
+    body[start:] = descriptor
+    struct.pack_into('>H', body, 16, len(descriptor))
+    assert parse_connect(bytes(body)).instance_name == 'xe1'

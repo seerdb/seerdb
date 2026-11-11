@@ -23,6 +23,7 @@ the defaults; the command line wins. The config file is INI::
     ; ws_port = 1522            ; also serve the seerdb WebSocket transport here
     ; query_ws_port = 1523      ; also serve the JSON-over-WebSocket query endpoint
     ; ws_origins = https://app.example  ; browser Origins it admits (comma list)
+    ; services = XE, APP       ; service names served besides the backend's own
     ; profile = profile.json    ; record per-statement statistics (SIGUSR1 writes)
 
     [clients]                   ; the Oracle logins the Mirror accepts
@@ -220,6 +221,14 @@ def _parser() -> argparse.ArgumentParser:
         '(a seerdb extension; no Oracle client speaks it)',
     )
     parser.add_argument(
+        '--service',
+        action='append',
+        metavar='NAME',
+        help="a service name the Mirror serves besides its backend's own (the "
+        "PostgreSQL database's name, the upstream's service), repeatable; a "
+        'client naming any other is refused with ORA-12514, as by a listener',
+    )
+    parser.add_argument(
         '--ws-origin',
         action='append',
         metavar='ORIGIN',
@@ -406,6 +415,12 @@ def build(
     else:
         raw = option(None, server, 'ws_origins', '')
         ws_origins = [o.strip() for o in raw.split(',') if o.strip()] or None
+    # The service names served besides the backend's own (#2471).
+    if args.service:
+        services = list(args.service)
+    else:
+        raw = option(None, server, 'services', '')
+        services = [n.strip() for n in raw.split(',') if n.strip()]
     # The JSON-over-WebSocket query endpoint (#2371).
     qws = option(args.query_ws_port, server, 'query_ws_port', '')
     query_ws_port = int(qws) if qws else None
@@ -471,6 +486,7 @@ def build(
                 presents=presents,
                 native_sql=native_sql,
                 per_user_roles=per_user_roles,
+                services=services,
             )
 
         return Launch(
@@ -530,6 +546,7 @@ def build(
             credentials=credentials,
             field_version=launch.field_version,
             auth_conninfo=pass_auth,
+            services=services,
         )
 
     launch = Launch(
