@@ -232,7 +232,9 @@ What works:
 - Connection pool: `seerdb.create_pool(host=..., user=...,
   password=..., service_name=..., min=2, max=10)` returns a
   thread-safe pool of warm authenticated connections. `pool.acquire()`
-  returns a context manager that releases on `__exit__`. Idle
+  returns the connection, which `pool.release(conn)`, `conn.close()` or
+  leaving a `with pool.acquire() as conn:` block hands back (async:
+  `await pool.acquire()` or `async with`). Idle
   connections health-check on next acquire (`ping_interval`).
   `getmode` / `wait_timeout` choose what `acquire()` does at `max`;
   `max_lifetime_session` and `max_idle_session` retire old and idle

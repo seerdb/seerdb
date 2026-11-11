@@ -9128,6 +9128,25 @@ class PoolIntegration(_ThrottleRetry, unittest.TestCase):
         finally:
             Pool.close()
 
+    def test_acquire_gives_the_connection_itself(self):
+        # Used as python-oracledb's pool is, without a `with` block: acquire()
+        # returned a guard with no cursor() (#2555). release() and close() both
+        # hand it back.
+        Pool = seerdb.create_pool(min=1, max=1, **self._kwargs())
+        try:
+            Conn = Pool.acquire()
+            Cur = Conn.cursor()
+            Cur.execute('SELECT 1 FROM dual')
+            self.assertEqual(Cur.fetchone(), (1,))
+            Pool.release(Conn)
+            self.assertEqual(Pool.busy, 0)
+            Conn = Pool.acquire()
+            self.assertEqual(Pool.busy, 1)
+            Conn.close()
+            self.assertEqual((Pool.busy, Pool.opened), (0, 1))
+        finally:
+            Pool.close()
+
     def test_grows_to_max_and_releases_for_reuse(self):
         Pool = seerdb.create_pool(min=1, max=3, **self._kwargs())
         try:
@@ -14598,6 +14617,22 @@ class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 await Cur.execute('SELECT 1 FROM dual')
                 self.assertEqual(await Cur.fetchone(), (1,))
             self.assertEqual(Pool.busy, 0)
+        finally:
+            await Pool.close()
+
+    async def test_acquire_gives_the_connection_itself(self):
+        # Awaited, as python-oracledb's is (#2555).
+        Pool = await seerdb.create_pool_async(min=1, max=1, **self._kwargs())
+        try:
+            Conn = await Pool.acquire()
+            Cur = Conn.cursor()
+            await Cur.execute('SELECT 1 FROM dual')
+            self.assertEqual(await Cur.fetchone(), (1,))
+            await Pool.release(Conn)
+            self.assertEqual(Pool.busy, 0)
+            Conn = await Pool.acquire()
+            await Conn.close()
+            self.assertEqual((Pool.busy, Pool.opened), (0, 1))
         finally:
             await Pool.close()
 

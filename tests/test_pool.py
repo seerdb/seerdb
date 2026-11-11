@@ -80,6 +80,12 @@ class AsyncFakePool(AsyncPool):
         return AsyncFakeConn()
 
 
+def raw(conn):
+    # The connection a pooled one stands for, which a test inspects after it
+    # is released: the pooled connection itself refuses use then (#2555).
+    return object.__getattribute__(conn, '_conn')
+
+
 def age(entry, seconds):
     entry.created_at -= seconds
     entry.released_at -= seconds
@@ -136,6 +142,7 @@ class TestGetmode(unittest.TestCase):
         pool = FakePool(min=1, max=1, getmode=seerdb.POOL_GETMODE_FORCEGET)
         with pool.acquire():
             with pool.acquire() as extra:
+                extra = raw(extra)
                 self.assertEqual(pool.opened, 2)
             self.assertTrue(extra.closed)
             self.assertEqual(pool.opened, 1)
@@ -180,7 +187,7 @@ class TestPing(unittest.TestCase):
         pool._free[0].conn.dead = True
         first = pool._free[0].conn
         with pool.acquire() as conn:
-            self.assertIsNot(conn, first)
+            self.assertIsNot(raw(conn), first)
             self.assertTrue(first.closed)
             self.assertEqual(pool.opened, 1)
 
@@ -191,12 +198,13 @@ class TestRetirement(unittest.TestCase):
         old = pool._free[0].conn
         age(pool._free[0], 11)
         with pool.acquire() as conn:
-            self.assertIsNot(conn, old)
+            self.assertIsNot(raw(conn), old)
         self.assertTrue(old.closed)
 
     def test_lifetime_closes_on_release_not_during_use(self):
         pool = FakePool(min=1, max=1, max_lifetime_session=10)
         with pool.acquire() as conn:
+            conn = raw(conn)
             age(pool._in_use[id(conn)], 11)
             self.assertFalse(conn.closed)
         self.assertTrue(conn.closed)
@@ -208,7 +216,7 @@ class TestRetirement(unittest.TestCase):
         age(pool._free[0], 100000)
         pool._policy.ping_interval = -1
         with pool.acquire() as conn:
-            self.assertIs(conn, old)
+            self.assertIs(raw(conn), old)
 
     def test_idle_closes_above_min_only(self):
         pool = FakePool(min=1, max=3, max_idle_session=10, ping_interval=-1)
@@ -379,6 +387,7 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
         pool = await self.full(getmode=seerdb.POOL_GETMODE_FORCEGET)
         async with pool.acquire():
             async with pool.acquire() as extra:
+                extra = raw(extra)
                 self.assertEqual(pool.opened, 2)
             self.assertTrue(extra.closed)
             self.assertEqual(pool.opened, 1)
@@ -393,7 +402,7 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
         old = pool._free[0].conn
         age(pool._free[0], 11)
         async with pool.acquire() as conn:
-            self.assertIsNot(conn, old)
+            self.assertIsNot(raw(conn), old)
         self.assertTrue(old.closed)
 
     async def test_idle_closes_above_min_only(self):
@@ -458,6 +467,61 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(pool.release(held), 2)
         proceed.set()
         await asyncio.wait_for(slow, 5)
+
+
+class TestAcquireGivesTheConnection(unittest.TestCase):
+    # acquire() returns the connection itself, as python-oracledb's does: used
+    # without a `with` block, it was a guard with no cursor() (#2555).
+    def test_used_without_a_with_block_and_released(self):
+        pool = FakePool(min=1, max=1)
+        conn = pool.acquire()
+        cur = conn.cursor()
+        cur.execute('select 1 from dual')
+        self.assertEqual(cur.fetchone(), (1,))
+        pool.release(conn)
+        self.assertEqual(len(pool._free), 1)
+        self.assertEqual(pool._in_use, {})
+        with self.assertRaisesRegex(InterfaceError, 'returned to its pool'):
+            conn.cursor()
+
+    def test_closing_it_hands_it_back(self):
+        pool = FakePool(min=1, max=1)
+        conn = pool.acquire()
+        conn.close()
+        self.assertEqual(len(pool._free), 1)
+        self.assertFalse(pool._free[0].conn.closed)
+        pool.release(conn)  # released already: nothing more to do
+        self.assertEqual(len(pool._free), 1)
+
+    def test_another_pools_connection_is_refused(self):
+        (one, other) = (FakePool(min=1, max=1), FakePool(min=1, max=1))
+        conn = one.acquire()
+        with self.assertRaisesRegex(InterfaceError, 'not acquired from this pool'):
+            other.release(conn)
+        one.release(conn)
+
+
+class TestAsyncAcquireGivesTheConnection(unittest.IsolatedAsyncioTestCase):
+    async def test_awaited_used_and_released(self):
+        pool = AsyncFakePool(min=1, max=1)
+        await pool.prewarm()
+        conn = await pool.acquire()
+        cur = conn.cursor()
+        await cur.execute('select 1 from dual')
+        self.assertEqual(await cur.fetchone(), (1,))
+        await pool.release(conn)
+        self.assertEqual(len(pool._free), 1)
+        with self.assertRaisesRegex(InterfaceError, 'returned to its pool'):
+            conn.cursor()
+
+    async def test_closing_it_hands_it_back(self):
+        pool = AsyncFakePool(min=1, max=1)
+        await pool.prewarm()
+        conn = await pool.acquire()
+        await conn.close()
+        self.assertEqual(len(pool._free), 1)
+        async with pool.acquire() as again:
+            self.assertIs(raw(again), pool._in_use[id(raw(again))].conn)
 
 
 class TestSessionCallback(unittest.TestCase):
