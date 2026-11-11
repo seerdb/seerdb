@@ -6265,7 +6265,6 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
     selecting the locator works and only reading it fails.
     """
 
-    @_requires(_postgres_cannot('serve a BFILE column'))
     def test_bfile_missing_directory_fetches_and_only_the_read_fails(self):
         # fetch_lobs=False used to materialise the BFILE at fetch time, which
         # opens the file -- so the SELECT itself raised ORA-22285 where
@@ -6326,7 +6325,6 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
         )
         self.assertEqual(Out.getvalue(), 'PYO_MISSING_DIR/pyo_missing_file.txt')
 
-    @_requires(_postgres_cannot('serve a BFILE column'))
     def test_bfile_methods_on_a_missing_directory(self):
         # getfilename() answers from the locator, so it works for a file that is
         # not there and a DIRECTORY that was never created. fileexists() asks
