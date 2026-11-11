@@ -9214,6 +9214,32 @@ def test_a_bfile_names_a_file_on_the_postgresql_host() -> None:
         backend.close()
 
 
+def test_a_bfile_binds_back_as_its_names() -> None:
+    # A BFILE bound back (#2510) is the ora_bfile its names make: compared,
+    # selected and stored as one, a name with a quote, a comma or a backslash
+    # in it included. Nothing reads the file.
+    from seerdb.server import BackendError, BFile
+
+    odd = BFile('PYO "DIR", 2510', 'a\\b(c).txt')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        assert backend.execute(
+            "SELECT CASE WHEN :1 IS NULL THEN 'null' ELSE 'set' END FROM dual",
+            [odd],
+        ).rows == [('set',)]
+        assert backend.execute('SELECT :1 FROM dual', [odd]).rows == [(odd,)]
+        backend.execute('CREATE TABLE bt2510 (n NUMBER, b BFILE)')
+        backend.execute('INSERT INTO bt2510 VALUES (1, :1)', [odd])
+        assert backend.execute('SELECT b FROM bt2510').rows == [(odd,)]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE bt2510')
+        except BackendError:
+            backend.rollback()  # never made
+        backend.close()
+
+
 def test_a_bfiles_bytes_are_read_on_the_postgresql_host() -> None:
     # A BFILE's length and bytes (#1672), read through PostgreSQL: the whole
     # file, a slice from a 1-based offset, an amount past the end cut short,
