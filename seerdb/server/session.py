@@ -30,6 +30,7 @@ from secrets import token_bytes
 from typing import NoReturn, ParamSpec, TypeVar
 
 from seerdb.common.crypto import VFR_12C_SHA2, decrypt_password
+from seerdb.common.datatypes import BFile
 from seerdb.common.dbobject import ObjectImage
 from seerdb.common.exceptions import (
     DataError,
@@ -4017,6 +4018,13 @@ def _resolve_temp_lob_binds(request: ExecRequest, temp_lobs: _TempLobs) -> ExecR
                 if is_clob:
                     return ClobValue(data if isinstance(data, str) else str(data))
                 return BlobValue(data if isinstance(data, bytes) else data.encode())
+        if isinstance(value, BfileRef) and (
+            names := decode_bfile_locator(value.locator)
+        ):
+            # A BFILE carries only its directory's name and its file's, as
+            # BFILENAME(dir, file) makes one: the backend is handed those, as it
+            # hands them over when it serves one (#2510).
+            return BFile(*names)
         if isinstance(value, BfileRef) or (
             isinstance(value, TempLobRef) and temp_lobs.resolve(value.locator) is None
         ):

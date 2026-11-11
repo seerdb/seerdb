@@ -6286,27 +6286,38 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
         finally:
             Conn.close()
 
-    @_requires(
-        _mirror_lacks('binding back a BFILE it served (#2510)'),
-        _Need(
-            'a BFILE bind needs the 10g+ bind',
-            min_fv=FIELD_VERSION_10_2,
-        ),
-    )
-    def test_a_fetched_bfile_binds_back(self):
-        # Bound by its locator with the BFILE OAC -- type 114, the type's buffer
-        # of 4000, no LOB cont-flag -- as python-oracledb binds one. It raised
-        # `Unknown OAC token` before anything was sent. The server takes the
-        # locator without opening the file, so the missing directory is fine.
+    def _fetched_bfile(self):
         self.cur.execute(
             'SELECT BFILENAME(:1, :2) FROM dual',
             ['PYO_MISSING_DIR', 'pyo_missing_file.txt'],
         )
         (Lob,) = self.cur.fetchone()
+        return Lob
+
+    @_requires(_Need('a BFILE bind needs the 10g+ bind', min_fv=FIELD_VERSION_10_2))
+    def test_a_fetched_bfile_binds_back(self):
+        # Bound by its locator with the BFILE OAC -- type 114, the type's buffer
+        # of 4000, no LOB cont-flag -- as python-oracledb binds one. It raised
+        # `Unknown OAC token` before anything was sent. The server takes the
+        # locator without opening the file, so the missing directory is fine.
+        # The Mirror refused it with ORA-22275 (#2510).
+        Lob = self._fetched_bfile()
         self.cur.execute(
             "SELECT CASE WHEN :1 IS NULL THEN 'null' ELSE 'set' END FROM dual", [Lob]
         )
         self.assertEqual(self.cur.fetchone(), ('set',))
+        self.cur.execute('SELECT :1 FROM dual', [Lob])
+        (Back,) = self.cur.fetchone()
+        self.assertEqual(
+            Back.getfilename(), ('PYO_MISSING_DIR', 'pyo_missing_file.txt')
+        )
+
+    @_requires(
+        _postgres_cannot("run DBMS_LOB's file routines"),
+        _Need('a BFILE bind needs the 10g+ bind', min_fv=FIELD_VERSION_10_2),
+    )
+    def test_a_fetched_bfile_binds_into_a_block(self):
+        Lob = self._fetched_bfile()
         Out = self.cur.var(str)
         self.cur.execute(
             'DECLARE d VARCHAR2(30); f VARCHAR2(200); '

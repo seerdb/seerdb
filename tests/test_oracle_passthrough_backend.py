@@ -39,6 +39,26 @@ def test_a_release_packs_by_its_own_layout():
     assert _packed_release('23.0.0.0.0') == 0x17000000
 
 
+def test_a_bfile_binds_upstream_by_the_locator_its_names_make():
+    # The Mirror hands a bound-back BFILE over as its names (#2510); upstream it
+    # binds as the locator BFILENAME returns for them, the same bytes from 11g
+    # to 23ai, in a statement and in a block's BindVar alike.
+    from seerdb.common.datatypes import BfileBind
+    from seerdb.common.tns import encode_bfile_locator
+    from seerdb.common.tns_consts import TNS_TYPE_BFILE
+    from seerdb.server import BFile
+    from seerdb.server.backends.passthrough import _upstream_bfiles
+
+    locator = encode_bfile_locator('PYO_DIR', 'f.txt')
+    (bound, kept) = _upstream_bfiles([BFile('PYO_DIR', 'f.txt'), 7])
+    assert isinstance(bound, BfileBind) and bound.locator == locator
+    assert kept == 7
+    (var,) = _upstream_bfiles(
+        [BindVar(BFile('PYO_DIR', 'f.txt'), TNS_TYPE_BFILE, 4000)]
+    )
+    assert isinstance(var, BindVar) and var.value.locator == locator
+
+
 @pytest.mark.parametrize(
     ('spoken', 'upstream'),
     [

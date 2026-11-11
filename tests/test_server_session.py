@@ -5427,6 +5427,23 @@ def test_a_lob_the_mirror_did_not_mint_is_refused_not_bound_empty() -> None:
         assert raised.value.ora_code == 22275
 
 
+def test_a_bfile_bound_back_is_handed_over_as_its_names() -> None:
+    # A BFILE's locator carries its directory's and its file's names, and the
+    # Mirror remembers nothing else for one: bound back, it is the BFile the
+    # backend served, for the backend to bind (#2510). It was ORA-22275.
+    from seerdb.common.tns import BfileRef, ExecRequest, encode_bfile_locator
+    from seerdb.server import BFile
+    from seerdb.server.session import _resolve_temp_lob_binds, _TempLobs
+
+    value = BfileRef(encode_bfile_locator('PYO_DIR', 'f.txt'))
+    rows = [[value, 1], [value, 2]]
+    resolved = _resolve_temp_lob_binds(
+        ExecRequest('insert into t values (:1, :2)', 0, 2, 0, rows[0], rows),
+        _TempLobs(),
+    )
+    assert resolved.bind_rows == [[BFile('PYO_DIR', 'f.txt'), n] for n in (1, 2)]
+
+
 def test_a_column_lob_the_mirror_served_resolves_when_bound_back() -> None:
     # A column LOB the Mirror served went out under a locator it minted and
     # logged the content against (LobEmitLog); bound back, that content is the

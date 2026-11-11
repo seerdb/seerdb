@@ -3958,6 +3958,22 @@ class _TypedNull:
         self.oid = oid
 
 
+class _BfileDumper(psycopg.adapt.Dumper):
+    # A BFILE bound back (#2510) is its ora_bfile: the two names, in the
+    # composite's text form, each quoted. The subclass made at connect carries
+    # the type's oid.
+    def dump(self, obj: object) -> bytes:
+        assert isinstance(obj, BFile)
+        return (
+            '('
+            + ','.join(
+                '"' + name.replace('\\', '\\\\').replace('"', '""') + '"'
+                for name in (obj.directory, obj.filename)
+            )
+            + ')'
+        ).encode()
+
+
 class _TypedNullDumper(psycopg.adapt.Dumper):
     # One dumper per type: the NULL goes out with the type's oid. psycopg
     # caches dumpers by this key and takes any hashable, though its type names
@@ -15994,6 +16010,10 @@ class PostgresBackend:
         if found.bfile is not None:
             register_composite(found.bfile, self._conn)
             self._bfile_oid = found.bfile.oid
+            self._conn.adapters.register_dumper(
+                BFile,
+                type('_BfileBindDumper', (_BfileDumper,), {'oid': found.bfile.oid}),
+            )
         for name, tns_type in (
             (_CLOB_TYPE, TNS_TYPE_CLOB),
             (_BLOB_TYPE, TNS_TYPE_BLOB),

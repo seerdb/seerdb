@@ -25,7 +25,12 @@ from decimal import Decimal
 from typing import TypeVar
 
 import seerdb
-from seerdb.common.datatypes import BFile, TempLob, dbtype_for_oracle_type
+from seerdb.common.datatypes import (
+    BFile,
+    BfileBind,
+    TempLob,
+    dbtype_for_oracle_type,
+)
 from seerdb.common.dbobject import (
     DbObject,
     DbObjectType,
@@ -35,7 +40,7 @@ from seerdb.common.dbobject import (
     served_lob_content,
 )
 from seerdb.common.sqltext import is_plsql
-from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta
+from seerdb.common.tns import AL16UTF16_CHARSET, ColumnMeta, encode_bfile_locator
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
@@ -906,7 +911,7 @@ class OraclePassthroughBackend:
     def _execute_upstream(self, sql: str, binds: Sequence = ()) -> Result:
         assert self._conn is not None  # authenticate() ran before any execute
         cursor = self._conn.cursor()
-        binds = self._resolve_object_binds(binds)
+        binds = _upstream_bfiles(self._resolve_object_binds(binds))
         sql = self._lob_select_item(sql, binds)
         binds = self._upstream_lob_binds(binds)
         # A PL/SQL block hands its binds over as BindVar (value + type + buffer
@@ -1085,11 +1090,13 @@ class OraclePassthroughBackend:
         # placeholder, not something the upstream driver can bind, and handing
         # one over kills the connection rather than raising (#826).
         batch = [
-            self._resolve_object_binds(
-                [
-                    receivers[i] if i in receivers else value
-                    for i, value in enumerate(row)
-                ]
+            _upstream_bfiles(
+                self._resolve_object_binds(
+                    [
+                        receivers[i] if i in receivers else value
+                        for i, value in enumerate(row)
+                    ]
+                )
             )
             for row in rows
         ]
@@ -1125,6 +1132,11 @@ class OraclePassthroughBackend:
         # through an upstream temp LOB either way.
         variables = []
         for bind in binds:
+            if isinstance(bind.value, BfileBind):
+                # A BFILE bound back goes IN by its locator, as a populated
+                # object does (#2510).
+                variables.append(bind.value)
+                continue
             if (
                 bind.tns_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB)
                 and getattr(self._conn, 'field_version', 0) < FIELD_VERSION_12_1
@@ -1397,6 +1409,25 @@ _ORA_PREFIX = re.compile(r'^ORA-(\d{5}):\s*')
 # RAW column cannot exceed 32767 bytes even with extended sizes on, so this
 # takes any value a return bind can carry.
 _RECEIVER_SIZE = 32767
+
+
+def _upstream_bfiles(binds: Sequence) -> list:
+    """Bind a BFILE on by the locator its two names make (#2510).
+
+    The Mirror hands a BFILE over as the names its locator carries; the
+    locator BFILENAME(dir, file) returns is those names and a fixed block,
+    the same bytes from 11g to 23ai, so it is rebuilt and bound as
+    python-oracledb binds a fetched one. A block's BindVar keeps its place.
+    """
+    out = list(binds)
+    for at, bind in enumerate(out):
+        value = bind.value if isinstance(bind, BindVar) else bind
+        if isinstance(value, BFile):
+            locator = BfileBind(encode_bfile_locator(value.directory, value.filename))
+            out[at] = (
+                replace(bind, value=locator) if isinstance(bind, BindVar) else locator
+            )
+    return out
 
 
 def _resolve_bfiles(rows: list) -> list:
