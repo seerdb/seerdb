@@ -3513,10 +3513,27 @@ class CursorIntegration(_IntegrationBase):
         else:
             self.assertIsNone(self.conn.max_identifier_length)
 
-    @_requires(_mirror_lacks('a listener refusing an unknown instance (#2471)'))
+    def test_an_unknown_service_name_is_refused(self):
+        # A listener refuses a SERVICE_NAME it doesn't serve with ORA-12514:
+        # measured on 10g, 11g, 18c, 21c and 23ai. The Mirror served any
+        # (#2471).
+        from seerdb.common.exceptions import DatabaseError
+
+        with self.assertRaises(DatabaseError) as raised:
+            seerdb.connect(
+                host=_HOST,
+                port=_PORT,
+                user=_USER,
+                password=_PASSWORD,
+                service_name='SEERDB_NO_SUCH_SERVICE',
+                **_FV_KW,
+            )
+        self.assertEqual(raised.exception.code, 12514)
+
     def test_an_unknown_instance_name_is_refused(self):
         # A listener refuses (INSTANCE_NAME=...) naming an instance it doesn't
-        # know, with ORA-12521: measured on 9i, 10g, 11g and 23ai (#2456).
+        # know, with ORA-12521: measured on 9i, 10g, 11g and 23ai (#2456). The
+        # Mirror served any (#2471).
         from seerdb.common.exceptions import DatabaseError
 
         with self.assertRaises(DatabaseError) as raised:

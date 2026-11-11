@@ -62,6 +62,7 @@ from seerdb.common.tns_consts import (
     TNS_DATA,
     TNS_GSO_CAN_RECV_ATTENTION,
     TNS_MSG_TYPE_FAST_AUTH,
+    TNS_REFUSE,
     TNS_VERSION_11_2,
     TNS_VERSION_12_1,
     TNS_VERSION_12_2,
@@ -208,6 +209,7 @@ def opens_with_oci_ano(first: bytes) -> bool:
 
 _SERVICE_RE = re.compile(rb'\(SERVICE_NAME\s*=\s*([^)\s]+)', re.IGNORECASE)
 _SID_RE = re.compile(rb'\(SID\s*=\s*([^)\s]+)', re.IGNORECASE)
+_INSTANCE_RE = re.compile(rb'\(INSTANCE_NAME\s*=\s*([^)\s]+)', re.IGNORECASE)
 _PROGRAM_RE = re.compile(rb'\(PROGRAM\s*=\s*([^)]*)\)', re.IGNORECASE)
 _USER_RE = re.compile(rb'\(USER\s*=\s*([^)]*)\)', re.IGNORECASE)
 
@@ -225,6 +227,7 @@ class ConnectRequest:
     program: str | None
     user: str | None
     descriptor: bytes
+    instance_name: str | None = None
 
 
 def _u16(body: bytes, offset: int) -> int:
@@ -278,7 +281,34 @@ def parse_connect(body: bytes) -> ConnectRequest:
         program=_match(_PROGRAM_RE, descriptor),
         user=_match(_USER_RE, descriptor),
         descriptor=descriptor,
+        instance_name=_match(_INSTANCE_RE, descriptor),
     )
+
+
+# A listener's refusal (#2471), as 10g, 11g, 18c, 21c and 23ai Free send one
+# for a service or an instance they don't serve: user reason 0x22, system
+# reason 0, then the descriptor with the error twice.
+_REFUSE_USER_REASON = 0x22
+
+
+def encode_refuse(code: int, version_no: int) -> bytes:
+    """The TNS_REFUSE a listener answers a CONNECT with, refusing it with
+    ORA-``code`` (12514 for an unknown service, 12521 for an unknown instance).
+
+    ``VSNNUM`` is the listener's release: 10g and 11g send their packed
+    release, 18c and 21c the major release alone (18.0, 21.0), 23ai 0.
+    ``version_no`` is the release the Mirror presents, packed as
+    ``AUTH_VERSION_NO``.
+    """
+    major = version_no >> 24
+    vsnnum = 0 if major >= 23 else major << 24 if major >= 18 else version_no
+    text = (
+        f'(DESCRIPTION=(TMP=)(VSNNUM={vsnnum})(ERR={code})'
+        f'(ERROR_STACK=(ERROR=(CODE={code})(EMFI=4))))'
+    ).encode('ascii')
+    body = struct.pack('>BBH', _REFUSE_USER_REASON, 0, len(text)) + text
+    packet, _ = encode_packet(TNS_REFUSE, body, DEFAULT_SDU)
+    return packet
 
 
 def encode_accept(

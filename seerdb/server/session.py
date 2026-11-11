@@ -298,6 +298,7 @@ from seerdb.server.handshake import (
     encode_fast_auth_reply,
     encode_oci_dty_reply,
     encode_pro_reply,
+    encode_refuse,
     fast_auth_field_version,
     is_ano_negotiation,
     negotiated_tns_version,
@@ -558,6 +559,17 @@ def handle_login(
     if connect_data_follows(connect):
         connect += _expect(stream, TNS_DATA, 'connect data')
     request = parse_connect(connect)
+    # A listener refuses a service or an instance it doesn't serve (#2471): the
+    # backend says which, and one that has no opinion is served whatever the
+    # client names.
+    refuse = getattr(backend, 'refuse_connect', None)
+    refused = refuse(request.service_name, request.instance_name) if refuse else None
+    if refused:
+        stream.send_raw(encode_refuse(refused, identity.version_no))
+        raise InterfaceError(
+            f'refused the connect with ORA-{refused:05d}: service '
+            f'{request.service_name!r}, instance {request.instance_name!r}'
+        )
     stream.send_raw(encode_accept(request, tns_version=tns_version))
     # Honour the SDU just negotiated in that ACCEPT. It was computed as
     # min(client, ours) and reported, but every later write still used the

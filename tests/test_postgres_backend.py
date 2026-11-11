@@ -3361,6 +3361,8 @@ _CONNINFO = os.environ.get(
     'MIRROR_PG', 'host=127.0.0.1 port=5433 user=pyo password=pyo123 dbname=mirror'
 )
 _CREDS = {'PYO': 'pyo123'}
+# The service the Mirror-over-PG serves: its database's name (#2471).
+_SERVICE = psycopg.conninfo.conninfo_to_dict(_CONNINFO).get('dbname', 'pyo')
 
 
 def _pg_reachable() -> bool:
@@ -3408,7 +3410,7 @@ def _connect(port: int):
         port=port,
         user='PYO',
         password='pyo123',
-        service_name='XE',
+        service_name=_SERVICE,
         timeout=20000,
     )
 
@@ -3518,7 +3520,7 @@ def test_a_login_opens_no_transaction_and_its_settings_outlast_a_rollback(
         listen.close()
 
     assert result.get('error') is None, result.get('error')
-    assert row == ('PYO', 'PYO', 'XE')
+    assert row == ('PYO', 'PYO', _SERVICE)
 
 
 def test_a_role_writes_only_the_records_of_what_it_owns() -> None:
@@ -3743,13 +3745,16 @@ def _per_user_mirror(
     threading.Thread(target=accept, daemon=True).start()
     port = listen.getsockname()[1]
 
+    # The service is the database's, this Mirror's own (#2471).
+    service = psycopg.conninfo.conninfo_to_dict(conninfo).get('dbname', _SERVICE)
+
     def login(user: str, password: str) -> Any:
         return seerdb.connect(
             host='127.0.0.1',
             port=port,
             user=user,
             password=password,
-            service_name='XE',
+            service_name=service,
             timeout=20000,
         )
 
@@ -5372,7 +5377,7 @@ def _connect_no_autocommit(port: int):
         port=port,
         user='PYO',
         password='pyo123',
-        service_name='XE',
+        service_name=_SERVICE,
         timeout=5000,
         autocommit=False,
     )
@@ -17006,3 +17011,21 @@ def test_a_routines_collection_parameter_and_local(_collection_backend) -> None:
                 backend.execute(drop)
             except Exception:
                 backend.rollback()
+
+
+def test_a_connect_names_the_database_or_a_service_given() -> None:
+    # A listener refuses what it doesn't serve (#2471): the Mirror-over-PG
+    # serves its database's name and the services it is given, as a service,
+    # and the database's name as its instance, whatever their case.
+    database = str(_SERVICE).upper()
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), services=['xe'])
+    try:
+        refuse = backend.refuse_connect
+        assert refuse(database.lower(), None) is None
+        assert refuse('XE', database) is None
+        assert refuse(None, None) is None
+        assert refuse('SEERDB_NO_SUCH_SERVICE', None) == 12514
+        assert refuse('XE', 'SEERDB_NO_SUCH_INSTANCE') == 12521
+        assert backend.session_info().instance_name == database
+    finally:
+        backend.close()

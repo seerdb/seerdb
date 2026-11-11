@@ -747,3 +747,16 @@ def test_a_type_that_is_no_collection_is_not_described():
     backend, cursor = _type_backend(None)
     assert backend.describe_type('SCOTT.NO_SUCH_TYPE') is None
     assert cursor.calls[0][1] == {'type_owner': 'SCOTT', 'type_name': 'NO_SUCH_TYPE'}
+
+
+def test_a_passthrough_serves_its_upstreams_service_and_asks_it_the_instance():
+    # A service other than the upstream's or one given is refused as by a
+    # listener (#2471); the instance goes upstream with the login, for the
+    # upstream's own listener to answer.
+    backend = OraclePassthroughBackend(
+        host='h', port=1, service='FREEPDB1', credentials={}, services=['xe']
+    )
+    assert backend.refuse_connect('freepdb1', None) is None
+    assert backend.refuse_connect('XE', 'FREE') is None
+    assert backend._instance_name == 'FREE'
+    assert backend.refuse_connect('SEERDB_NO_SUCH_SERVICE', None) == 12514

@@ -278,7 +278,7 @@ import psycopg
 from psycopg import sql
 from psycopg.abc import DumperKey
 from psycopg.adapt import Loader, PyFormat
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.composite import CompositeInfo, register_composite
 
 from seerdb.common.datatypes import JSON, BcDate, BFile, IntervalYM
@@ -412,7 +412,14 @@ from seerdb.server.accounts import (
     _password_text,
     _user_name,
 )
-from seerdb.server.backend import BlobValue, ClobValue, SessionInfo, TypeDescription
+from seerdb.server.backend import (
+    ORA_UNKNOWN_INSTANCE,
+    ORA_UNKNOWN_SERVICE,
+    BlobValue,
+    ClobValue,
+    SessionInfo,
+    TypeDescription,
+)
 from seerdb.server.backends.sqlparser import (
     Unsupported,
     rewrite_connect_by,
@@ -15087,6 +15094,9 @@ def _dba_group(group: str) -> str:
 # per process: a later process makes them again, after a dictionary that may
 # have new tables.
 _USER_GROUP_READY: dict[str, str] = {}
+# Each connection string's database, as its first connection reported it: the
+# service and instance a session serves (#2471), known before it connects.
+_DATABASE_NAMES: dict[str, str] = {}
 # ORA-01940, a DROP USER of a user with a session open (#1857).
 _ORA_USER_CONNECTED = 1940
 
@@ -15406,6 +15416,7 @@ class PostgresBackend:
         presents: str = '12.1',
         native_sql: bool = False,
         per_user_roles: bool = False,
+        services: Sequence[str] = (),
     ) -> None:
         if per_user_roles and auth_conninfo is None:
             # A role's password is kept with its account (#1857).
@@ -15437,6 +15448,8 @@ class PostgresBackend:
         self._per_user = per_user_roles
         self._admin_conninfo = conninfo
         self._presents = presents
+        # The service names served besides the database's own (#2471).
+        self._services = frozenset(name.upper() for name in services)
         # The translation report's switch, and whether a client may run
         # native PostgreSQL SQL at all (#1859): the operator's choice, off
         # unless the launcher turns it on. Off, a PG hint is a hint Oracle does
@@ -15470,6 +15483,7 @@ class PostgresBackend:
         (major, minor) = self._release
         group = _USER_GROUP_READY.get(self._admin_conninfo, '')
         self._conn = _CountedConnection.connect(conninfo, cursor_factory=_CountedCursor)
+        _DATABASE_NAMES.setdefault(self._admin_conninfo, self._conn.info.dbname)
         # V$VERSION and DBMS_UTILITY.DB_VERSION read the presented release from
         # the session (#1704), so the shared dictionary serves either release.
         # In the same statement: whether the database's installation is this
@@ -16312,6 +16326,29 @@ class PostgresBackend:
             self._at_once(sql.SQL('; ').join(statements))
         except psycopg.Error:
             self._conn.rollback()
+
+    def refuse_connect(
+        self, service_name: str | None, instance_name: str | None
+    ) -> int | None:
+        """What a listener refuses (#2471): a service other than the
+        database's name or one of the services given, ORA-12514, and an
+        instance other than the one the login reports (the database's name,
+        as ``session_info`` gives it), ORA-12521. Names compare as Oracle's
+        do, whatever their case."""
+        database = _DATABASE_NAMES.get(self._admin_conninfo) or conninfo_to_dict(
+            self._admin_conninfo
+        ).get('dbname')
+        if not database:
+            return None  # nothing to compare with: libpq's default, unseen
+        name = str(database).upper()
+        if service_name is not None and service_name.upper() not in {
+            name,
+            *self._services,
+        }:
+            return ORA_UNKNOWN_SERVICE
+        if instance_name is not None and instance_name.upper() != name:
+            return ORA_UNKNOWN_INSTANCE
+        return None
 
     def session_info(self) -> SessionInfo:
         """The session's identity, for the Mirror's login reply (#1212).
