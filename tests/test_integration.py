@@ -9792,7 +9792,6 @@ class RefCursorInBindIntegration(_IntegrationBase):
         rc.execute("SELECT level, 'String ' || level FROM dual CONNECT BY level <= 5")
         return rc
 
-    @_requires(_postgres_cannot('fetch in a block from a REF CURSOR bound IN (#2452)'))
     def test_the_block_fetches_from_the_bound_cursor(self):
         # The proof that the id reached the server and named a usable cursor:
         # the block read a row off it and wrote the row down. Row 1 was consumed

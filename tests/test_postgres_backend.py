@@ -7076,6 +7076,42 @@ def test_a_cursor_bound_in_is_not_reported_back() -> None:
             backend.rollback()
 
 
+def test_a_cursor_bound_in_out_and_closed_comes_back_none() -> None:
+    # A procedure handed a client's cursor IN OUT, which reads from it and
+    # closes it (#2452): the CALL returns the portal's name, which names nothing
+    # any more. It goes back as None, the closed cursor a routine leaves (#1048),
+    # where draining it failed the call with "cursor does not exist".
+    from seerdb.common.tns_consts import TNS_TYPE_REFCURSOR
+    from seerdb.server.backend import BindVar
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE rc2452 (n NUMBER)')
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE rc2452p(c IN OUT SYS_REFCURSOR) IS\n'
+            '  n NUMBER;\nBEGIN\n  FETCH c INTO n;\n  INSERT INTO rc2452 VALUES (n);\n'
+            '  CLOSE c;\nEND;'
+        )
+        portal = backend.open_ref_cursor(
+            'SELECT level FROM dual CONNECT BY level <= 5', 1
+        )
+        result = backend.execute(
+            'BEGIN rc2452p(:1); END;',
+            [BindVar(value=portal, tns_type=TNS_TYPE_REFCURSOR, max_size=0)],
+        )
+        assert result.out_binds == [None]
+        assert [tuple(r) for r in backend.execute('SELECT n FROM rc2452').rows] == [
+            (2,)
+        ]
+    finally:
+        backend.rollback()
+        for drop in ('DROP PROCEDURE rc2452p', 'DROP TABLE rc2452'):
+            try:
+                backend.execute(drop)
+            except Exception:
+                backend.rollback()
+
+
 def test_a_failing_call_keeps_the_callers_open_work() -> None:
     # A procedure or function call that fails undoes only itself (#1632): the
     # caller's uncommitted row survives it, as 23ai's does, where a rollback of
