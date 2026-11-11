@@ -8950,6 +8950,12 @@ def encode_dictionary_description(Dictionary: dict) -> bytes:
     # connection class or a purity requests no pooled server by itself (#1990).
     ServerType = Dictionary['env'].get('server_type')
     Drcp = b'(SERVER=' + ServerType.encode('ascii') + b')' if ServerType else b''
+    # The DRCP implicit pooling boundary follows it, where python-oracledb
+    # writes it (#2542). The server does the pooling; a dedicated server and
+    # one before 23ai ignore it.
+    Boundary = Dictionary['env'].get('pool_boundary')
+    if Boundary:
+        Drcp += b'(POOL_BOUNDARY=' + Boundary.encode('ascii') + b')'
     # The instance to reach, after the service as the reference client writes
     # it, and the keepalive interval opening the DESCRIPTION (#2456).
     Instance = Dictionary['env'].get('instance_name') or ''

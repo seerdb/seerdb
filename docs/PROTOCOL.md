@@ -365,6 +365,7 @@ When SSL/TLS is used, `PROTOCOL=TCPS`.
 Two optional parts go where python-oracledb 26.1 writes them (#2456):
 - `(EXPIRE_TIME=<minutes>)` opens the DESCRIPTION, when `expire_time` is above 0. The client also turns TCP keepalive on, with the first probe after that many minutes of quiet.
 - `(INSTANCE_NAME=<instance>)` follows the service name, before `(SERVER=...)`.
+- `(POOL_BOUNDARY=statement|transaction)` follows `(SERVER=...)`, when `pool_boundary` is given (#2542). See §30.
 
 The listener acts on the instance name. Measured on 9i, 10g, 11g and 23ai (2026-11-04): the instance it serves connects, and one it doesn't know is refused with ORA-12521, *connection refused by the listener*. The Mirror doesn't check it yet (#2471).
 
@@ -8381,6 +8382,31 @@ trailing `ORA-01403` on a fetch is the normal end-of-data marker, not an error.
 Verified on 21c and 23ai (sync + async): connections route through the broker
 (`v$cpool_stats` / `v$cpool_conn_info` show the connection class). Needs the
 server pool started (`DBMS_CONNECTION_POOL.START_POOL`).
+
+**Implicit connection pooling** (#2542, 23ai): `pool_boundary='statement'` or
+`'transaction'` adds `(POOL_BOUNDARY=<value>)` to CONNECT_DATA, after
+`(SERVER=pooled)`, in the CONNECT and in the AUTH's `AUTH_CONNECT_STRING`. That
+is all the client sends: the server takes the session back into the pool at
+each boundary and attaches one again at the next call. Measured on 23ai Free
+23.26.2 against python-oracledb 26.1:
+
+- **Replies:** every reply opens with a `SESS_RET` piggyback, its session flags
+  4 (session changed) after the first. The OER's call status is 0x4001, two
+  bytes on the wire (`04 02 40 01`), where it is one otherwise. A reader that
+  assumes a one-byte call status hangs (#2540).
+- **Release:** a connected client idle between transactions holds no pooled
+  server under `transaction` (0 busy, 1 without a boundary). Under `statement`
+  a client with open cursors keeps its server, python-oracledb's as seerdb's.
+- **Values:** the server takes either word in any case and refuses another
+  with ORA-24545 on a pooled connection. A dedicated connection, 21c, 11g and
+  10g ignore the parameter. seerdb refuses another value before connecting.
+
+Not sent yet: python-oracledb's pool also marks request boundaries for the
+server, a function 176 (`0xb0`) piggyback carrying a ub8 `0x44`
+(REQUEST_BEGIN | EXPLICIT_BOUNDARY) on the first call after an acquire and
+`0x48` (REQUEST_END) on the rollback at release. It sends them only when the
+server's runtime capabilities have the session-state bit (`0x10` in the TTC
+byte).
 
 ## 31. Sessionless transactions (#133, 23ai)
 
