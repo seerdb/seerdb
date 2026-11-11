@@ -212,6 +212,8 @@ class DescriptorTarget:
     # interval in minutes (#2456).
     instance_name: str = ''
     expire_time: int = 0
+    # The DRCP implicit pooling boundary CONNECT_DATA names (#2542).
+    pool_boundary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +229,7 @@ class Address:
     https_proxy: str = ''
     https_proxy_port: int = 0
     instance_name: str = ''
+    pool_boundary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -264,6 +267,22 @@ def server_type_value(value: str | None) -> str | None:
     return lowered
 
 
+_POOL_BOUNDARIES = frozenset({'statement', 'transaction'})
+
+
+def pool_boundary_value(value: str | None) -> str | None:
+    """A DRCP implicit pooling boundary as written into (POOL_BOUNDARY=...):
+    statement or transaction, lower-cased; None for none (#2542). The server
+    refuses any other value with ORA-24545 on a pooled connection and ignores
+    the parameter on a dedicated one, so it is checked here, as server_type is."""
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered not in _POOL_BOUNDARIES:
+        raise ProgrammingError(f'invalid pool_boundary: {value}')
+    return lowered
+
+
 # The keys read, at each level. CID only describes the client, which seerdb
 # reports itself, and FAILOVER means nothing with one address. Anything else is
 # refused by name rather than ignored -- python-oracledb acts on most of them
@@ -283,7 +302,7 @@ _ADDRESS_KEYS = frozenset(
     {'protocol', 'host', 'port', 'https_proxy', 'https_proxy_port'}
 )
 _CONNECT_DATA_KEYS = frozenset(
-    {'service_name', 'sid', 'cid', 'server', 'instance_name'}
+    {'service_name', 'sid', 'cid', 'server', 'instance_name', 'pool_boundary'}
 )
 _DEFAULT_PORT = 1521
 
@@ -399,7 +418,7 @@ def _connect_data(description: list[tuple[str, Node]]) -> Address:
     # The description's CONNECT_DATA, as an Address its addresses fill in.
     connect_data = [v for k, v in description if k == 'connect_data']
     service_name = sid = instance_name = ''
-    server_type = None
+    server_type = pool_boundary = None
     if connect_data:
         data = _branch(connect_data[0], 'connect_data')
         _refuse_unread(data, _CONNECT_DATA_KEYS, 'CONNECT_DATA parameter')
@@ -414,8 +433,20 @@ def _connect_data(description: list[tuple[str, Node]]) -> Address:
             if not isinstance(found, str):
                 raise NetConfigError('SERVER in CONNECT_DATA must be a word')
             server_type = server_type_value(found)
+        found = _find_first(data, 'pool_boundary')
+        if found is not None:
+            if not isinstance(found, str):
+                raise NetConfigError('POOL_BOUNDARY in CONNECT_DATA must be a word')
+            pool_boundary = pool_boundary_value(found)
     return Address(
-        '', 0, 'tcp', service_name, sid, server_type, instance_name=instance_name
+        '',
+        0,
+        'tcp',
+        service_name,
+        sid,
+        server_type,
+        instance_name=instance_name,
+        pool_boundary=pool_boundary,
     )
 
 
@@ -494,6 +525,7 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         first.https_proxy_port,
         first.instance_name,
         expire_time or 0,
+        first.pool_boundary,
     )
 
 

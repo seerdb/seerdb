@@ -24,7 +24,8 @@ raises NotSupportedError naming it, rather than being ignored. A ``tcps://``
 prefix, or PROTOCOL=TCPS in a descriptor, turns TLS on, and a ``:server_type``
 suffix or (SERVER=...) in CONNECT_DATA sets the server type (#1977). A third
 segment or (INSTANCE_NAME=...) names the instance, and ``?expire_time=`` or
-(EXPIRE_TIME=...) turns TCP keepalive on (#2456).
+(EXPIRE_TIME=...) turns TCP keepalive on (#2456). ``?pool_boundary=`` or
+(POOL_BOUNDARY=...) sets the DRCP implicit pooling boundary (#2542).
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from seerdb.client.netconfig import (
     NetConfigError,
     Route,
     parse_descriptor,
+    pool_boundary_value,
     proxy_address,
     resolve_alias,
     server_type_value,
@@ -65,6 +67,7 @@ class DsnTarget:
     https_proxy_port: int = 0
     instance_name: str = ''
     expire_time: int = 0
+    pool_boundary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,8 @@ class ConnectArguments:
     # between keepalive probes, 0 for none (#2456).
     instance_name: str = ''
     expire_time: int = 0
+    # The DRCP implicit pooling boundary, (POOL_BOUNDARY=...) (#2542).
+    pool_boundary: str | None = None
 
     def as_tuple(self) -> tuple:
         # In field order, for a constructor to unpack into its own arguments.
@@ -150,6 +155,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             https_proxy_port=found.https_proxy_port,
             instance_name=found.instance_name,
             expire_time=found.expire_time,
+            pool_boundary=found.pool_boundary,
         )
     protocol = 'tcp'
     scheme, separator, after = text.partition('://')
@@ -197,6 +203,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             https_proxy_port=found.https_proxy_port,
             instance_name=found.instance_name,
             expire_time=found.expire_time,
+            pool_boundary=found.pool_boundary,
         )
     port = _DEFAULT_PORT
     if rest.startswith(':'):
@@ -266,6 +273,7 @@ def _apply_parameters(
             'https_proxy',
             'https_proxy_port',
             'expire_time',
+            'pool_boundary',
         }
     )
     if unread:
@@ -293,6 +301,15 @@ def _apply_parameters(
                 f'dsn {dsn!r}: expire_time={parameters["expire_time"]!r} is not a number'
             )
         args = replace(args, expire_time=int(parameters['expire_time']))
+    if 'pool_boundary' in parameters:
+        try:
+            boundary = pool_boundary_value(parameters['pool_boundary'])
+        except ProgrammingError:
+            raise ProgrammingError(
+                f'dsn {dsn!r}: pool_boundary={parameters["pool_boundary"]!r}'
+                ' is not statement or transaction'
+            ) from None
+        args = replace(args, pool_boundary=boundary)
     if 'transport_connect_timeout' in parameters:
         args = replace(
             args, timeout=_timeout_ms(dsn, parameters['transport_connect_timeout'])
@@ -328,6 +345,7 @@ def _apply_parameters(
             args.https_proxy or '',
             args.https_proxy_port,
             args.instance_name,
+            args.pool_boundary,
         )
         args = replace(
             args,
@@ -362,6 +380,8 @@ def resolve_dsn_arguments(
         args = replace(args, instance_name=info.instance_name)
     if info.expire_time:
         args = replace(args, expire_time=info.expire_time)
+    if info.pool_boundary:
+        args = replace(args, pool_boundary=info.pool_boundary)
     if info.service_name:
         args = replace(args, service_name=info.service_name, sid='')
     elif info.sid:

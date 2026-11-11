@@ -340,7 +340,7 @@ exercise.
 | **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+, and a pooled 11g session) | ✅ |
 | **Arrow / DataFrame fetch** — `cursor.fetch_df_all` / `fetch_df_batches` (pyarrow `Table` / record batches) | ✅ |
 | **SODA** — document store over `DBMS_SODA`: collections, documents, query-by-example (with streaming), insert / read / upsert / update / delete / bulk, indexing + data guide (18c+) | ✅ |
-| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, `is_healthy()` with no round trip, `transaction_in_progress` (10g+), `max_identifier_length` and `instance_name` from the login reply, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects; `instance_name` (a parameter, the Easy Connect `/service/instance` form, or `INSTANCE_NAME`), `expire_time` (TCP keepalive), `dsn` as an Easy Connect string, a connect descriptor (with address failover) or a `tnsnames.ora` alias, IPv6, TCPS through an HTTPS proxy; `ws://` / `wss://` to a Mirror's WebSocket listener (a seerdb extension, the `ws` extra) | ✅ |
+| **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, `is_healthy()` with no round trip, `transaction_in_progress` (10g+), `max_identifier_length` and `instance_name` from the login reply, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), and its implicit connection pooling (`pool_boundary`), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects; `instance_name` (a parameter, the Easy Connect `/service/instance` form, or `INSTANCE_NAME`), `expire_time` (TCP keepalive), `dsn` as an Easy Connect string, a connect descriptor (with address failover) or a `tnsnames.ora` alias, IPv6, TCPS through an HTTPS proxy; `ws://` / `wss://` to a Mirror's WebSocket listener (a seerdb extension, the `ws` extra) | ✅ |
 | **Authentication** — O3LOGON (8i / 9i) and O5LOGON (10g+, 128 / 192 / 256-bit); token-based auth — OAuth2 (bare JWT) and OCI IAM (signed) for Autonomous Database | ✅ |
 | **Native network encryption** — Advanced Networking (ANO): AES-CBC encryption + SHA-2 data-integrity negotiated at connect, for a server with `SQLNET.ENCRYPTION_SERVER` / `CRYPTO_CHECKSUM_SERVER` set | ✅ |
 | **Advanced Queuing (AQ)** — enqueue / dequeue over `DBMS_AQ`, including JSON payloads | ✅ |
@@ -453,6 +453,11 @@ through the LOB it arrives as, where python-oracledb has the server redefine the
 column and send it inline. The values are the same; it costs a read per LOB. A
 JSON or VECTOR column can't be converted by a handler yet.
 
+A **`pool_boundary`** that is neither `statement` nor `transaction` raises
+`ProgrammingError` before connecting, as a bad `server_type` does in both
+drivers; python-oracledb sends it on as given, and a pooled server refuses it
+(ORA-24545).
+
 (Oracle's `'' == NULL` rule applies to LOBs as to strings, so an empty-string /
 empty-bytes bind stores — and reads back — as `None`.)
 
@@ -528,7 +533,12 @@ open an HTTP `CONNECT` tunnel, and TLS then verifies the database server through
 it; a proxy beside a plain TCP address is not used. A `:server_type` suffix (`dbhost/MYDB:pooled`) or `(SERVER=...)` in a
 descriptor sets `server_type`, which `connect()` also takes: `dedicated`,
 `shared` or `pooled`, the last asking for DRCP (`cclass` and `purity` only label
-the session, as in python-oracledb). Oracle 11g's pool serves only clients in
+the session, as in python-oracledb). `pool_boundary` (`statement` or
+`transaction`; an argument, `?pool_boundary=` or `(POOL_BOUNDARY=...)`) asks a
+23ai DRCP pool for implicit connection pooling, where the server takes the
+session back at each boundary; an older server and a dedicated one ignore it.
+Another value is refused with `ProgrammingError` before connecting, where
+python-oracledb sends it on and a pooled server refuses it (ORA-24545). Oracle 11g's pool serves only clients in
 OCI's native form, which seerdb speaks for a pooled 11g connection. There it
 runs queries, DML, DDL, `commit` and `rollback` and PL/SQL blocks, with
 scalar IN, OUT and IN OUT binds and values of any size into LOB and LONG
@@ -548,7 +558,7 @@ descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is
 refused with `NotSupportedError` for now. Of Easy Connect's `?` parameters, `sdu`, `pool_connection_class`
 (`cclass`), `pool_purity` (`new` / `self`), `transport_connect_timeout`
 (seconds, or `ms` / `sec` / `min`; it sets `timeout`, which also bounds the
-login), `retry_count` / `retry_delay` and `https_proxy` / `https_proxy_port` are read and win over the arguments beside them; any other is refused by
+login), `retry_count` / `retry_delay`, `https_proxy` / `https_proxy_port` and `pool_boundary` are read and win over the arguments beside them; any other is refused by
 name, where python-oracledb ignores the ones it does not know. python-oracledb
 ignores descriptor parameters it does not know; seerdb refuses them by name.
 

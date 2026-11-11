@@ -83,6 +83,7 @@ from seerdb.client.netconfig import (
     Route,
     check_proxy_reply,
     holds_wallet,
+    pool_boundary_value,
     proxy_connect_request,
     server_type_value,
 )
@@ -230,6 +231,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         https_proxy_port: int = 0,
         instance_name: str | None = None,
         expire_time: int = 0,
+        pool_boundary: str | None = None,
         wallet_location: str | None = None,
         wallet_password: str | None = None,
         config_dir: str | None = None,
@@ -283,6 +285,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 https_proxy_port,
                 instance_name=instance_name or '',
                 expire_time=expire_time,
+                pool_boundary=pool_boundary,
             )
             (
                 host,
@@ -303,6 +306,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 protocol,
                 instance_name,
                 expire_time,
+                pool_boundary,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # The transport in force (#1988); a route address can repoint it.
         self.protocol = protocol
@@ -333,6 +337,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         # server reports at login is `instance_name`, set from its reply.
         self._instance_name_requested = instance_name or ''
         self.expire_time = expire_time
+        # The DRCP implicit pooling boundary, written into (POOL_BOUNDARY=...)
+        # after (SERVER=...); the server does the pooling (#2542).
+        self.pool_boundary = pool_boundary_value(pool_boundary)
         self.password = password
         self.sid = sid
         self.service_name = service_name
@@ -703,6 +710,8 @@ class AsyncOracleConnect(_ConnectionLogic):
             self.server_type = address.server_type
         if address.instance_name:
             self._instance_name_requested = address.instance_name
+        if address.pool_boundary:
+            self.pool_boundary = address.pool_boundary
         if address.https_proxy:
             (self.https_proxy, self.https_proxy_port) = (
                 address.https_proxy,

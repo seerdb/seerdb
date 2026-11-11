@@ -111,6 +111,7 @@ class _ConnectionLogic:
     serial_num: int | None
     _instance_name_requested: str
     expire_time: int
+    pool_boundary: str | None
     socket_options: object
     conn_state: int
     timeout: int
@@ -824,6 +825,7 @@ class _ConnectionLogic:
                 'server_type': self.server_type,
                 'instance_name': self._instance_name_requested,
                 'expire_time': self.expire_time,
+                'pool_boundary': self.pool_boundary,
                 'password': self.password,
                 'sid': self.sid,
                 'service_name': self.service_name,

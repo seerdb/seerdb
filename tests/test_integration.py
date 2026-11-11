@@ -3707,6 +3707,41 @@ class CursorIntegration(_IntegrationBase):
                     cur.execute('SELECT 1 FROM dual')
                     self.assertEqual(cur.fetchone(), (1,))
 
+    def test_a_pool_boundary_connects(self):
+        # pool_boundary (#2542) asks a 23ai DRCP pool for implicit pooling; an
+        # older server and a dedicated one ignore it. Under it the server
+        # answers with a two-byte call status, which hung a LOB read (#2540).
+        for boundary in ('statement', 'transaction'):
+            with self.subTest(pool_boundary=boundary):
+                try:
+                    conn = seerdb.connect(
+                        user=_USER,
+                        password=_PASSWORD,
+                        host=_HOST,
+                        port=_PORT,
+                        service_name=_SERVICE,
+                        **{
+                            **_FV_KW,
+                            'server_type': 'pooled',
+                            'pool_boundary': boundary,
+                        },
+                    )
+                except seerdb.DatabaseError as e:
+                    if getattr(e, 'code', None) == 12520:
+                        self.skipTest('the DRCP pool is not started on this server')
+                    raise
+                with conn:
+                    cur = conn.cursor()
+                    for _ in range(2):
+                        cur.execute('SELECT 1 FROM dual')
+                        self.assertEqual(cur.fetchone(), (1,))
+                    if _target_is_8i():
+                        continue  # 8i has no TO_CLOB, and no DRCP to test
+                    cur.execute("SELECT TO_CLOB(RPAD('x', 3000, 'x')) FROM dual")
+                    lob = cur.fetchone()[0]
+                    text = lob if isinstance(lob, str) else lob.read()
+                    self.assertEqual(text, 'x' * 3000)
+
     def test_an_aggregate_over_a_null_group(self):
         # An aggregate that skipped NULLs makes the server set a warning in the
         # closing status, a field that before 12.1 is a ub2; read as one byte
