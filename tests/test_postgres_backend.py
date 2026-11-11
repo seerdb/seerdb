@@ -5557,8 +5557,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_plsql_number_text with DBMS_OUTPUT's PUT_LINE and PUT of a
     # number (#2181), and sys.ora_datetime_text, sys.ora_zone_text,
     # sys.ora_tstz_text, sys.ora_ltz_text and sys.ora_computed_text (#2162),
-    # and sys.ora_identity_on_null (#2413).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 116
+    # and sys.ora_identity_on_null (#2413), and a collection's errors in
+    # PL/SQL: sys.ora_coll_fault, sys.ora_coll_index, sys.ora_coll_gone and
+    # sys.ora_coll_raise (#2547).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 120
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -16742,3 +16744,239 @@ def test_a_connect_to_an_installed_database_installs_nothing(
     finally:
         monkeypatch.undo()
         admin.close()
+
+
+# --- A VARRAY's and a nested table's elements and methods in PL/SQL (#2547) ---
+
+# (name, the statements on v, 23ai's VARRAY answer, its nested table's), v
+# starting as T(10, 20, 30); an answer 'ORA-nnnnn' is the error 23ai raised.
+# Each measured on 23ai Free 23.26.2.
+_COLLECTION_CASES = [
+    ('count', 'r := v.count;', '3', '3'),
+    ('first_last', "r := v.first || ',' || v.last;", '1,3', '1,3'),
+    ('limit', "r := nvl(to_char(v.limit), 'null');", '10', 'null'),
+    ('read_2', 'r := v(2);', '20', '20'),
+    ('read_0', 'r := v(0);', 'ORA-06532', 'ORA-06532'),
+    ('read_4', 'r := v(4);', 'ORA-06533', 'ORA-06533'),
+    ('read_11', 'r := v(11);', 'ORA-06532', 'ORA-06533'),
+    ('read_null_idx', 'r := v(NULL);', 'ORA-06502', 'ORA-06502'),
+    ('assign_2', 'v(2) := 99; r := v(2);', '99', '99'),
+    ('assign_4', 'v(4) := 99;', 'ORA-06533', 'ORA-06533'),
+    (
+        'extend',
+        "v.extend; r := v.count || ':' || nvl(to_char(v(4)), 'null');",
+        '4:null',
+        '4:null',
+    ),
+    ('extend_2', 'v.extend(2); r := v.count;', '5', '5'),
+    ('extend_copy', "v.extend(2, 1); r := v(4) || ',' || v(5);", '10,10', '10,10'),
+    ('extend_past_limit', 'v.extend(8);', 'ORA-06532', None),
+    ('trim', 'v.trim; r := v.count;', '2', '2'),
+    ('trim_2', 'v.trim(2); r := v.count;', '1', '1'),
+    ('trim_past_count', 'v.trim(4);', 'ORA-06533', 'ORA-06533'),
+    (
+        'delete_all',
+        "v.delete; r := v.count || ':' || nvl(to_char(v.first), 'null');",
+        '0:null',
+        '0:null',
+    ),
+    (
+        'exists',
+        "r := case when v.exists(3) then 'y' else 'n' end || case when v.exists(4) then 'y' else 'n' end || case when v.exists(0) then 'y' else 'n' end;",
+        'ynn',
+        'ynn',
+    ),
+    (
+        'next_prior',
+        "r := v.next(1) || ',' || nvl(to_char(v.next(3)), 'null') || ',' || v.prior(3) || ',' || nvl(to_char(v.prior(1)), 'null');",
+        '2,null,2,null',
+        '2,null,2,null',
+    ),
+    ('null_count', 'v := NULL; r := v.count;', 'ORA-06531', 'ORA-06531'),
+    ('null_read', 'v := NULL; r := v(1);', 'ORA-06531', 'ORA-06531'),
+    ('null_extend', 'v := NULL; v.extend;', 'ORA-06531', 'ORA-06531'),
+    (
+        'null_exists',
+        "v := NULL; r := case when v.exists(1) then 'y' else 'n' end;",
+        'n',
+        'n',
+    ),
+    (
+        'empty_first',
+        "v := T(); r := nvl(to_char(v.first), 'null') || ',' || v.count;",
+        'null,0',
+        'null,0',
+    ),
+    ('ctor_values', "v := T(1, 2); r := v.count || ':' || v(2);", '2:2', '2:2'),
+    (
+        'for_count',
+        "FOR i IN 1..v.count LOOP v(i) := v(i) * 2; END LOOP; r := v(1) || ',' || v(3);",
+        '20,60',
+        '20,60',
+    ),
+    ('is_null', "r := case when v is null then 'null' else 'set' end;", 'set', 'set'),
+    (
+        'null_first',
+        "v := NULL; r := nvl(to_char(v.first), 'null');",
+        'ORA-06531',
+        'ORA-06531',
+    ),
+    (
+        'null_last',
+        "v := NULL; r := nvl(to_char(v.last), 'null');",
+        'ORA-06531',
+        'ORA-06531',
+    ),
+    (
+        'null_limit',
+        "v := NULL; r := nvl(to_char(v.limit), 'null');",
+        'ORA-06531',
+        'ORA-06531',
+    ),
+    (
+        'null_next',
+        "v := NULL; r := nvl(to_char(v.next(1)), 'null');",
+        'ORA-06531',
+        'ORA-06531',
+    ),
+    (
+        'null_prior',
+        "v := NULL; r := nvl(to_char(v.prior(1)), 'null');",
+        'ORA-06531',
+        'ORA-06531',
+    ),
+    ('null_trim', 'v := NULL; v.trim;', 'ORA-06531', 'ORA-06531'),
+    ('null_delete', 'v := NULL; v.delete;', 'ORA-06531', 'ORA-06531'),
+    ('null_assign_elem', 'v := NULL; v(1) := 5;', 'ORA-06531', 'ORA-06531'),
+    (
+        'exists_null_idx',
+        "r := case when v.exists(NULL) then 'y' else 'n' end;",
+        'n',
+        'n',
+    ),
+    ('next_null', "r := nvl(to_char(v.next(NULL)), 'null');", 'null', 'null'),
+    ('next_0', "r := nvl(to_char(v.next(0)), 'null');", '1', '1'),
+    (
+        'next_big',
+        "r := nvl(to_char(v.next(100)), 'null') || ',' || nvl(to_char(v.prior(100)), 'null');",
+        'null,3',
+        'null,3',
+    ),
+    ('prior_0', "r := nvl(to_char(v.prior(0)), 'null');", 'null', 'null'),
+    ('read_frac', 'r := v(2.6);', '30', '30'),
+    ('assign_frac', 'v(1.4) := 7; r := v(1);', '7', '7'),
+    ('extend_0', 'v.extend(0); r := v.count;', '3', '3'),
+    ('extend_neg', 'v.extend(-1); r := v.count;', 'ORA-06502', 'ORA-06502'),
+    ('extend_null_n', 'v.extend(NULL); r := v.count;', '3', '3'),
+    ('extend_copy_bad', 'v.extend(1, 5); r := v.count;', 'ORA-06533', 'ORA-06533'),
+    ('trim_0', 'v.trim(0); r := v.count;', '3', '3'),
+    ('trim_neg', 'v.trim(-1); r := v.count;', 'ORA-06502', 'ORA-06502'),
+    (
+        'trim_all',
+        "v.trim(3); r := v.count || nvl(to_char(v.first), 'null');",
+        '0null',
+        '0null',
+    ),
+    ('assign_after_extend', 'v.extend; v(4) := 40; r := v(4);', '40', '40'),
+    ('read_neg', 'r := v(-1);', 'ORA-06532', 'ORA-06532'),
+    (
+        'copy_semantics',
+        "DECLARE w T; BEGIN w := v; w(1) := 99; r := v(1) || ',' || w(1); END;",
+        '10,99',
+        '10,99',
+    ),
+]
+
+
+@pytest.fixture(scope='module')
+def _collection_backend():
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    for drop in ('DROP TYPE c2547v', 'DROP TYPE c2547n'):
+        try:
+            backend.execute(drop)
+        except Exception:
+            backend.rollback()
+    backend.execute('CREATE TYPE c2547v AS VARRAY(10) OF NUMBER')
+    backend.execute('CREATE TYPE c2547n AS TABLE OF NUMBER')
+    yield backend
+    backend.rollback()
+    for drop in ('DROP TYPE c2547v', 'DROP TYPE c2547n'):
+        backend.execute(drop)
+
+
+def _collection_answer(backend, block: str) -> str | None:
+    # The block's :out, or the ORA error it raised as 'ORA-nnnnn'.
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BackendError, BindVar
+
+    out = BindVar(value=None, tns_type=TNS_TYPE_VARCHAR, max_size=200)
+    try:
+        value = backend.execute(block, [out]).out_binds[0]
+    except BackendError as exc:
+        backend.rollback()
+        return f'ORA-{exc.ora_code:05d}'
+    return None if value is None else str(value)
+
+
+@pytest.mark.parametrize('typ', ['c2547v', 'c2547n'])
+@pytest.mark.parametrize(
+    'body,varray,nested',
+    [c[1:] for c in _COLLECTION_CASES],
+    ids=[c[0] for c in _COLLECTION_CASES],
+)
+def test_a_collection_in_plsql_answers_as_23ai(
+    _collection_backend, typ: str, body: str, varray: str, nested: str
+) -> None:
+    # Every element access and method, against 23ai's answer (#2547): the
+    # value, or the error -- ORA-06531 for a NULL collection, 06502 for a NULL
+    # index, 06532 outside the limit, 06533 beyond the count.
+    body = body.replace('T(', typ + '(').replace('w T;', f'w {typ};')
+    block = (
+        f'DECLARE v {typ} := {typ}(10, 20, 30); r VARCHAR2(200); '
+        f'BEGIN {body} :out := r; END;'
+    )
+    want = varray if typ == 'c2547v' else nested
+    assert _collection_answer(_collection_backend, block) == want
+
+
+def test_a_nested_tables_delete_of_one_element_is_refused(_collection_backend) -> None:
+    # DELETE(n) leaves a gap, which no PostgreSQL array holds (#2547): refused
+    # when it runs, saying so, rather than renumbering the elements after it.
+    block = (
+        'DECLARE v c2547n := c2547n(10, 20, 30); r VARCHAR2(200); '
+        'BEGIN v.delete(2); :out := r; END;'
+    )
+    assert _collection_answer(_collection_backend, block) == 'ORA-03001'
+
+
+def test_a_routines_collection_parameter_and_local(_collection_backend) -> None:
+    # The same rewrite in a standalone procedure and a package member: an IN
+    # OUT parameter filled by EXTEND and assignment, and a local read back.
+    backend = _collection_backend
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE c2547_fill(n IN NUMBER, l IN OUT c2547v) IS '
+            'BEGIN l := c2547v(); FOR i IN 1..n LOOP l.extend; l(i) := i * 100; '
+            'END LOOP; END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE c2547_pkg AS '
+            'FUNCTION total(l c2547v) RETURN NUMBER; END;'
+        )
+        backend.execute(
+            'CREATE OR REPLACE PACKAGE BODY c2547_pkg AS '
+            'FUNCTION total(l c2547v) RETURN NUMBER IS s NUMBER := 0; c c2547v := l; '
+            'BEGIN FOR i IN 1..c.count LOOP s := s + c(i); END LOOP; RETURN s; END; END;'
+        )
+        block = (
+            'DECLARE v c2547v; r VARCHAR2(200); BEGIN c2547_fill(3, v); '
+            "r := v.count || ':' || c2547_pkg.total(v); :out := r; END;"
+        )
+        assert _collection_answer(backend, block) == '3:600'
+    finally:
+        backend.rollback()
+        for drop in ('DROP PACKAGE c2547_pkg', 'DROP PROCEDURE c2547_fill'):
+            try:
+                backend.execute(drop)
+            except Exception:
+                backend.rollback()

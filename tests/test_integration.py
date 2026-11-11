@@ -9909,9 +9909,6 @@ class ObjectBlockBindIntegration(_IntegrationBase):
         self.assertIsNone(var.getvalue())
 
 
-@_requires(
-    _postgres_cannot('bind an object or collection OUT through a package (#2451)')
-)
 @_requires(_OBJECT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectOutBindIntegration(_IntegrationBase):
@@ -13128,10 +13125,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                         except seerdb.DatabaseError:
                             pass  # a CREATE above failed, so nothing to drop
 
-    @_requires(
-        _postgres_cannot('bind an object or collection OUT through a package (#2451)'),
-        _OBJECT_BIND,
-    )
+    @_requires(_OBJECT_BIND)
     async def test_a_bare_object_out_bind_takes_its_value(self):
         # PL/SQL-bound: the object OUT bind is filled by a PL/SQL PACKAGE (#1127).
         # Async twin of ObjectOutBindIntegration (#1029): an object handed to

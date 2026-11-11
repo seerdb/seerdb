@@ -1371,6 +1371,38 @@ _HELPER_FUNCTIONS_DDL = (
             )
         )
     )
+    # A VARRAY's or nested table's errors in PL/SQL (#2547), raised where a
+    # translated subscript or method finds one. Each returns an integer, so it
+    # stands in a subscript or a count; it never returns. The checks around
+    # them are written inline, so the ordinary path calls nothing.
+    # ora_coll_fault: the subscript k of a collection of n elements, limit lim
+    # (NULL for a nested table), gone when the collection is NULL.
+    + 'CREATE OR REPLACE FUNCTION sys.ora_coll_fault(k numeric, n integer, '
+    'lim integer, gone boolean) RETURNS integer LANGUAGE plpgsql VOLATILE AS $$ '
+    "BEGIN IF gone THEN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
+    "'ORA-06531: Reference to uninitialized collection'; END IF; "
+    "IF k IS NULL THEN RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
+    "'ORA-06502: PL/SQL: value or conversion error: NULL index table key value'; "
+    'END IF; IF round(k) < 1 OR round(k) > lim THEN RAISE EXCEPTION USING '
+    "ERRCODE = 'P0001', MESSAGE = 'ORA-06532: subscript outside of limit'; "
+    "END IF; RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
+    "'ORA-06533: Subscript beyond count'; END $$;"
+    # A subscript evaluated once: one that calls something, which the inline
+    # check would call again (#2547).
+    'CREATE OR REPLACE FUNCTION sys.ora_coll_index(k numeric, n integer, '
+    'lim integer, gone boolean) RETURNS integer LANGUAGE plpgsql VOLATILE AS $$ '
+    'BEGIN IF NOT gone AND round(k) BETWEEN 1 AND n THEN RETURN round(k); END IF; '
+    'RETURN sys.ora_coll_fault(k, n, lim, gone); END $$;'
+    # A NULL collection read from: PostgreSQL answers a NULL array's element
+    # NULL without evaluating the subscript, so the read goes through
+    # coalesce(v, ora_coll_gone(v)), which calls this only for a NULL v.
+    'CREATE OR REPLACE FUNCTION sys.ora_coll_gone(anyarray) RETURNS anyarray '
+    "LANGUAGE plpgsql VOLATILE AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'P0001', "
+    "MESSAGE = 'ORA-06531: Reference to uninitialized collection'; END $$;"
+    # Any other of a collection method's errors, by its message.
+    'CREATE OR REPLACE FUNCTION sys.ora_coll_raise(message text) RETURNS integer '
+    "LANGUAGE plpgsql VOLATILE AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = 'P0001', "
+    'MESSAGE = message; END $$;'
 )
 
 
@@ -11354,6 +11386,7 @@ def _translate_routine_ddl(
     user_routines: frozenset[str] | None = None,
     mark: bool = True,
     routine_kind: Callable[[str], str | None] | None = None,
+    collection_type: Callable[[str], _CollectionVar | None] | None = None,
 ) -> str:
     """Rewrite an Oracle ``CREATE PROCEDURE`` / ``CREATE FUNCTION`` to a PL/pgSQL
     routine (#503): translate the parameter types + ``IN OUT`` → ``INOUT``, map
@@ -11361,7 +11394,8 @@ def _translate_routine_ddl(
     ``LANGUAGE plpgsql`` dollar-quoted body. Non-routine SQL is unchanged.
     With ``routine_kind``, a statement of the body that is a bare call becomes
     one PL/pgSQL runs (:func:`_perform_bare_calls`), a call of the routine
-    itself among them (#2180)."""
+    itself among them (#2180). With ``collection_type``, the elements and
+    methods of its VARRAYs and nested tables are PostgreSQL's (#2547)."""
     head = _ROUTINE_HEAD.match(sql)
     if head is None:
         return sql
@@ -11374,6 +11408,11 @@ def _translate_routine_ddl(
     if tail is None:
         return sql
     return_type, authid, body = tail.groups()
+    if collection_type is not None:
+        body = _rewrite_collections(
+            body,
+            _collection_variables(_declaration_parts(params, body), collection_type),
+        )
     # Oracle allows a routine with no parameters to omit the list entirely
     # (FUNCTION f RETURN NUMBER AS …); PostgreSQL always needs the parentheses, so
     # an absent list (params is None) becomes an empty one (#530).
@@ -11941,6 +11980,309 @@ def _rewrite_index_tables(body: str, tables: dict[str, str]) -> str:
     return _unmask_quoted(rewrite(masked), contents)
 
 
+# --- Schema-level VARRAYs and nested tables in PL/SQL (#2547) -----------------
+
+
+@dataclass(frozen=True)
+class _CollectionVar:
+    """A schema-level VARRAY or nested table, as the rewrite of a variable of
+    its type needs it (#2547): a VARRAY's limit, None for a nested table, and
+    the element's PostgreSQL type, which an EXTEND's NULLs take."""
+
+    limit: int | None
+    element: str
+
+
+# A collection method on a VARRAY or a nested table.
+_ARRAY_METHOD = re.compile(
+    r'\s*\.\s*(COUNT|FIRST|LAST|NEXT|PRIOR|EXISTS|DELETE|EXTEND|TRIM|LIMIT)\b',
+    re.IGNORECASE,
+)
+# What follows a declaration's type: its initial value or default, NOT NULL.
+_DECLARATION_TAIL = re.compile(r'(?is)\s*(?::=|\bDEFAULT\b).*$')
+_DECLARATION_NOT_NULL = re.compile(r'(?is)\s+NOT\s+NULL\s*$')
+# A name in a declaration, schema-qualified or not.
+_DECLARED_WORD = re.compile(
+    r'"[^"]+"|[A-Za-z_][\w$#]*(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][\w$#]*))*'
+)
+# An element assigned, `v(k) := x`, after the key's closing paren.
+_ELEMENT_ASSIGN = re.compile(r'\s*:=')
+# A call in a subscript, which the inline check would make more than once; a
+# subscript with one is evaluated once instead, unless every call in it is of
+# a built-in that only computes (#2547).
+_SUBSCRIPT_CALL = re.compile(r'("?)([\w$#.]+)\1\s*\(')
+_PURE_FUNCTIONS = frozenset(
+    {
+        'abs',
+        'ceil',
+        'floor',
+        'greatest',
+        'least',
+        'length',
+        'mod',
+        'nvl',
+        'coalesce',
+        'round',
+        'sign',
+        'trunc',
+        'to_number',
+        'cardinality',
+    }
+)
+# A count or index that is a plain number.
+_PLAIN_NUMBER = re.compile(r'\s*\d+\s*')
+# A NULL collection's error, where a method meets one (#2547).
+_COLLECTION_GONE = 'sys.ora_coll_fault(NULL, 0, NULL, true)'
+# Oracle's texts for the errors only a method raises (#2547).
+_VALUE_ERROR = 'ORA-06502: PL/SQL: value or conversion error'
+_SPARSE_DELETE = (
+    'ORA-03001: unimplemented feature: DELETE(n) of a nested table, which the '
+    'Mirror keeps without gaps'
+)
+
+
+def _collection_variables(
+    declarations: Iterable[str], lookup: Callable[[str], _CollectionVar | None]
+) -> dict[str, _CollectionVar]:
+    """The variables and parameters among ``declarations`` whose type is a
+    schema-level VARRAY or nested table, as ``lookup`` names them (#2547):
+    name (lower case) -> what the rewrite needs of the type. A declaration is
+    `name [CONSTANT] [IN] [OUT] [NOCOPY] type [NOT NULL] [:= | DEFAULT ...]`."""
+    found: dict[str, _CollectionVar] = {}
+    for declaration in declarations:
+        text = _DECLARATION_NOT_NULL.sub('', _DECLARATION_TAIL.sub('', declaration))
+        words = _DECLARED_WORD.findall(text)
+        if words and words[0].upper() == 'DECLARE':
+            words = words[1:]
+        if len(words) < 2 or words[0].startswith('"'):
+            continue
+        typ = lookup(re.sub(r'\s+', '', words[-1]))
+        if typ is not None:
+            found[words[0].lower()] = typ
+    return found
+
+
+def _declaration_parts(
+    params: str | None, body: str, leading: bool = True
+) -> list[str]:
+    # A routine's parameters, the declarations of its body before BEGIN, and
+    # those of each block nested in it, DECLARE to its BEGIN. Not `leading`:
+    # a block's body, past its own BEGIN, has only the nested ones.
+    declared = (params or '').split(',')
+    start: int | None = 0 if leading else None
+    for word, begin, end in _words(body):
+        if word == 'DECLARE':
+            start = end
+        elif word == 'BEGIN' and start is not None:
+            declared += body[start:begin].split(';')
+            start = None
+    return declared
+
+
+def _rewrite_collections(body: str, variables: dict[str, _CollectionVar]) -> str:
+    """A PL/SQL body with its VARRAYs' and nested tables' elements and methods
+    in PostgreSQL's terms (#2547), each as Oracle has it, errors included.
+
+    ``variables`` maps each such variable (lower case) to its type. A VARRAY
+    or nested table is a domain over an array, so an element is the array's,
+    behind a check that raises Oracle's error for a NULL collection, a NULL
+    index, one outside the limit or one beyond the count. The check is
+    written inline, so the ordinary path calls nothing; it costs about as
+    much as the subscript itself. The methods that change the collection
+    (EXTEND, TRIM, DELETE) stand as statements, their checks inline before
+    them. DELETE(n) of a nested table would leave a gap no array holds, and
+    is refused when it runs.
+    """
+    if not variables:
+        return body
+    (masked, contents) = _mask_quoted(body)
+    names = '|'.join(re.escape(n) for n in sorted(variables, key=len, reverse=True))
+    # Not a field of something else, `x.v`; `1..v.COUNT` is a range, not one.
+    use = re.compile(rf'(?<![\w$#])(?<![\w$#")]\.)({names})(?![\w$#])', re.IGNORECASE)
+
+    def limit_of(name: str) -> str:
+        limit = variables[name.lower()].limit
+        return 'NULL' if limit is None else str(limit)
+
+    def number(text: str) -> str:
+        # A key or count as numeric: a bare NULL, or a bind's text, would
+        # otherwise choose another overload of round().
+        return text.strip() if _PLAIN_NUMBER.fullmatch(text) else f'({text})::numeric'
+
+    def checked(name: str, key: str) -> str:
+        # The array subscript for element `key`, or Oracle's error.
+        key = number(key)
+        n = f'cardinality({name})'
+        arguments = f'{key}, {n}, {limit_of(name)}, {name} IS NULL'
+        if any(
+            call.group(2).lower() not in _PURE_FUNCTIONS
+            for call in _SUBSCRIPT_CALL.finditer(key)
+        ):
+            return f'sys.ora_coll_index({arguments})'
+        return (
+            f'CASE WHEN round({key}) BETWEEN 1 AND {n} THEN round({key})::integer '
+            f'ELSE sys.ora_coll_fault({arguments}) END'
+        )
+
+    def count_check(count: str) -> str:
+        # A negative count, which EXTEND and TRIM refuse.
+        if _PLAIN_NUMBER.fullmatch(count):
+            return ''
+        return (
+            f"IF {count} < 0 THEN PERFORM sys.ora_coll_raise('{_VALUE_ERROR}'); "
+            'END IF; '
+        )
+
+    def method_statement(name: str, kind: str, args: list[str]) -> str | None:
+        # EXTEND, TRIM or DELETE as the statements that do it, or None.
+        n = f'cardinality({name})'
+        null_check = f'IF {name} IS NULL THEN PERFORM {_COLLECTION_GONE}; END IF; '
+        element = variables[name.lower()].element
+        if kind == 'extend':
+            count = number(args[0]) if args else '1'
+            fill = (
+                f'{name}[{checked(name, args[1])}]'
+                if len(args) > 1
+                else f'NULL::{element}'
+            )
+            grow = (
+                f'{name} := array_append({name}, {fill})'
+                if count == '1'
+                else f'{name} := {name} || array_fill({fill}, '
+                f'ARRAY[round({count})::integer])'
+            )
+            limit = limit_of(name)
+            past = (
+                f'IF {n} + {count} > {limit} THEN PERFORM '
+                f'sys.ora_coll_fault({n} + {count}, {n}, {limit}, false); END IF; '
+                if limit != 'NULL'
+                else ''
+            )
+            guard = '' if count == '1' else f'IF {count} > 0 THEN '
+            end = '' if count == '1' else '; END IF'
+            return f'{null_check}{count_check(count)}{past}{guard}{grow}{end}'
+        if kind == 'trim':
+            count = number(args[0]) if args else '1'
+            return (
+                f'{null_check}{count_check(count)}IF {count} > {n} THEN PERFORM '
+                f'sys.ora_coll_fault({n} + 1, {n}, NULL, false); END IF; '
+                f'IF {count} > 0 THEN {name} := {name}[1:{n} - round({count})::integer]; '
+                'END IF'
+            )
+        if kind == 'delete':
+            if args:
+                return f"PERFORM sys.ora_coll_raise('{_SPARSE_DELETE}')"
+            return f"{null_check}{name} := '{{}}'"
+        return None
+
+    def method_value(name: str, kind: str, args: list[str]) -> str | None:
+        # COUNT, FIRST, LAST, LIMIT, EXISTS, NEXT or PRIOR as a value, or None.
+        n = f'cardinality({name})'
+        counted = f'coalesce({n}, {_COLLECTION_GONE})'
+        if kind == 'count':
+            return counted
+        if kind == 'first':
+            return f'(CASE WHEN {counted} > 0 THEN 1 END)'
+        if kind == 'last':
+            return f'nullif({counted}, 0)'
+        if kind == 'limit':
+            return f'(CASE WHEN {name} IS NULL THEN {_COLLECTION_GONE} ELSE {limit_of(name)} END)'
+        if not args:
+            return None
+        key = number(args[0])
+        if kind == 'exists':
+            return f'coalesce(round({key}) BETWEEN 1 AND {n}, false)'
+        if kind == 'next':
+            return (
+                f'(CASE WHEN {name} IS NULL THEN {_COLLECTION_GONE} WHEN {key} < {n} '
+                f'THEN greatest(floor({key}) + 1, 1)::integer END)'
+            )
+        if kind == 'prior':
+            return (
+                f'(CASE WHEN {name} IS NULL THEN {_COLLECTION_GONE} WHEN {key} > 1 AND '
+                f'{n} > 0 THEN least(ceil({key}) - 1, {n})::integer END)'
+            )
+        return None
+
+    def arguments(text: str, at: int) -> tuple[list[str], int]:
+        # A method's parenthesised arguments from `at`, each rewritten, and
+        # where they end; none when no parenthesis follows.
+        stripped = len(text) - len(text[at:].lstrip())
+        if not text.startswith('(', stripped):
+            return ([], at)
+        close = _matching_paren(text, stripped)
+        inner = rewrite(text[stripped + 1 : close])
+        parts: list[str] = []
+        depth, start = 0, 0
+        for i, char in enumerate(inner):
+            if char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+            elif char == ',' and depth == 0:
+                parts.append(inner[start:i].strip())
+                start = i + 1
+        last = inner[start:].strip()
+        if last or parts:
+            parts.append(last)
+        return (parts, close + 1)
+
+    def rewrite(text: str) -> str:
+        out: list[str] = []
+        pos = 0
+        while (found := use.search(text, pos)) is not None:
+            name = found.group(1)
+            after = found.end()
+            at_start = _STATEMENT_START.search(text, 0, found.start()) is not None
+            method = _ARRAY_METHOD.match(text, after)
+            if method is not None:
+                kind = method.group(1).lower()
+                (args, end) = arguments(text, method.end())
+                statement = (
+                    method_statement(name, kind, args)
+                    if kind in ('extend', 'trim', 'delete') and at_start
+                    else None
+                )
+                value = (
+                    None if statement is not None else method_value(name, kind, args)
+                )
+                if statement is None and value is None:
+                    out.append(text[pos:after])
+                    pos = after
+                    continue
+                out.append(text[pos : found.start()] + (statement or value or ''))
+                pos = end
+                continue
+            stripped = len(text) - len(text[after:].lstrip())
+            if not text.startswith('(', stripped):
+                out.append(text[pos:after])
+                pos = after
+                continue
+            close = _matching_paren(text, stripped)
+            key = rewrite(text[stripped + 1 : close]).strip()
+            written = at_start and (
+                _ELEMENT_ASSIGN.match(text, close + 1) is not None
+                or _ELEMENT_FIELD_ASSIGN.match(text, close + 1) is not None
+            )
+            if written:
+                element = f'{name}[{checked(name, key)}]'
+            else:
+                # A read. PostgreSQL answers a NULL array's element NULL without
+                # evaluating the subscript, so a NULL collection is caught first.
+                element = (
+                    f'(coalesce({name}, sys.ora_coll_gone({name})))'
+                    f'[{checked(name, key)}]'
+                )
+                if _ELEMENT_FIELD.match(text, close + 1):
+                    element = f'({element})'  # `v(k).f`: a field of an element
+            out.append(text[pos : found.start()] + element)
+            pos = close + 1
+        out.append(text[pos:])
+        return ''.join(out)
+
+    return _unmask_quoted(rewrite(masked), contents)
+
+
 def _routine_index_tables(
     package: str, member: _PackageMember, types: dict[str, str]
 ) -> dict[str, str]:
@@ -12075,6 +12417,7 @@ def _translate_package_ddl(
     spec_index_types: Callable[[str], dict[str, str]] | None = None,
     user_routines: Callable[[], frozenset[str]] | None = None,
     routine_kind: Callable[[str], str | None] | None = None,
+    collection_type: Callable[[str], _CollectionVar | None] | None = None,
 ) -> str:
     """A PL/SQL package's DDL as a schema of its name (#1605).
 
@@ -12160,8 +12503,15 @@ def _translate_package_ddl(
             _package_routine(
                 package,
                 m,
-                _rewrite_index_tables(
-                    m.body, _routine_index_tables(package, m, index_types)
+                _rewrite_collections(
+                    _rewrite_index_tables(
+                        m.body, _routine_index_tables(package, m, index_types)
+                    ),
+                    _collection_variables(
+                        _declaration_parts(m.params, m.body), collection_type
+                    )
+                    if collection_type is not None
+                    else {},
                 ),
                 names,
                 member_kind,
@@ -12323,6 +12673,7 @@ def _bind_block(
     sql: str,
     locals_: dict[str, tuple[int, str, str]],
     routine_kind: Callable[[str], str | None] | None = None,
+    collection_type: Callable[[str], _CollectionVar | None] | None = None,
 ) -> str:
     """An anonymous block with binds, as a PostgreSQL DO block (#1456, #1459).
 
@@ -12351,7 +12702,9 @@ def _bind_block(
         for name, (slot, _t, _i) in locals_.items()
     )
     return _translate_plsql_block(
-        f'{declare} BEGIN BEGIN {body.rstrip()} END;{keep} END;', routine_kind
+        f'{declare} BEGIN BEGIN {body.rstrip()} END;{keep} END;',
+        routine_kind,
+        collection_type,
     )
 
 
@@ -12573,12 +12926,15 @@ def _plsql_pads(sql: str) -> str:
 
 
 def _translate_plsql_block(
-    sql: str, routine_kind: Callable[[str], str | None] | None = None
+    sql: str,
+    routine_kind: Callable[[str], str | None] | None = None,
+    collection_type: Callable[[str], _CollectionVar | None] | None = None,
 ) -> str:
     """Wrap an anonymous DECLARE/BEGIN … END block as a PostgreSQL ``DO $$ … $$``
     block, mapping the declared local types (#533). Non-block SQL is unchanged.
     With ``routine_kind``, a statement that is a bare call becomes one PL/pgSQL
-    runs (:func:`_perform_bare_calls`)."""
+    runs (:func:`_perform_bare_calls`). With ``collection_type``, the elements
+    and methods of its VARRAYs and nested tables are PostgreSQL's (#2547)."""
     hoisted = _hoist_local_functions(sql)
     if hoisted is not None:
         return hoisted
@@ -12586,6 +12942,14 @@ def _translate_plsql_block(
     if match is None:
         return sql
     declare_part, body = match.groups()
+    if collection_type is not None:
+        variables = _collection_variables(
+            (declare_part or '').split(';') + _declaration_parts(None, body, False),
+            collection_type,
+        )
+        body = _rewrite_collections(body, variables)
+        if declare_part:
+            declare_part = _rewrite_collections(declare_part, variables)
     declare = _translate_routine_types(declare_part) if declare_part else ''
     body = _nested_declarations(body)
     if routine_kind is not None:
@@ -15442,6 +15806,10 @@ class PostgresBackend:
         # is no package's; any DDL starts it over.
         self._plsql_types: dict[int, tuple[str, str, str, dict] | None] = {}
         self._collection_name_cache: frozenset[str] | None = None
+        # What the PL/SQL rewrite needs of each collection type a declaration
+        # named (#2547), kept while the set of names it was read against is.
+        self._collection_vars: dict[str, _CollectionVar | None] = {}
+        self._collection_vars_of: frozenset[str] | None = None
         # Each package's functions a call may name without parentheses (#1651).
         self._package_function_cache: dict[str, frozenset[str]] | None = None
         # The names synonyms give for sequences, routines and packages, and
@@ -16987,6 +17355,7 @@ class PostgresBackend:
                 self._package_index_types,
                 self._user_routine_names,
                 self._routine_kind,
+                self._collection_var,
             ),
             sql,
         )
@@ -17004,11 +17373,14 @@ class PostgresBackend:
                 sql,
                 self._user_routine_names() if _ROUTINE_HEAD.match(sql) else None,
                 routine_kind=self._routine_kind,
+                collection_type=self._collection_var,
             ),
             sql,
         )
         sql = _ruled(
-            'plsql-block', _translate_plsql_block(sql, self._routine_kind), sql
+            'plsql-block',
+            _translate_plsql_block(sql, self._routine_kind, self._collection_var),
+            sql,
         )
         sql = _translate_idioms(sql)
         sql = _ruled(
@@ -18487,6 +18859,33 @@ class PostgresBackend:
                 )
             self._routine_synonym_cache = synonyms
         return self._routine_synonym_cache
+
+    def _collection_var(self, name: str) -> _CollectionVar | None:
+        """A schema-level VARRAY or nested table by the name a PL/SQL
+        declaration gives its type (#2547); None for any other type. Whether
+        the name is a collection's comes from the cached set of their names,
+        so a declaration of any other type costs no round trip, and one that
+        is a collection's is read once until the next DDL."""
+        names = self._collection_names()
+        key = name.replace('"', '').lower()
+        if key not in names:
+            return None
+        if self._collection_vars_of is not names:
+            self._collection_vars = {}
+            self._collection_vars_of = names
+        if key not in self._collection_vars:
+            row = self._conn.execute(
+                'SELECT (SELECT max(substring(pg_get_constraintdef(c.oid) '
+                "FROM '<=\\s*([0-9]+)')::int) FROM pg_constraint c "
+                'WHERE c.contypid = t.oid), format_type(b.typelem, NULL) '
+                'FROM pg_type t JOIN pg_type b ON b.oid = t.typbasetype '
+                'WHERE t.oid = to_regtype(%s)',
+                (name,),
+            ).fetchone()
+            self._collection_vars[key] = (
+                None if row is None else _CollectionVar(limit=row[0], element=row[1])
+            )
+        return self._collection_vars[key]
 
     def _collection_names(self) -> frozenset[str]:
         # The collection types (array domains) of the user schemas, by name and
@@ -21947,7 +22346,9 @@ class PostgresBackend:
             if '$$' in initial:  # it would end the DO block's quoting
                 raise UnsupportedFeature('a bind value holding $$ in a PL/SQL block')
             locals_[name] = (slot, pg_type, initial)
-        block = _translate_idioms(_bind_block(sql, locals_, self._routine_kind))
+        block = _translate_idioms(
+            _bind_block(sql, locals_, self._routine_kind, self._collection_var)
+        )
         slots = list(locals_.values())
         # The block and the read-back of every bind's value, in one round trip
         # (#1917). An object or collection comes back as its own type, cast
