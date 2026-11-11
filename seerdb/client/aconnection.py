@@ -1249,6 +1249,9 @@ class AsyncOracleConnect(_ConnectionLogic):
 
         try:
             Pro = decode_token_pro(Packet)
+            # The database's charsets, for a native 9i session's temporary LOBs (#2537).
+            self._server_charset = Pro.get('charset_id')
+            self._server_ncharset = Pro.get('ncharset_id')
             Caps = Pro['compile_caps']
             self._server_compile_caps = Caps
             self._server_runtime_caps = Pro.get('runtime_caps') or b''

@@ -8319,3 +8319,41 @@ class NativeReexecuteTest(unittest.TestCase):
         sql = 'INSERT INTO t VALUES (:1)'
         self.assertIsNone(pooled._cache_key(sql, [1], None, False, {}))
         self.assertIsNotNone(dedicated._cache_key(sql, [1], None, False, {}))
+
+
+class Oall8NineLobCharsetTest(unittest.TestCase):
+    # A temporary LOB on a native 9i session is made in its own charset, which
+    # the login's TTI_PRO names (#2537).
+    @staticmethod
+    def _capture(name):
+        sys.path.insert(0, os.path.dirname(__file__))
+        from replay import load_capture
+
+        return load_capture(name)
+
+    def test_the_login_names_both_charsets(self):
+        from seerdb.common.tns import decode_token_pro
+
+        Pro = decode_token_pro(self._capture('o9i_pro_reply.hexdump'))
+        self.assertEqual((Pro['charset_id'], Pro['ncharset_id']), (31, 2000))
+
+    def test_a_temporary_lob_is_made_in_its_own_charset(self):
+        from seerdb.client.dialect import Fv2Oall8Dialect
+
+        def made(csfrm):
+            Dialect = Fv2Oall8Dialect(lambda: 5, 31, 2000)
+            Request = next(Dialect.create_temp_lob(False, csfrm)).data
+            return int.from_bytes(Request[-10:-8], 'little')
+
+        self.assertEqual((made(1), made(2)), (31, 2000))
+
+    def test_an_nclob_binds_in_its_national_form(self):
+        from seerdb.common.datatypes import TempLob
+        from seerdb.common.tns import _encode_9i_bind_oac
+
+        Nclob = _encode_9i_bind_oac(TempLob(bytes(84), False, csfrm=2))
+        Clob = _encode_9i_bind_oac(TempLob(bytes(84), False, csfrm=1))
+        self.assertEqual(
+            (Nclob[29:32], Clob[29:32]),
+            (bytes.fromhex('d00702'), bytes.fromhex('690301')),
+        )
