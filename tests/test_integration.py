@@ -6371,13 +6371,10 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
 class BindDirectionIntegration(_IntegrationBase):
     """``cursor.bind_directions``: what the server said each bind was (#1064)."""
 
-    # Only a backend with a real server behind it can know the directions;
-    # one that cannot reports every bind OUT, which is the documented
-    # fallback rather than a gap (#1064).
+    # A backend with a real server behind it forwards the server's directions;
+    # the Mirror-over-PG reports what the block's text shows, as 23ai would
+    # (#1783, #2453).
 
-    @_requires(
-        _postgres_cannot("report a block's bind directions as Oracle does (#2453)")
-    )
     def test_a_block_reports_its_bind_directions(self):
         # The wire carries no direction on the way in, so the reply is the only
         # place this can be learned. The Mirror's passthrough forwards these so
@@ -6389,6 +6386,16 @@ class BindDirectionIntegration(_IntegrationBase):
         )
         self.assertEqual(Out.getvalue(), 'got a value')
         self.assertEqual(self.cur.bind_directions, [16, 32])  # OUT, IN
+
+    def test_an_out_bind_left_unassigned_comes_back_null(self):
+        # A bind the block only writes is OUT, and the server never reads what
+        # the client sent for it (#2453).
+        Value = self.cur.var(int)
+        for _ in range(2):
+            Value.setvalue(0, 41)
+            self.cur.execute('begin if 1 = 0 then :r := 1; end if; end;', {'r': Value})
+            self.assertEqual(self.cur.bind_directions, [16])  # OUT
+            self.assertIsNone(Value.getvalue())
 
     def test_a_block_whose_binds_are_all_in_reports_them_too(self):
         self.cur.execute('CREATE TABLE ' + self.TABLE + ' (n NUMBER)')

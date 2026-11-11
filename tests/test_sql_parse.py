@@ -397,22 +397,78 @@ class TestPlsqlBindDirections(unittest.TestCase):
             ['IN', 'IN', 'IN'],
         )
 
+    def test_an_assignment_target_is_out(self):
+        # Each answer measured on 23ai Free 23.26.2 (#2453).
+        for Sql, Count, Want in (
+            ("begin :result := 'got ' || :given; end;", 2, ['OUT', 'IN']),
+            ('begin :x := :y + 1; end;', 2, ['OUT', 'IN']),
+            ('begin :r := 1; end;', 1, ['OUT']),
+            ('begin\n  :r\n  :=\n  2;\nend;', 1, ['OUT']),
+            ('begin :r:=2; end;', 1, ['OUT']),
+            ('begin :r := 1; :r := 2; end;', 1, ['OUT']),
+            ('begin if 1 = 0 then :r := 1; end if; end;', 1, ['OUT']),
+            ('begin :r := 1; exception when others then :r := 2; end;', 1, ['OUT']),
+            ('declare v number := :a; begin :b := v; end;', 2, ['IN', 'OUT']),
+        ):
+            with self.subTest(Sql):
+                self.assertEqual(self.directions(Sql, Count), Want)
+
+    def test_a_condition_or_a_bound_is_read(self):
+        # Measured on 23ai (#2453).
+        for Sql, Count, Want in (
+            ('begin if :a > 0 then :b := :a; end if; end;', 2, ['IN', 'OUT']),
+            (
+                'begin :b := case when :a > 0 then 1 else 0 end; end;',
+                2,
+                ['OUT', 'IN'],
+            ),
+            ('begin for i in 1 .. :n loop :t := i; end loop; end;', 2, ['IN', 'OUT']),
+            (
+                'begin :r := :a; if :a is null then :r := 0; end if; end;',
+                2,
+                ['OUT', 'IN'],
+            ),
+            (
+                'begin if :a = 1 then null; elsif :b = 2 then null; end if; end;',
+                2,
+                ['IN', 'IN'],
+            ),
+            ('begin loop exit when :a > 0; end loop; end;', 1, ['IN']),
+        ):
+            with self.subTest(Sql):
+                self.assertEqual(self.directions(Sql, Count), Want)
+
+    def test_read_and_written_is_in_out(self):
+        # In either order, measured on 23ai (#2453).
+        for Sql, Count, Want in (
+            ('begin :x := :x + 1; end;', 1, ['IN OUT']),
+            ('begin :r := 1; :s := :r; end;', 2, ['IN OUT', 'OUT']),
+            ('begin :r := :g; :g := 2; end;', 2, ['OUT', 'IN OUT']),
+            (
+                'begin select 1 into :o from dual; :p := :o; end;',
+                2,
+                ['IN OUT', 'OUT'],
+            ),
+            ('begin while :n > 0 loop :n := :n - 1; end loop; end;', 1, ['IN OUT']),
+            ('begin select c into :o from t where id = :o; end;', 1, ['IN OUT']),
+        ):
+            with self.subTest(Sql):
+                self.assertEqual(self.directions(Sql, Count), Want)
+
     def test_what_might_be_written_is_in_out(self):
-        # A call argument, an assignment target, a bind both read and an INTO
-        # target, and one passed to a function on the right of `:=`.
+        # A call argument takes the routine's mode, which the text doesn't say:
+        # 23ai answers IN for put_line's and OUT for get_line's, and upper's
+        # inside an expression IN. Each is IN OUT here, which loses nothing.
         self.assertEqual(self.directions('begin p(:a, :b); end;', 2), ['IN OUT'] * 2)
         self.assertEqual(
-            self.directions('begin :x := :y + 1; end;', 2), ['IN OUT', 'IN']
+            self.directions('begin :r := upper(:a); end;', 2), ['OUT', 'IN OUT']
         )
         self.assertEqual(
-            self.directions('begin select c into :o from t where id = :o; end;', 1),
-            ['IN OUT'],
+            self.directions('begin if f(:a) then null; end if; end;', 1), ['IN OUT']
         )
-        self.assertEqual(self.directions('begin :r := f(:a); end;', 2), ['IN OUT'] * 2)
-        self.assertEqual(
-            self.directions('begin if :a > 0 then :b := :a; end if; end;', 2),
-            ['IN OUT', 'IN OUT'],
-        )
+        # Part of a bind written, or a bind that opens a statement as a call.
+        self.assertEqual(self.directions('begin :r(1) := 2; end;', 1), ['IN OUT'])
+        self.assertEqual(self.directions('begin :r.f := 2; end;', 1), ['IN OUT'])
 
     def test_it_gives_up_on_what_it_cannot_map(self):
         self.assertIsNone(self.directions('begin :1 := 2; end;', 1))
