@@ -9834,6 +9834,81 @@ class RefCursorInBindIntegration(_IntegrationBase):
                 pass
 
 
+@_requires(_OBJECT_BIND)
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class ObjectBlockBindIntegration(_IntegrationBase):
+    """An object or collection bound into a block of several statements (#2548).
+
+    A block of one call takes the call path; one of several runs as a whole,
+    and has to take the object in and give it back as the object it is.
+    """
+
+    REC = 'PYORACLE_BLKREC_T'
+    TYPE = 'PYORACLE_BLKARR_T'
+    PROC = 'PYORACLE_BLK_RENAME'
+
+    def setUp(self):
+        super().setUp()
+        self._drop_objects()
+        self.cur.execute(
+            f'CREATE TYPE {self.REC} AS OBJECT (id NUMBER, name VARCHAR2(40))'
+        )
+        self.cur.execute(f'CREATE TYPE {self.TYPE} AS VARRAY(10) OF NUMBER')
+        self.cur.execute(f"""CREATE PROCEDURE {self.PROC}(r IN OUT {self.REC}) IS
+              BEGIN
+                r.id := r.id + 1;
+                r.name := 'renamed ' || r.name;
+              END;""")
+
+    def _drop_objects(self):
+        for stmt in (
+            f'DROP PROCEDURE {self.PROC}',
+            f'DROP TYPE {self.TYPE}',
+            f'DROP TYPE {self.REC}',
+        ):
+            try:
+                self.cur.execute(stmt)
+            except seerdb.DatabaseError:
+                pass  # best-effort teardown of leftovers
+
+    def tearDown(self):
+        self._drop_objects()
+        super().tearDown()
+
+    def test_a_record_goes_in_and_comes_back_changed(self):
+        obj = self.conn.gettype(self.REC).newobject()
+        obj.ID = 7
+        obj.NAME = 'Alice'
+        tail = self.cur.var(int)
+        self.cur.execute(f'BEGIN {self.PROC}(:1); :2 := 4242; END;', [obj, tail])
+        self.assertEqual((int(obj.ID), obj.NAME), (8, 'renamed Alice'))
+        self.assertEqual(int(tail.getvalue()), 4242)
+
+    def test_a_collection_goes_in_and_comes_back(self):
+        typ = self.conn.gettype(self.TYPE)
+        given = typ.newobject([1, 2, 3])
+        made = typ.newobject()
+        seen = self.cur.var(str)
+        self.cur.execute(
+            f"BEGIN :made := {self.TYPE}(7, 8); :seen := 'null'; "
+            "IF :given IS NOT NULL THEN :seen := 'set'; END IF; END;",
+            {'given': given, 'made': made, 'seen': seen},
+        )
+        self.assertEqual([int(v) for v in made.aslist()], [7, 8])
+        self.assertEqual([int(v) for v in given.aslist()], [1, 2, 3])
+        self.assertEqual(seen.getvalue(), 'set')
+
+    def test_a_null_object_goes_in_null(self):
+        var = self.cur.var(self.conn.gettype(self.REC))
+        seen = self.cur.var(str)
+        self.cur.execute(
+            "BEGIN :seen := 'set'; IF :obj IS NULL THEN :seen := 'null'; END IF; END;",
+            {'obj': var, 'seen': seen},
+        )
+        self.assertEqual(seen.getvalue(), 'null')
+        self.assertIsNone(var.getvalue())
+
+
 @_requires(
     _postgres_cannot('bind an object or collection OUT through a package (#2451)')
 )

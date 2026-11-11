@@ -21928,33 +21928,61 @@ class PostgresBackend:
         # for a cursor the block never opened.
         names = _bind_names(sql)
         locals_: dict[str, tuple[int, str, str]] = {}
+        # An object or collection bind's local, by slot: its PostgreSQL type's
+        # OID, which its value is read back and decoded as (#2548).
+        objects: dict[int, int] = {}
+        resolved = self._resolve_object_binds(binds)
         for slot, (name, bind) in enumerate(zip(names, binds)):
-            pg_type = _block_bind_type(bind)
-            value = bind.value if isinstance(bind, BindVar) else bind
-            initial = (
-                'NULL'
-                if pg_type == 'refcursor' or value is None
-                else psycopg.sql.Literal(value).as_string(self._conn)
-            )
+            local = self._block_object_local(bind, resolved[slot])
+            if local is not None:
+                (pg_type, initial, objects[slot]) = local
+            else:
+                pg_type = _block_bind_type(bind)
+                value = bind.value if isinstance(bind, BindVar) else bind
+                initial = (
+                    'NULL'
+                    if pg_type == 'refcursor' or value is None
+                    else psycopg.sql.Literal(value).as_string(self._conn)
+                )
             if '$$' in initial:  # it would end the DO block's quoting
                 raise UnsupportedFeature('a bind value holding $$ in a PL/SQL block')
             locals_[name] = (slot, pg_type, initial)
         block = _translate_idioms(_bind_block(sql, locals_, self._routine_kind))
         slots = list(locals_.values())
         # The block and the read-back of every bind's value, in one round trip
-        # (#1917).
+        # (#1917). An object or collection comes back as its own type, cast
+        # from the text the setting carries, so it decodes as a CALL's OUT does.
         kept = self._conn.cursor()
         with self._conn.pipeline():
             self._conn.execute(block)
             if slots:
                 kept.execute(
                     'SELECT '
-                    + ', '.join('current_setting(%s, true)' for _slot in slots),
+                    + ', '.join(
+                        f"substr(NULLIF(current_setting(%s, true), ''), 2)::{t}"
+                        if slot in objects
+                        else 'current_setting(%s, true)'
+                        for slot, t, _i in slots
+                    ),
                     [_BLOCK_BIND_SETTING.format(slot) for slot, _t, _i in slots],
                 )
         row = kept.fetchone() if slots else None
         values = [b.value if isinstance(b, BindVar) else b for b in binds]
         for index, (slot, pg_type, _initial) in enumerate(slots):
+            if slot in objects:
+                value = None if row is None else row[index]
+                values[slot] = (
+                    None
+                    if value is None
+                    else self._object_out(
+                        objects[slot],
+                        value,
+                        toid=binds[slot].toid
+                        if isinstance(binds[slot], BindVar)
+                        else b'',
+                    )
+                )
+                continue
             setting = None if row is None else row[index]
             text = setting[1:] if setting else None
             if pg_type != 'refcursor':
@@ -21965,6 +21993,32 @@ class PostgresBackend:
                 # None when the block never opened it, or closed it.
                 values[slot] = self._drain_refcursor(text) if text else None
         return Result(out_binds=values)
+
+    def _block_object_local(
+        self, bind: object, resolved: object
+    ) -> tuple[str, str, int] | None:
+        # An object or collection bind's block local (#2548): its PostgreSQL
+        # type, the literal it starts as, and the type's OID; None for any
+        # other bind. The value is decoded from the client's image as the call
+        # paths decode it (#1607); a NULL one is NULL of its type (#1622).
+        value = bind.value if isinstance(bind, BindVar) else bind
+        if isinstance(resolved, BindVar) and isinstance(resolved.value, _TypedNull):
+            (oid, initial) = (resolved.value.oid, 'NULL')
+        elif isinstance(value, ObjectImage):
+            image_oid = value.type_oid or b''
+            found = _pg_oid_of(image_oid[4:20] if len(image_oid) >= 20 else image_oid)
+            if found is None:
+                return None
+            oid = found
+            if isinstance(resolved, _CollectionBind):
+                literal = psycopg.sql.Literal(_as_ora_number(resolved.value))
+                initial = f'({literal.as_string(self._conn)})::{resolved.domain}'
+            else:
+                initial = psycopg.sql.Literal(resolved).as_string(self._conn)
+        else:
+            return None
+        row = self._conn.execute('SELECT %s::oid::regtype::text', (oid,)).fetchone()
+        return None if row is None else (row[0], initial, oid)
 
     def _drain_refcursor(self, portal: str) -> CursorResult | None:
         # A REF CURSOR OUT bind: the routine OPENed a portal, whose name the CALL
