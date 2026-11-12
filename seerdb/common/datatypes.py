@@ -595,13 +595,16 @@ class BFile:
 
 
 class BcDate:
-    """An Oracle DATE or TIMESTAMP before year 1, which no ``datetime`` can hold (#1071).
+    """An Oracle DATE or TIMESTAMP no ``datetime`` can hold: one before year 1
+    (#1071), or a Julian leap day (#2601).
 
     Oracle's DATE reaches back to 4712 BC; Python's ``datetime`` starts at year
-    1. A Mirror backend that has such a value -- fetched from a real server, or
-    loaded from its own database -- hands it over as this, and the Mirror encodes
-    it byte for byte like any other date. The year is numbered as Oracle numbers
-    it: negative for BC, with no year 0, so -4712 is 4712 BC.
+    1. Oracle's is also Julian before 1582-10-15, so it has February 29 of 100,
+    200, ... 1500, which the Gregorian ``datetime`` has not. A Mirror backend
+    that has such a value -- fetched from a real server, or loaded from its own
+    database -- hands it over as this, and the Mirror encodes it byte for byte
+    like any other date. The year is numbered as Oracle numbers it: negative
+    for BC, with no year 0, so -4712 is 4712 BC.
 
     ``microsecond`` is the TIMESTAMP fraction; a DATE column drops it, as it does
     a ``datetime``'s. A BC ``TIMESTAMP WITH TIME ZONE`` is not covered.
@@ -619,9 +622,17 @@ class BcDate:
         second: int = 0,
         microsecond: int = 0,
     ):
-        if not -4712 <= year <= -1:
+        julian_leap_day = (
+            month == 2
+            and day == 29
+            and 1 <= year <= 1582
+            and year % 100 == 0
+            and year % 400 != 0
+        )
+        if not (-4712 <= year <= -1 or julian_leap_day):
             raise ValueError(
-                f'year {year} is not before year 1 (-4712 to -1); use a datetime'
+                f'year {year} is not before year 1 (-4712 to -1), nor the date '
+                'a Julian leap day; use a datetime'
             )
         for name, value, low, high in (
             ('month', month, 1, 12),
