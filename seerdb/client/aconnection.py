@@ -395,6 +395,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._txn_priority: str | None = None
         self._txn_priority_pending: str | None = None
         self._session_keywords: dict[int, str | None] = {}
+        # Whether a DRCP pooled server has answered (#2544), which a release
+        # is sent only to.
+        self._pooled_server = False
         # Token auth (#125), resolved at connect time.
         self.access_token = access_token
         # Kerberos (#2378): the server knows the user from the ticket the
@@ -448,6 +451,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         # Request boundaries (#464): pooled session-state marker + in-request flag.
         self._session_state_desired: int = 0
         self._in_request: bool = False
+        # See OracleConnect._drcp_released (#2544).
+        self._drcp_released: bool = False
         self._transaction_context: bytes | None = None  # two-phase commit (#131)
         self._sessionless_txn_active = False  # sessionless txns (#133)
         # Native network encryption / data integrity (#437). Set by the ANO
@@ -499,6 +504,7 @@ class AsyncOracleConnect(_ConnectionLogic):
     def _next_seq(self) -> int:
         from seerdb.common.tns_consts import MAX_SEQ_NUM
 
+        self._drcp_released = False  # a call brings a pooled server back
         seq = self.seq
         self.seq = self.seq % MAX_SEQ_NUM + 1
         return seq
@@ -3314,6 +3320,13 @@ class AsyncOracleConnect(_ConnectionLogic):
                     struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
                 )
                 await self._wr.drain()
+            elif self.conn_state == CONN_STATE_AUTHENTICATED and self._drcp_released:
+                # A released pooled server (#2544): the EOF packet alone, as in
+                # OracleConnect.close.
+                self._wr.write(
+                    struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                )
+                await self._wr.drain()
             elif self.conn_state == CONN_STATE_AUTHENTICATED:
                 if not self.autocommit:
                     await self.rollback()
@@ -3385,6 +3398,31 @@ class AsyncOracleConnect(_ConnectionLogic):
 
     # --- End-to-end application tracing (#183), async port ---
 
+    async def _release_pooled_server(self) -> None:
+        # Async port of OracleConnect._release_pooled_server (#2544).
+        from seerdb.common.tns import encode_session_release
+
+        # Only to a server that said it is one: 10g and a Mirror serve a
+        # pooled request with a dedicated server, which a release resets.
+        if (
+            self.server_type != 'pooled'
+            or self.conn_state != CONN_STATE_AUTHENTICATED
+            or self._dialect is not None
+            or self._native11
+            or not self._pooled_server
+        ):
+            return
+
+        await self.send(
+            TNS_DATA, encode_session_release(self._next_seq(), self.field_version)
+        )
+        # The next call may be served by another session, whose cursors these
+        # ids are not: what was queued for close went with the REQUEST_END,
+        # and a cached cursor is parsed afresh.
+        self._cursors_to_close = []
+        self._cursor_cache.clear()
+        self._drcp_released = True
+
     async def _end_request(self) -> None:
         # End a pooled logical request (#464): cancel an unflushed BEGIN, else
         # send REQUEST_END on a rollback. See OracleConnect._end_request.
@@ -3398,7 +3436,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._in_request = False
         from seerdb.common.tns_consts import TTI_ROLLBACK
 
-        Pre = self._flush_session_state_bytes()
+        # The cursors still queued for close go with it, while the session is
+        # attached: after a pooled server's release (#2544) the server refuses
+        # a close of the old session's cursors (ORA-56600).
+        Pre = self._flush_cursor_closes_bytes() + self._flush_session_state_bytes()
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_ROLLBACK))
         await self.send(TNS_DATA, Pre + Data)
         await self._handle_response()

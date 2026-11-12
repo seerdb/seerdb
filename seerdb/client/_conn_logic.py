@@ -35,6 +35,7 @@ from seerdb.client.enums import TransactionPriority
 from seerdb.common.end_user_sec import EndUserSecurityContext
 from seerdb.common.exceptions import NotSupportedError, ProgrammingError
 from seerdb.common.tns import (
+    SESSION_KEYWORD_POOLED_SERVER,
     encode_alter_session_piggyback,
     encode_ano_fragment,
     encode_app_context_piggyback,
@@ -139,6 +140,7 @@ class _ConnectionLogic:
     _txn_priority: str | None
     _txn_priority_pending: str | None
     _session_keywords: dict[int, str | None]
+    _pooled_server: bool
     _session_state_desired: int
     _in_request: bool
     _supports_eor: bool
@@ -616,6 +618,9 @@ class _ConnectionLogic:
         Keywords = self._session_keywords
         if TNS_KEYWORD_NUM_TXN_PRIORITY in Keywords:
             self._txn_priority = Keywords[TNS_KEYWORD_NUM_TXN_PRIORITY]
+        if SESSION_KEYWORD_POOLED_SERVER in Keywords:
+            # A DRCP pooled server answered (#2544): a session return came.
+            self._pooled_server = True
         Keywords.clear()
 
     def _require_txn_priority(self) -> None:

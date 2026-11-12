@@ -3849,6 +3849,39 @@ class CursorIntegration(_IntegrationBase):
         finally:
             pool.close()
 
+    def test_a_drcp_pool_hands_its_server_back_and_is_served_again(self):
+        # A pool releases its pooled server whenever it takes a connection
+        # back, as python-oracledb's does (#2544), and the next acquire is
+        # served by whichever server DRCP picks. The cursors closed before a
+        # release went with its REQUEST_END: closed after it, against the old
+        # session, they were ORA-56600. The pool's close then only hangs up.
+        try:
+            pool = seerdb.create_pool(
+                user=_USER,
+                password=_PASSWORD,
+                host=_HOST,
+                port=_PORT,
+                service_name=_SERVICE,
+                min=1,
+                max=1,
+                **{**_FV_KW, 'server_type': 'pooled'},
+            )
+        except seerdb.DatabaseError as e:
+            if getattr(e, 'code', None) == 12520:
+                self.skipTest('the DRCP pool is not started on this server')
+            raise
+        try:
+            for n in range(3):
+                conn = pool.acquire()
+                for _ in range(2):
+                    cur = conn.cursor()
+                    cur.execute('SELECT :1 FROM dual', [n])
+                    self.assertEqual(cur.fetchone(), (n,))
+                    cur.close()
+                pool.release(conn)
+        finally:
+            pool.close()
+
     def test_a_long_program_name_connects(self):
         # 8i's login gives a program name one length byte, which stops at 252:
         # 253 to 255 failed the login and a longer one could not be sent at all
@@ -12137,6 +12170,28 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 async with Conn.cursor() as Cur:
                     await Cur.execute('SELECT 1 FROM dual')
                     self.assertEqual(await Cur.fetchone(), (1,))
+        finally:
+            await Pool.close()
+
+    async def test_a_drcp_pool_hands_its_server_back_and_is_served_again(self):
+        # Async twin of CursorIntegration's (#2544).
+        try:
+            Pool = await seerdb.create_pool_async(
+                **self._kwargs(server_type='pooled'), min=1, max=1
+            )
+        except seerdb.DatabaseError as E:
+            if getattr(E, 'code', None) == 12520:
+                self.skipTest('the DRCP pool is not started on this server')
+            raise
+        try:
+            for N in range(3):
+                Conn = await Pool.acquire()
+                for _ in range(2):
+                    Cur = Conn.cursor()
+                    await Cur.execute('SELECT :1 FROM dual', [N])
+                    self.assertEqual(await Cur.fetchone(), (N,))
+                    await Cur.close()
+                await Pool.release(Conn)
         finally:
             await Pool.close()
 

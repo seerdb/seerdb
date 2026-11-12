@@ -1172,6 +1172,9 @@ class OracleConnect(_ConnectionLogic):
         self._txn_priority: str | None = None
         self._txn_priority_pending: str | None = None
         self._session_keywords: dict[int, str | None] = {}
+        # Whether a DRCP pooled server has answered (#2544), which a release
+        # is sent only to.
+        self._pooled_server = False
         # Token-based auth (#125): a JWT str (OAuth2) or (token, private_key)
         # (OCI IAM), resolved at connect time into the token + optional PEM key.
         self.access_token = access_token
@@ -1242,6 +1245,9 @@ class OracleConnect(_ConnectionLogic):
         # func-176 piggyback, and whether a logical request is currently open.
         self._session_state_desired: int = 0
         self._in_request: bool = False
+        # Whether the pooled server was released and no call has gone since
+        # (#2544): then a close needs no logoff, only the EOF packet.
+        self._drcp_released: bool = False
         # Two-phase commit (#131): the opaque transaction context the server
         # returns from tpc_begin, replayed on prepare/commit/rollback/end.
         self._transaction_context: bytes | None = None
@@ -1321,6 +1327,7 @@ class OracleConnect(_ConnectionLogic):
         self._object_type_describing: set[tuple[str, ...]] = set()
 
     def _next_seq(self) -> int:
+        self._drcp_released = False  # a call brings a pooled server back
         seq = self.seq
         self.seq = self.seq % MAX_SEQ_NUM + 1
         return seq
@@ -3629,6 +3636,15 @@ class OracleConnect(_ConnectionLogic):
                     self._write(
                         struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
                     )
+            elif self.conn_state == CONN_STATE_AUTHENTICATED and self._drcp_released:
+                # A released pooled server (#2544) holds nothing of this
+                # connection's: it ends with the EOF packet alone, as
+                # python-oracledb's does, not with a logoff a server would
+                # first have to be attached for.
+                if self.sock is not None:
+                    self._write(
+                        struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                    )
             elif self.conn_state == CONN_STATE_AUTHENTICATED:
                 if not self.autocommit:
                     self.rollback()
@@ -4542,6 +4558,37 @@ class OracleConnect(_ConnectionLogic):
 
     # --- End-to-end application tracing (#183) ---
 
+    def _release_pooled_server(self) -> None:
+        # Hand the pooled (DRCP) server back to its pool once a client pool
+        # has taken this connection back (#2544), as python-oracledb's pool
+        # does: a one-way session release after the REQUEST_END rollback.
+        # Without it the server stayed busy for as long as the connection sat
+        # idle in the client pool. Nothing answers it; the next call is served
+        # by whichever server DRCP picks. A dedicated server, and a session in
+        # an older dialect's form, are left as they are.
+        from seerdb.common.tns import encode_session_release
+
+        # Only to a server that said it is one: 10g and a Mirror serve a
+        # pooled request with a dedicated server, which a release resets.
+        if (
+            self.server_type != 'pooled'
+            or self.conn_state != CONN_STATE_AUTHENTICATED
+            or self._dialect is not None
+            or self._native11
+            or not self._pooled_server
+        ):
+            return
+
+        self.send(
+            TNS_DATA, encode_session_release(self._next_seq(), self.field_version)
+        )
+        # The next call may be served by another session, whose cursors these
+        # ids are not: what was queued for close went with the REQUEST_END,
+        # and a cached cursor is parsed afresh.
+        self._cursors_to_close = []
+        self._cursor_cache.clear()
+        self._drcp_released = True
+
     def _end_request(self) -> None:
         # Marks the end of a pooled logical request (#464). If a BEGIN was armed
         # but never flushed (no operation ran), just cancel it. Otherwise send a
@@ -4558,7 +4605,10 @@ class OracleConnect(_ConnectionLogic):
         self._in_request = False
         from seerdb.common.tns_consts import TTI_ROLLBACK
 
-        Pre = self._flush_session_state_bytes()
+        # The cursors still queued for close go with it, while the session is
+        # attached: after a pooled server's release (#2544) the server refuses
+        # a close of the old session's cursors (ORA-56600).
+        Pre = self._flush_cursor_closes_bytes() + self._flush_session_state_bytes()
         Data = encode_dictionary(self._make_dict(DictionaryType.tran, req=TTI_ROLLBACK))
         self.send(TNS_DATA, Pre + Data)
         self._handle_response()

@@ -148,6 +148,7 @@ class AsyncPool:
                 # open; a failure means the connection is dead, so discard it.
                 try:
                     await conn._end_request()
+                    await conn._release_pooled_server()
                 except Exception:
                     Retired.append(conn)
                 else:

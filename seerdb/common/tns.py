@@ -263,6 +263,7 @@ from seerdb.common.tns_consts import (
     TNS_LONG_LENGTH_INDICATOR,
     TNS_MAX_SHORT_LENGTH,
     TNS_MSG_TYPE_FAST_AUTH,
+    TNS_MSG_TYPE_ONEWAY_FN,
     TNS_NULL_LENGTH_INDICATOR,
     TNS_OER_WARN_COMPILATION_ERROR,
     TNS_REDIRECT,
@@ -687,6 +688,11 @@ def set_decode_dml_rowcounts(Flag: bool) -> None:
 _DECODE_SESSION_KEYWORDS: contextvars.ContextVar[dict[int, str | None] | None] = (
     contextvars.ContextVar('decode_session_keywords', default=None)
 )
+# Recorded in the same sink, under a key no SYNC keyword has, when a reply
+# carried a session return (SESS_RET): a DRCP pooled server served the call
+# (#2544). A dedicated server, 10g's for a pooled request among them, and a
+# Mirror send none, and a session release would end their sessions.
+SESSION_KEYWORD_POOLED_SERVER = -1
 
 
 # The call status and error code of the last OER or status a connection decoded
@@ -7371,6 +7377,9 @@ def decode_token_server_piggyback(Data: bytes, Acc: tuple) -> tuple:
     Opcode = Rest[0]
     Rest = Rest[1:]
     if Opcode == TNS_SERVER_PIGGYBACK_SESS_RET:
+        Sink = _DECODE_SESSION_KEYWORDS.get()
+        if Sink is not None:
+            Sink[SESSION_KEYWORD_POOLED_SERVER] = None
         (_, Rest) = decode_ub4(Rest)  # number of DTYs (ub2)
         Rest = Rest[1:]  # length of DTYs (ub1)
         (NumElements, Rest) = decode_ub4(Rest)  # number of pairs (ub2)
@@ -17910,6 +17919,23 @@ _SESSION_RELEASE: wire_schema.Schema = (
 )
 _SESSION_RELEASE_OCI = wire_schema.compile_encoder(_SESSION_RELEASE, _OCI)
 SESSION_RELEASE_MODE_EXIT = 3
+# The thin form python-oracledb sends when its pool takes back a connection to
+# a pooled (DRCP) server (#2544): a one-way call, which no reply answers, with
+# the 23ai token after the sequence. Mode 0 hands the server back to the DRCP
+# pool, keeping the session; captured from python-oracledb 26.1 against 23ai
+# Free as `1a a3 <seq> 00 00 00 00`.
+_SESSION_RELEASE_ONEWAY: wire_schema.Schema = (
+    ('const', bytes([TNS_MSG_TYPE_ONEWAY_FN, TNS_FUNC_SESSION_RELEASE])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('ptr', 'tag_pointer'),
+    ('n4', 'tag_length'),
+    ('n4', 'mode'),
+)
+_SESSION_RELEASE_ONEWAY_THIN = wire_schema.compile_encoder(
+    _SESSION_RELEASE_ONEWAY, _THIN
+)
+SESSION_RELEASE_MODE_POOL = 0
 
 
 # The logoff (TTI_LOGOFF), as sqlplus 11.2 ends a dedicated 11g session in the
@@ -17926,6 +17952,27 @@ _OCI_LOGOFF_OCI = wire_schema.compile_encoder(_OCI_LOGOFF, _OCI)
 def encode_logoff_oci(Seq: int) -> bytes:
     """End a dedicated 11g session in the native form, as sqlplus 11.2 does."""
     return _OCI_LOGOFF_OCI({'seq': Seq, 'token_number': None})
+
+
+def encode_session_release(
+    Seq: int, FieldVersion: int, Mode: int = SESSION_RELEASE_MODE_POOL
+) -> bytes:
+    """Release a pooled (DRCP) server back to its pool, as python-oracledb's
+    pool does when it takes the connection back (#2544). One-way: nothing
+    answers it, and the next call is served by whichever server DRCP picks."""
+    saved = _ENCODE_FIELD_VERSION.set(FieldVersion)
+    try:
+        return _SESSION_RELEASE_ONEWAY_THIN(
+            {
+                'seq': Seq,
+                'token_number': 0,
+                'tag_pointer': False,
+                'tag_length': 0,
+                'mode': Mode,
+            }
+        )
+    finally:
+        _ENCODE_FIELD_VERSION.reset(saved)
 
 
 def encode_session_release_oci(

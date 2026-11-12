@@ -402,6 +402,7 @@ class Pool:
                 # discard it rather than return a broken connection.
                 try:
                     conn._end_request()
+                    conn._release_pooled_server()
                 except Exception:
                     Retired.append(conn)
                 else:

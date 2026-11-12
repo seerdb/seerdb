@@ -47,6 +47,9 @@ class FakeConn:
     def _end_request(self):
         pass
 
+    def _release_pooled_server(self):
+        pass
+
 
 class FakePool(Pool):
     def _open_connection(self):
@@ -72,6 +75,9 @@ class AsyncFakeConn(FakeConn):
         self.closed = True
 
     async def _end_request(self):
+        pass
+
+    async def _release_pooled_server(self):
         pass
 
 
