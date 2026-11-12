@@ -6154,6 +6154,47 @@ class TestFv2ZeroLengthColumn(unittest.TestCase):
         rows = decode_fv2_exec_response(self.BEFORE_A_VALUE, cols)
         self.assertEqual(rows, ([[None, 5]], 1403))
 
+    # SELECT TO_NUMBER(NULL) AS a FROM dual: the describe, then the rows.
+    NUMBER_DESCRIBE = bytes.fromhex(
+        '0801010200000000000000000000010101010141000004000000000101000300'
+        '00000000000000000000000000010100000000'
+    )
+    NUMBER_ALONE = bytes.fromhex(
+        '0602010100010a0000000700810104010102057b000001010003000000000000'
+        '0000000000000000010100000000194f52412d30313430333a206e6f20646174'
+        '6120666f756e640a'
+    )
+    # SELECT TO_NUMBER(NULL) AS a, 5 AS b FROM dual
+    NUMBER_PAIR_DESCRIBE = bytes.fromhex(
+        '0801020200000000000000000000010101010141000002000000010200000000'
+        '0000010101010142000004000000000101000300000000000000000000000000'
+        '00010100000000'
+    )
+    NUMBER_BEFORE_A_VALUE = bytes.fromhex(
+        '0602010200010a0000000700810102c1060004010102057b0000010100030000'
+        '000000000000000000000000010100000000194f52412d30313430333a206e6f'
+        '206461746120666f756e640a'
+    )
+
+    def test_a_number_described_with_a_zero_length_still_sends_its_length(self):
+        # 9.2.0.4 describes a NUMBER expression that is NULL -- TO_NUMBER(NULL),
+        # DECODE(1, 2, 3), LENGTH(NULL) -- with a zero data length too, but its
+        # cell is `00 81 01`, a zero length before the indicator. Read as empty,
+        # the ORA-01403 after the row went unseen, the fetch was sent again, and
+        # the server answered ORA-01002 (#2578).
+        from seerdb.common.tns import decode_fv2_describe, decode_fv2_exec_status
+
+        cols = decode_fv2_describe(self.NUMBER_DESCRIBE)
+        self.assertEqual([(c['data_type'], c['data_length']) for c in cols], [(2, 0)])
+        self.assertEqual(
+            decode_fv2_exec_status(self.NUMBER_ALONE, cols), ([[None]], 1403, None)
+        )
+        cols = decode_fv2_describe(self.NUMBER_PAIR_DESCRIBE)
+        self.assertEqual(
+            decode_fv2_exec_status(self.NUMBER_BEFORE_A_VALUE, cols),
+            ([[None, 5]], 1403, None),
+        )
+
 
 class TestFv2LongRows(unittest.TestCase):
     """Oracle 9i LONG columns in a batch fetch (#102): the value is a chunked

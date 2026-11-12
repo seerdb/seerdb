@@ -16744,11 +16744,19 @@ def decode_fv2_exec_status(Data: bytes, Columns: list) -> tuple[list, int, str |
                 if (
                     Col.get('data_length', None) == 0
                     and DataType not in _LONG_DATA_TYPES
+                    and DataType != TNS_TYPE_NUMBER
                 ):
                     # A column described with a zero data length -- `SELECT NULL`
                     # -- is always NULL and sends no value at all, only the
                     # indicator (#1185). The 9i form of #682. A LONG is
-                    # described with a zero length too, and does carry data.
+                    # described with a zero length too, and does carry data. So
+                    # does a NUMBER: 9.2.0.4 describes `TO_NUMBER(NULL)`,
+                    # `DECODE(1, 2, 3)` or `LENGTH(NULL)` with a zero length and
+                    # sends the NULL as `00 81 01`, a zero length before the
+                    # indicator, where `SELECT NULL` (VARCHAR) and
+                    # `HEXTORAW(NULL)` (RAW) send `81 01`. Read as empty, the
+                    # cell left a byte behind, the ORA-01403 after the row went
+                    # unseen, and the fetch was re-sent: ORA-01002 (#2578).
                     (_, Rest) = _O7_EMPTY_CELL_FROM_THIN(Rest)
                     Row.append(None)
                     continue

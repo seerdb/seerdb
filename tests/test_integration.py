@@ -519,9 +519,6 @@ _MOD_FLOAT_BY_ZERO = _Need(
     '10g and 11g give 0',
     min_server=18,
 )
-_NULL_NUMBER_EXPRESSION = _Need(
-    '9i reads a NULL NUMBER expression out of sequence (#2578)', min_fv=_FV
-)
 _STREAMED_LOB_BIND = _Need(
     '9i takes no bind over 4000 bytes into a LOB column (#2260)', min_fv=_FV
 )
@@ -2795,6 +2792,18 @@ class TypesIntegration(_IntegrationBase):
         # Oracle folds a DECODE that matches nothing into the same thing.
         self.cur.execute("SELECT NULL AS a, 5 AS b, DECODE(3, 1, 'one') AS c FROM dual")
         self.assertEqual(self.cur.fetchone(), (None, 5, None))
+
+    def test_null_number_expression_column(self):
+        # A NUMBER expression that is NULL is described with a zero data length
+        # as well, but its cell still carries a length. On 9i it was read as
+        # an empty one: the end of the fetch went unseen and the next one was
+        # ORA-01002 (#2578).
+        self.cur.execute(
+            'SELECT TO_NUMBER(NULL) AS a, 5 AS b, DECODE(1, 2, 3) AS c, '
+            'LENGTH(NULL) AS d, NULL * 1 AS e FROM dual'
+        )
+        self.assertEqual(self.cur.fetchall(), [(None, 5, None, None, None)])
+        self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
@@ -5893,7 +5902,6 @@ class BindIntegration(_IntegrationBase):
                 self.assertEqual(self.cur.fetchone(), (7.5,))
                 self.assertIs(self.cur.description[0][1], described)
 
-    @_requires(_NULL_NUMBER_EXPRESSION)
     def test_mod_of_untyped_operands_is_a_number(self):
         # Oracle converts a string or NULL operand to NUMBER. Over PostgreSQL,
         # two untyped operands matched no overload ("not unique"), and beside
