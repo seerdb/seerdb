@@ -8289,6 +8289,311 @@ class BooleanIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchall(), [(1, True), (2, False)])
 
 
+@_requires(_ARRAY_DML)
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class DataFrameExecuteManyIntegration(_IntegrationBase):
+    """executemany from a DataFrame (#2461): any object with the Arrow PyCapsule
+    stream interface binds column i to placeholder i+1, typed by its Arrow type,
+    one array execute per record batch, as python-oracledb 3.3+ does it."""
+
+    def _table(self, columns: str) -> None:
+        self._drop_silently(self.cur)
+        self.cur.execute(f'CREATE TABLE {self.TABLE} ({columns})')
+
+    def _frame(self):
+        import datetime
+        import decimal
+
+        import pyarrow as pa
+
+        return pa.table(
+            {
+                'i': pa.array([1, None, 3], pa.int64()),
+                'd': pa.array(
+                    [decimal.Decimal('1.25'), None, decimal.Decimal('-3.50')],
+                    pa.decimal128(10, 2),
+                ),
+                's': pa.array(['a', None, ''], pa.string()),
+                'b': pa.array([b'\x01', None, b'\x03\x04'], pa.binary()),
+                't': pa.array(
+                    [datetime.datetime(2026, 11, 12, 1, 2, 3, 456789), None, None],
+                    pa.timestamp('us'),
+                ),
+                'dt': pa.array([datetime.date(2026, 11, 12), None, None], pa.date32()),
+            }
+        )
+
+    _COLUMNS = (
+        'i NUMBER, d NUMBER(10, 2), s VARCHAR2(20), b RAW(10), t TIMESTAMP, dt DATE'
+    )
+
+    def test_a_table_loads_by_position_with_nulls(self):
+        # The null row is NULL in every column, and an empty string NULL too,
+        # as Oracle stores one; a date32 is a DATE.
+        import datetime
+        import decimal
+
+        self._table(self._COLUMNS)
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3, :4, :5, :6)', self._frame()
+        )
+        self.assertEqual(self.cur.rowcount, 3)
+        self.cur.execute(
+            f'SELECT i, d, s, b, t, dt FROM {self.TABLE} ORDER BY i NULLS LAST'
+        )
+        self.assertEqual(
+            [tuple(r) for r in self.cur.fetchall()],
+            [
+                (
+                    1,
+                    decimal.Decimal('1.25'),
+                    'a',
+                    b'\x01',
+                    datetime.datetime(2026, 11, 12, 1, 2, 3, 456789),
+                    datetime.datetime(2026, 11, 12),
+                ),
+                (3, decimal.Decimal('-3.5'), None, b'\x03\x04', None, None),
+                (None, None, None, None, None, None),
+            ],
+        )
+
+    @_requires(
+        _mirror_lacks('a BINARY_FLOAT / BINARY_DOUBLE bind keeping its type (#2562)')
+    )
+    def test_floats_bind_as_binary_float_and_double(self):
+        # float32 binds BINARY_FLOAT and float64 BINARY_DOUBLE, typed by the
+        # Arrow schema: into a NUMBER column the server converts, and DUMP of
+        # the bind itself names its type.
+        import pyarrow as pa
+
+        frame = pa.table(
+            {'f': pa.array([1.5], pa.float32()), 'g': pa.array([2.25], pa.float64())}
+        )
+        self._table('f VARCHAR2(40), g VARCHAR2(40)')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (DUMP(:1), DUMP(:2))', frame
+        )
+        self.cur.execute(f'SELECT f, g FROM {self.TABLE}')
+        (f, g) = self.cur.fetchone()
+        self.assertTrue(f.startswith('Typ=100 '), f)
+        self.assertTrue(g.startswith('Typ=101 '), g)
+
+    def _three_batches(self, values):
+        import pyarrow as pa
+
+        frame = pa.Table.from_batches(
+            pa.table({'i': pa.array(values, pa.int64())}).to_batches(max_chunksize=2)
+        )
+        self.assertEqual(frame.column(0).num_chunks, 3)
+        return frame
+
+    def test_batches_add_up(self):
+        # Each record batch is one array execute, and rowcount covers them
+        # all; python-oracledb reports the last batch's rowcount alone.
+        self._table('i NUMBER')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1)',
+            self._three_batches([1, 2, 3, 4, 5]),
+        )
+        self.assertEqual(self.cur.rowcount, 5)
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (5,))
+
+    @_requires(
+        _Need(
+            'the executemany after a batch error is ORA-01001 below 12.1 (#2563)',
+            min_fv=FIELD_VERSION_12_1,
+        )
+    )
+    def test_a_batch_errors_offset_counts_from_the_first_row(self):
+        self._table('i NUMBER PRIMARY KEY')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1)',
+            self._three_batches([1, 2, 3, 1, 5]),
+            batcherrors=True,
+        )
+        self.assertEqual(self.cur.rowcount, 4)
+        self.assertEqual(
+            [(e.offset, e.code) for e in self.cur.getbatcherrors()], [(3, 1)]
+        )
+
+    def test_large_strings_and_binaries_bind_as_long_and_long_raw(self):
+        import pyarrow as pa
+
+        text = 'x' * 40000
+        self._table('i NUMBER, l LONG')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2)',
+            pa.table({'i': pa.array([1]), 'l': pa.array([text], pa.large_string())}),
+        )
+        self.cur.execute(f'SELECT l FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (text,))
+        data = bytes(range(256)) * 160
+        self._table('i NUMBER, r LONG RAW')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2)',
+            pa.table({'i': pa.array([1]), 'r': pa.array([data], pa.large_binary())}),
+        )
+        self.cur.execute(f'SELECT r FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (data,))
+
+    def test_an_interval_binds_as_interval_day_to_second(self):
+        # Arrow's month-day-nano interval, its months ignored as
+        # python-oracledb ignores them; the nanoseconds to the microsecond.
+        import datetime
+
+        import pyarrow as pa
+
+        self._table('iv INTERVAL DAY(3) TO SECOND(6)')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1)',
+            pa.table(
+                {
+                    'iv': pa.array(
+                        [pa.MonthDayNano([0, 2, 3_723_000_001_000]), None],
+                        pa.month_day_nano_interval(),
+                    )
+                }
+            ),
+        )
+        self.cur.execute(f'SELECT iv FROM {self.TABLE} ORDER BY iv NULLS LAST')
+        self.assertEqual(
+            [r[0] for r in self.cur.fetchall()],
+            [datetime.timedelta(days=2, seconds=3723, microseconds=1), None],
+        )
+
+    @_requires(_BOOLEAN)
+    def test_a_bool_column_binds_as_boolean(self):
+        import pyarrow as pa
+
+        self._table('i NUMBER, ok BOOLEAN')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2)',
+            pa.table({'i': [1, 2, 3], 'ok': pa.array([True, False, None])}),
+        )
+        self.cur.execute(f'SELECT ok FROM {self.TABLE} ORDER BY i')
+        self.assertEqual([r[0] for r in self.cur.fetchall()], [True, False, None])
+
+    @_requires(_VECTOR_BIND)
+    def test_lists_and_structs_bind_as_vectors(self):
+        # A list column is a dense VECTOR of its element type, a struct of
+        # num_dimensions / indices / values a sparse one (23ai).
+        import array
+
+        import pyarrow as pa
+
+        try:
+            self._table('i NUMBER, v VECTOR(3, FLOAT64), sv VECTOR(5, FLOAT32, SPARSE)')
+        except seerdb.DatabaseError as exc:
+            self.skipTest(f'no VECTOR here: {exc}')
+        sparse = pa.struct(
+            [
+                ('num_dimensions', pa.int64()),
+                ('indices', pa.list_(pa.uint32())),
+                ('values', pa.list_(pa.float32())),
+            ]
+        )
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3)',
+            pa.table(
+                {
+                    'i': [1],
+                    'v': pa.array([[1.5, 2.5, 3.5]], pa.list_(pa.float64())),
+                    'sv': pa.array(
+                        [
+                            {
+                                'num_dimensions': 5,
+                                'indices': [1, 3],
+                                'values': [2.0, 4.0],
+                            }
+                        ],
+                        sparse,
+                    ),
+                }
+            ),
+        )
+        self.cur.execute(f'SELECT v, sv FROM {self.TABLE}')
+        (v, sv) = self.cur.fetchone()
+        self.assertEqual(v, array.array('d', [1.5, 2.5, 3.5]))
+        self.assertEqual(
+            (sv.num_dimensions, list(sv.indices), list(sv.values)),
+            (5, [1, 3], [2.0, 4.0]),
+        )
+
+    def test_a_null_column_and_a_named_bind(self):
+        # A column of Arrow's null type binds as VARCHAR2 NULLs; columns go by
+        # position whatever the placeholders are named.
+        import pyarrow as pa
+
+        self._table('i NUMBER, s VARCHAR2(10)')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:id, :name)',
+            pa.table({'i': pa.array([7, 8]), 's': pa.array([None, None], pa.null())}),
+        )
+        self.cur.execute(f'SELECT i, s FROM {self.TABLE} ORDER BY i')
+        self.assertEqual(
+            [tuple(r) for r in self.cur.fetchall()], [(7, None), (8, None)]
+        )
+
+    def test_an_unsupported_type_is_refused_before_anything_is_sent(self):
+        import datetime
+
+        import pyarrow as pa
+
+        self._table('i NUMBER')
+        frame = pa.table(
+            {
+                'i': pa.array([1], pa.int64()),
+                't': pa.array([datetime.time(1, 2)], pa.time64('us')),
+            }
+        )
+        with self.assertRaises(seerdb.NotSupportedError):
+            self.cur.executemany(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', frame)
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (0,))
+
+    def test_an_empty_frame_runs_nothing(self):
+        import pyarrow as pa
+
+        self._table('i NUMBER')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1)',
+            pa.table({'i': pa.array([], pa.int64())}),
+        )
+        self.assertEqual(self.cur.rowcount, 0)
+
+    def test_the_async_cursor_loads_a_frame(self):
+        import asyncio
+
+        self._table(self._COLUMNS)
+        frame = self._frame()
+
+        async def load():
+            async with await seerdb.connect_async(
+                host=_HOST,
+                port=_PORT,
+                user=_USER,
+                password=_PASSWORD,
+                service_name=_SERVICE,
+                **_FV_KW,
+            ) as conn:
+                cur = conn.cursor()
+                await cur.executemany(
+                    f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3, :4, :5, :6)', frame
+                )
+                count = cur.rowcount
+                await conn.commit()
+                return count
+
+        self.assertEqual(asyncio.run(load()), 3)
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone(), (3,))
+
+    def tearDown(self):
+        self._drop_silently(self.cur)
+        super().tearDown()
+
+
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class VectorIntegration(_IntegrationBase):
     # Native VECTOR columns, 23ai+ (#55, TNS type 127). The server delivers the
