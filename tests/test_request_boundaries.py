@@ -281,9 +281,11 @@ class TestDrcpSessionRelease(unittest.TestCase):
         conn._write = written.append
         conn.send = lambda t, d: sent.append(d)
         conn.disconnect = lambda: None
+        conn._large_packets = True
         conn.close()
         self.assertEqual(sent, [])  # no rollback, no logoff
-        self.assertEqual(len(written), 1)
+        # The EOF packet, as python-oracledb's (#2558).
+        self.assertEqual([w.hex() for w in written], ['0000000a060000000040'])
 
 
 if __name__ == '__main__':

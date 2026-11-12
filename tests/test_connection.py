@@ -3,7 +3,6 @@
 
 import asyncio
 import socket
-import struct
 import threading
 import time
 import unittest
@@ -99,18 +98,24 @@ class TestAsyncCloseTeardown(unittest.TestCase):
         return a
 
     def test_close_rolls_back_then_emits_eof_marker(self):
-        from seerdb.common.tns_consts import TNS_DATA, TNS_DATA_FLAGS_EOF
-
-        a = self._authenticated_conn(autocommit=False)
-        writer = a._writer  # disconnect() nulls the attribute during close()
-        asyncio.run(a.close())
-
-        marker = struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
-        a.rollback.assert_awaited_once()  # autocommit off -> roll back
-        a._handle_response.assert_awaited_once()  # logoff response is read
-        # logoff dictionary is sent before the marker, which is the last write
-        self.assertGreaterEqual(len(writer.writes), 2)
-        self.assertEqual(writer.writes[-1], marker)
+        # The marker is an empty DATA packet in the session's framing: 10
+        # bytes, the data flags after the 8-byte header, as python-oracledb
+        # 26.1 sends it to 23ai (`0000000a 06 00 0000 0040`). Packed by hand,
+        # it was 8 bytes with the flags in the header checksum (#2558).
+        for large, marker in (
+            (False, '000a00000600000000' + '40'),
+            (True, '0000000a0600000000' + '40'),
+        ):
+            with self.subTest(large=large):
+                a = self._authenticated_conn(autocommit=False)
+                a._large_packets = large
+                writer = a._writer  # disconnect() nulls it during close()
+                asyncio.run(a.close())
+                a.rollback.assert_awaited_once()  # autocommit off -> roll back
+                a._handle_response.assert_awaited_once()  # logoff is answered
+                # the logoff is sent before the marker, which is the last write
+                self.assertGreaterEqual(len(writer.writes), 2)
+                self.assertEqual(writer.writes[-1].hex(), marker)
 
     def test_close_skips_rollback_when_autocommit(self):
         a = self._authenticated_conn(autocommit=True)
@@ -168,9 +173,8 @@ class TestSyncAsyncTeardownParity(unittest.TestCase):
     _STEP_METHODS = ('rollback', 'commit', 'send', '_handle_response', 'disconnect')
 
     def _marker(self):
-        from seerdb.common.tns_consts import TNS_DATA, TNS_DATA_FLAGS_EOF
-
-        return struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+        # The EOF packet in the legacy framing a fresh connection has (#2558).
+        return bytes.fromhex('000a0000060000000040')
 
     def _instrument(self, conn, method, trace, is_async):
         # Replace every teardown substep except the method under test with a
@@ -247,6 +251,8 @@ class TestSyncAsyncTeardownParity(unittest.TestCase):
 
     def test_close_step_parity(self):
         self._assert_parity('close')
+        for autocommit in (False, True):
+            self.assertIn('eof_marker', self._sync_trace('close', autocommit))
 
     def test_commit_step_parity(self):
         self._assert_parity('commit')
