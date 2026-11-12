@@ -249,6 +249,14 @@ would cost far more than anyone gains from it.
   The Mirror gives the exact result in each case. A zero result is +0 on both,
   and from 18c `MOD(x, 0)` is `x`
   ([#2572](https://github.com/seerdb/seerdb/issues/2572)).
+- **The digits of NUMBER math functions.** `SQRT`, `EXP`, `LN`, `LOG`,
+  `POWER`, the trigonometric and the hyperbolic functions of a NUMBER return a
+  NUMBER, as Oracle's do, with about 17 significant digits. Oracle's have 38 to
+  40, of which its last one or two are not always correct. `SQRT(2)` is
+  `1.414213562373095` here and `1.41421356237309504880168872420969807857` on
+  23ai. Matching Oracle's digits would make each call 30 to 150 times slower
+  than it is now
+  ([#2585](https://github.com/seerdb/seerdb/issues/2585)).
 - **A NUMBER past BINARY_FLOAT's range in BINARY_FLOAT arithmetic.** BINARY_FLOAT
   and BINARY_DOUBLE arithmetic follows IEEE 754 as Oracle's does. A division by
   zero is an infinity or NaN, a BINARY_FLOAT that overflows is an infinity, and
