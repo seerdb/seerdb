@@ -3317,14 +3317,14 @@ class AsyncOracleConnect(_ConnectionLogic):
                     self._native11_sending = False
                 await self._next_data_packet()
                 self._wr.write(
-                    struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                    encode_data_packet(b'', TNS_DATA_FLAGS_EOF, self._large_packets)
                 )
                 await self._wr.drain()
             elif self.conn_state == CONN_STATE_AUTHENTICATED and self._drcp_released:
                 # A released pooled server (#2544): the EOF packet alone, as in
                 # OracleConnect.close.
                 self._wr.write(
-                    struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                    encode_data_packet(b'', TNS_DATA_FLAGS_EOF, self._large_packets)
                 )
                 await self._wr.drain()
             elif self.conn_state == CONN_STATE_AUTHENTICATED:
@@ -3340,7 +3340,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 # over rapid reconnect cycles. Format: 10-byte header (PacketSize,
                 # PacketFlags, Type, Flags, DataFlags).
                 self._wr.write(
-                    struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                    encode_data_packet(b'', TNS_DATA_FLAGS_EOF, self._large_packets)
                 )
                 await self._wr.drain()
         except Exception:

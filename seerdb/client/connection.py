@@ -3634,7 +3634,7 @@ class OracleConnect(_ConnectionLogic):
                 self._next_data_packet()
                 if self.sock is not None:
                     self._write(
-                        struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                        encode_data_packet(b'', TNS_DATA_FLAGS_EOF, self._large_packets)
                     )
             elif self.conn_state == CONN_STATE_AUTHENTICATED and self._drcp_released:
                 # A released pooled server (#2544) holds nothing of this
@@ -3643,7 +3643,7 @@ class OracleConnect(_ConnectionLogic):
                 # first have to be attached for.
                 if self.sock is not None:
                     self._write(
-                        struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                        encode_data_packet(b'', TNS_DATA_FLAGS_EOF, self._large_packets)
                     )
             elif self.conn_state == CONN_STATE_AUTHENTICATED:
                 if not self.autocommit:
@@ -3657,11 +3657,12 @@ class OracleConnect(_ConnectionLogic):
                 # Final empty TNS_DATA packet with the EOF data flag, telling
                 # the server to fully release the session. Without this the
                 # session lingers server-side and accumulates over rapid
-                # reconnect cycles. Format: 10-byte header (PacketSize,
-                # PacketFlags, Type, Flags, DataFlags).
+                # reconnect cycles. The 8-byte header in the session's framing,
+                # then the data flags: written by hand as 8 bytes, the header
+                # claimed 10 and the flags sat in its checksum (#2558).
                 if self.sock is not None:
                     self._write(
-                        struct.pack('>hhBBh', 10, 0, TNS_DATA, 0, TNS_DATA_FLAGS_EOF)
+                        encode_data_packet(b'', TNS_DATA_FLAGS_EOF, self._large_packets)
                     )
         except (OSError, Exception):
             # If the server already hung up or our state is out of sync, we
