@@ -519,6 +519,11 @@ _MOD_FLOAT_BY_ZERO = _Need(
     '10g and 11g give 0',
     min_server=18,
 )
+_BITAND_FETCHABLE = _Need(
+    "8i's SQL BITAND returns a type no client can fetch: its sqlplus gets "
+    'ORA-00932, and seerdb refuses it (#2584)',
+    not_8i=True,
+)
 _STREAMED_LOB_BIND = _Need(
     '9i takes no bind over 4000 bytes into a LOB column (#2260)', min_fv=_FV
 )
@@ -5953,6 +5958,81 @@ class BindIntegration(_IntegrationBase):
             self.cur.execute('SELECT BITAND(7, 2) AS b FROM dual')
         self.cur.execute('SELECT 1 + 1 FROM dual')
         self.assertEqual(self.cur.fetchone(), (2,))
+
+    def test_numeric_functions_of_untyped_arguments_are_numbers(self):
+        # Oracle converts a NULL, string or string-bind argument of a numeric
+        # function or operator to a NUMBER. Over PostgreSQL, ROUND(NULL),
+        # POWER(NULL, 2) and NULL * NULL were "not unique", and ABS(NULL) or
+        # SIN(:1) a BINARY_DOUBLE (#2581).
+        null_args = [
+            f'{f}(NULL)'
+            for f in (
+                'ROUND',
+                'TRUNC',
+                'ABS',
+                'SIGN',
+                'CEIL',
+                'FLOOR',
+                'SQRT',
+                'EXP',
+                'LN',
+                'SIN',
+                'COS',
+                'TAN',
+                'ASIN',
+                'ACOS',
+                'ATAN',
+                'SINH',
+                'COSH',
+                'TANH',
+            )
+        ]
+        null_args += [
+            'ROUND(NULL, NULL)',
+            'POWER(NULL, 2)',
+            'POWER(2, NULL)',
+            'POWER(NULL, NULL)',
+            'ATAN2(NULL, NULL)',
+            'NULL + NULL',
+            'NULL - NULL',
+            'NULL * NULL',
+            'NULL / NULL',
+            '-NULL',
+        ]
+        cases = [(expr, [], None) for expr in null_args] + [
+            ("ROUND('8.756', '1')", [], Decimal('8.8')),
+            ('TRUNC(:1, :2)', ['8.75', '1'], Decimal('8.7')),
+            ("ROUND(8.756, '1.7')", [], Decimal('8.8')),
+            ('ABS(:1)', ['-3'], 3),
+            ("CEIL('0.5')", [], 1),
+            ('FLOOR(:1)', [None], None),
+            ("POWER('2', '3')", [], 8),
+            ('POWER(:1, :2)', ['8', '2'], 64),
+            ("'8' + '2'", [], 10),
+            (':1 - :2', ['8', '2'], 6),
+            (':1 * :2', [None, None], None),
+            ("'7' / '2'", [], Decimal('3.5')),
+            ('-:1', ['8.5'], Decimal('-8.5')),
+        ]
+        self._assert_numbers(cases)
+        # Unary plus leaves a string a string.
+        self.cur.execute('SELECT +:1 FROM dual', ['8'])
+        self.assertEqual(self.cur.fetchone(), ('8',))
+        self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_VARCHAR)
+
+    @_requires(_BITAND_FETCHABLE)
+    def test_bitand_of_untyped_arguments_is_a_number(self):
+        # As above (#2581).
+        self._assert_numbers(
+            [('BITAND(NULL, NULL)', [], None), ("BITAND('7', '2')", [], 2)]
+        )
+
+    def _assert_numbers(self, cases):
+        for expr, binds, value in cases:
+            with self.subTest(expr=expr, binds=binds):
+                self.cur.execute(f'SELECT {expr} FROM dual', binds)
+                self.assertEqual(self.cur.fetchone(), (value,))
+                self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
 
     def test_interval_ds_bind(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v INTERVAL DAY(4) TO SECOND(6))')

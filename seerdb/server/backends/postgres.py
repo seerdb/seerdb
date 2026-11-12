@@ -1366,6 +1366,104 @@ _HELPER_FUNCTIONS_DDL = (
         f'END IF; IF x {op} best THEN best := x; END IF; END LOOP; END $$;'
         for name, op in (('greatest', '>'), ('least', '<'))
     )
+    # The same for the other numeric functions and the arithmetic operators
+    # (#2581): ROUND(NULL), POWER(NULL, 2), NULL * NULL, -:1 with a string bind
+    # were "not unique", and ABS(NULL), SQRT('2'), SIN(:1) took double
+    # precision, a BINARY_DOUBLE. Oracle converts a string to a NUMBER, in
+    # ROUND and TRUNC too, whose date forms a string never reaches (ORA-01722).
+    # A digit count is truncated, as Oracle's is. A character column takes
+    # these as well, converted as Oracle converts it.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.{name}(text) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT pg_catalog.{name}($1::numeric) $$;'
+        for name in (
+            'round',
+            'trunc',
+            'abs',
+            'sign',
+            'ceil',
+            'floor',
+            'sqrt',
+            'exp',
+            'ln',
+        )
+    )
+    # PostgreSQL computes these in double precision only. Through text, the
+    # numeric keeps all 17 digits a double cast to numeric drops to 15.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.{name}(text) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT pg_catalog.{name}($1::numeric)::text::numeric $$;'
+        for name in (
+            'sin',
+            'cos',
+            'tan',
+            'asin',
+            'acos',
+            'atan',
+            'sinh',
+            'cosh',
+            'tanh',
+        )
+    )
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.{name}({value}, text) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT pg_catalog.{name}($1::numeric, '
+        'pg_catalog.trunc($2::numeric)::integer) $$;'
+        for name in ('round', 'trunc')
+        for value in ('text', 'numeric')
+    )
+    # POWER's integer overloads above are an exact match for an integer
+    # operand, so POWER(NULL, 2) was resolved among them alone, before any
+    # text overload: one with each integer type joins them.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.power({left}, {right}) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$$ SELECT pg_catalog.power($1::numeric, $2::numeric) $$;'
+        for left, right in (('text', 'text'),)
+        + tuple(
+            pair
+            for other in ('smallint', 'integer', 'bigint', 'numeric')
+            for pair in (('text', other), (other, 'text'))
+        )
+    )
+    + (
+        'CREATE OR REPLACE FUNCTION sys.atan2(text, text) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$$ SELECT pg_catalog.atan2($1::numeric, $2::numeric)::text::numeric $$;'
+    )
+    + (
+        'CREATE OR REPLACE FUNCTION sys.bitand(text, text) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$$ SELECT oracle.bitand(pg_catalog.trunc($1::numeric)::bigint, '
+        'pg_catalog.trunc($2::numeric)::bigint)::numeric $$;'
+    )
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_text_{name}(text, text) '
+        'RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT $1::numeric {op} $2::numeric $$;'
+        'DO $$ BEGIN '
+        f'CREATE OPERATOR {op} (LEFTARG = text, RIGHTARG = text, '
+        f'FUNCTION = sys.ora_text_{name}); '
+        'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+        for op, name in (('+', 'add'), ('-', 'sub'), ('*', 'mul'), ('/', 'div'))
+    )
+    # Unary minus converts as well; unary plus leaves its operand as it is,
+    # Oracle's +NULL and +:1 being character values.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_text_neg(text) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT -($1::numeric) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_text_pos(text) RETURNS text '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+        'DO $$ BEGIN '
+        'CREATE OPERATOR - (RIGHTARG = text, FUNCTION = sys.ora_text_neg); '
+        'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+        'DO $$ BEGIN '
+        'CREATE OPERATOR + (RIGHTARG = text, FUNCTION = sys.ora_text_pos); '
+        'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    )
     # POWER of two integers (#1362): PostgreSQL has power() for numeric and for
     # double precision only, and resolves two integers to the double precision
     # one, so POWER(143, 9) lost its low digits. Oracle's POWER of NUMBERs is
