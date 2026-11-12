@@ -5579,8 +5579,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_tstz_text, sys.ora_ltz_text and sys.ora_computed_text (#2162),
     # and sys.ora_identity_on_null (#2413), and a collection's errors in
     # PL/SQL: sys.ora_coll_fault, sys.ora_coll_index, sys.ora_coll_gone and
-    # sys.ora_coll_raise (#2547).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 120
+    # sys.ora_coll_raise (#2547), and the + - * / of a real with an integer or
+    # a numeric, 32 sys.ora_real_*, with the 24 sys.ora_int_numeric_* that keep
+    # an integer with a numeric unambiguous (#2569).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 176
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL

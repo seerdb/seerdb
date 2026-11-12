@@ -5769,6 +5769,29 @@ class BindIntegration(_IntegrationBase):
                 self.assertEqual(got, value)
                 self.assertIs(type(got), type(value))
 
+    @_requires(_BINARY_FLOAT_SERVER)
+    def test_binary_float_with_a_number_stays_binary_float(self):
+        # Oracle converts the NUMBER operand to BINARY_FLOAT and computes in
+        # single precision: 1.5f - 0.1 is the float nearest 1.4, described as
+        # a BINARY_FLOAT. With a BINARY_DOUBLE, it is a BINARY_DOUBLE. The
+        # Mirror over PostgreSQL widened every real with a NUMBER or an
+        # integer to a double, so the first gave 1.4 as a BINARY_DOUBLE
+        # (#2569).
+        f = 'TO_BINARY_FLOAT(1.5)'
+        single = seerdb.DB_TYPE_BINARY_FLOAT
+        for expr, described, value in (
+            (f'{f} - 0.1', single, 1.399999976158142),
+            (f'0.1 + {f}', single, 1.600000023841858),
+            (f'{f} * 3', single, 4.5),
+            (f'3 / {f}', single, 2.0),
+            ('TO_BINARY_FLOAT(0.1) + 0.2', single, 0.30000001192092896),
+            (f'{f} * TO_BINARY_DOUBLE(2)', seerdb.DB_TYPE_BINARY_DOUBLE, 3.0),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (value,))
+                self.assertIs(self.cur.description[0][1], described)
+
     def test_interval_ds_bind(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v INTERVAL DAY(4) TO SECOND(6))')
         Value = datetime.timedelta(

@@ -1262,6 +1262,43 @@ _HELPER_FUNCTIONS_DDL = (
         for left in ('smallint', 'integer', 'bigint')
         for right in ('smallint', 'integer', 'bigint')
     )
+    # BINARY_FLOAT arithmetic with a NUMBER (#2569): Oracle converts the NUMBER
+    # to BINARY_FLOAT and computes in single precision, so 1.5f - 0.1 is a
+    # BINARY_FLOAT 1.399999976. PostgreSQL has no real operator for an integer
+    # or numeric operand and widens both to double precision: 1.4, described as
+    # a BINARY_DOUBLE. An operator for each pair is an exact match, found before
+    # any cast, and applies PostgreSQL's own real one. real with double
+    # precision keeps PostgreSQL's, which gives a BINARY_DOUBLE as Oracle does.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_real_{name}({left}, {right}) '
+        'RETURNS real LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT $1::real OPERATOR(pg_catalog.{op}) $2::real $$;'
+        'DO $$ BEGIN '
+        f'CREATE OPERATOR {op} (LEFTARG = {left}, RIGHTARG = {right}, '
+        f'FUNCTION = sys.ora_real_{name}); '
+        'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+        for op, name in (('+', 'add'), ('-', 'sub'), ('*', 'mul'), ('/', 'div'))
+        for other in ('smallint', 'integer', 'bigint', 'numeric')
+        for left, right in (('real', other), (other, 'real'))
+    )
+    # An integer with a numeric, which PostgreSQL resolved by casting the
+    # integer to numeric, now has those real operators as candidates too, an
+    # integer and a numeric both casting to real implicitly: `n + 1` was
+    # "operator is not unique". An exact operator for each pair does what the
+    # resolution did, the numeric operator (the Mirror's own /, #1598) on both
+    # cast to numeric.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_int_numeric_{name}({left}, {right}) '
+        'RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT $1::numeric {op} $2::numeric $$;'
+        'DO $$ BEGIN '
+        f'CREATE OPERATOR {op} (LEFTARG = {left}, RIGHTARG = {right}, '
+        f'FUNCTION = sys.ora_int_numeric_{name}); '
+        'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+        for op, name in (('+', 'add'), ('-', 'sub'), ('*', 'mul'), ('/', 'div'))
+        for other in ('smallint', 'integer', 'bigint')
+        for left, right in (('numeric', other), (other, 'numeric'))
+    )
     # POWER of two integers (#1362): PostgreSQL has power() for numeric and for
     # double precision only, and resolves two integers to the double precision
     # one, so POWER(143, 9) lost its low digits. Oracle's POWER of NUMBERs is
