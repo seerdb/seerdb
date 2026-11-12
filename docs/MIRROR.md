@@ -127,6 +127,11 @@ clients are not served. What is checked, and how (measured 2026-10-31):
   - object and collection binds and fetches.
 - **Transactions:** commit and rollback, savepoints, sessionless transactions
   (within one Mirror process), and transaction priority as session state.
+- **Pooled (DRCP) connections:** a client asking for a pooled server
+  (`(SERVER=POOLED)`, `server_type='pooled'`) is served by its own session, as
+  by a DRCP pool that always hands back the same server. A pool's session
+  release keeps the session, and is not answered, as a real server answers
+  none ([#2559](https://github.com/seerdb/seerdb/issues/2559)).
 - **Two seerdb extensions:** a WebSocket listener for browser clients, and a
   JSON query endpoint (*The WebSocket listener*).
 
