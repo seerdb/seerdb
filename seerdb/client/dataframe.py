@@ -272,21 +272,14 @@ def arrow_batches(
     for field, typ in zip(schema, types):
         if typ is None:
             _refuse(field.type)
-    # Where a declared type would go out as something else, the column is left
-    # to its values' own typing, as a plain executemany types it. From 12.1 that
-    # is a large string or binary: declared LONG / LONG RAW, one over 32 KB is
-    # refused (#2564), while a long value binds as one by itself. Below 12.1
-    # it is a string or binary: declared, it goes with the type's 32 KB buffer,
-    # which a 9i server takes for a LONG (ORA-01461), and there a LONG must be
-    # declared to bind past 4000 bytes.
+    # Below 12.1 a string or binary column is left to its values' own typing, as
+    # a plain executemany types it: declared, it goes with the type's 32 KB
+    # buffer, which a 9i server takes for a LONG (ORA-01461), and there a LONG
+    # must be declared to bind past 4000 bytes.
     from seerdb.common.tns_consts import FIELD_VERSION_12_1
 
     modern = field_version is None or field_version >= FIELD_VERSION_12_1
-    loose = (
-        (dt.DB_TYPE_LONG, dt.DB_TYPE_LONG_RAW)
-        if modern
-        else (dt.DB_TYPE_VARCHAR, dt.DB_TYPE_RAW)
-    )
+    loose = () if modern else (dt.DB_TYPE_VARCHAR, dt.DB_TYPE_RAW)
     types = [None if typ in loose else typ for typ in types]
     out = []
     for batch in batches:

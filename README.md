@@ -462,10 +462,7 @@ JSON or VECTOR column can't be converted by a handler yet.
 
 An **`executemany` from a DataFrame** in several record batches reports the
 `rowcount` of all of them, and numbers its batch errors from the frame's first
-row; python-oracledb's `rowcount` is the last batch's alone. A `large_string` /
-`large_binary` column binds by its values' own type, a long one as LONG / LONG
-RAW, rather than declared so
-([#2564](https://github.com/seerdb/seerdb/issues/2564)).
+row; python-oracledb's `rowcount` is the last batch's alone.
 
 A **`pool_boundary`** that is neither `statement` nor `transaction` raises
 `ProgrammingError` before connecting, as a bad `server_type` does in both

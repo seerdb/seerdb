@@ -13464,8 +13464,12 @@ def _oac_rep_row(Rows: list) -> list:
     # minimal VARCHAR2 -- and the later value then overflowed it (ORA-01461, the
     # value exceeded the maximum VARCHAR2 length), which is exactly what a
     # DataFrame column with a leading NULL hits (#894). A column that is NULL in
-    # every row keeps None (a VARCHAR2 NULL bind, as before).
+    # every row keeps None (a VARCHAR2 NULL bind, as before). A declared bind is
+    # a Var per row, sized to fit its own value, so the largest one is chosen as
+    # well (#2564).
     def _size(Value: object) -> int:
+        if isinstance(Value, Var) and not Value.is_array:
+            return Value.size
         if isinstance(Value, str):
             return len(Value.encode('utf-8'))
         if isinstance(Value, (bytes, bytearray)):
