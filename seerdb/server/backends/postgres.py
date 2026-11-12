@@ -389,6 +389,8 @@ from seerdb.common.types import rowid_to_string
 from seerdb.common.vector import SparseVector
 from seerdb.server import (
     BackendError,
+    BinaryDoubleValue,
+    BinaryFloatValue,
     BindVar,
     Capability,
     ColumnMeta,
@@ -4079,6 +4081,14 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
             # declared type, where there is a PostgreSQL type to cast to.
             cast = _NULL_CASTS.get(value.tns_type)
             out.append(f'%({key})s::{cast}' if cast else f'%({key})s')
+        elif isinstance(value, BinaryFloatValue):
+            # A BINARY_FLOAT bind is a real, which describes as a BINARY_FLOAT,
+            # as Oracle's does, where its float alone is a double (#2562).
+            out.append(f'%({key})s::real')
+        elif isinstance(value, BinaryDoubleValue):
+            # The double twin: PostgreSQL types a bare float as a double, but
+            # an expression over the bind is typed from the cast, not inferred.
+            out.append(f'%({key})s::double precision')
         elif isinstance(value, LtzValue):
             # A TIMESTAMP WITH LOCAL TIME ZONE bind is the instant in the
             # database time zone, where a TIMESTAMP bind is a wall-clock time

@@ -5748,6 +5748,27 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(rows[0], (math.inf,))
         self.assertTrue(math.isnan(rows[1][0]))
 
+    @_requires(_BINARY_FLOAT_SERVER)
+    def test_declared_binary_float_and_double_binds_keep_their_type(self):
+        # Oracle types a bind by the type the client declared, not by its
+        # value: 1.5 declared BINARY_FLOAT describes as one, BINARY_DOUBLE as
+        # the other, and undeclared as a NUMBER. Through the Mirror both
+        # declared binds came back NUMBER over the passthrough and
+        # BINARY_DOUBLE over PostgreSQL (#2562).
+        for declared, described, value in (
+            (seerdb.DB_TYPE_BINARY_FLOAT, seerdb.DB_TYPE_BINARY_FLOAT, 1.5),
+            (seerdb.DB_TYPE_BINARY_DOUBLE, seerdb.DB_TYPE_BINARY_DOUBLE, 1.5),
+            (None, seerdb.DB_TYPE_NUMBER, Decimal('1.5')),
+        ):
+            with self.subTest(declared=declared):
+                if declared is not None:
+                    self.cur.setinputsizes(declared)
+                self.cur.execute('SELECT :1 FROM dual', [1.5])
+                (got,) = self.cur.fetchone()
+                self.assertIs(self.cur.description[0][1], described)
+                self.assertEqual(got, value)
+                self.assertIs(type(got), type(value))
+
     def test_interval_ds_bind(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v INTERVAL DAY(4) TO SECOND(6))')
         Value = datetime.timedelta(
@@ -8435,9 +8456,7 @@ class DataFrameExecuteManyIntegration(_IntegrationBase):
             ],
         )
 
-    @_requires(
-        _mirror_lacks('a BINARY_FLOAT / BINARY_DOUBLE bind keeping its type (#2562)')
-    )
+    @_requires(_postgres_cannot("report Oracle's type number in DUMP (#2568)"))
     def test_floats_bind_as_binary_float_and_double(self):
         # float32 binds BINARY_FLOAT and float64 BINARY_DOUBLE, typed by the
         # Arrow schema: into a NUMBER column the server converts, and DUMP of

@@ -50,6 +50,8 @@ from seerdb.common.tns import (
 from seerdb.server.backend import (
     Backend,
     BackendError,
+    BinaryDoubleValue,
+    BinaryFloatValue,
     BindVar,
     BlobValue,
     Capability,
@@ -83,6 +85,8 @@ __all__ = [
     'Backend',
     'BackendError',
     'BackendFactory',
+    'BinaryDoubleValue',
+    'BinaryFloatValue',
     'BindVar',
     'BlobValue',
     'Capability',
