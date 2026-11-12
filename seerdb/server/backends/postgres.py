@@ -1519,6 +1519,12 @@ _HELPER_FUNCTIONS_DDL = (
         f'END IF; IF x {op} best THEN best := x; END IF; END LOOP; END $$;'
         for name, op in (('greatest', '>'), ('least', '<'))
     )
+    # NULLIF keeping a domain (#2596; _translate_nullif).
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_nullif(a anycompatible, b anycompatible) '
+        'RETURNS anycompatible LANGUAGE sql IMMUTABLE PARALLEL SAFE AS '
+        '$$ SELECT CASE WHEN a = b THEN NULL ELSE a END $$;'
+    )
     # The same for the other numeric functions and the arithmetic operators
     # (#2581): ROUND(NULL), POWER(NULL, 2), NULL * NULL, -:1 with a string bind
     # were "not unique", and ABS(NULL), SQRT('2'), SIN(:1) took double
@@ -1975,8 +1981,37 @@ _HELPER_FUNCTIONS_DDL = (
 # call found no function at all. This one hands the number's text to orafce's
 # to_date, which is what Oracle does.
 _ORAFCE_HELPERS_DDL = (
-    'CREATE OR REPLACE FUNCTION to_date(numeric, text) RETURNS oracle.date '
-    'LANGUAGE sql STABLE STRICT AS $$ SELECT oracle.to_date($1::text, $2) $$;'
+    # A DATE is ora_date, a column's and a bind's (#2596); this one returned
+    # orafce's own DATE once, and a return type cannot be replaced, so it is
+    # dropped first -- unless something of the user's depends on it.
+    'DO $$ BEGIN IF (SELECT prorettype FROM pg_proc WHERE oid = '
+    "to_regprocedure('to_date(numeric, text)')) = to_regtype('oracle.date') THEN "
+    'DROP FUNCTION to_date(numeric, text); END IF; '
+    'EXCEPTION WHEN dependent_objects_still_exist THEN NULL; END $$;'
+    'DO $$ BEGIN '
+    'CREATE OR REPLACE FUNCTION to_date(numeric, text) RETURNS ora_date '
+    'LANGUAGE sql STABLE STRICT AS $f$ SELECT oracle.to_date($1::text, $2)::ora_date $f$; '
+    'EXCEPTION WHEN invalid_function_definition THEN NULL; END $$;'
+    # TO_DATE gives orafce's DATE, a domain of its own beside ora_date, the
+    # Mirror's: NVL, COALESCE, CASE or DECODE of a DATE column and a TO_DATE
+    # resolved to their base type, a timestamp, and its difference with a date
+    # was an interval, where Oracle's is a number of days (#2596). These come
+    # before orafce's on the search path and give an ora_date.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.to_date({args}) RETURNS ora_date '
+        'LANGUAGE sql STABLE STRICT AS '
+        f'$$ SELECT oracle.to_date({params})::ora_date $$;'
+        for args, params in (
+            ('text', '$1'),
+            ('text, text', '$1, $2'),
+            ('integer, text', '$1, $2'),
+        )
+    )
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_rr_year(ora_date) RETURNS ora_date '
+        'LANGUAGE sql STABLE STRICT AS $$ SELECT ($1::timestamp + make_interval(years => '
+        'sys.ora_rr_shift(extract(year FROM $1)::integer)))::ora_date $$;'
+    )
     # TRUNC / ROUND of a DATE or a TIMESTAMP return a DATE (#2076), so the
     # difference of two is a number of days. orafce's return a timestamp, which
     # the DATE operators (#1611) do not take, and the difference was an
@@ -8992,13 +9027,37 @@ def _translate_greatest_least(sql: str) -> str:
         args = [_translate_greatest_least(a).strip() for a in args]
         listed = ', '.join(args)
         if all(_PLAIN_ARGUMENT.fullmatch(a) for a in args):
+            # The NULL is an array's element out of range, typed as the
+            # element: a CASE's untyped ELSE NULL made PostgreSQL resolve a
+            # DATE, the ora_date domain, to its base type, and the result's
+            # difference with a date an interval (#2596).
             return (
-                f'CASE WHEN num_nulls(VARIADIC ARRAY[{listed}]) = 0 '
-                f'THEN {name.lower()}({listed}) END'
+                f'(ARRAY[{name.lower()}({listed})])'
+                f'[CASE WHEN num_nulls(VARIADIC ARRAY[{listed}]) = 0 THEN 1 END]'
             )
         return f'sys.ora_{name.lower()}({listed})'
 
     return _rewrite_calls(sql, _GREATEST_LEAST_NAMES, guarded, '_$#."')
+
+
+# NULLIF (#2596): PostgreSQL's resolves a domain to its base type, so the
+# NULLIF of two DATEs, the ora_date domain, was a timestamp, and its
+# difference with a date an interval. sys.ora_nullif keeps it; PostgreSQL
+# inlines it, so it costs what the bare NULLIF does.
+_NULLIF_NAMES = frozenset({'NULLIF'})
+
+
+def _translate_nullif(sql: str) -> str:
+    if 'nullif' not in sql.lower():
+        return sql
+
+    def keeping(_name: str, args: list[str]) -> str | None:
+        if len(args) != 2:
+            return None
+        listed = ', '.join(_translate_nullif(a).strip() for a in args)
+        return f'sys.ora_nullif({listed})'
+
+    return _rewrite_calls(sql, _NULLIF_NAMES, keeping, '_$#."')
 
 
 # ORA-30487: what Oracle answers for MEDIAN ... OVER (... ORDER BY ...), whose
@@ -11078,6 +11137,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
     sql = _ruled('greatest-least', _translate_greatest_least(sql), sql)
+    sql = _ruled('nullif', _translate_nullif(sql), sql)
     sql = _ruled('median', _translate_median(sql), sql)
     sql = _ruled('avg', _translate_avg(sql), sql)
     sql = _ruled('json-functions', _translate_json_functions(sql), sql)

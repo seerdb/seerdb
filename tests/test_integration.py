@@ -5856,6 +5856,34 @@ class BindIntegration(_IntegrationBase):
                 self.assertEqual(self.cur.fetchone(), (Decimal(value),))
                 self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
 
+    def test_a_date_mixed_with_another_date_stays_a_date(self):
+        # NVL, NVL2, GREATEST, LEAST or DECODE of two DATEs is a DATE, so its
+        # difference with a date is a number of days. Over PostgreSQL a TO_DATE
+        # was orafce's own DATE beside the Mirror's, and a mix of the two -- or
+        # any GREATEST or LEAST -- a timestamp, the difference an INTERVAL
+        # (#2596).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (d DATE, e DATE)')
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (TO_DATE('2020-01-15 12:00', "
+            "'YYYY-MM-DD HH24:MI'), TO_DATE('2020-01-10', 'YYYY-MM-DD'))"
+        )
+        to_date = "TO_DATE('2020-01-01', 'YYYY-MM-DD')"
+        bind = datetime.datetime(2020, 1, 5)
+        for expr, binds, days in (
+            (f'NVL(d, {to_date}) - e', [], Decimal('5.5')),
+            (f'NVL2(d, {to_date}, e) - e', [], -9),
+            ('GREATEST(d, e) - e', [], Decimal('5.5')),
+            (f'LEAST(d, {to_date}) - e', [], -9),
+            ('GREATEST(d, SYSDATE) - SYSDATE', [], 0),
+            (f'DECODE(1, 1, {to_date}, d) - e', [], -9),
+            (f'NVL(:1, {to_date}) - e', [bind], -5),
+            ('GREATEST(:1, e) - :1', [bind], 5),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM {self.TABLE}', binds)
+                self.assertEqual(self.cur.fetchone(), (days,))
+                self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
+
     def test_a_date_bind_is_a_date(self):
         # seerdb binds a datetime without a fraction as a DATE, as Oracle's
         # clients do, and Oracle types the bind and every expression over it
