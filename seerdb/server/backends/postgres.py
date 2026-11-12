@@ -1500,6 +1500,51 @@ _HELPER_FUNCTIONS_DDL = (
             'tanh',
         )
     )
+    # And of a NUMBER (#2585): Oracle's is a NUMBER, PostgreSQL's a double
+    # precision, a BINARY_DOUBLE. An overload for numeric is an exact match
+    # for a NUMBER column or a decimal literal; one for each integer type, for
+    # an integer literal, which would otherwise take double precision, the
+    # numeric category's preferred type -- as SQRT, EXP and LN of one did,
+    # whose numeric overloads are PostgreSQL's. The value is still computed
+    # in double precision, its 17 digits kept through text.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.{name}({kind}) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT pg_catalog.{name}($1::double precision)::text::numeric $$;'
+        for name in (
+            'sin',
+            'cos',
+            'tan',
+            'asin',
+            'acos',
+            'atan',
+            'sinh',
+            'cosh',
+            'tanh',
+        )
+        for kind in ('numeric', 'smallint', 'integer', 'bigint')
+    )
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.{name}({kind}) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT pg_catalog.{name}($1::numeric) $$;'
+        for name in ('sqrt', 'exp', 'ln')
+        for kind in ('smallint', 'integer', 'bigint')
+    )
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.atan2({kind}, {kind}) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$$ SELECT pg_catalog.atan2($1::double precision, $2::double precision)'
+        '::text::numeric $$;'
+        for kind in ('numeric', 'smallint', 'integer', 'bigint')
+    )
+    # The square root of a BINARY_FLOAT is one; a double precision square root
+    # rounded to single precision is the correctly rounded one.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.sqrt(real) RETURNS real '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        '$$ SELECT pg_catalog.sqrt($1::double precision)::real $$;'
+    )
     + ''.join(
         f'CREATE OR REPLACE FUNCTION sys.{name}({value}, text) RETURNS numeric '
         'LANGUAGE sql IMMUTABLE STRICT AS '

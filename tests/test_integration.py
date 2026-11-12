@@ -5849,6 +5849,47 @@ class BindIntegration(_IntegrationBase):
                 self.assertEqual(self.cur.fetchone(), (value,))
                 self.assertIs(self.cur.description[0][1], described)
 
+    def test_trigonometric_functions_of_a_number_are_numbers(self):
+        # Over PostgreSQL, which has them for double precision only, these
+        # came back as BINARY_DOUBLE, and SQRT, EXP and LN of an integer
+        # literal too (#2585). Oracle's are NUMBER, whatever the NUMBER.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, i NUMBER(5))')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (0.5, 2)')
+        for expr, value in (
+            ('SIN(n)', math.sin(0.5)),
+            ('COS(i)', math.cos(2)),
+            ('TAN(0.5)', math.tan(0.5)),
+            ('ASIN(n)', math.asin(0.5)),
+            ('ACOS(1)', 0.0),
+            ('ATAN(i)', math.atan(2)),
+            ('SINH(1)', math.sinh(1)),
+            ('COSH(n)', math.cosh(0.5)),
+            ('TANH(2)', math.tanh(2)),
+            ('ATAN2(n, i)', math.atan2(0.5, 2)),
+            ('ATAN2(1, 2)', math.atan2(1, 2)),
+            ('SQRT(4)', 2.0),
+            ('EXP(1)', math.e),
+            ('LN(1)', 0.0),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM {self.TABLE}')
+                (got,) = self.cur.fetchone()
+                self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
+                self.assertAlmostEqual(float(got), value, places=12)
+
+    @_requires(_BINARY_FLOAT_SERVER)
+    def test_square_root_of_a_binary_float_is_a_binary_float(self):
+        # Oracle's SQRT keeps a BINARY_FLOAT single (#2585); its other
+        # functions of one are BINARY_DOUBLE.
+        self.cur.execute(
+            'SELECT SQRT(TO_BINARY_FLOAT(2)), EXP(TO_BINARY_FLOAT(0)) FROM dual'
+        )
+        (root, one) = self.cur.fetchone()
+        self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_BINARY_FLOAT)
+        self.assertIs(self.cur.description[1][1], seerdb.DB_TYPE_BINARY_DOUBLE)
+        self.assertEqual(root, 1.4142135381698608)  # sqrt(2) in single precision
+        self.assertEqual(one, 1.0)
+
     @_requires(_BINARY_FLOAT_SERVER)
     def test_binary_float_and_double_arithmetic_is_ieee(self):
         # Oracle divides a BINARY_FLOAT / BINARY_DOUBLE by zero to an infinity
