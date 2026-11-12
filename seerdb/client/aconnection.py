@@ -1699,7 +1699,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             and len(Result) >= 3
             and isinstance(Result[2], int)
             and Result[2] > 0
-            and Result[1] in (0, ORA_NO_DATA_FOUND)
+            # A batch error keeps the cursor: the batch ran, some rows failed.
+            # Left out, a cached cursor stayed in the cache but was queued for
+            # close below, and its next execute answered ORA-01001.
+            and Result[1] in (0, ORA_NO_DATA_FOUND, ORA_ARRAY_DML_ERRORS)
         ):
             # Gate the write on CacheKey too so 12c+ (cache disabled) never
             # parks a stray {None: cursor_id} entry (#80); mirrors the sync fix.
