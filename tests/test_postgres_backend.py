@@ -2091,10 +2091,13 @@ def test_translate_idioms_rewrites_decode_to_case() -> None:
 
 def test_translate_idioms_makes_greatest_and_least_null_with_a_null() -> None:
     # Oracle's GREATEST and LEAST are NULL when an argument is; PostgreSQL's
-    # skip it (#2580). Columns, binds and literals are guarded inline.
+    # skip it (#2580). Columns, binds and literals are guarded inline, the
+    # NULL an array's element out of range so that it has the result's type: a
+    # DATE stays a DATE (#2596).
     assert _translate_idioms('SELECT LEAST(a, t.b, :1, 2.5, NULL) FROM t') == (
-        'SELECT CASE WHEN num_nulls(VARIADIC ARRAY[a, t.b, :1, 2.5, NULL]) = 0 '
-        'THEN least(a, t.b, :1, 2.5, NULL) END FROM t'
+        'SELECT (ARRAY[least(a, t.b, :1, 2.5, NULL)])'
+        '[CASE WHEN num_nulls(VARIADIC ARRAY[a, t.b, :1, 2.5, NULL]) = 0 THEN 1 END] '
+        'FROM t'
     )
     # Anything else is seen once, by sys.ora_greatest / sys.ora_least: a call,
     # an expression, a sequence's NEXTVAL, and a nested GREATEST.
@@ -2102,8 +2105,8 @@ def test_translate_idioms_makes_greatest_and_least_null_with_a_null() -> None:
         "SELECT greatest(length(s), a + 1, 'x,y'), LEAST(GREATEST(a, b), c) FROM t"
     ) == (
         "SELECT sys.ora_greatest(length(s), a + 1, 'x,y'), "
-        'sys.ora_least(CASE WHEN num_nulls(VARIADIC ARRAY[a, b]) = 0 '
-        'THEN greatest(a, b) END, c) '
+        'sys.ora_least((ARRAY[greatest(a, b)])'
+        '[CASE WHEN num_nulls(VARIADIC ARRAY[a, b]) = 0 THEN 1 END], c) '
         'FROM t'
     )
     assert _translate_idioms('SELECT GREATEST(s.NEXTVAL, 0) FROM dual') == (
@@ -2116,6 +2119,76 @@ def test_translate_idioms_makes_greatest_and_least_null_with_a_null() -> None:
         "SELECT x FROM t WHERE c = 'least(a, b)'",
     ):
         assert _translate_idioms(untouched) == untouched
+
+
+def test_translate_idioms_keeps_nullifs_type() -> None:
+    # PostgreSQL's NULLIF resolves a domain to its base type, so the NULLIF of
+    # two DATEs was a timestamp (#2596); sys.ora_nullif keeps it. Nested,
+    # and a qualified call or a string left alone.
+    assert _translate_idioms('SELECT NULLIF(d, NULLIF(e, :1)) FROM t') == (
+        'SELECT sys.ora_nullif(d, sys.ora_nullif(e, :1)) FROM t'
+    )
+    for untouched in (
+        'SELECT pg_catalog.nullif(a, b) FROM t',
+        "SELECT x FROM t WHERE c = 'nullif(a, b)'",
+    ):
+        assert _translate_idioms(untouched) == untouched
+
+
+def test_a_date_mixed_with_another_stays_a_date() -> None:
+    # Oracle's NVL, NVL2, COALESCE, GREATEST, LEAST, CASE, DECODE and NULLIF of
+    # two DATEs are a DATE, whatever made each: a column, TO_DATE, SYSDATE, a
+    # bind, TRUNC, ADD_MONTHS, LAST_DAY, d + 1. Over PostgreSQL a TO_DATE was
+    # orafce's own DATE, a second domain beside the Mirror's, and a mix of the
+    # two -- or a GREATEST, LEAST or NULLIF of any -- resolved to a timestamp,
+    # whose difference with a date was an interval (#2596). 23ai's answer for
+    # every pair: a number of days.
+    import itertools
+
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import DateValue
+
+    sources = (
+        'e',
+        'SYSDATE',
+        "TO_DATE('2020-01-01', 'YYYY-MM-DD')",
+        ':1',
+        'TRUNC(e)',
+        'ADD_MONTHS(e, 1)',
+        'LAST_DAY(e)',
+        '(e + 1)',
+    )
+    forms = (
+        'NVL({a}, {b})',
+        'NVL2({a}, {a}, {b})',
+        'COALESCE({a}, {b})',
+        'GREATEST({a}, {b})',
+        'LEAST({a}, {b})',
+        'CASE WHEN 1 = 1 THEN {a} ELSE {b} END',
+        'DECODE(1, 1, {a}, {b})',
+        'NULLIF({a}, {b})',
+    )
+    bind = DateValue.of(datetime.datetime(2020, 1, 1))
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE dm2596t (d DATE, e DATE)')
+        backend.execute(
+            "INSERT INTO dm2596t VALUES (TO_DATE('2020-01-15 10:20:30', "
+            "'YYYY-MM-DD HH24:MI:SS'), TO_DATE('2019-11-03', 'YYYY-MM-DD'))"
+        )
+        for form, (a, b) in itertools.product(
+            forms, itertools.product(('d',) + sources, sources)
+        ):
+            expr = form.format(a=a, b=b)
+            binds = [bind] if ':1' in expr else []
+            result = backend.execute(f'SELECT ({expr}) - d FROM dm2596t', binds)
+            assert result.columns[0].data_type == TNS_TYPE_NUMBER, expr
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE dm2596t')
+        except Exception:
+            backend.rollback()
 
 
 def test_translate_idioms_rewrites_minus_to_except() -> None:
@@ -5689,8 +5762,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # (#2571), and the 50 numeric and integer overloads of the trigonometric
     # and hyperbolic functions, ATAN2, SQRT, EXP and LN, with SQRT of a real
     # (#2585), and DUMP in Oracle's terms: sys.dump for 16 types at each of
-    # its four arities, sys.ora_dump_text and five encoders (#2568).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 362
+    # its four arities, sys.ora_dump_text and five encoders (#2568), and
+    # sys.ora_nullif, a NULLIF keeping a domain (#2596).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 363
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
