@@ -222,7 +222,9 @@ from seerdb.common.tns_consts import (
     TNS_MARKER_TYPE_RESET,
     TNS_MSG_TYPE_FAST_AUTH,
     TNS_MSG_TYPE_ONEWAY_FN,
+    TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFILE,
+    TNS_TYPE_BFLOAT,
     TNS_TYPE_BLOB,
     TNS_TYPE_CHAR,
     TNS_TYPE_CLOB,
@@ -277,6 +279,8 @@ from seerdb.server.auth import (
 from seerdb.server.backend import (
     Backend,
     BackendError,
+    BinaryDoubleValue,
+    BinaryFloatValue,
     BindVar,
     BlobValue,
     Capability,
@@ -1713,7 +1717,7 @@ def _serve_thin_session(
             )
             if resolved is None:  # refused, and answered with its error
                 continue
-            request = _mark_ltz_binds(resolved)
+            request = _mark_value_binds(resolved)
             _attach_object_bind_lobs(request, lob_emit_log, temp_lobs)
             if request.scrollable:
                 lobs = _answer_scroll(stream, backend, request, cursors)
@@ -3974,22 +3978,37 @@ def _answer_lobops(
     return lobs, current, current_object_lob
 
 
-def _mark_ltz_binds(request: ExecRequest) -> ExecRequest:
+# The value binds whose decoded value stands for more than one bind type, by the
+# type the client declared: the value type the decoder gives, and the marker
+# that says which type it was.
+_MARKED_BINDS: dict[int, tuple[type, Callable[..., object]]] = {
     # A TIMESTAMP WITH LOCAL TIME ZONE bind decodes to the same naive datetime
-    # a TIMESTAMP bind does, but Oracle reads the two in different zones, so
-    # the backend is handed an LtzValue that says which it was (#1222). A NULL
-    # stays None: an ordinary NULL arrives as a BindVar with its type already.
-    ltz = {
-        i
+    # a TIMESTAMP bind does, but Oracle reads the two in different zones
+    # (#1222).
+    TNS_TYPE_TIMESTAMPLTZ: (datetime.datetime, LtzValue.of),
+    # A BINARY_FLOAT / BINARY_DOUBLE bind decodes to the float a NUMBER bind
+    # can, but Oracle types the bind and every expression over it by the
+    # declared type (#2562).
+    TNS_TYPE_BFLOAT: (float, BinaryFloatValue),
+    TNS_TYPE_BDOUBLE: (float, BinaryDoubleValue),
+}
+
+
+def _mark_value_binds(request: ExecRequest) -> ExecRequest:
+    # Hand the backend each bind of a _MARKED_BINDS type marked as the type it
+    # was declared. A NULL stays None: an ordinary NULL arrives as a BindVar
+    # with its type already.
+    marks = {
+        i: _MARKED_BINDS[meta[0]]
         for i, meta in enumerate(request.bind_meta)
-        if meta and meta[0] == TNS_TYPE_TIMESTAMPLTZ
+        if meta and meta[0] in _MARKED_BINDS
     }
-    if not ltz:
+    if not marks:
         return request
 
     def mark(i: int, value: object) -> object:
-        if i in ltz and type(value) is datetime.datetime:
-            return LtzValue.of(value)
+        if i in marks and type(value) is marks[i][0]:
+            return marks[i][1](value)
         return value
 
     rows = [[mark(i, v) for i, v in enumerate(row)] for row in request.bind_rows]
@@ -5128,7 +5147,7 @@ def _answer_reexecute_binds(
         resolved = _resolve_or_refuse(stream, execute, temp_lobs)
         if resolved is None:  # refused, and answered with its error
             return []
-        return _answer_query(stream, backend, _mark_ltz_binds(resolved), cursors)
+        return _answer_query(stream, backend, _mark_value_binds(resolved), cursors)
     sql = cursors.query_sql(request.cursor)
     if sql is None:
         stream.write_packet(

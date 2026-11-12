@@ -278,6 +278,46 @@ def test_an_ltz_bind_is_declared_upstream_as_one():
     assert cursor.declared is None
 
 
+def test_a_binary_float_or_double_bind_is_declared_upstream_as_one():
+    # A BINARY_FLOAT / BINARY_DOUBLE bind arrives marked as one (#2562); bound
+    # on as a bare float it would be a NUMBER, and so would `:1 / 3`, so the
+    # passthrough declares it -- alone, beside a typed NULL, and across an
+    # array. A bare float, a NUMBER bind, is left to bind by its value.
+    from seerdb.common.tns_consts import TNS_TYPE_NUMBER
+    from seerdb.server.backend import BinaryDoubleValue, BinaryFloatValue
+
+    single = BinaryFloatValue(1.5)
+    double = BinaryDoubleValue(2.25)
+
+    class _ArrayCursor(_FakeCursor):
+        def executemany(self, sql, rows, **kwargs):
+            self.bound = [list(r) for r in rows]
+
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _ArrayCursor()
+    backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+
+    backend.execute('INSERT INTO t VALUES (:1, :2, :3)', [single, double, 1.5])
+    assert cursor.declared == (
+        seerdb.DB_TYPE_BINARY_FLOAT,
+        seerdb.DB_TYPE_BINARY_DOUBLE,
+        None,
+    )
+    assert cursor.bound == [1.5, 2.25, 1.5]
+
+    (typed,) = _plsql_binds((None, TNS_TYPE_NUMBER, 22))
+    backend.execute('INSERT INTO t VALUES (:1, :2)', [typed, single])
+    assert cursor.declared == (seerdb.DB_TYPE_NUMBER, seerdb.DB_TYPE_BINARY_FLOAT)
+
+    cursor.declared = None
+    backend.execute_many('INSERT INTO t VALUES (:1, :2)', [[1, double], [2, None]])
+    assert cursor.declared == (None, seerdb.DB_TYPE_BINARY_DOUBLE)
+
+    cursor.declared = None
+    backend.execute('INSERT INTO t VALUES (:1)', [1.5])
+    assert cursor.declared is None
+
+
 class _FakeLobConn:
     """An upstream connection that records the temp LOBs made on it."""
 

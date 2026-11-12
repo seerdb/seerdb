@@ -64,6 +64,8 @@ from seerdb.server.accounts import (
 from seerdb.server.backend import (
     ORA_UNKNOWN_SERVICE,
     BackendError,
+    BinaryDoubleValue,
+    BinaryFloatValue,
     BindVar,
     BlobValue,
     Capability,
@@ -184,6 +186,23 @@ _BFILE_READ_CHUNK = 32767
 # serves no client below 11.2, so a 10.2-band client is relayed at 11.2's forms
 # instead, as the Mirror over PostgreSQL gives that band.
 _UPSTREAM_FLOOR_FIELD_VERSION = FIELD_VERSION_11_2
+
+
+def _value_bind_type(value: object) -> object:
+    # The upstream type to declare for a value whose Python type alone would
+    # bind as something else, or None. A TIMESTAMP WITH LOCAL TIME ZONE bind
+    # arrives as an LtzValue (#1222): bound on as a bare datetime it would be a
+    # TIMESTAMP, read in the session zone rather than the database's (#1225). A
+    # BINARY_FLOAT / BINARY_DOUBLE bind arrives marked as one (#2562): bound on
+    # as a bare float it would be a NUMBER, and so would every expression over
+    # it.
+    if isinstance(value, LtzValue):
+        return seerdb.DB_TYPE_TIMESTAMP_LTZ
+    if isinstance(value, BinaryFloatValue):
+        return seerdb.DB_TYPE_BINARY_FLOAT
+    if isinstance(value, BinaryDoubleValue):
+        return seerdb.DB_TYPE_BINARY_DOUBLE
+    return None
 
 
 class OraclePassthroughBackend:
@@ -826,21 +845,20 @@ class OraclePassthroughBackend:
 
     @staticmethod
     def _declare_value_binds(cursor: object, rows: Sequence[Sequence]) -> None:
-        # Declare the binds whose value alone would bind as something else.
-        # A TIMESTAMP WITH LOCAL TIME ZONE bind arrives as an LtzValue (#1222).
-        # Bound on as a bare datetime it would be a TIMESTAMP, which the upstream
-        # reads in the session zone rather than the database's, so declare each
-        # position that holds one as LTZ again (#1225). A character bind arrives
-        # as a VarcharValue, with the buffer the client declared, which the
-        # upstream describes the bind by (#2106): bound by its value, a sqlplus
-        # VARCHAR2(30) variable printed 32 wide where Oracle gives 128. A size
-        # declares the buffer in bytes, as the client declared it.
+        # Declare the binds whose value alone would bind as something else:
+        # each position holding a marked value as its type (_value_bind_type).
+        # A character bind arrives as a VarcharValue, with the buffer the
+        # client declared, which the upstream describes the bind by (#2106):
+        # bound by its value, a sqlplus VARCHAR2(30) variable printed 32 wide
+        # where Oracle gives 128. A size declares the buffer in bytes, as the
+        # client declared it.
         width = max((len(row) for row in rows), default=0)
         declared: dict[int, object] = {}
         for row in rows:
             for i, value in enumerate(row):
-                if isinstance(value, LtzValue):
-                    declared[i] = seerdb.DB_TYPE_TIMESTAMP_LTZ
+                marked = _value_bind_type(value)
+                if marked is not None:
+                    declared[i] = marked
                 elif isinstance(value, VarcharValue) and value.max_size > 0:
                     known = declared.get(i)
                     if not isinstance(known, int) or value.max_size > known:
@@ -965,11 +983,7 @@ class OraclePassthroughBackend:
                     sizes.append(b.max_size)
                     resolved.append(b)
                 else:
-                    sizes.append(
-                        seerdb.DB_TYPE_TIMESTAMP_LTZ
-                        if isinstance(b, LtzValue)
-                        else None
-                    )
+                    sizes.append(_value_bind_type(b))
                     resolved.append(b)
             cursor.setinputsizes(*sizes)
             binds = resolved

@@ -1878,6 +1878,21 @@ def test_translate_binds_wraps_interval_ym_as_make_interval() -> None:
     assert neg == {'b1': -14}
 
 
+def test_translate_binds_casts_binary_float_and_double() -> None:
+    # A BINARY_FLOAT / BINARY_DOUBLE bind arrives marked as one (#2562). Its
+    # placeholder is cast to real / double precision, so `SELECT :1 FROM dual`
+    # describes the declared type, where a bare float is a double whatever was
+    # declared. A bare float, a NUMBER bind, stays uncast.
+    from seerdb.server import BinaryDoubleValue, BinaryFloatValue
+
+    sql, params = _translate_binds(
+        'SELECT :1, :2, :3 FROM dual',
+        [BinaryFloatValue(1.5), BinaryDoubleValue(2.25), 0.5],
+    )
+    assert sql == 'SELECT %(b1)s::real, %(b2)s::double precision, %(b3)s FROM dual'
+    assert params == {'b1': 1.5, 'b2': 2.25, 'b3': 0.5}
+
+
 def test_translate_binds_skips_colon_in_quoted_identifier() -> None:
     # A ':' inside a double-quoted identifier (a column named "col:ons") is part of
     # the name, not a bind; the scanner copies the quoted region verbatim so the

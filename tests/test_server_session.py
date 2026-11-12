@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import decimal
 import socket
 import threading
 import zlib
@@ -742,13 +743,73 @@ def test_an_ltz_bind_reaches_the_backend_marked_as_one() -> None:
     assert rows[3][0] is None
 
 
-def test_mark_ltz_binds_leaves_nulls_and_other_types_alone() -> None:
+def test_a_binary_float_or_double_bind_reaches_the_backend_marked_as_one() -> None:
+    # A BINARY_FLOAT, a BINARY_DOUBLE and a NUMBER bind of 1.5 can all reach the
+    # backend as a float; the first two are marked as what they were declared,
+    # since Oracle types the bind by that (#2562). Once, again (the re-execute)
+    # and as an array.
+    from seerdb.server import BinaryDoubleValue, BinaryFloatValue
+
+    listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(('127.0.0.1', 0))
+    listen.listen(1)
+    port = listen.getsockname()[1]
+
+    result: dict = {}
+    backend = _RecordingArrayBackend()
+    server = threading.Thread(
+        target=_run_recording_session, args=(listen, result, backend), daemon=True
+    )
+    server.start()
+
+    conn = seerdb.connect(
+        host='127.0.0.1',
+        port=port,
+        user='PYO',
+        password='pyo123',
+        service_name='XE',
+        timeout=5000,
+    )
+    sql = 'INSERT INTO t (f, d) VALUES (:1, :2)'
+    types = (seerdb.DB_TYPE_BINARY_FLOAT, seerdb.DB_TYPE_BINARY_DOUBLE)
+    try:
+        cursor = conn.cursor()
+        for _ in range(2):
+            cursor.setinputsizes(*types)
+            cursor.execute(sql, [1.5, 2.25])
+        cursor.setinputsizes(*types)
+        cursor.executemany(sql, [[1.5, 2.25], [None, 2.25]])
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        server.join(timeout=5)
+        listen.close()
+
+    assert result.get('error') is None, result.get('error')
+    rows = backend.inserts
+    assert len(rows) == 4
+    for f, d in rows[:3]:
+        assert type(f) is BinaryFloatValue and f == 1.5
+        assert type(d) is BinaryDoubleValue and d == 2.25
+    assert rows[3][0] is None
+
+
+def test_mark_value_binds_leaves_nulls_and_other_types_alone() -> None:
     # Only a non-NULL datetime at an LTZ position is marked; a NULL, a BindVar
     # (which says its type itself) and every other position are left as they are.
     from seerdb.common.tns import ExecRequest
-    from seerdb.common.tns_consts import TNS_TYPE_TIMESTAMP, TNS_TYPE_TIMESTAMPLTZ
-    from seerdb.server import BindVar, LtzValue
-    from seerdb.server.session import _mark_ltz_binds
+    from seerdb.common.tns_consts import (
+        TNS_TYPE_BDOUBLE,
+        TNS_TYPE_BFLOAT,
+        TNS_TYPE_NUMBER,
+        TNS_TYPE_TIMESTAMP,
+        TNS_TYPE_TIMESTAMPLTZ,
+    )
+    from seerdb.server import BinaryDoubleValue, BinaryFloatValue, BindVar, LtzValue
+    from seerdb.server.session import _mark_value_binds
 
     value = datetime.datetime(2026, 9, 25, 13, 45, 6)
     null = BindVar(value=None, tns_type=TNS_TYPE_TIMESTAMPLTZ, max_size=11)
@@ -767,7 +828,7 @@ def test_mark_ltz_binds_leaves_nulls_and_other_types_alone() -> None:
             (TNS_TYPE_TIMESTAMPLTZ, 11),
         ],
     )
-    marked = _mark_ltz_binds(request)
+    marked = _mark_value_binds(request)
     assert [type(v) for v in marked.binds] == [
         LtzValue,
         datetime.datetime,
@@ -776,7 +837,30 @@ def test_mark_ltz_binds_leaves_nulls_and_other_types_alone() -> None:
     ]
     assert marked.bind_rows == [marked.binds]
     no_ltz = replace(request, bind_meta=[(TNS_TYPE_TIMESTAMP, 11)] * 4)
-    assert _mark_ltz_binds(no_ltz) is no_ltz
+    assert _mark_value_binds(no_ltz) is no_ltz
+    # A float is marked at a BINARY_FLOAT / BINARY_DOUBLE position alone (#2562):
+    # at a NUMBER one it stays a float, and a value the decoder gave as
+    # something else is not a float to mark.
+    floats = [1.5, 1.5, 1.5, decimal.Decimal('1.5')]
+    request = replace(
+        request,
+        binds=floats,
+        bind_rows=[floats],
+        bind_meta=[
+            (TNS_TYPE_BFLOAT, 4),
+            (TNS_TYPE_BDOUBLE, 8),
+            (TNS_TYPE_NUMBER, 22),
+            (TNS_TYPE_BFLOAT, 4),
+        ],
+    )
+    marked = _mark_value_binds(request)
+    assert [type(v) for v in marked.binds] == [
+        BinaryFloatValue,
+        BinaryDoubleValue,
+        float,
+        decimal.Decimal,
+    ]
+    assert marked.binds[:3] == [1.5, 1.5, 1.5]
 
 
 def _exec_body() -> bytes:

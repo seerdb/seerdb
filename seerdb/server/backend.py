@@ -181,6 +181,28 @@ class LtzValue(datetime.datetime):
         )
 
 
+class BinaryFloatValue(float):
+    """A BINARY_FLOAT bind's value: a ``float`` that says it was bound as one
+    (#2562).
+
+    A BINARY_FLOAT, a BINARY_DOUBLE and a NUMBER bind can all decode to the
+    same ``float``. Oracle types the bind, and every expression over it, by the
+    type the client declared: ``SELECT :1 / 3 FROM dual`` describes a
+    BINARY_FLOAT. A backend that binds the bare value on binds a NUMBER or a
+    double. It IS a ``float``, so a backend that does not care needs nothing
+    new.
+    """
+
+    __slots__ = ()
+
+
+class BinaryDoubleValue(float):
+    """A BINARY_DOUBLE bind's value: the double twin of
+    :class:`BinaryFloatValue` (#2562)."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True)
 class CursorResult:
     """A REF CURSOR OUT bind's value: the nested result set the block opened, as
