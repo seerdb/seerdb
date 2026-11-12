@@ -5805,6 +5805,57 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    def test_date_differences_and_months_between_keep_oracles_digits(self):
+        # A NUMBER keeps twenty base-100 digits; over PostgreSQL a DATE
+        # difference kept 16 decimals and MONTHS_BETWEEN, orafce's, 15
+        # (#2597). MONTHS_BETWEEN rounds its fraction of a month before adding
+        # the whole months, so one near zero keeps fewer: 23ai's answers.
+        def d(text):
+            return f"TO_DATE('{text}', 'YYYY-MM-DD HH24:MI:SS')"
+
+        for expr, value in (
+            (
+                f'{d("2020-01-15 10:20:30")} - {d("2020-01-01 00:00:00")}',
+                '14.43090277777777777777777777777777777778',
+            ),
+            (
+                f'{d("2020-01-01 00:00:00")} - {d("2020-01-01 08:00:00")}',
+                '-0.3333333333333333333333333333333333333333',
+            ),
+            (
+                f'{d("2020-01-01 00:00:01")} - {d("2020-01-01 00:00:00")}',
+                '0.00001157407407407407407407407407407407407407',
+            ),
+            (
+                f'{d("2019-01-01 00:00:00")} - {d("2020-12-31 23:59:59")}',
+                '-730.999988425925925925925925925925925926',
+            ),
+            (
+                f'MONTHS_BETWEEN({d("2020-01-15 10:20:30")}, {d("2019-11-03 04:00:00")})',
+                '2.39562051971326164874551971326164874552',
+            ),
+            (
+                f'MONTHS_BETWEEN({d("2020-02-28 00:00:00")}, {d("2020-01-31 00:00:00")})',
+                '0.9032258064516129032258064516129032258065',
+            ),
+            (
+                f'MONTHS_BETWEEN({d("1999-12-31 23:59:59")}, {d("2000-01-01 00:00:00")})',
+                '-3.733572281959378733572281959378734E-7',
+            ),
+            (
+                f'MONTHS_BETWEEN({d("2020-03-31 00:00:00")}, {d("2020-02-29 00:00:00")})',
+                '1',
+            ),
+            (
+                f'MONTHS_BETWEEN({d("2020-03-15 12:00:00")}, {d("2020-02-15 00:00:00")})',
+                '1',
+            ),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (Decimal(value),))
+                self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
+
     def test_a_date_bind_is_a_date(self):
         # seerdb binds a datetime without a fraction as a DATE, as Oracle's
         # clients do, and Oracle types the bind and every expression over it
