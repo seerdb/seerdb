@@ -16253,13 +16253,12 @@ class PostgresBackend:
                 'SELECT count(*), max(id), ' + _DDL_GENERATION + ' FROM sys.ora_ddl_log'
             ).fetchone()
             if row is not None and row[0] > _DDL_LOG_KEPT:
-                with self._conn.transaction():
-                    self._conn.execute(
-                        'DELETE FROM sys.ora_ddl_log WHERE id < %s', (row[1],)
-                    )
-                    row = self._conn.execute(
-                        'SELECT 0, 0, ' + _DDL_GENERATION
-                    ).fetchone()
+                # Each committed at once, as the rest of the login is (#1914):
+                # a transaction around them made a trimming login the one that
+                # opened one (#2573). Neither needs it -- the newest row stays,
+                # and the session has read nothing of the schema yet.
+                self._at_once('DELETE FROM sys.ora_ddl_log WHERE id < %s', (row[1],))
+                row = self._at_once('SELECT 0, 0, ' + _DDL_GENERATION).fetchone()
             self._ddl_generation = None if row is None else row[2]
         except psycopg.Error:
             self._conn.rollback()

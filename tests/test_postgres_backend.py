@@ -34,6 +34,7 @@ from psycopg.conninfo import make_conninfo  # noqa: E402
 
 from seerdb.server.accounts import _ACCOUNTS_READY  # noqa: E402
 from seerdb.server.backends.postgres import (  # noqa: E402
+    _DDL_LOG_KEPT,
     _DICTIONARY_STAMP,
     _HELPER_FUNCTIONS_DDL,
     _IS_DDL,
@@ -3565,6 +3566,47 @@ def test_a_login_opens_no_transaction_and_its_settings_outlast_a_rollback(
 
     assert result.get('error') is None, result.get('error')
     assert row == ('PYO', 'PYO', _SERVICE)
+
+
+def test_a_login_that_trims_the_ddl_log_opens_no_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A login cuts the DDL log back when it has grown past _DDL_LOG_KEPT rows.
+    # It did so in a transaction, the one login step not in autocommit, so the
+    # test above failed whenever the suite's own DDL had left the log full
+    # (#2573). From a full log, the login trims it and opens no transaction.
+    sent: list[tuple[str, bool]] = []
+    execute = psycopg.Cursor.execute
+
+    def recorded(cursor: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append((str(query), cursor.connection.autocommit))
+        return execute(cursor, query, *args, **kwargs)
+
+    # The first login installs the log, and looks the installation up (#1871).
+    listen, server, result = _start_mirror()
+    _connect(listen.getsockname()[1]).close()
+    server.join(timeout=5)
+    listen.close()
+    with psycopg.connect(_CONNINFO, autocommit=True) as pg:
+        pg.execute(
+            'INSERT INTO sys.ora_ddl_log SELECT nextval(pg_get_serial_sequence('
+            "'sys.ora_ddl_log', 'id')) FROM generate_series(1, %s)",
+            (_DDL_LOG_KEPT + 1,),
+        )
+        listen, server, result = _start_mirror()
+        monkeypatch.setattr(psycopg.Cursor, 'execute', recorded)
+        try:
+            _connect(listen.getsockname()[1]).close()
+        finally:
+            monkeypatch.undo()
+            server.join(timeout=5)
+            listen.close()
+        (kept,) = _fetched_row(pg.execute('SELECT count(*) FROM sys.ora_ddl_log'))
+
+    assert result.get('error') is None, result.get('error')
+    assert any(query.startswith('DELETE FROM sys.ora_ddl_log') for query, _ in sent)
+    assert [query for query, autocommit in sent if not autocommit] == []
+    assert kept <= _DDL_LOG_KEPT
 
 
 def test_a_role_writes_only_the_records_of_what_it_owns() -> None:
