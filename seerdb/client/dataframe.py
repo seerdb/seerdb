@@ -122,3 +122,176 @@ def build_table(rows: list, description: list) -> pa.Table:
         for I in range(NumCols)
     ]
     return pa.table(dict(zip(Names, Arrays))) if Names else pa.table({})
+
+
+# --- Arrow in: executemany from a DataFrame (#2461) --------------------------
+# An object with the Arrow PyCapsule stream interface (pyarrow, pandas, polars,
+# ...) as executemany's parameters, as python-oracledb 3.3+ takes it: column i
+# binds placeholder i+1, typed by its Arrow type rather than by its values, and
+# each record batch is one array execute. The bind type of each Arrow type, as
+# python-oracledb's OracleMetadata.from_arrow_schema gives it.
+
+
+def _arrow_bind_type(typ: pa.DataType):
+    from seerdb.common import datatypes as dt
+
+    if pa.types.is_integer(typ) or pa.types.is_decimal(typ):
+        return dt.DB_TYPE_NUMBER
+    if (
+        pa.types.is_string(typ)
+        or pa.types.is_null(typ)
+        or getattr(pa.types, 'is_string_view', lambda _: False)(typ)
+    ):
+        return dt.DB_TYPE_VARCHAR
+    if pa.types.is_large_string(typ):
+        return dt.DB_TYPE_LONG
+    if (
+        pa.types.is_binary(typ)
+        or pa.types.is_fixed_size_binary(typ)
+        or getattr(pa.types, 'is_binary_view', lambda _: False)(typ)
+    ):
+        return dt.DB_TYPE_RAW
+    if pa.types.is_large_binary(typ):
+        return dt.DB_TYPE_LONG_RAW
+    if pa.types.is_float32(typ):
+        return dt.DB_TYPE_BINARY_FLOAT
+    if pa.types.is_float64(typ):
+        return dt.DB_TYPE_BINARY_DOUBLE
+    if pa.types.is_boolean(typ):
+        return dt.DB_TYPE_BOOLEAN
+    if pa.types.is_timestamp(typ):
+        return dt.DB_TYPE_TIMESTAMP
+    if pa.types.is_date(typ):
+        return dt.DB_TYPE_DATE
+    if pa.types.is_list(typ) or pa.types.is_fixed_size_list(typ):
+        # A dense vector of an element type VECTOR has.
+        return dt.DB_TYPE_VECTOR if typ.value_type in _VECTOR_TYPECODES else None
+    if pa.types.is_struct(typ):
+        return dt.DB_TYPE_VECTOR  # a sparse vector
+    if typ == pa.month_day_nano_interval():
+        return dt.DB_TYPE_INTERVAL_DS
+    return None
+
+
+# A dense vector's element type, as the array typecode encode_vector writes it.
+_VECTOR_TYPECODES = {
+    pa.float32(): 'f',
+    pa.float64(): 'd',
+    pa.int8(): 'b',
+    pa.uint8(): 'B',
+}
+
+
+def _vector(values, typecode: str):
+    import array
+
+    return None if values is None else array.array(typecode, values)
+
+
+def _arrow_values(column: pa.Array) -> list:
+    # The Python values a column binds, as python-oracledb converts them: an
+    # empty string or binary is NULL, as Oracle stores it; a timestamp is its
+    # UTC wall time to the microsecond, whatever its zone; an interval's months
+    # are ignored.
+    import datetime
+
+    typ = column.type
+    if pa.types.is_timestamp(typ):
+        column = column.cast(pa.timestamp('us'), safe=False)
+    elif pa.types.is_date64(typ):
+        column = column.cast(pa.timestamp('ms')).cast(pa.timestamp('us'))
+    values = column.to_pylist()
+    if pa.types.is_date32(typ):
+        return [
+            None if v is None else datetime.datetime(v.year, v.month, v.day)
+            for v in values
+        ]
+    if (
+        pa.types.is_string(typ)
+        or pa.types.is_large_string(typ)
+        or pa.types.is_binary(typ)
+        or pa.types.is_large_binary(typ)
+        or pa.types.is_fixed_size_binary(typ)
+    ):
+        return [None if not v else v for v in values]
+    if typ == pa.month_day_nano_interval():
+        return [
+            None
+            if v is None
+            else datetime.timedelta(days=v.days, microseconds=v.nanoseconds // 1000)
+            for v in values
+        ]
+    if pa.types.is_list(typ) or pa.types.is_fixed_size_list(typ):
+        typecode = _VECTOR_TYPECODES[typ.value_type]
+        return [_vector(v, typecode) for v in values]
+    if pa.types.is_struct(typ):
+        from seerdb.common.vector import SparseVector
+
+        out: list[object] = []
+        for v in values:
+            if v is None:
+                out.append(None)
+                continue
+            typecode = _VECTOR_TYPECODES.get(typ.field('values').type.value_type, 'd')
+            out.append(
+                SparseVector(
+                    v['num_dimensions'],
+                    _vector(v['indices'], 'I'),
+                    _vector(v['values'], typecode),
+                )
+            )
+        return out
+    return values
+
+
+def _refuse(typ: pa.DataType) -> None:
+    from seerdb.common.exceptions import NotSupportedError
+
+    raise NotSupportedError(
+        f'conversion from Apache Arrow type "{typ}" to Oracle Database is not supported'
+    )
+
+
+def arrow_batches(
+    source, field_version: int | None = None
+) -> list[tuple[list, list[tuple]]]:
+    """Each record batch of an Arrow PyCapsule stream as ``(types, rows)``: the
+    bind type of each column, by position, and the batch's rows (#2461).
+
+    Every column is checked before any batch is built, so an unsupported type
+    is refused before anything is sent."""
+    from seerdb.common import datatypes as dt
+
+    try:
+        reader = pa.RecordBatchReader.from_stream(source)
+        schema, batches = reader.schema, list(reader)
+    except AttributeError:  # a pyarrow before from_stream (15)
+        table = pa.table(source)
+        schema, batches = table.schema, table.to_batches()
+    types = [_arrow_bind_type(field.type) for field in schema]
+    for field, typ in zip(schema, types):
+        if typ is None:
+            _refuse(field.type)
+    # Where a declared type would go out as something else, the column is left
+    # to its values' own typing, as a plain executemany types it. From 12.1 that
+    # is a large string or binary: declared LONG / LONG RAW, one over 32 KB is
+    # refused (#2564), while a long value binds as one by itself. Below 12.1
+    # it is a string or binary: declared, it goes with the type's 32 KB buffer,
+    # which a 9i server takes for a LONG (ORA-01461), and there a LONG must be
+    # declared to bind past 4000 bytes.
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1
+
+    modern = field_version is None or field_version >= FIELD_VERSION_12_1
+    loose = (
+        (dt.DB_TYPE_LONG, dt.DB_TYPE_LONG_RAW)
+        if modern
+        else (dt.DB_TYPE_VARCHAR, dt.DB_TYPE_RAW)
+    )
+    types = [None if typ in loose else typ for typ in types]
+    out = []
+    for batch in batches:
+        if batch.num_rows == 0:
+            continue
+        columns = [_arrow_values(batch.column(i)) for i in range(batch.num_columns)]
+        out.append((types, list(zip(*columns))))
+    return out

@@ -174,6 +174,10 @@ What works:
   record batches (column types derived from the describe, so a NUMBER /
   Decimal column lands as the right Arrow type without inference). Sync
   and async
+- Arrow / DataFrame load: `cur.executemany(sql, df)` takes any object with
+  the Arrow PyCapsule interface (pyarrow, pandas, polars) as its rows,
+  column *i* binding placeholder *i + 1* with the type its Arrow type maps
+  to, one array execute per record batch. Sync and async
 - LOB objects: a SELECT of a CLOB / BLOB returns a `LOB` you can
   `read(offset, amount)`, `size()`, `write(value, offset)`, `trim()`,
   `open()` / `close()` / `isopen()` and `getchunksize()` — sync, and the
@@ -341,6 +345,7 @@ exercise.
 | **Result handling** — large-result `TTI_FETCH` drain, server-side scrollable cursors (`scroll()`, with a client-buffered fallback), `rowfactory`, `lastrowid` | ✅ |
 | **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+, and a pooled 11g session) | ✅ |
 | **Arrow / DataFrame fetch** — `cursor.fetch_df_all` / `fetch_df_batches` (pyarrow `Table` / record batches) | ✅ |
+| **Arrow / DataFrame load** — `cursor.executemany(sql, df)` from any Arrow PyCapsule object | ✅ |
 | **SODA** — document store over `DBMS_SODA`: collections, documents, query-by-example (with streaming), insert / read / upsert / update / delete / bulk, indexing + data guide (18c+) | ✅ |
 | **Connection** — pool (warm sessions + idle health-check), statement cache, `changepassword`, `is_healthy()` with no round trip, `transaction_in_progress` (10g+), `max_identifier_length` and `instance_name` from the login reply, TLS, wallet mTLS, DRCP (`server_type='pooled'`, with `cclass` / `purity`; a DRCP pool generates its own class, as in python-oracledb), and its implicit connection pooling (`pool_boundary`), proxy auth, an opt-in negotiation cache that skips a round trip on fast-auth reconnects; `instance_name` (a parameter, the Easy Connect `/service/instance` form, or `INSTANCE_NAME`), `expire_time` (TCP keepalive), `dsn` as an Easy Connect string, a connect descriptor (with address failover) or a `tnsnames.ora` alias, IPv6, TCPS through an HTTPS proxy; `ws://` / `wss://` to a Mirror's WebSocket listener (a seerdb extension, the `ws` extra) | ✅ |
 | **Authentication** — O3LOGON (8i / 9i) and O5LOGON (10g+, 128 / 192 / 256-bit); token-based auth — OAuth2 (bare JWT) and OCI IAM (signed) for Autonomous Database | ✅ |
@@ -454,6 +459,13 @@ A **CLOB / BLOB** an output type handler wants as `str` / `bytes` is read
 through the LOB it arrives as, where python-oracledb has the server redefine the
 column and send it inline. The values are the same; it costs a read per LOB. A
 JSON or VECTOR column can't be converted by a handler yet.
+
+An **`executemany` from a DataFrame** in several record batches reports the
+`rowcount` of all of them, and numbers its batch errors from the frame's first
+row; python-oracledb's `rowcount` is the last batch's alone. A `large_string` /
+`large_binary` column binds by its values' own type, a long one as LONG / LONG
+RAW, rather than declared so
+([#2564](https://github.com/seerdb/seerdb/issues/2564)).
 
 A **`pool_boundary`** that is neither `statement` nor `transaction` raises
 `ProgrammingError` before connecting, as a bad `server_type` does in both

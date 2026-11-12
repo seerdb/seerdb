@@ -526,6 +526,10 @@ class Cursor(_CursorLogic):
         self._check_open()
         if arraydmlrowcounts and self._connection.field_version < FIELD_VERSION_12_1:
             raise NotSupportedError('arraydmlrowcounts requires an Oracle 12.1+ server')
+        if hasattr(seq_of_parameters, '__arrow_c_stream__'):
+            return self._executemany_arrow(
+                operation, seq_of_parameters, batcherrors, arraydmlrowcounts
+            )
         self._batcherrors = []
         self._arraydmlrowcounts = []
         Rows = [
@@ -547,6 +551,37 @@ class Cursor(_CursorLogic):
             BatchErrors=batcherrors,
             ArrayDmlRowCounts=arraydmlrowcounts,
         )
+
+    def _executemany_arrow(
+        self, operation: str, source, batcherrors: bool, arraydmlrowcounts: bool
+    ) -> 'Cursor':
+        # A DataFrame -- any object with the Arrow PyCapsule stream interface --
+        # as the rows (#2461), as python-oracledb 3.3+ takes it: column i binds
+        # placeholder i+1, typed by its Arrow type, and each record batch is one
+        # array execute. rowcount, the batch errors (their offsets counted from
+        # the first row) and the row counts cover every batch. python-oracledb
+        # reports the last batch's rowcount alone.
+        from seerdb.client.dataframe import arrow_batches
+
+        Batches = arrow_batches(source, self._connection.field_version)
+        if not Batches:
+            return self.executemany(operation, [])
+        (Total, Errors, Counts, Offset) = (0, [], [], 0)
+        for Types, Rows in Batches:
+            self.setinputsizes(*Types)
+            self.executemany(
+                operation,
+                Rows,
+                batcherrors=batcherrors,
+                arraydmlrowcounts=arraydmlrowcounts,
+            )
+            Total += self._rowcount
+            Errors += [{**E, 'offset': E['offset'] + Offset} for E in self._batcherrors]
+            Counts += self._arraydmlrowcounts
+            Offset += len(Rows)
+        (self._rowcount, self._batcherrors) = (Total, Errors)
+        self._arraydmlrowcounts = Counts
+        return self
 
     def _executemany_block(self, operation: str, Rows: list) -> 'Cursor':
         # A PL/SQL block's rows, one execute each (#2479). Sent as one array

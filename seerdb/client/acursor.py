@@ -547,6 +547,10 @@ class AsyncCursor(_CursorLogic):
         self._check_open()
         if arraydmlrowcounts and self._connection.field_version < FIELD_VERSION_12_1:
             raise NotSupportedError('arraydmlrowcounts requires an Oracle 12.1+ server')
+        if hasattr(seq_of_parameters, '__arrow_c_stream__'):
+            return await self._executemany_arrow(
+                operation, seq_of_parameters, batcherrors, arraydmlrowcounts
+            )
         self._batcherrors = []
         self._arraydmlrowcounts = []
         Rows = [
@@ -568,6 +572,32 @@ class AsyncCursor(_CursorLogic):
             BatchErrors=batcherrors,
             ArrayDmlRowCounts=arraydmlrowcounts,
         )
+
+    async def _executemany_arrow(
+        self, operation: str, source, batcherrors: bool, arraydmlrowcounts: bool
+    ) -> 'AsyncCursor':
+        # Async port of Cursor._executemany_arrow (#2461).
+        from seerdb.client.dataframe import arrow_batches
+
+        Batches = arrow_batches(source, self._connection.field_version)
+        if not Batches:
+            return await self.executemany(operation, [])
+        (Total, Errors, Counts, Offset) = (0, [], [], 0)
+        for Types, Rows in Batches:
+            self.setinputsizes(*Types)
+            await self.executemany(
+                operation,
+                Rows,
+                batcherrors=batcherrors,
+                arraydmlrowcounts=arraydmlrowcounts,
+            )
+            Total += self._rowcount
+            Errors += [{**E, 'offset': E['offset'] + Offset} for E in self._batcherrors]
+            Counts += self._arraydmlrowcounts
+            Offset += len(Rows)
+        (self._rowcount, self._batcherrors) = (Total, Errors)
+        self._arraydmlrowcounts = Counts
+        return self
 
     async def _executemany_block(self, operation: str, Rows: list) -> 'AsyncCursor':
         # A PL/SQL block's rows, one execute each (#2479); see
