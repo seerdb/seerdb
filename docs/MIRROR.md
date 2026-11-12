@@ -215,9 +215,10 @@ Each area has limits, listed under *Known limits*.
 
 ### Deliberate differences from Oracle
 
-In a few places the Mirror over PostgreSQL accepts slightly wider input than
-Oracle does. This is a choice, not a gap: Oracle's stricter behaviour would
-cost far more to reproduce than anyone gains from it.
+In a few places the Mirror over PostgreSQL differs from Oracle on purpose: it
+accepts slightly wider input, or gives a well-defined result where Oracle's
+follows no rule. This is a choice, not a gap: reproducing Oracle's behaviour
+would cost far more than anyone gains from it.
 
 - **JSON duplicate keys.** A document with a repeated key, such as
   `{"a": 1, "a": 2}`, is accepted and the last value is kept: `{"a":2}`. That's
@@ -238,6 +239,16 @@ cost far more to reproduce than anyone gains from it.
   the keys were written in. The difference shows only where a document's text is
   compared or shown
   ([#2421](https://github.com/seerdb/seerdb/issues/2421)).
+- **MOD and REMAINDER of a BINARY_FLOAT / BINARY_DOUBLE at the extremes.** The
+  Mirror computes the exact IEEE `fmod` and `remainder` of the two values, as
+  Oracle does wherever their quotient is below 2^53 and they lie in NUMBER's
+  range: `MOD(TO_BINARY_FLOAT(5.1), 0.3)` is the BINARY_FLOAT `0.2999997` on
+  both. Past that, 23ai's results follow no rule an application could rely on.
+  `MOD(2^200, 7)` is 2, where the exact remainder is 4. `MOD(1e126, 7)` raises
+  ORA-01426, but `MOD(-1e126, 7)` is -4. A dividend near 1e-130 may give NaN.
+  The Mirror gives the exact result in each case. A zero result is +0 on both,
+  and from 18c `MOD(x, 0)` is `x`
+  ([#2572](https://github.com/seerdb/seerdb/issues/2572)).
 
 ### Not served
 

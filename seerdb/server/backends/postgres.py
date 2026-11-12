@@ -1299,6 +1299,61 @@ _HELPER_FUNCTIONS_DDL = (
         for other in ('smallint', 'integer', 'bigint')
         for left, right in (('numeric', other), (other, 'numeric'))
     )
+    # MOD and REMAINDER of a BINARY_FLOAT / BINARY_DOUBLE (#2572), which orafce
+    # has for integers and numeric only. Oracle's are IEEE fmod and remainder
+    # in the operands' type: MOD(5.1f, 0.3) is the BINARY_FLOAT 0.2999997, and
+    # a NUMBER operand is converted. MOD(x, 0) is x and REMAINDER(x, 0) NaN, as
+    # Oracle's, and a zero result is +0 where fmod(-6, 3) is -0. PostgreSQL has
+    # no fmod, and a float cast to numeric keeps 6 or 15 digits, so each
+    # operand is taken apart exactly instead: the integer mantissa and binary
+    # exponent from its IEEE bits, the remainder of the two scaled to one
+    # exponent taken in numeric, and the result -- always a float -- scaled
+    # back. REMAINDER then rounds the quotient to the nearest, ties to even.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_float_mod(x double precision, '
+        'y double precision, nearest boolean) RETURNS double precision '
+        'LANGUAGE plpgsql IMMUTABLE STRICT AS $$ DECLARE b bigint; mx numeric; '
+        'my numeric; ex integer; ey integer; e integer; xi numeric; yi numeric; '
+        "r numeric; BEGIN IF x = 'NaN' OR y = 'NaN' OR x IN ('Infinity', "
+        "'-Infinity') THEN RETURN 'NaN'; END IF; "
+        "IF y = 0 THEN RETURN CASE WHEN nearest THEN 'NaN' ELSE x END; END IF; "
+        'IF x = 0 THEN RETURN 0; END IF; '
+        "IF y IN ('Infinity', '-Infinity') THEN RETURN x; END IF; "
+        "b := ('x' || encode(float8send(x), 'hex'))::bit(64)::bigint; "
+        'ex := (b >> 52) & 2047; mx := b & 4503599627370495; '
+        'IF ex = 0 THEN ex := -1074; '
+        'ELSE mx := mx + 4503599627370496; ex := ex - 1075; END IF; '
+        "b := ('x' || encode(float8send(y), 'hex'))::bit(64)::bigint; "
+        'ey := (b >> 52) & 2047; my := b & 4503599627370495; '
+        'IF ey = 0 THEN ey := -1074; '
+        'ELSE my := my + 4503599627370496; ey := ey - 1075; END IF; '
+        'e := least(ex, ey); xi := mx * power(2::numeric, ex - e); '
+        'yi := my * power(2::numeric, ey - e); r := xi % yi; '
+        'IF nearest AND (2 * r > yi OR (2 * r = yi AND ((xi - r) / yi) % 2 = 1)) '
+        'THEN r := r - yi; END IF; '
+        'IF r = 0 THEN RETURN 0; END IF; '
+        'RETURN sign(x) * r::double precision * power(2::double precision, e); '
+        'END $$;'
+    )
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.{name}({kind}, {kind}) RETURNS {kind} '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT sys.ora_float_mod($1, $2, {nearest})::{kind} $$;'
+        for name, nearest in (('mod', 'false'), ('remainder', 'true'))
+        for kind in ('real', 'double precision')
+    )
+    # Two untyped operands -- MOD(NULL, NULL), MOD('7', '2'), two string binds
+    # -- have no type to pick an overload by. They were "not unique" among the
+    # integer and numeric ones; beside the double precision one above they would
+    # take that, PostgreSQL's preferred numeric type. Oracle converts each to a
+    # NUMBER. PostgreSQL resolves unknown operands to a text overload first,
+    # and this one converts as Oracle does.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.{name}(text, text) RETURNS numeric '
+        'LANGUAGE sql IMMUTABLE STRICT AS '
+        f'$$ SELECT {name}($1::numeric, $2::numeric) $$;'
+        for name in ('mod', 'remainder')
+    )
     # POWER of two integers (#1362): PostgreSQL has power() for numeric and for
     # double precision only, and resolves two integers to the double precision
     # one, so POWER(143, 9) lost its low digits. Oracle's POWER of NUMBERs is
@@ -7719,16 +7774,28 @@ _IDIOM_REWRITES: list[
         r"RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = "
         r"'ORA-' || lpad(abs((\1))::text, 5, '0') || ': ' || (\2);",
     ),
-    # BINARY_DOUBLE/FLOAT special values → IEEE-754 float literals.
+    # BINARY_DOUBLE/FLOAT special values → IEEE-754 float literals, each of
+    # its own width: a BINARY_FLOAT one is a real, so MOD(BINARY_FLOAT_NAN, 2)
+    # is a BINARY_FLOAT, as Oracle's is (#2572).
     (
         'binary-infinity',
-        re.compile(r'\bbinary_(?:double|float)_infinity\b', re.IGNORECASE),
+        re.compile(r'\bbinary_double_infinity\b', re.IGNORECASE),
         "'Infinity'::float8",
     ),
     (
         'binary-nan',
-        re.compile(r'\bbinary_(?:double|float)_nan\b', re.IGNORECASE),
+        re.compile(r'\bbinary_double_nan\b', re.IGNORECASE),
         "'NaN'::float8",
+    ),
+    (
+        'binary-float-infinity',
+        re.compile(r'\bbinary_float_infinity\b', re.IGNORECASE),
+        "'Infinity'::real",
+    ),
+    (
+        'binary-float-nan',
+        re.compile(r'\bbinary_float_nan\b', re.IGNORECASE),
+        "'NaN'::real",
     ),
     # A negative INTERVAL DAY TO SECOND literal. Oracle's leading `-` negates the
     # whole interval — INTERVAL '-1 02:03:04' DAY TO SECOND is -(1d 2h3m4s) — but

@@ -514,6 +514,14 @@ _BINARY_FLOAT = _Need('BINARY_FLOAT / BINARY_DOUBLE are 10g+', min_fv=_FV)
 _BINARY_FLOAT_SERVER = _Need(
     'BINARY_FLOAT / BINARY_DOUBLE are Oracle 10g+', min_server=10
 )
+_MOD_FLOAT_BY_ZERO = _Need(
+    'MOD of a BINARY_FLOAT / BINARY_DOUBLE by 0 is the dividend from 18c; '
+    '10g and 11g give 0',
+    min_server=18,
+)
+_NULL_NUMBER_EXPRESSION = _Need(
+    '9i reads a NULL NUMBER expression out of sequence (#2578)', min_fv=_FV
+)
 _STREAMED_LOB_BIND = _Need(
     '9i takes no bind over 4000 bytes into a LOB column (#2260)', min_fv=_FV
 )
@@ -5826,6 +5834,80 @@ class BindIntegration(_IntegrationBase):
                 self.cur.execute(f'SELECT {expr} FROM dual')
                 self.assertEqual(self.cur.fetchone(), (value,))
                 self.assertIs(self.cur.description[0][1], described)
+
+    @_requires(_BINARY_FLOAT_SERVER)
+    def test_mod_and_remainder_of_binary_float_and_double(self):
+        # IEEE fmod and remainder in the operands' type: a NUMBER operand is
+        # converted, so MOD(5.1f, 0.3) is the BINARY_FLOAT 0.2999997.
+        # REMAINDER(x, 0) is NaN, a NaN or infinite dividend NaN, an infinite
+        # divisor gives x, and a zero result is +0. The Mirror over PostgreSQL
+        # had neither function for either type (#2572).
+        single = seerdb.DB_TYPE_BINARY_FLOAT
+        double = seerdb.DB_TYPE_BINARY_DOUBLE
+        f, d = 'TO_BINARY_FLOAT', 'TO_BINARY_DOUBLE'
+        for expr, described, value in (
+            (f'MOD({f}(1.5), 1)', single, 0.5),
+            (f'MOD({f}(-7.5), 2)', single, -1.5),
+            (f'MOD({f}(7.5), -2)', single, 1.5),
+            (f'MOD({f}(5.1), 0.3)', single, 0.2999997138977051),
+            (f'MOD(7, {f}(2.5))', single, 2.0),
+            (f'MOD({d}(1.5), 1)', double, 0.5),
+            (f'MOD({f}(7.5), {d}(2))', double, 1.5),
+            (f'MOD({d}(123456789.123), 0.001)', double, 0.000999993376923471),
+            (f'MOD({d}(-6), 3)', double, 0.0),
+            (f'MOD({f}(7.5), BINARY_FLOAT_INFINITY)', single, 7.5),
+            (f'REMAINDER({f}(7.5), 2)', single, -0.5),
+            (f'REMAINDER({f}(5), 2)', single, 1.0),
+            (f'REMAINDER({f}(7), 2)', single, -1.0),
+            (f'REMAINDER({d}(5.5), 2)', double, -0.5),
+            (f'REMAINDER(7, {f}(2.5))', single, -0.5),
+            (f'REMAINDER({d}(-6), 3)', double, 0.0),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                (got,) = self.cur.fetchone()
+                self.assertEqual(got, value)
+                self.assertEqual(math.copysign(1, got), math.copysign(1, value))
+                self.assertIs(self.cur.description[0][1], described)
+        for expr, described in (
+            (f'REMAINDER({f}(7.5), 0)', single),
+            ('MOD(BINARY_FLOAT_NAN, 2)', single),
+            ('MOD(BINARY_FLOAT_INFINITY, 2)', single),
+            ('REMAINDER(BINARY_DOUBLE_NAN, 2)', double),
+            ('REMAINDER(-BINARY_DOUBLE_INFINITY, 2)', double),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertTrue(math.isnan(self.cur.fetchone()[0]))
+                self.assertIs(self.cur.description[0][1], described)
+
+    @_requires(_MOD_FLOAT_BY_ZERO)
+    def test_mod_of_binary_float_by_zero_is_the_dividend(self):
+        # 18c on, as NUMBER's MOD does; 10g and 11g give 0 (#2572).
+        for kind, described in (
+            ('TO_BINARY_FLOAT', seerdb.DB_TYPE_BINARY_FLOAT),
+            ('TO_BINARY_DOUBLE', seerdb.DB_TYPE_BINARY_DOUBLE),
+        ):
+            with self.subTest(kind=kind):
+                self.cur.execute(f'SELECT MOD({kind}(7.5), 0) FROM dual')
+                self.assertEqual(self.cur.fetchone(), (7.5,))
+                self.assertIs(self.cur.description[0][1], described)
+
+    @_requires(_NULL_NUMBER_EXPRESSION)
+    def test_mod_of_untyped_operands_is_a_number(self):
+        # Oracle converts a string or NULL operand to NUMBER. Over PostgreSQL,
+        # two untyped operands matched no overload ("not unique"), and beside
+        # MOD of a double (#2572) they would have taken that one.
+        for sql, binds, value in (
+            ('SELECT MOD(NULL, NULL) FROM dual', [], None),
+            ("SELECT MOD('7', '2') FROM dual", [], 1),
+            ('SELECT MOD(:1, :2) FROM dual', ['7', '2'], 1),
+            ('SELECT MOD(:1, :2) FROM dual', [None, None], None),
+        ):
+            with self.subTest(sql=sql, binds=binds):
+                self.cur.execute(sql, binds)
+                self.assertEqual(self.cur.fetchone(), (value,))
+                self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
 
     def test_interval_ds_bind(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v INTERVAL DAY(4) TO SECOND(6))')
