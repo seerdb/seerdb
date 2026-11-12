@@ -553,11 +553,70 @@ _ROWID_TYPE_DDL = (
 # orafce.
 _DATE_TYPES = ('ora_date', 'oracle.date')
 _DAY_NUMBER_TYPES = ('smallint', 'integer', 'bigint', 'numeric', 'double precision')
+# A NUMBER as Oracle keeps one (#2597): twenty base-100 digits from the first
+# that is not zero, so 2.39... has 38 decimals and 0.46... 40. PL/pgSQL that
+# rounds a variable, its decimal exponent from a double's log10 corrected
+# exactly. It is written into each function that needs it, and those name
+# PostgreSQL's operators and functions instead of setting a search_path: a
+# helper of its own, or SET search_path, each doubled the cost of a DATE
+# difference, and the session's own path finds the Mirror's operators first.
+_PG_DIV = 'OPERATOR(pg_catalog./)'
+
+
+def _oracle_number_rounding(name: str) -> str:
+    # PL/pgSQL statements rounding the numeric variable `name` in place, as
+    # above, with an integer variable `e` declared beside it.
+    return (
+        f'IF {name} <> 0 THEN '
+        f'e := pg_catalog.floor(pg_catalog.log(pg_catalog.abs({name})::double precision)); '
+        f'IF pg_catalog.abs({name}) >= pg_catalog.power(10::numeric, e + 1) THEN e := e + 1; '
+        f'ELSIF pg_catalog.abs({name}) < pg_catalog.power(10::numeric, e) THEN e := e - 1; '
+        f'END IF; {name} := pg_catalog.trim_scale(pg_catalog.round({name}, 2 * (19 - '
+        f'pg_catalog.floor(e::numeric {_PG_DIV} 2)::integer))); END IF; '
+    )
+
+
 _DATE_ARITHMETIC_DDL = (
+    # A DATE difference in days, computed at fifty decimals and rounded as
+    # Oracle's: 14.430902777... to 38 decimals, where PostgreSQL's default
+    # scale kept 16 (#2597).
     'CREATE OR REPLACE FUNCTION sys.ora_date_minus(timestamp, timestamp) '
-    'RETURNS numeric LANGUAGE sql IMMUTABLE STRICT SET search_path = pg_catalog '
-    'AS $$ SELECT trim_scale(extract(epoch FROM $1 OPERATOR(pg_catalog.-) $2) / 86400) $$;'
-    'CREATE OR REPLACE FUNCTION sys.ora_date_plus(timestamp, numeric) '
+    'RETURNS numeric LANGUAGE plpgsql IMMUTABLE STRICT '
+    'AS $$ DECLARE x numeric; e integer; BEGIN '
+    'x := pg_catalog.round(extract(epoch FROM $1 OPERATOR(pg_catalog.-) $2), 50) '
+    f'{_PG_DIV} 86400; {_oracle_number_rounding("x")}RETURN x; END $$;'
+    # MONTHS_BETWEEN by Oracle's rule (#2597), where orafce's kept 15 digits:
+    # whole months when the two are the same day of the month or both a
+    # month's last day, else the day and time difference over a 31-day month.
+    # Oracle rounds that fraction to a NUMBER before adding the months, so a
+    # result near zero keeps fewer digits: 23:59:59 on 1999-12-31 against
+    # 2000-01-01 is -3.733572281959378733572281959378734E-7, 34 of them.
+    'CREATE OR REPLACE FUNCTION sys.ora_months_between(a timestamp, b timestamp) '
+    'RETURNS numeric LANGUAGE plpgsql IMMUTABLE STRICT '
+    'AS $$ DECLARE x numeric; f numeric; e integer; BEGIN '
+    'x := (extract(year FROM a) OPERATOR(pg_catalog.-) extract(year FROM b)) '
+    'OPERATOR(pg_catalog.*) 12 OPERATOR(pg_catalog.+) (extract(month FROM a) '
+    'OPERATOR(pg_catalog.-) extract(month FROM b)); '
+    'IF extract(day FROM a) = extract(day FROM b) OR ('
+    "pg_catalog.date_trunc('month', a OPERATOR(pg_catalog.+) interval '1 day') "
+    "<> pg_catalog.date_trunc('month', a) AND "
+    "pg_catalog.date_trunc('month', b OPERATOR(pg_catalog.+) interval '1 day') "
+    "<> pg_catalog.date_trunc('month', b)) THEN RETURN x; END IF; "
+    'f := pg_catalog.round((extract(day FROM a) '
+    'OPERATOR(pg_catalog.-) extract(day FROM b)) OPERATOR(pg_catalog.*) 86400 '
+    'OPERATOR(pg_catalog.+) (extract(epoch FROM a::time) '
+    'OPERATOR(pg_catalog.-) extract(epoch FROM b::time)), 50) '
+    f'{_PG_DIV} 2678400; {_oracle_number_rounding("f")}'
+    f'x := x OPERATOR(pg_catalog.+) f; {_oracle_number_rounding("x")}RETURN x; END $$;'
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.months_between({left}, {right}) '
+        'RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS '
+        '$$ SELECT sys.ora_months_between($1::timestamp, $2::timestamp) $$;'
+        for left in _DATE_TYPES + ('timestamp',)
+        for right in _DATE_TYPES + ('timestamp',)
+        if (left == 'timestamp') == (right == 'timestamp')
+    )
+    + 'CREATE OR REPLACE FUNCTION sys.ora_date_plus(timestamp, numeric) '
     'RETURNS ora_date LANGUAGE sql IMMUTABLE STRICT SET search_path = pg_catalog '
     "AS $$ SELECT ($1 OPERATOR(pg_catalog.+) $2 * interval '1 day')::timestamp(0) $$;"
     + ''.join(
