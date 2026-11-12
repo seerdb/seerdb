@@ -5613,8 +5613,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # an integer with a numeric unambiguous (#2569), and sys.ora_float_mod
     # behind the MOD and REMAINDER of a real and of a double precision, with
     # their text overloads for two untyped operands (#2572), and
-    # sys.ora_greatest and sys.ora_least (#2580).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 185
+    # sys.ora_greatest and sys.ora_least (#2580), and the text overloads
+    # of the other numeric functions, with the four arithmetic operators
+    # and unary minus and plus of text (#2581).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 224
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
