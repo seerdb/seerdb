@@ -1269,10 +1269,103 @@ _HELPER_FUNCTIONS_DDL = (
     # a BINARY_DOUBLE. An operator for each pair is an exact match, found before
     # any cast, and applies PostgreSQL's own real one. real with double
     # precision keeps PostgreSQL's, which gives a BINARY_DOUBLE as Oracle does.
+    #
+    # IEEE arithmetic (#2571). Oracle's BINARY_FLOAT / BINARY_DOUBLE divide by
+    # zero to an infinity or NaN, a BINARY_FLOAT that overflows is an infinity,
+    # and a result too small for either type is 0. PostgreSQL raises for each
+    # (ORA-01476, ORA-01426); only a BINARY_DOUBLE overflow raises on both.
+    # These shadow PostgreSQL's float operators, which the Mirror's search_path
+    # finds last. A real result is computed in double precision -- for two
+    # reals that neither overflows nor underflows, and rounding twice gives the
+    # single-precision result, double having more than 2 * 24 + 2 bits -- and
+    # rounded to real here: from 2^128 - 2^103 it rounds to an infinity, and
+    # to 2^-150 and below to 0, where PostgreSQL's cast would raise.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_to_real(d double precision) '
+        'RETURNS real LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT CASE '
+        "WHEN d <> 'NaN' AND abs(d) >= 3.4028235677973366e38::double precision "
+        "THEN CASE WHEN d > 0 THEN 'Infinity'::real ELSE '-Infinity'::real END "
+        'WHEN abs(d) <= 7.006492321624085e-46::double precision THEN 0::real '
+        'ELSE d::real END $$;'
+    )
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_real_{name}(x real, y real) '
+        'RETURNS real LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT '
+        f'sys.ora_to_real(x::double precision OPERATOR(pg_catalog.{op}) '
+        'y::double precision) $$;'
+        for op, name in (('+', 'add'), ('-', 'sub'), ('*', 'mul'))
+    )
+    # A division by zero is NaN for 0 or NaN over it, else an infinity of the
+    # dividend's sign: Oracle has no negative zero, so the divisor's is none.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_real_div(x real, y real) '
+        'RETURNS real LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT CASE '
+        "WHEN y = 0 THEN CASE WHEN x = 'NaN' OR x = 0 THEN 'NaN'::real "
+        "WHEN x > 0 THEN 'Infinity'::real ELSE '-Infinity'::real END "
+        'ELSE sys.ora_to_real(x::double precision OPERATOR(pg_catalog./) '
+        'y::double precision) END $$;'
+    )
+    # A double precision product or quotient raises for a result too small
+    # only where an operand is far from 1; that rare case is computed apart,
+    # and its underflow is 0.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_double_tiny(x double precision, '
+        'y double precision, divide boolean) RETURNS double precision '
+        'LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$ BEGIN '
+        'IF divide THEN RETURN x OPERATOR(pg_catalog./) y; END IF; '
+        'RETURN x OPERATOR(pg_catalog.*) y; '
+        'EXCEPTION WHEN numeric_value_out_of_range THEN '
+        "IF SQLERRM LIKE '%underflow%' THEN RETURN 0; END IF; RAISE; END $$;"
+        'CREATE OR REPLACE FUNCTION sys.ora_double_mul(x double precision, '
+        'y double precision) RETURNS double precision LANGUAGE sql IMMUTABLE '
+        'PARALLEL SAFE AS $$ SELECT CASE WHEN x <> 0 AND y <> 0 AND '
+        '(abs(x) < 1e-150::double precision OR abs(y) < 1e-150::double precision) '
+        'THEN sys.ora_double_tiny(x, y, false) '
+        'ELSE x OPERATOR(pg_catalog.*) y END $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_double_div(x double precision, '
+        'y double precision) RETURNS double precision LANGUAGE sql IMMUTABLE '
+        'PARALLEL SAFE AS $$ SELECT CASE '
+        "WHEN y = 0 THEN CASE WHEN x = 'NaN' OR x = 0 THEN 'NaN'::double precision "
+        "WHEN x > 0 THEN 'Infinity'::double precision "
+        "ELSE '-Infinity'::double precision END "
+        'WHEN x <> 0 AND (abs(x) < 1e-150::double precision '
+        'OR abs(y) > 1e150::double precision) '
+        'THEN sys.ora_double_tiny(x, y, true) '
+        'ELSE x OPERATOR(pg_catalog./) y END $$;'
+    )
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_{fn}_{name}(x {left}, y {right}) '
+        f'RETURNS {result} LANGUAGE sql IMMUTABLE PARALLEL SAFE AS '
+        f'$$ SELECT sys.ora_{base}_{name}(x, y) $$;'
+        'DO $$ BEGIN '
+        f'CREATE OPERATOR {op} (LEFTARG = {left}, RIGHTARG = {right}, '
+        f'FUNCTION = sys.ora_{fn}_{name}); '
+        'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+        for fn, base, left, right, result, ops in (
+            ('float4', 'real', 'real', 'real', 'real', '+-*/'),
+            (
+                'float8',
+                'double',
+                'double precision',
+                'double precision',
+                'double precision',
+                '*/',
+            ),
+            ('float48', 'double', 'real', 'double precision', 'double precision', '*/'),
+            ('float84', 'double', 'double precision', 'real', 'double precision', '*/'),
+        )
+        for op, name in (('+', 'add'), ('-', 'sub'), ('*', 'mul'), ('/', 'div'))
+        if op in ops
+    )
+    # With a NUMBER (#2569), converted by a plain cast: the functions above
+    # name an operand more than once, and PostgreSQL inlines them only for
+    # an operand as cheap as a cast -- through sys.ora_to_real, real / 2 took
+    # ninety times as long. A NUMBER past BINARY_FLOAT's range so still raises
+    # as it converts, where Oracle's is an infinity.
     + ''.join(
         f'CREATE OR REPLACE FUNCTION sys.ora_real_{name}({left}, {right}) '
-        'RETURNS real LANGUAGE sql IMMUTABLE STRICT AS '
-        f'$$ SELECT $1::real OPERATOR(pg_catalog.{op}) $2::real $$;'
+        'RETURNS real LANGUAGE sql IMMUTABLE PARALLEL SAFE AS '
+        f'$$ SELECT sys.ora_real_{name}($1::real, $2::real) $$;'
         'DO $$ BEGIN '
         f'CREATE OPERATOR {op} (LEFTARG = {left}, RIGHTARG = {right}, '
         f'FUNCTION = sys.ora_real_{name}); '

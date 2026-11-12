@@ -249,6 +249,15 @@ would cost far more than anyone gains from it.
   The Mirror gives the exact result in each case. A zero result is +0 on both,
   and from 18c `MOD(x, 0)` is `x`
   ([#2572](https://github.com/seerdb/seerdb/issues/2572)).
+- **A NUMBER past BINARY_FLOAT's range in BINARY_FLOAT arithmetic.** BINARY_FLOAT
+  and BINARY_DOUBLE arithmetic follows IEEE 754 as Oracle's does. A division by
+  zero is an infinity or NaN, a BINARY_FLOAT that overflows is an infinity, and
+  a result too small for its type is 0. The exception is a NUMBER operand
+  beyond about 3.4e38, as in `TO_BINARY_FLOAT(1) * 1e39`: Oracle converts it to
+  an infinity, and the Mirror raises ORA-01426 as it converts. Converting it
+  safely would stop PostgreSQL from inlining the operators, which made
+  `real / 2` ninety times slower
+  ([#2571](https://github.com/seerdb/seerdb/issues/2571)).
 
 ### Not served
 

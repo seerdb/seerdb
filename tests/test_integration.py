@@ -5850,6 +5850,50 @@ class BindIntegration(_IntegrationBase):
                 self.assertIs(self.cur.description[0][1], described)
 
     @_requires(_BINARY_FLOAT_SERVER)
+    def test_binary_float_and_double_arithmetic_is_ieee(self):
+        # Oracle divides a BINARY_FLOAT / BINARY_DOUBLE by zero to an infinity
+        # or NaN, a BINARY_FLOAT overflow is an infinity, and a result too
+        # small for either type is 0. Over PostgreSQL each raised (#2571);
+        # a BINARY_DOUBLE overflow raises on both. 10g to 23ai alike.
+        (f, d) = ('TO_BINARY_FLOAT', 'TO_BINARY_DOUBLE')
+        (single, double) = (seerdb.DB_TYPE_BINARY_FLOAT, seerdb.DB_TYPE_BINARY_DOUBLE)
+        inf = math.inf
+        for expr, value, described in (
+            (f'{f}(1.5) / 0', inf, single),
+            (f'-{f}(1.5) / 0', -inf, single),
+            (f'{f}(1.5) / {f}(0)', inf, single),
+            (f'{f}(1.5) / -{f}(0)', inf, single),
+            (f'1 / {f}(0)', inf, single),
+            (f'{d}(1.5) / 0', inf, double),
+            (f'{d}(-1.5) / {d}(0)', -inf, double),
+            (f'{f}(1.5) / {d}(0)', inf, double),
+            (f'{f}(1e38) * 10', inf, single),
+            (f'{f}(3e38) + {f}(3e38)', inf, single),
+            (f'-{f}(3e38) - {f}(3e38)', -inf, single),
+            (f'{f}(1e38) / {f}(1e-10)', inf, single),
+            (f'{f}(1e-38) * {f}(1e-10)', 0.0, single),
+            (f'{f}(1e-45) / 2', 0.0, single),
+            (f'{d}(1e-308) * {d}(1e-100)', 0.0, double),
+            (f'{d}(1e-308) / {d}(1e100)', 0.0, double),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (value,))
+                self.assertIs(self.cur.description[0][1], described)
+        for expr, described in (
+            (f'{f}(0) / 0', single),
+            (f'0 / {f}(0)', single),
+            (f'{d}(0) / {d}(0)', double),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertTrue(math.isnan(self.cur.fetchone()[0]))
+                self.assertIs(self.cur.description[0][1], described)
+        with self.assertRaisesRegex(seerdb.DatabaseError, 'ORA-01426'):
+            self.cur.execute(f'SELECT {d}(1e308) * {d}(10) FROM dual')
+            self.cur.fetchall()
+
+    @_requires(_BINARY_FLOAT_SERVER)
     def test_mod_and_remainder_of_binary_float_and_double(self):
         # IEEE fmod and remainder in the operands' type: a NUMBER operand is
         # converted, so MOD(5.1f, 0.3) is the BINARY_FLOAT 0.2999997.

@@ -5657,8 +5657,11 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # their text overloads for two untyped operands (#2572), and
     # sys.ora_greatest and sys.ora_least (#2580), and the text overloads
     # of the other numeric functions, with the four arithmetic operators
-    # and unary minus and plus of text (#2581).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 224
+    # and unary minus and plus of text (#2581), and the 18 behind IEEE
+    # BINARY_FLOAT / BINARY_DOUBLE arithmetic: sys.ora_to_real, the real and
+    # double precision operations and the operators shadowing PostgreSQL's
+    # (#2571).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 242
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
