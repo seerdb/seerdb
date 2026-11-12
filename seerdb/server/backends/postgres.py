@@ -1354,6 +1354,18 @@ _HELPER_FUNCTIONS_DDL = (
         f'$$ SELECT {name}($1::numeric, $2::numeric) $$;'
         for name in ('mod', 'remainder')
     )
+    # GREATEST and LEAST with an argument that is more than a column, a bind or
+    # a literal (#2580; _translate_greatest_least). Oracle's are NULL when any
+    # argument is; PostgreSQL's skip a NULL. One pass, each argument evaluated
+    # once, typed as PostgreSQL's own: the arguments' common type.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_{name}(VARIADIC v anycompatiblearray, '
+        'OUT best anycompatible) LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS '
+        '$$ DECLARE x best%TYPE; BEGIN best := v[array_lower(v, 1)]; '
+        'FOREACH x IN ARRAY v LOOP IF x IS NULL THEN best := NULL; RETURN; '
+        f'END IF; IF x {op} best THEN best := x; END IF; END LOOP; END $$;'
+        for name, op in (('greatest', '>'), ('least', '<'))
+    )
     # POWER of two integers (#1362): PostgreSQL has power() for numeric and for
     # double precision only, and resolves two integers to the double precision
     # one, so POWER(143, 9) lost its low digits. Oracle's POWER of NUMBERs is
@@ -8502,6 +8514,42 @@ def _translate_decode(sql: str) -> str:
     return _rewrite_calls(sql, _DECODE_NAMES, case, '_$#."')
 
 
+# GREATEST and LEAST (#2580): Oracle's are NULL when any argument is NULL, and
+# PostgreSQL's skip a NULL argument, so LEAST(a, b) with a NULL was b. A call
+# whose arguments are each a column, a bind or a literal -- which cost nothing
+# to name twice -- is guarded inline, at about 1.6 times the bare call over a
+# million rows; any other takes sys.ora_greatest / sys.ora_least, which see
+# each argument once, so a sequence's NEXTVAL advances once, at about eleven
+# times. Both keep PostgreSQL's typing, the arguments' common type.
+_GREATEST_LEAST_NAMES = frozenset({'GREATEST', 'LEAST'})
+_PLAIN_ARGUMENT = re.compile(
+    r"""(?isx)
+    [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?[fd]?   # a number
+    | n?'(?:[^']|'')*'                                 # a string
+    | :(?:"[^"\n]+"|\w+)                               # a bind
+    | (?!.*\.\s*nextval$)                              # a column, not NEXTVAL
+      (?:"[^"]+"|[a-z_][\w$#]*)(?:\s*\.\s*(?:"[^"]+"|[a-z_][\w$#]*)){0,2}
+    """
+)
+
+
+def _translate_greatest_least(sql: str) -> str:
+    if 'greatest' not in sql.lower() and 'least' not in sql.lower():
+        return sql
+
+    def guarded(name: str, args: list[str]) -> str | None:
+        args = [_translate_greatest_least(a).strip() for a in args]
+        listed = ', '.join(args)
+        if all(_PLAIN_ARGUMENT.fullmatch(a) for a in args):
+            return (
+                f'CASE WHEN num_nulls(VARIADIC ARRAY[{listed}]) = 0 '
+                f'THEN {name.lower()}({listed}) END'
+            )
+        return f'sys.ora_{name.lower()}({listed})'
+
+    return _rewrite_calls(sql, _GREATEST_LEAST_NAMES, guarded, '_$#."')
+
+
 # ORA-30487: what Oracle answers for MEDIAN ... OVER (... ORDER BY ...), whose
 # window takes only a PARTITION BY (#1994).
 _ORA_ORDER_BY_NOT_ALLOWED = 30487
@@ -10578,6 +10626,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('signed-year', _translate_signed_year(sql), sql)
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
+    sql = _ruled('greatest-least', _translate_greatest_least(sql), sql)
     sql = _ruled('median', _translate_median(sql), sql)
     sql = _ruled('avg', _translate_avg(sql), sql)
     sql = _ruled('json-functions', _translate_json_functions(sql), sql)

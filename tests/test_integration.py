@@ -5917,6 +5917,33 @@ class BindIntegration(_IntegrationBase):
                 self.assertEqual(self.cur.fetchone(), (value,))
                 self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
 
+    def test_greatest_and_least_are_null_with_a_null_argument(self):
+        # Over PostgreSQL, whose GREATEST and LEAST skip a NULL, LEAST(a, b)
+        # with a NULL was b (#2580). Columns, binds and literals take one form
+        # there, calls and expressions another.
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (a NUMBER, b NUMBER, s VARCHAR2(5))'
+        )
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (NULL, 1, NULL)')
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (3, 1, 'q')")
+        for expr, binds, values in (
+            ('LEAST(a, b)', [], [None, 1]),
+            ('GREATEST(a, b)', [], [None, 3]),
+            ('GREATEST(b, a, 5)', [], [None, 5]),
+            ("LEAST(s, 'x')", [], [None, 'q']),
+            ('LEAST(:1, b)', [None], [None, None]),
+            ('LEAST(:1, b)', [0], [0, 0]),
+            ('LEAST(NULL, b)', [], [None, None]),
+            ('GREATEST(a + 1, b)', [], [None, 4]),
+            ('LEAST(LENGTH(s), 9)', [], [None, 1]),
+            ('GREATEST(LEAST(a, 2), b)', [], [None, 2]),
+        ):
+            with self.subTest(expr=expr, binds=binds):
+                self.cur.execute(
+                    f'SELECT {expr} FROM {self.TABLE} ORDER BY a NULLS FIRST', binds
+                )
+                self.assertEqual([r[0] for r in self.cur.fetchall()], values)
+
     def test_interval_ds_bind(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v INTERVAL DAY(4) TO SECOND(6))')
         Value = datetime.timedelta(

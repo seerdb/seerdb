@@ -2062,6 +2062,35 @@ def test_translate_idioms_rewrites_decode_to_case() -> None:
         assert _translate_idioms(untouched) == untouched
 
 
+def test_translate_idioms_makes_greatest_and_least_null_with_a_null() -> None:
+    # Oracle's GREATEST and LEAST are NULL when an argument is; PostgreSQL's
+    # skip it (#2580). Columns, binds and literals are guarded inline.
+    assert _translate_idioms('SELECT LEAST(a, t.b, :1, 2.5, NULL) FROM t') == (
+        'SELECT CASE WHEN num_nulls(VARIADIC ARRAY[a, t.b, :1, 2.5, NULL]) = 0 '
+        'THEN least(a, t.b, :1, 2.5, NULL) END FROM t'
+    )
+    # Anything else is seen once, by sys.ora_greatest / sys.ora_least: a call,
+    # an expression, a sequence's NEXTVAL, and a nested GREATEST.
+    assert _translate_idioms(
+        "SELECT greatest(length(s), a + 1, 'x,y'), LEAST(GREATEST(a, b), c) FROM t"
+    ) == (
+        "SELECT sys.ora_greatest(length(s), a + 1, 'x,y'), "
+        'sys.ora_least(CASE WHEN num_nulls(VARIADIC ARRAY[a, b]) = 0 '
+        'THEN greatest(a, b) END, c) '
+        'FROM t'
+    )
+    assert _translate_idioms('SELECT GREATEST(s.NEXTVAL, 0) FROM dual') == (
+        "SELECT sys.ora_greatest(nextval('s'), 0) FROM dual"
+    )
+    # A qualified call, another function's name and a string are left alone.
+    for untouched in (
+        'SELECT pg_catalog.greatest(a, b) FROM t',
+        'SELECT my_least(a, b) FROM t',
+        "SELECT x FROM t WHERE c = 'least(a, b)'",
+    ):
+        assert _translate_idioms(untouched) == untouched
+
+
 def test_translate_idioms_rewrites_minus_to_except() -> None:
     # Oracle's MINUS set operator is PostgreSQL's EXCEPT; the SQLAlchemy Oracle
     # dialect's get_table_names query uses MINUS (#759).
@@ -5583,8 +5612,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # a numeric, 32 sys.ora_real_*, with the 24 sys.ora_int_numeric_* that keep
     # an integer with a numeric unambiguous (#2569), and sys.ora_float_mod
     # behind the MOD and REMAINDER of a real and of a double precision, with
-    # their text overloads for two untyped operands (#2572).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 183
+    # their text overloads for two untyped operands (#2572), and
+    # sys.ora_greatest and sys.ora_least (#2580).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 185
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
