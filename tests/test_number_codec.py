@@ -13,10 +13,12 @@ go-ora's number test table; the vectors themselves are Oracle output.
 Regenerate with tools/gen_number_vectors.py against any live Oracle.
 """
 
+import random
 import unittest
 from decimal import Decimal
 
-from seerdb.common.tns import encode_token_decimal
+from seerdb.common.exceptions import DataError
+from seerdb.common.tns import encode_token_decimal, encode_token_num
 from seerdb.common.types import decode_number
 
 # (expected decoded value, wire bytes as hex). Comment = the SQL literal dumped.
@@ -52,6 +54,31 @@ VECTORS = [
         Decimal('3.1415926535897932384626433832795'),
         'c1040f105d42245a5021272f1b2c27215033',
     ),  # pi to 31 digits (near NUMBER's 38-digit precision)
+    # The ends of NUMBER's range, 1e-130 <= |value| < 1e126 (#2575).
+    (999 * 10**123, 'ff645b'),  # 9.99e125
+    (-999 * 10**123, '00020b66'),  # -9.99e125
+    (Decimal('1E-130'), '8002'),  # 1e-130
+    (Decimal('-1E-130'), '7f6466'),  # -1e-130
+    (
+        (10**38 - 1) * 10**88,
+        'ff64646464646464646464646464646464646464',
+    ),  # 9.9999999999999999999999999999999999999e125
+]
+
+# (float, wire bytes as hex): what python-oracledb 26.1.0 sends for each
+# float, dumped by 23ai. It binds the float's shortest round-trip digits, so the
+# NUMBER reads back as the same float; seerdb kept 15 or 16 of them (#2576).
+FLOAT_VECTORS = [
+    (1 / 3, 'c02222222222222222'),
+    (-1 / 3, '3f444444444444444466'),
+    (2 / 3, 'c04343434343434343'),
+    (0.1 + 0.2, 'c01f0101010101010129'),
+    (float(2**53 + 2), 'c85b08145d374b0a5f'),
+    (1e15 + 0.25, 'c80b0101010101010115'),
+    (9.9e125, 'ff64'),
+    (1.2345678901234566e125, 'ff0d23394f5b0d23393d'),
+    (1.5e-130, '800233'),
+    (5e-130 / 3, '80024343434343434342'),
 ]
 
 
@@ -79,6 +106,53 @@ class TestNumberEncodeVectors(unittest.TestCase):
                 self.assertEqual(
                     encode_token_decimal(Decimal(Expected)), bytes.fromhex(Hex)
                 )
+
+    def test_a_float_encodes_as_python_oracledb_sends_it(self):
+        for Value, Hex in FLOAT_VECTORS:
+            with self.subTest(value=repr(Value)):
+                self.assertEqual(encode_token_num(Value), bytes.fromhex(Hex))
+
+    def test_a_float_reads_back_as_itself(self):
+        # 400 random floats in each fifth decade NUMBER holds: every one reads
+        # back as the float that was bound. 94% of them did not (#2576).
+        Rng = random.Random(2576)
+        for Decade in range(-129, 126, 5):
+            for _ in range(400):
+                Value = Rng.uniform(1, 10) * 10.0**Decade
+                if not 1e-130 <= Value < 1e126:
+                    continue
+                Got = decode_number(encode_token_num(Value))
+                self.assertEqual(float(Got), Value, repr(Value))
+                Got = decode_number(encode_token_num(-Value))
+                self.assertEqual(float(Got), -Value, repr(-Value))
+
+    def test_a_value_out_of_range_is_refused(self):
+        # Past 1e126 the exponent byte overflowed (a ValueError from bytes());
+        # below 1e-130 it wrapped into a negative number's form, and 1e-131
+        # bound as -9e-129 (#2575). python-oracledb refuses both (DPY-4003),
+        # whichever type the value is, and rounds nothing to zero.
+        for Value in (
+            1e126,
+            -1e126,
+            1e200,
+            1e-131,
+            -1e-131,
+            1e-200,
+            5e-324,
+            Decimal('1E+126'),
+            Decimal('-1E-131'),
+            Decimal('9.9999E-131'),
+            10**126,
+            -(10**130),
+        ):
+            with self.subTest(value=repr(Value)):
+                with self.assertRaisesRegex(
+                    DataError, 'cannot be represented as an Oracle number'
+                ):
+                    if isinstance(Value, Decimal):
+                        encode_token_decimal(Value)
+                    else:
+                        encode_token_num(Value)
 
 
 if __name__ == '__main__':
