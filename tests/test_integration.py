@@ -5944,6 +5944,16 @@ class BindIntegration(_IntegrationBase):
                 )
                 self.assertEqual([r[0] for r in self.cur.fetchall()], values)
 
+    @_requires(_ONLY_8I)
+    def test_a_column_8i_cannot_return_is_refused_before_the_fetch(self):
+        # 8i describes SQL's BITAND as type 29, which no client fetches: its
+        # sqlplus gets ORA-00932. Fetching it anyway was an ORA-00600 [kpodfl1]
+        # in the server process (#2584). The refusal leaves the session usable.
+        with self.assertRaisesRegex(seerdb.NotSupportedError, 'data type 29'):
+            self.cur.execute('SELECT BITAND(7, 2) AS b FROM dual')
+        self.cur.execute('SELECT 1 + 1 FROM dual')
+        self.assertEqual(self.cur.fetchone(), (2,))
+
     def test_interval_ds_bind(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v INTERVAL DAY(4) TO SECOND(6))')
         Value = datetime.timedelta(

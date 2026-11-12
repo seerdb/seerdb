@@ -22,8 +22,14 @@ test_integration exercises the real bytes on 8i.
 import unittest
 from unittest import mock
 
-from seerdb.client.dialect import RECV, O8iDialect
-from seerdb.common.exceptions import DataError, DateOutOfRangeError, Truncated
+from seerdb.client.dialect import RECV, Fv2Oall8Dialect, O8iDialect, Send
+from seerdb.common.exceptions import (
+    DataError,
+    DateOutOfRangeError,
+    NotSupportedError,
+    Truncated,
+)
+from seerdb.common.tns import decode_8i_dcb_describe
 
 
 def _start(side_effect):
@@ -369,6 +375,50 @@ class TestABlockReplyReadsOn(unittest.TestCase):
         self.assertTrue(o8i_block_complete(reply))
         for cut in (1, 18, 19, 21, 2009, 4018, len(reply) - 1):
             self.assertFalse(o8i_block_complete(reply[:cut]), cut)
+
+
+# The describes 8.1.7 answered `SELECT BITAND(7, 2) AS b FROM dual` and
+# `SELECT 5 AS b FROM dual` with, captured live (#2584), past the packet header.
+_BITAND_DESCRIBE = bytes.fromhex(
+    '10198046a3ad1c23fb040000787e0b0c14370d203e0200000000000000000001'
+    '000000331d000000000000000000000000000000000000000000000000010101'
+    '000000014200000000000000000700000007787e0b0c14372b080400f49d2700'
+    '00000000010000000000000000000000040000000000000000000001001e0003'
+    '0040000000000000000000000000000000000000000000060000010000000000'
+    '000000000000000000000000'
+)
+_NUMBER_DESCRIBE = bytes.fromhex(
+    '101998097fcc68160f050000787e0b0c14372c223e0200000000000200000001'
+    '0000003302000000020000000000000000000000000000000000000000010101'
+    '000000014200000000000000000700000007787e0b0c14372c06020100000001'
+    '00000000000000000000000702c10600000000080400f49d2700000000000100'
+    '0000000000000000000004010000000000000000000100130003004000000000'
+    '0000000000000000000000000000000000060000010000000000000000000000'
+    '000000000000'
+)
+
+
+class TestAColumnNoClientFetches(unittest.TestCase):
+    # 8i describes SQL's BITAND as type 29, which its own sqlplus is refused
+    # (ORA-00932); fetching it was an ORA-00600 [kpodfl1] in the server
+    # process (#2584). The fetch is refused before anything is sent.
+    def test_bitand_is_refused_before_the_fetch(self):
+        (columns, _rest) = decode_8i_dcb_describe(_BITAND_DESCRIBE)
+        self.assertEqual(columns[0]['data_type'], 29)
+        dialect = O8iDialect(next_seq=lambda: 1)
+        fetch = dialect._fetch_rest(1, columns, None)
+        with self.assertRaisesRegex(NotSupportedError, 'column B as data type 29'):
+            next(fetch)
+
+    def test_a_number_is_fetched(self):
+        (columns, _rest) = decode_8i_dcb_describe(_NUMBER_DESCRIBE)
+        dialect = O8iDialect(next_seq=lambda: 1)
+        self.assertIsInstance(next(dialect._fetch_rest(1, columns, None)), Send)
+
+    def test_only_8i_refuses(self):
+        # The 9i OALL8 dialect describes BITAND as a NUMBER; nothing is refused.
+        (columns, _rest) = decode_8i_dcb_describe(_BITAND_DESCRIBE)
+        self.assertEqual(Fv2Oall8Dialect(next_seq=lambda: 1)._unfetchable(columns), [])
 
 
 if __name__ == '__main__':
