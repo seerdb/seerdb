@@ -181,6 +181,35 @@ class LtzValue(datetime.datetime):
         )
 
 
+class DateValue(datetime.datetime):
+    """A DATE bind's value: a naive ``datetime`` that says it was bound as a
+    DATE (#2593).
+
+    A DATE and a TIMESTAMP bind with no fraction decode to the same
+    ``datetime``, but Oracle types the bind, and every expression over it, by
+    the type the client declared: the difference of two DATEs is a NUMBER of
+    days, of two TIMESTAMPs an INTERVAL DAY TO SECOND. It IS a ``datetime``, so
+    a backend that does not care needs nothing new.
+    """
+
+    __slots__ = ()
+
+    @classmethod
+    def of(cls, value: datetime.datetime) -> DateValue:
+        """The same value, marked as bound as a DATE."""
+        return cls(
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            value.tzinfo,
+            fold=value.fold,
+        )
+
+
 class BinaryFloatValue(float):
     """A BINARY_FLOAT bind's value: a ``float`` that says it was bound as one
     (#2562).

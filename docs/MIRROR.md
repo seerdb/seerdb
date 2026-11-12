@@ -56,7 +56,7 @@ first. Decided in [#1861](https://github.com/seerdb/seerdb/issues/1861).
     `ColumnMeta`, `BindVar`, `BackendError`, `UnsupportedFeature`, `Capability`,
     `Credentials` and `credential_lookup`;
   - the value types `BlobValue`, `ClobValue`, `VarcharValue`, `BFile`, `LtzValue`,
-    `BinaryFloatValue`, `BinaryDoubleValue` and `BcDate`.
+    `DateValue`, `BinaryFloatValue`, `BinaryDoubleValue` and `BcDate`.
 - **A deployment's data across upgrades:** a database that a released Mirror
   over PostgreSQL set up keeps working when a newer release of the same major
   version connects to it. That covers its accounts, roles, recorded grants,

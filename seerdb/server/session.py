@@ -228,6 +228,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_BLOB,
     TNS_TYPE_CHAR,
     TNS_TYPE_CLOB,
+    TNS_TYPE_DATE,
     TNS_TYPE_JSON,
     TNS_TYPE_LONG,
     TNS_TYPE_LONGRAW,
@@ -286,6 +287,7 @@ from seerdb.server.backend import (
     Capability,
     ClobValue,
     CursorResult,
+    DateValue,
     LtzValue,
     Result,
     SessionInfo,
@@ -3986,6 +3988,10 @@ _MARKED_BINDS: dict[int, tuple[type, Callable[..., object]]] = {
     # a TIMESTAMP bind does, but Oracle reads the two in different zones
     # (#1222).
     TNS_TYPE_TIMESTAMPLTZ: (datetime.datetime, LtzValue.of),
+    # A DATE bind decodes to the datetime a TIMESTAMP bind without a fraction
+    # does, but Oracle types the bind and every expression over it by the
+    # declared type: the difference of two is a NUMBER of days (#2593).
+    TNS_TYPE_DATE: (datetime.datetime, DateValue.of),
     # A BINARY_FLOAT / BINARY_DOUBLE bind decodes to the float a NUMBER bind
     # can, but Oracle types the bind and every expression over it by the
     # declared type (#2562).

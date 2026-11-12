@@ -1894,6 +1894,32 @@ def test_translate_binds_casts_binary_float_and_double() -> None:
     assert params == {'b1': 1.5, 'b2': 2.25, 'b3': 0.5}
 
 
+def test_translate_binds_casts_a_date_bind_to_the_mirror_date() -> None:
+    # A DATE bind arrives marked as one (#2593). Its placeholder is cast to the
+    # Mirror's DATE, so the difference of two is a NUMBER of days, as Oracle's
+    # is, where two timestamps' is an interval; a typed NULL DATE likewise. A
+    # bare datetime, a TIMESTAMP bind, stays uncast.
+    import datetime
+
+    from seerdb.common.tns_consts import TNS_TYPE_DATE
+    from seerdb.server import BindVar, DateValue
+
+    value = datetime.datetime(2020, 1, 15, 10, 20, 30)
+    sql, params = _translate_binds(
+        'SELECT :1 - :2, :3, :4 FROM dual',
+        [
+            DateValue.of(value),
+            DateValue.of(value),
+            BindVar(value=None, tns_type=TNS_TYPE_DATE, max_size=7),
+            value,
+        ],
+    )
+    assert sql == (
+        'SELECT %(b1)s::ora_date - %(b2)s::ora_date, %(b3)s::ora_date, %(b4)s FROM dual'
+    )
+    assert params['b1'] == value and params['b4'] == value
+
+
 def test_translate_binds_skips_colon_in_quoted_identifier() -> None:
     # A ':' inside a double-quoted identifier (a column named "col:ons") is part of
     # the name, not a bind; the scanner copies the quoted region verbatim so the

@@ -863,6 +863,35 @@ def test_mark_value_binds_leaves_nulls_and_other_types_alone() -> None:
     assert marked.binds[:3] == [1.5, 1.5, 1.5]
 
 
+def test_a_date_bind_reaches_the_backend_marked_as_one() -> None:
+    # A DATE bind and a TIMESTAMP bind without a fraction decode to the same
+    # datetime; the DATE one is marked, since Oracle types the bind by it: the
+    # difference of two is a NUMBER of days (#2593). A NULL stays None.
+    from seerdb.common.tns import ExecRequest
+    from seerdb.common.tns_consts import TNS_TYPE_DATE, TNS_TYPE_TIMESTAMP
+    from seerdb.server import DateValue
+    from seerdb.server.session import _mark_value_binds
+
+    value = datetime.datetime(2020, 1, 15, 10, 20, 30)
+    row = [value, value, None]
+    request = ExecRequest(
+        'select :1 - :2, :3 from dual',
+        0,
+        3,
+        0,
+        binds=row,
+        bind_rows=[row],
+        bind_meta=[(TNS_TYPE_DATE, 7), (TNS_TYPE_TIMESTAMP, 11), (TNS_TYPE_DATE, 7)],
+    )
+    marked = _mark_value_binds(request)
+    assert [type(v) for v in marked.binds] == [
+        DateValue,
+        datetime.datetime,
+        type(None),
+    ]
+    assert marked.binds[0] == value
+
+
 def _exec_body() -> bytes:
     from seerdb.common.tns import encode_dictionary_exec
 

@@ -71,6 +71,7 @@ from seerdb.server.backend import (
     Capability,
     ClobValue,
     CursorResult,
+    DateValue,
     LtzValue,
     Result,
     SessionInfo,
@@ -195,9 +196,11 @@ def _value_bind_type(value: object) -> object:
     # TIMESTAMP, read in the session zone rather than the database's (#1225). A
     # BINARY_FLOAT / BINARY_DOUBLE bind arrives marked as one (#2562): bound on
     # as a bare float it would be a NUMBER, and so would every expression over
-    # it.
+    # it. A DATE bind arrives marked as one (#2593).
     if isinstance(value, LtzValue):
         return seerdb.DB_TYPE_TIMESTAMP_LTZ
+    if isinstance(value, DateValue):
+        return seerdb.DB_TYPE_DATE
     if isinstance(value, BinaryFloatValue):
         return seerdb.DB_TYPE_BINARY_FLOAT
     if isinstance(value, BinaryDoubleValue):

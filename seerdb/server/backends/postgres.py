@@ -396,6 +396,7 @@ from seerdb.server import (
     ColumnMeta,
     Credentials,
     CursorResult,
+    DateValue,
     LtzValue,
     Result,
     UnsupportedFeature,
@@ -4086,7 +4087,7 @@ _NULL_CASTS = {
     TNS_TYPE_NUMBER: 'numeric',
     TNS_TYPE_BFLOAT: 'real',
     TNS_TYPE_BDOUBLE: 'double precision',
-    TNS_TYPE_DATE: 'timestamp',
+    TNS_TYPE_DATE: _DATE_TYPE,
     TNS_TYPE_TIMESTAMP: 'timestamp',
     TNS_TYPE_TIMESTAMPTZ: _TSTZ_TYPE,
     TNS_TYPE_TIMESTAMPLTZ: 'timestamptz',
@@ -4579,6 +4580,11 @@ def _translate_binds(sql: str, binds: Sequence) -> tuple[str, dict]:
             # The double twin: PostgreSQL types a bare float as a double, but
             # an expression over the bind is typed from the cast, not inferred.
             out.append(f'%({key})s::double precision')
+        elif isinstance(value, DateValue):
+            # A DATE bind is the Mirror's DATE, so the difference of two is a
+            # NUMBER of days, as Oracle's is, where a timestamp's is an
+            # interval (#2593).
+            out.append(f'%({key})s::{_DATE_TYPE}')
         elif isinstance(value, LtzValue):
             # A TIMESTAMP WITH LOCAL TIME ZONE bind is the instant in the
             # database time zone, where a TIMESTAMP bind is a wall-clock time
