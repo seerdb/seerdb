@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Callable, Protocol
 
+from seerdb.common.datatypes import dbtype_for_oracle_type
 from seerdb.common.sqltext import is_reusable_dml
 from seerdb.common.tns import (
     FV2_BIND_IN,
@@ -862,6 +863,11 @@ class Oall8Dialect:
         # hint, the rows asked for.
         return fetch
 
+    def _unfetchable(self, columns: list) -> list:
+        # The described columns this tier's fetch cannot ask for: none but on
+        # 8i (O8iDialect).
+        return []
+
     # --- the shared call sequences
 
     def _closing(self) -> bytes:
@@ -951,6 +957,19 @@ class Oall8Dialect:
         # opened (#798). A LONG / LONG RAW column caps the value at the fetch's
         # long-size field and returns one row per fetch, so ask for the whole
         # value (#377).
+        refused = self._unfetchable(columns) if cursor else []
+        if refused:
+            from seerdb.common.exceptions import NotSupportedError
+
+            col = refused[0]
+            name = col.get('column_name') or b''
+            if isinstance(name, bytes):
+                name = name.decode('utf-8', errors='replace')
+            raise NotSupportedError(
+                f'Oracle {self._wire} describes column {name} as data type '
+                f'{col.get("data_type")}, which it returns to no client (its own '
+                'gets ORA-00932: inconsistent datatypes)'
+            )
         has_long = any(col.get('data_type') in _O8I_LONG_TYPES for col in columns)
         long_size = _LONG_WHOLE if has_long else self._long_size(columns, fetch)
         row_count = 1 if has_long else (fetch or 15)
@@ -1250,6 +1269,18 @@ class O8iDialect(Oall8Dialect):
     connection.py by ``isinstance(O8iDialect)``). It adds nothing to the shared
     base — 8i uses the 32-bit ``_encode_dml`` the base provides — but is its own
     type so the login tier stays detectable and the 9i OALL8 dialect distinct."""
+
+    def _unfetchable(self, columns: list) -> list:
+        # 8i describes SQL's BITAND as type 29, which no client fetches: its
+        # sqlplus is refused with ORA-00932, and the fetch seerdb sent was an
+        # ORA-00600 [kpodfl1] in the server process (#2584). A type with no
+        # DbType is one seerdb cannot read either.
+        return [
+            col
+            for col in columns
+            if dbtype_for_oracle_type(col.get('data_type') or 0, col.get('csfrm') or 1)
+            is None
+        ]
 
 
 class Fv2Oall8Dialect(Oall8Dialect):
