@@ -11987,10 +11987,7 @@ def _translate_routine_ddl(
         return sql
     return_type, authid, body = tail.groups()
     if collection_type is not None:
-        body = _rewrite_collections(
-            body,
-            _collection_variables(_declaration_parts(params, body), collection_type),
-        )
+        body = _routine_collections(params, body, collection_type)
     # Oracle allows a routine with no parameters to omit the list entirely
     # (FUNCTION f RETURN NUMBER AS …); PostgreSQL always needs the parentheses, so
     # an absent list (params is None) becomes an empty one (#530).
@@ -12565,10 +12562,14 @@ def _rewrite_index_tables(body: str, tables: dict[str, str]) -> str:
 class _CollectionVar:
     """A schema-level VARRAY or nested table, as the rewrite of a variable of
     its type needs it (#2547): a VARRAY's limit, None for a nested table, and
-    the element's PostgreSQL type, which an EXTEND's NULLs take."""
+    the element's PostgreSQL type, which an EXTEND's NULLs take. And the
+    domain itself and the array it is over (#2550): a local variable is
+    declared the array, a copy around a call the domain."""
 
     limit: int | None
     element: str
+    domain: str = ''
+    array: str = ''
 
 
 # A collection method on a VARRAY or a nested table.
@@ -12861,6 +12862,146 @@ def _rewrite_collections(body: str, variables: dict[str, _CollectionVar]) -> str
     return _unmask_quoted(rewrite(masked), contents)
 
 
+# A local VARRAY or nested table (#2550). PL/pgSQL updates a plain array
+# variable in place, but copies a domain-typed one whole on every assignment
+# -- `v(k) := x` and an EXTEND cost the collection's size, so filling one was
+# quadratic. A local is declared the array its domain is over: a VARRAY's
+# limit is checked by the element and EXTEND rewrites (_rewrite_collections),
+# and a value of the domain, a constructor's or a parameter's, assigns to
+# it. Parameters stay the domain, so a routine's signature and describe do
+# not change.
+def _collection_locals(
+    params: str | None,
+    variables: dict[str, _CollectionVar],
+    lookup: Callable[[str], _CollectionVar | None],
+) -> dict[str, _CollectionVar]:
+    # Of `variables`, those that are not parameters, and so are declared in
+    # the body.
+    parameters = _collection_variables((params or '').split(','), lookup)
+    return {k: v for k, v in variables.items() if k not in parameters and v.array}
+
+
+def _plain_collection_locals(
+    text: str, locals_: dict[str, _CollectionVar], leading: bool = True
+) -> str:
+    # `text` with each local collection's declaration, `v [CONSTANT] t`, of
+    # the array its type is over: in the declarations before the first BEGIN
+    # (when `leading`) and in each nested block's, DECLARE to its BEGIN.
+    if not locals_:
+        return text
+    (masked, contents) = _mask_quoted(text)
+    regions: list[tuple[int, int]] = []
+    start: int | None = 0 if leading else None
+    for word, begin, end in _words(masked):
+        if word == 'DECLARE':
+            start = end
+        elif word == 'BEGIN' and start is not None:
+            regions.append((start, begin))
+            start = None
+    if start is not None:
+        regions.append((start, len(masked)))
+    names = '|'.join(re.escape(n) for n in sorted(locals_, key=len, reverse=True))
+    declared = re.compile(
+        rf'(?is)((?:^|;)\s*({names})\s+(?:CONSTANT\s+)?)({_DECLARED_WORD.pattern})'
+    )
+    (out, pos) = ([], 0)
+    for a, b in regions:
+        out.append(masked[pos:a])
+        out.append(
+            declared.sub(
+                lambda m: m.group(1) + locals_[m.group(2).lower()].array, masked[a:b]
+            )
+        )
+        pos = b
+    out.append(masked[pos:])
+    return _unmask_quoted(''.join(out), contents)
+
+
+def _routine_collections(
+    params: str | None,
+    body: str,
+    lookup: Callable[[str], _CollectionVar | None] | None,
+) -> str:
+    # A routine's or package member's body with its collections' elements and
+    # methods rewritten (#2547) and its local ones plain arrays (#2550).
+    if lookup is None:
+        return body
+    variables = _collection_variables(_declaration_parts(params, body), lookup)
+    body = _rewrite_collections(body, variables)
+    locals_ = _collection_locals(params, variables, lookup)
+    return _wrap_collection_calls(_plain_collection_locals(body, locals_), locals_)
+
+
+# An argument that is a local collection, positional or named.
+_COLLECTION_ARGUMENT = re.compile(r'\s*(?:[\w$#]+\s*=>\s*)?([\w$#]+)\s*')
+
+
+def _wrap_collection_calls(body: str, locals_: dict[str, _CollectionVar]) -> str:
+    # `body` with each statement that is a call passing a local collection,
+    # `p(n, v);`, given a copy of it of its domain around the call: a plain
+    # array is refused as an IN OUT argument of the domain ("argument is not
+    # writable", the coercion making it an expression). The copy goes back
+    # after the call; a PL/SQL statement that is a call is a procedure's.
+    if not locals_:
+        return body
+    tokens = list(sql_tokens(body))
+    (out, pos, index, start) = ([], 0, 0, True)
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if token.kind in ('space', 'comment'):
+            continue
+        if token.kind not in ('word', 'identifier'):
+            start = body[token.start : token.end] == ';'
+            continue
+        (first, end) = (token.start, token.end)
+        while (
+            index + 1 < len(tokens)
+            and body[tokens[index].start : tokens[index].end] == '.'
+            and tokens[index + 1].kind in ('word', 'identifier')
+        ):
+            end = tokens[index + 1].end
+            index += 2
+        upper = body[first:end].upper()
+        (at_start, start) = (start, upper in _STATEMENT_OPENERS)
+        if not at_start or upper in _BLOCK_KEYWORDS or upper in _STATEMENT_OPENERS:
+            continue
+        open_at = end + len(body[end:]) - len(body[end:].lstrip())
+        if body[open_at : open_at + 1] != '(':
+            continue
+        close = _matching_paren(body, open_at)
+        semi = close + 1 + len(body[close + 1 :]) - len(body[close + 1 :].lstrip())
+        if body[semi : semi + 1] != ';':
+            continue
+        passed = []
+        for a, b in _top_level_items(body, open_at + 1, close):
+            arg = _COLLECTION_ARGUMENT.fullmatch(body, a, b)
+            if arg is not None and arg.group(1).lower() in locals_:
+                passed.append((arg.start(1), arg.end(1), arg.group(1).lower()))
+        if not passed:
+            continue
+        copies: dict[str, str] = {}
+        (call, at) = ([], first)
+        for a, b, name in passed:
+            copy = copies.setdefault(name, f'ora$coll{len(copies) + 1}')
+            call += [body[at:a], copy]
+            at = b
+        call.append(body[at : semi + 1])
+        declare = ' '.join(f'{c} {locals_[n].domain};' for n, c in copies.items())
+        before = ' '.join(f'{c} := {n};' for n, c in copies.items())
+        after = ' '.join(f'{n} := {c};' for n, c in copies.items())
+        out += [
+            body[pos:first],
+            f'DECLARE {declare} BEGIN {before} {"".join(call)} {after} END;',
+        ]
+        pos = semi + 1
+        while index < len(tokens) and tokens[index].start <= semi:
+            index += 1
+        start = True
+    out.append(body[pos:])
+    return ''.join(out)
+
+
 def _routine_index_tables(
     package: str, member: _PackageMember, types: dict[str, str]
 ) -> dict[str, str]:
@@ -13081,15 +13222,12 @@ def _translate_package_ddl(
             _package_routine(
                 package,
                 m,
-                _rewrite_collections(
+                _routine_collections(
+                    m.params,
                     _rewrite_index_tables(
                         m.body, _routine_index_tables(package, m, index_types)
                     ),
-                    _collection_variables(
-                        _declaration_parts(m.params, m.body), collection_type
-                    )
-                    if collection_type is not None
-                    else {},
+                    collection_type,
                 ),
                 names,
                 member_kind,
@@ -13528,6 +13666,12 @@ def _translate_plsql_block(
         body = _rewrite_collections(body, variables)
         if declare_part:
             declare_part = _rewrite_collections(declare_part, variables)
+        locals_ = _collection_locals(None, variables, collection_type)
+        body = _wrap_collection_calls(
+            _plain_collection_locals(body, locals_, leading=False), locals_
+        )
+        if declare_part:
+            declare_part = _plain_collection_locals(declare_part, locals_)
     declare = _translate_routine_types(declare_part) if declare_part else ''
     body = _nested_declarations(body)
     if routine_kind is not None:
@@ -19488,13 +19632,18 @@ class PostgresBackend:
             row = self._conn.execute(
                 'SELECT (SELECT max(substring(pg_get_constraintdef(c.oid) '
                 "FROM '<=\\s*([0-9]+)')::int) FROM pg_constraint c "
-                'WHERE c.contypid = t.oid), format_type(b.typelem, NULL) '
+                'WHERE c.contypid = t.oid), format_type(b.typelem, NULL), '
+                'format_type(t.oid, NULL), format_type(t.typbasetype, NULL) '
                 'FROM pg_type t JOIN pg_type b ON b.oid = t.typbasetype '
                 'WHERE t.oid = to_regtype(%s)',
                 (name,),
             ).fetchone()
             self._collection_vars[key] = (
-                None if row is None else _CollectionVar(limit=row[0], element=row[1])
+                None
+                if row is None
+                else _CollectionVar(
+                    limit=row[0], element=row[1], domain=row[2], array=row[3]
+                )
             )
         return self._collection_vars[key]
 

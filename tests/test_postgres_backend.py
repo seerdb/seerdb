@@ -17138,6 +17138,85 @@ def test_a_routines_collection_parameter_and_local(_collection_backend) -> None:
                 backend.rollback()
 
 
+def test_a_local_collection_is_a_plain_array() -> None:
+    # PL/pgSQL copies a domain-typed array variable whole on every assignment,
+    # so filling a collection element by element was quadratic (#2550). A
+    # local is declared the array its domain is over; a parameter stays the
+    # domain; a call that passes a local gets a copy of the domain around it,
+    # since a plain array is no IN OUT argument of one. A string naming the
+    # type is text, not a declaration.
+    from seerdb.server.backends.postgres import _CollectionVar
+
+    typ = _CollectionVar(limit=10, element='numeric', domain='t2550', array='numeric[]')
+
+    def lookup(name: str) -> _CollectionVar | None:
+        return typ if name.lower() == 't2550' else None
+
+    def kind(name: str) -> str | None:
+        return 'p' if name.lower() == 'fill' else None
+
+    block = _translate_plsql_block(
+        "DECLARE v t2550 := t2550(); w CONSTANT t2550 := t2550(); s VARCHAR2(9) := 't2550'; "
+        'BEGIN fill(1, v); fill(l => w); DECLARE x t2550; BEGIN x := v; END; END;',
+        kind,
+        lookup,
+    )
+    assert 'DECLARE v numeric[] := t2550(); w CONSTANT numeric[] := t2550(); ' in block
+    assert "s varchar(9) := 't2550';" in block
+    assert (
+        'DECLARE ora$coll1 t2550; BEGIN ora$coll1 := v; CALL fill(1, ora$coll1); '
+        'v := ora$coll1; END;'
+    ) in block
+    assert 'CALL fill(l => ora$coll1); w := ora$coll1; END;' in block
+    assert 'DECLARE x numeric[]; BEGIN x := v; END;' in block
+    routine = _translate_routine_ddl(
+        'CREATE OR REPLACE PROCEDURE q(l IN OUT t2550) IS v t2550; '
+        'BEGIN fill(2, v); fill(2, l); END;',
+        routine_kind=kind,
+        collection_type=lookup,
+    )
+    assert 'PROCEDURE q(l INOUT t2550)' in routine
+    assert 'DECLARE v numeric[]; BEGIN DECLARE ora$coll1 t2550;' in routine
+    assert 'CALL fill(2, l);' in routine
+
+
+def test_a_local_varray_keeps_its_limit_and_its_in_out_calls(
+    _collection_backend,
+) -> None:
+    # A local VARRAY is a plain array now (#2550): its limit is the EXTEND
+    # rewrite's to keep, and a procedure filling it through an IN OUT
+    # parameter -- positional or named -- still does.
+    backend = _collection_backend
+    assert (
+        _collection_answer(
+            backend,
+            'DECLARE v c2547v := c2547v(); r VARCHAR2(200); '
+            'BEGIN FOR i IN 1..11 LOOP v.extend; END LOOP; :out := r; END;',
+        )
+        == 'ORA-06532'
+    )
+    try:
+        backend.execute(
+            'CREATE OR REPLACE PROCEDURE c2550_fill(n IN NUMBER, l IN OUT c2547v) IS '
+            'BEGIN l := c2547v(); FOR i IN 1..n LOOP l.extend; l(i) := i; END LOOP; END;'
+        )
+        assert (
+            _collection_answer(
+                backend,
+                'DECLARE v c2547v; w c2547v; r VARCHAR2(200); '
+                'BEGIN c2550_fill(3, v); c2550_fill(n => 2, l => w); '
+                "r := v.count || ',' || w.count || ',' || v(3); :out := r; END;",
+            )
+            == '3,2,3'
+        )
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP PROCEDURE c2550_fill')
+        except Exception:
+            backend.rollback()
+
+
 def test_a_connect_names_the_database_or_a_service_given() -> None:
     # A listener refuses what it doesn't serve (#2471): the Mirror-over-PG
     # serves its database's name and the services it is given, as a service,
