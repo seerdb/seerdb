@@ -3849,6 +3849,26 @@ class CursorIntegration(_IntegrationBase):
         finally:
             pool.close()
 
+    def test_a_one_way_message_is_not_answered(self):
+        # A Mirror answered a one-way message (type 26) as a call, and the
+        # client read that answer as its next call's reply (#2559). The one a
+        # client sends is python-oracledb's pool's session release, which it
+        # sends whatever server it got. A real dedicated server never answers
+        # the call after one (18c, 21c, 23ai), so this runs on a Mirror only:
+        # it keeps the session, as a pool that hands back the same server.
+        if not os.environ.get('SEERDB_TEST_MIRROR'):
+            self.skipTest('a dedicated server hangs after a session release')
+        from seerdb.common.tns import encode_session_release
+        from seerdb.common.tns_consts import TNS_DATA
+
+        with _connect_with() as conn:
+            conn.send(
+                TNS_DATA, encode_session_release(conn._next_seq(), conn.field_version)
+            )
+            cur = conn.cursor()
+            cur.execute('SELECT 42 FROM dual')
+            self.assertEqual(cur.fetchone(), (42,))
+
     def test_a_drcp_pool_hands_its_server_back_and_is_served_again(self):
         # A pool releases its pooled server whenever it takes a connection
         # back, as python-oracledb's does (#2544), and the next acquire is

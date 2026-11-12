@@ -211,6 +211,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_PIPELINE_END,
     TNS_FUNC_REEXECUTE,
     TNS_FUNC_REEXECUTE_AND_FETCH,
+    TNS_FUNC_SESSION_RELEASE,
     TNS_FUNC_SESSION_STATE,
     TNS_FUNC_SET_END_TO_END_ATTR,
     TNS_FUNC_SET_SCHEMA,
@@ -220,6 +221,7 @@ from seerdb.common.tns_consts import (
     TNS_MARKER_TYPE_BREAK,
     TNS_MARKER_TYPE_RESET,
     TNS_MSG_TYPE_FAST_AUTH,
+    TNS_MSG_TYPE_ONEWAY_FN,
     TNS_TYPE_BFILE,
     TNS_TYPE_BLOB,
     TNS_TYPE_CHAR,
@@ -1639,6 +1641,17 @@ def _serve_thin_session(
         body = _skip_piggybacks(
             body, backend, temp_lobs, refused, stream.reply_prefix
         )  # CLOSE_CURSORS, …
+        if body[:1] == bytes([TNS_MSG_TYPE_ONEWAY_FN]):
+            # A one-way message, which nothing answers (#2559): an answer is
+            # read as the reply to the client's next call, and the session
+            # desyncs. The one a client sends is the session release a
+            # python-oracledb pool sends a pooled server it takes a connection
+            # back from. The Mirror serves a pooled request with the session
+            # it has, as a DRCP pool that always hands the same server back,
+            # so the release keeps it: there is nothing to give back.
+            if body[1:2] != bytes([TNS_FUNC_SESSION_RELEASE]):
+                logger.info('one-way message dropped: %s', body[:2].hex())
+            continue
         if refused and len(body) >= 2 and body[0] == TTI_FUN:
             # A piggyback the backend refused fails the call behind it, which a
             # real server then does not run (#1778).
