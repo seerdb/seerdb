@@ -4754,6 +4754,24 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.getbatcherrors(), [])
 
+    @_requires(_ARRAY_DML)
+    def test_the_statement_runs_again_after_a_batch_error(self):
+        # Below 12.1 the statement's server cursor is cached, and a batch error
+        # keeps it. It was queued for close all the same, so the next execute
+        # of the statement answered ORA-01001 (#2563).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY)')
+        sql = f'INSERT INTO {self.TABLE} VALUES (:1)'
+        self.cur.executemany(sql, [(1,), (2,)], batcherrors=True)
+        self.cur.executemany(sql, [(3,), (1,)], batcherrors=True)
+        self.assertEqual(
+            [(e.offset, e.code) for e in self.cur.getbatcherrors()], [(1, 1)]
+        )
+        self.cur.executemany(sql, [(4,), (5,)], batcherrors=True)
+        self.assertEqual(self.cur.getbatcherrors(), [])
+        self.cur.execute(sql, [6])
+        self.cur.execute(f'SELECT id FROM {self.TABLE} ORDER BY id')
+        self.assertEqual([r[0] for r in self.cur.fetchall()], [1, 2, 3, 4, 5, 6])
+
     # ----- executemany arraydmlrowcounts (12c+) -----
 
     @_requires(_ARRAY_DML_ROWCOUNTS)
@@ -8399,12 +8417,6 @@ class DataFrameExecuteManyIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone(), (5,))
 
-    @_requires(
-        _Need(
-            'the executemany after a batch error is ORA-01001 below 12.1 (#2563)',
-            min_fv=FIELD_VERSION_12_1,
-        )
-    )
     def test_a_batch_errors_offset_counts_from_the_first_row(self):
         self._table('i NUMBER PRIMARY KEY')
         self.cur.executemany(
@@ -14596,6 +14608,25 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     )
                     await Cur.execute('SELECT id FROM PYORACLE_ASYNC_BE ORDER BY id')
                     self.assertEqual([r[0] for r in await Cur.fetchall()], [1, 2, 3])
+                finally:
+                    await Cur.execute('DROP TABLE PYORACLE_ASYNC_BE')
+
+    @_requires(_ARRAY_DML)
+    async def test_async_statement_runs_again_after_a_batch_error(self):
+        # Async mirror of test_the_statement_runs_again_after_a_batch_error
+        # (#2563): the cached cursor a batch error keeps is not closed.
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute(
+                    'CREATE TABLE PYORACLE_ASYNC_BE (id NUMBER PRIMARY KEY)'
+                )
+                sql = 'INSERT INTO PYORACLE_ASYNC_BE VALUES (:1)'
+                try:
+                    await Cur.executemany(sql, [(1,), (2,)], batcherrors=True)
+                    await Cur.executemany(sql, [(3,), (1,)], batcherrors=True)
+                    await Cur.executemany(sql, [(4,)], batcherrors=True)
+                    await Cur.execute('SELECT id FROM PYORACLE_ASYNC_BE ORDER BY id')
+                    self.assertEqual([r[0] for r in await Cur.fetchall()], [1, 2, 3, 4])
                 finally:
                     await Cur.execute('DROP TABLE PYORACLE_ASYNC_BE')
 
