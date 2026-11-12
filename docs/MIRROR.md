@@ -258,6 +258,15 @@ would cost far more than anyone gains from it.
   safely would stop PostgreSQL from inlining the operators, which made
   `real / 2` ninety times slower
   ([#2571](https://github.com/seerdb/seerdb/issues/2571)).
+- **DUMP of an expression.** `DUMP` reports Oracle's type number and stored
+  bytes, in each of its formats and byte ranges. Oracle dumps a column in its
+  stored form and an expression in its in-memory form, which PostgreSQL cannot
+  tell apart, so the Mirror dumps every value as a column of its type would be.
+  On 23ai, `DUMP(TRUNC(d))` is `Typ=13 Len=8`, a string literal `Typ=96`, and
+  `SYSDATE - SYSDATE` `Typ=14`. The Mirror gives `Typ=12 Len=7`, `Typ=1` and
+  `Typ=2`. An NVARCHAR2 dumps its UTF-8 bytes, where Oracle shows AL16UTF16. A
+  DATE bind dumps as a TIMESTAMP, `Typ=180`
+  ([#2568](https://github.com/seerdb/seerdb/issues/2568)).
 
 ### Not served
 

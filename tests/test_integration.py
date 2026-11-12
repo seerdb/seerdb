@@ -5877,6 +5877,82 @@ class BindIntegration(_IntegrationBase):
                 self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
                 self.assertAlmostEqual(float(got), value, places=12)
 
+    def test_dump_shows_oracle_type_numbers_and_bytes(self):
+        # DUMP reports a value's Oracle type number and its stored bytes; over
+        # PostgreSQL it was orafce's, PostgreSQL's type oid and in-memory bytes
+        # (#2568). The formats and the byte range, and a NULL's text NULL.
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (n NUMBER, m NUMBER, v VARCHAR2(10), '
+            'c CHAR(3), d DATE, r RAW(4))'
+        )
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (1.5, -12.34, 'abc', 'xy', "
+            "TO_DATE('2020-01-15', 'YYYY-MM-DD'), HEXTORAW('DEADBEEF'))"
+        )
+        for expr, binds, dumped in (
+            ('DUMP(n)', [], 'Typ=2 Len=3: 193,2,51'),
+            ('DUMP(m)', [], 'Typ=2 Len=4: 62,89,67,102'),
+            ('DUMP(0)', [], 'Typ=2 Len=1: 128'),
+            ('DUMP(-1)', [], 'Typ=2 Len=3: 62,100,102'),
+            ('DUMP(1e125)', [], 'Typ=2 Len=2: 255,11'),
+            ('DUMP(v)', [], 'Typ=1 Len=3: 97,98,99'),
+            ('DUMP(c)', [], 'Typ=96 Len=3: 120,121,32'),
+            ('DUMP(d)', [], 'Typ=12 Len=7: 120,120,1,15,1,1,1'),
+            ('DUMP(r)', [], 'Typ=23 Len=4: 222,173,190,239'),
+            ('DUMP(n, 16)', [], 'Typ=2 Len=3: c1,2,33'),
+            ('DUMP(n, 8)', [], 'Typ=2 Len=3: 301,2,63'),
+            ('DUMP(n, 17)', [], 'Typ=2 Len=3: c1,^B,3'),
+            ('DUMP(n, 1016)', [], 'Typ=2 Len=3: c1,2,33'),
+            ('DUMP(n, 10, 2)', [], 'Typ=2 Len=3: 2,51'),
+            ('DUMP(n, 10, 2, 1)', [], 'Typ=2 Len=3: 2'),
+            ('DUMP(v, 16, -1)', [], 'Typ=1 Len=3: 63'),
+            ('DUMP(n, 10, 5)', [], None),
+            ('DUMP(NULL)', [], 'NULL'),
+            ('DUMP(:1)', [Decimal('1.5')], 'Typ=2 Len=3: 193,2,51'),
+            ('DUMP(:1)', ['hi'], 'Typ=1 Len=2: 104,105'),
+            ('DUMP(:1)', [None], 'NULL'),
+        ):
+            with self.subTest(expr=expr, binds=binds):
+                self.cur.execute(f'SELECT {expr} FROM {self.TABLE}', binds)
+                self.assertEqual(self.cur.fetchone(), (dumped,))
+        # Past 1000 a character type names its character set, the database's.
+        self.cur.execute(f'SELECT DUMP(v, 1016) FROM {self.TABLE}')
+        self.assertRegex(
+            self.cur.fetchone()[0], r'^Typ=1 Len=3 CharacterSet=\w+: 61,62,63$'
+        )
+
+    @_requires(_BINARY_FLOAT_SERVER)
+    def test_dump_of_floats_timestamps_and_intervals(self):
+        # As above, for the 10g types and the 9i datetimes (#2568).
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (f BINARY_FLOAT, g BINARY_DOUBLE, '
+            't TIMESTAMP(6), t0 TIMESTAMP, z TIMESTAMP WITH TIME ZONE, '
+            'l TIMESTAMP WITH LOCAL TIME ZONE, '
+            'ym INTERVAL YEAR TO MONTH, ds INTERVAL DAY TO SECOND)'
+        )
+        self.cur.execute(
+            f'INSERT INTO {self.TABLE} VALUES (-1.5, 1.5, '
+            "TIMESTAMP '2020-01-15 10:20:30.123456', TIMESTAMP '2020-01-15 10:20:30', "
+            "TO_TIMESTAMP_TZ('2020-01-15 10:20:30.5 -05:30', "
+            "'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'), TIMESTAMP '2020-01-15 10:20:30', "
+            "INTERVAL '-1-2' YEAR TO MONTH, INTERVAL '3 04:05:06.5' DAY TO SECOND)"
+        )
+        for expr, dumped in (
+            ('DUMP(f)', 'Typ=100 Len=4: 64,63,255,255'),
+            ('DUMP(g)', 'Typ=101 Len=8: 191,248,0,0,0,0,0,0'),
+            ('DUMP(t)', 'Typ=180 Len=11: 120,120,1,15,11,21,31,7,91,202,0'),
+            ('DUMP(t0)', 'Typ=180 Len=7: 120,120,1,15,11,21,31'),
+            ('DUMP(z)', 'Typ=181 Len=13: 120,120,1,15,16,51,31,29,205,101,0,15,30'),
+            ('DUMP(ym)', 'Typ=182 Len=5: 127,255,255,255,58'),
+            ('DUMP(ds)', 'Typ=183 Len=11: 128,0,0,3,64,65,66,157,205,101,0'),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM {self.TABLE}')
+                self.assertEqual(self.cur.fetchone(), (dumped,))
+        # LOCAL TIME ZONE is stored in the database time zone, its type 231.
+        self.cur.execute(f'SELECT DUMP(l) FROM {self.TABLE}')
+        self.assertTrue(self.cur.fetchone()[0].startswith('Typ=231 Len=7: '))
+
     @_requires(_BINARY_FLOAT_SERVER)
     def test_square_root_of_a_binary_float_is_a_binary_float(self):
         # Oracle's SQRT keeps a BINARY_FLOAT single (#2585); its other
@@ -8806,7 +8882,6 @@ class DataFrameExecuteManyIntegration(_IntegrationBase):
             ],
         )
 
-    @_requires(_postgres_cannot("report Oracle's type number in DUMP (#2568)"))
     def test_floats_bind_as_binary_float_and_double(self):
         # float32 binds BINARY_FLOAT and float64 BINARY_DOUBLE, typed by the
         # Arrow schema: into a NUMBER column the server converts, and DUMP of

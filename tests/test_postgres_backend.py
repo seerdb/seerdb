@@ -5662,8 +5662,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # double precision operations and the operators shadowing PostgreSQL's
     # (#2571), and the 50 numeric and integer overloads of the trigonometric
     # and hyperbolic functions, ATAN2, SQRT, EXP and LN, with SQRT of a real
-    # (#2585).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 292
+    # (#2585), and DUMP in Oracle's terms: sys.dump for 16 types at each of
+    # its four arities, sys.ora_dump_text and five encoders (#2568).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 362
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL

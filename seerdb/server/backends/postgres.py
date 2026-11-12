@@ -1545,6 +1545,156 @@ _HELPER_FUNCTIONS_DDL = (
         'LANGUAGE sql IMMUTABLE STRICT AS '
         '$$ SELECT pg_catalog.sqrt($1::double precision)::real $$;'
     )
+    # DUMP in Oracle's terms (#2568): orafce's reported PostgreSQL's type oid
+    # and in-memory bytes. Each value is encoded as Oracle stores it in a
+    # column -- an expression's in-memory form (a computed DATE's Typ=13, a
+    # string literal's 96) PostgreSQL cannot tell from a column's -- and
+    # shown by sys.ora_dump_text in the format asked for: 8, 10, 16 or 17
+    # (a printable byte as itself, 1 to 31 as ^A.., the rest in hex), past
+    # 1000 with a character type's character set, over the byte range asked
+    # for, NULL when it starts past the value; a NULL value is the text NULL.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_dump_text(typ integer, b bytea, '
+        'fmt integer, start integer, len integer, charset text) '
+        'RETURNS varchar LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$ '
+        'DECLARE n integer; base integer; lo integer; hi integer; v integer; '
+        "parts text[] := '{}'; BEGIN "
+        "IF b IS NULL THEN RETURN 'NULL'; END IF; "
+        'n := length(b); '
+        "IF typ IN (1, 96) AND n = 0 THEN RETURN 'NULL'; END IF; "
+        'base := coalesce(fmt, 10) % 1000; '
+        'IF base NOT IN (8, 16, 17) THEN base := 10; END IF; '
+        'IF coalesce(start, 0) = 0 THEN lo := 1; '
+        'ELSIF start > 0 THEN lo := start; ELSE lo := n + start + 1; END IF; '
+        'IF lo < 1 OR lo > n THEN RETURN NULL; END IF; '
+        'hi := CASE WHEN coalesce(len, 0) <= 0 THEN n ELSE least(n, lo + len - 1) END; '
+        'FOR i IN lo..hi LOOP v := get_byte(b, i - 1); '
+        'parts := parts || CASE base WHEN 16 THEN to_hex(v) '
+        "WHEN 8 THEN ltrim(((v >> 6) * 100 + ((v >> 3) & 7) * 10 + (v & 7))::text, '0') "
+        'WHEN 17 THEN CASE WHEN v BETWEEN 32 AND 126 THEN chr(v) '
+        "WHEN v BETWEEN 1 AND 31 THEN '^' || chr(v + 64) ELSE to_hex(v) END "
+        'ELSE v::text END; END LOOP; '
+        "RETURN 'Typ=' || typ || ' Len=' || n "
+        '|| CASE WHEN coalesce(fmt, 10) >= 1000 AND charset IS NOT NULL '
+        "THEN ' CharacterSet=' || charset ELSE '' END "
+        "|| ': ' || array_to_string(parts, ','); END $$;"
+    )
+    # A NUMBER: an exponent byte, then base-100 digits, each plus one; a
+    # negative one's exponent and digits complemented, and 102 after fewer
+    # than twenty digits.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_number_bytes(x numeric) RETURNS bytea '
+        'LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ '
+        "DECLARE a numeric; e integer; m numeric; d integer; o bytea := ''; "
+        'k integer := 0; neg boolean; BEGIN '
+        "IF x = 0 THEN RETURN '\\x80'::bytea; END IF; "
+        'neg := x < 0; a := abs(x); '
+        'e := floor(log(100::numeric, a))::integer; '
+        'IF a >= power(100::numeric, e + 1) THEN e := e + 1; END IF; '
+        'IF a < power(100::numeric, e) THEN e := e - 1; END IF; '
+        'm := a * power(10::numeric, -2 * e); '
+        'WHILE m <> 0 AND k < 20 LOOP d := trunc(m); '
+        "o := o || set_byte('\\x00'::bytea, 0, "
+        'CASE WHEN neg THEN 101 - d ELSE d + 1 END); '
+        'm := (m - d) * 100; k := k + 1; END LOOP; '
+        "o := set_byte('\\x00'::bytea, 0, CASE WHEN neg THEN 62 - e ELSE 193 + e END) || o; "
+        "IF neg AND k < 20 THEN o := o || '\\x66'::bytea; END IF; "
+        'RETURN o; END $$;'
+    )
+    # A DATE's seven bytes (century and year plus 100, hour, minute and second
+    # plus 1), and a TIMESTAMP's nanoseconds after them when it has any.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_datetime_bytes(t timestamp, '
+        'fraction boolean) RETURNS bytea LANGUAGE plpgsql IMMUTABLE STRICT '
+        'PARALLEL SAFE AS $$ DECLARE y integer; ns bigint; o bytea; BEGIN '
+        'y := extract(year FROM t)::integer; '
+        "o := '\\x00000000000000'::bytea; "
+        'o := set_byte(o, 0, div(y, 100)::integer + 100); o := set_byte(o, 1, y % 100 + 100); '
+        'o := set_byte(o, 2, extract(month FROM t)::integer); '
+        'o := set_byte(o, 3, extract(day FROM t)::integer); '
+        'o := set_byte(o, 4, extract(hour FROM t)::integer + 1); '
+        'o := set_byte(o, 5, extract(minute FROM t)::integer + 1); '
+        'o := set_byte(o, 6, floor(extract(second FROM t))::integer + 1); '
+        'ns := (extract(microsecond FROM t)::bigint % 1000000) * 1000; '
+        'IF fraction AND ns <> 0 THEN '
+        "o := o || decode(lpad(to_hex(ns), 8, '0'), 'hex'); END IF; "
+        'RETURN o; END $$;'
+    )
+    # A WITH TIME ZONE value: its UTC time, its nanoseconds, then its offset's
+    # hours plus 20 and minutes plus 60.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_tstz_bytes(v ora_tstz) RETURNS bytea '
+        'LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ '
+        'DECLARE t timestamp; ns bigint; BEGIN '
+        "t := (v).utc AT TIME ZONE 'UTC'; "
+        'ns := (extract(microsecond FROM t)::bigint % 1000000) * 1000; '
+        'RETURN sys.ora_datetime_bytes(t, false) '
+        "|| decode(lpad(to_hex(ns), 8, '0'), 'hex') "
+        "|| set_byte('\\x00'::bytea, 0, div((v).off, 3600)::integer + 20) "
+        "|| set_byte('\\x00'::bytea, 0, div((v).off % 3600, 60)::integer + 60); "
+        'END $$;'
+    )
+    # INTERVALs: each field offset -- days and nanoseconds, or years, by
+    # 2^31 in four bytes; hours, minutes, seconds and months by 60.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_interval_bytes(v interval, ym boolean) '
+        'RETURNS bytea LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ '
+        'DECLARE j interval; sec numeric; s integer; BEGIN '
+        'IF ym THEN RETURN '
+        "decode(lpad(to_hex(extract(year FROM v)::bigint + 2147483648), 8, '0'), 'hex') "
+        "|| set_byte('\\x00'::bytea, 0, extract(month FROM v)::integer + 60); END IF; "
+        'j := justify_hours(v); sec := extract(second FROM j); s := trunc(sec); '
+        "RETURN decode(lpad(to_hex(extract(day FROM j)::bigint + 2147483648), 8, '0'), 'hex') "
+        "|| set_byte('\\x00'::bytea, 0, extract(hour FROM j)::integer + 60) "
+        "|| set_byte('\\x00'::bytea, 0, extract(minute FROM j)::integer + 60) "
+        "|| set_byte('\\x00'::bytea, 0, s + 60) "
+        '|| decode(lpad(to_hex(round((sec - s) * 1000000000)::bigint + 2147483648), '
+        "8, '0'), 'hex'); END $$;"
+    )
+    # A BINARY_FLOAT / BINARY_DOUBLE: its IEEE bytes, the sign bit set on a
+    # positive one, every bit flipped on a negative one.
+    + (
+        'CREATE OR REPLACE FUNCTION sys.ora_float_bytes(b bytea) RETURNS bytea '
+        'LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ BEGIN '
+        'IF get_byte(b, 0) < 128 THEN RETURN set_byte(b, 0, get_byte(b, 0) + 128); END IF; '
+        'FOR i IN 0..length(b) - 1 LOOP b := set_byte(b, i, 255 - get_byte(b, i)); '
+        'END LOOP; RETURN b; END $$;'
+    )
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.dump(x {kind}{extra}) RETURNS varchar '
+        'LANGUAGE sql STABLE PARALLEL SAFE AS '
+        f'$$ SELECT sys.ora_dump_text({typ}, {encoded}, {args}, {charset}) $$;'
+        for kind, typ, encoded, charset in (
+            ('numeric', 2, 'sys.ora_number_bytes(x)', 'NULL'),
+            # An integer literal, which would take double precision.
+            ('smallint', 2, 'sys.ora_number_bytes(x)', 'NULL'),
+            ('integer', 2, 'sys.ora_number_bytes(x)', 'NULL'),
+            ('bigint', 2, 'sys.ora_number_bytes(x)', 'NULL'),
+            ('text', 1, "convert_to(x, 'UTF8')", "'AL32UTF8'"),
+            ('bpchar', 96, "convert_to(textin(bpcharout(x)), 'UTF8')", "'AL32UTF8'"),
+            ('bytea', 23, 'x', 'NULL'),
+            ('real', 100, 'sys.ora_float_bytes(float4send(x))', 'NULL'),
+            ('double precision', 101, 'sys.ora_float_bytes(float8send(x))', 'NULL'),
+            ('ora_date', 12, 'sys.ora_datetime_bytes(x, false)', 'NULL'),
+            ('oracle.date', 12, 'sys.ora_datetime_bytes(x, false)', 'NULL'),
+            ('timestamp', 180, 'sys.ora_datetime_bytes(x, true)', 'NULL'),
+            ('ora_tstz', 181, 'sys.ora_tstz_bytes(x)', 'NULL'),
+            (
+                'timestamptz',
+                231,
+                "sys.ora_datetime_bytes(x AT TIME ZONE 'UTC', true)",
+                'NULL',
+            ),
+            ('interval', 183, 'sys.ora_interval_bytes(x, false)', 'NULL'),
+            ('ora_intervalym', 182, 'sys.ora_interval_bytes(x, true)', 'NULL'),
+        )
+        for extra, args in (
+            ('', '10, 0, NULL'),
+            (', fmt integer', 'fmt, 0, NULL'),
+            (', fmt integer, start integer', 'fmt, start, NULL'),
+            (', fmt integer, start integer, len integer', 'fmt, start, len'),
+        )
+    )
     + ''.join(
         f'CREATE OR REPLACE FUNCTION sys.{name}({value}, text) RETURNS numeric '
         'LANGUAGE sql IMMUTABLE STRICT AS '
