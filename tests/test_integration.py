@@ -5805,6 +5805,22 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute('SELECT 1 FROM dual')
         self.assertEqual(self.cur.fetchone(), (1,))
 
+    def test_a_date_bind_is_a_date(self):
+        # seerdb binds a datetime without a fraction as a DATE, as Oracle's
+        # clients do, and Oracle types the bind and every expression over it
+        # so: the difference of two is a NUMBER of days. Over PostgreSQL it was
+        # a timestamp, and the difference an INTERVAL DAY TO SECOND (#2593).
+        a = datetime.datetime(2020, 1, 15, 10, 20, 30)
+        b = datetime.datetime(2020, 1, 10, 4, 20, 30)
+        self.cur.execute('SELECT :1 - :2, :1, NVL(:1, SYSDATE) - :2 FROM dual', [a, b])
+        self.assertEqual(self.cur.fetchone(), (Decimal('5.25'), a, Decimal('5.25')))
+        self.assertEqual(
+            [d[1] for d in self.cur.description],
+            [seerdb.DB_TYPE_NUMBER, seerdb.DB_TYPE_DATE, seerdb.DB_TYPE_NUMBER],
+        )
+        self.cur.execute('SELECT DUMP(:1) FROM dual', [a])
+        self.assertEqual(self.cur.fetchone(), ('Typ=12 Len=7: 120,120,1,15,11,21,31',))
+
     @_requires(_BINARY_FLOAT_SERVER)
     def test_declared_binary_float_and_double_binds_keep_their_type(self):
         # Oracle types a bind by the type the client declared, not by its

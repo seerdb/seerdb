@@ -278,6 +278,21 @@ def test_an_ltz_bind_is_declared_upstream_as_one():
     assert cursor.declared is None
 
 
+def test_a_date_bind_is_declared_upstream_as_one():
+    # A DATE bind arrives marked as one (#2593) and is declared a DATE; a bare
+    # datetime is left to bind by its value.
+    import datetime
+
+    from seerdb.server.backend import DateValue
+
+    value = datetime.datetime(2020, 1, 15, 10, 20, 30)
+    backend = OraclePassthroughBackend(host='h', port=1, service='s', credentials={})
+    cursor = _FakeCursor()
+    backend._conn = type('Conn', (), {'cursor': lambda self: cursor})()
+    backend.execute('SELECT :1 - :2 FROM dual', [DateValue.of(value), value])
+    assert cursor.declared == (seerdb.DB_TYPE_DATE, None)
+
+
 def test_a_binary_float_or_double_bind_is_declared_upstream_as_one():
     # A BINARY_FLOAT / BINARY_DOUBLE bind arrives marked as one (#2562); bound
     # on as a bare float it would be a NUMBER, and so would `:1 / 3`, so the
