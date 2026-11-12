@@ -365,6 +365,27 @@ def _checked_value(dbtype: object, value: object) -> object:
     return value
 
 
+# The types whose size is the most bytes a value may take, so a longer value
+# grows the variable to fit it (#2564).
+_SIZED_TYPES = frozenset(
+    {TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_RAW, TNS_TYPE_LONG, TNS_TYPE_LONGRAW}
+)
+
+
+def _value_size(dbtype: _DbType, value: object) -> int:
+    """The bytes `value` takes as a bind of `dbtype`, or 0 for a value whose
+    width the type fixes. A variable's size is its bind's announced maximum
+    length, and the server refuses a longer value with ORA-01461, so setting a
+    longer one grows the variable, as python-oracledb's does (#2564)."""
+    if dbtype.tns_type not in _SIZED_TYPES:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode('utf-16-be' if dbtype.csfrm == 2 else 'utf-8'))
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    return 0
+
+
 class Var:
     """A bind container that can receive an OUT / IN OUT value.
 
@@ -435,10 +456,14 @@ class Var:
         # A value the variable's type can't bind is refused here, as
         # python-oracledb refuses it, rather than reaching the server as the
         # wrong type's bytes (#2477). An array variable checks each element.
+        # A value longer than the variable's size grows it (#2564).
         if self.is_array and isinstance(value, (list, tuple)):
             value = [_checked_value(self.dbtype, Item) for Item in value]
+            for Item in value:
+                self.size = max(self.size, _value_size(self.dbtype, Item))
         else:
             value = _checked_value(self.dbtype, value)
+            self.size = max(self.size, _value_size(self.dbtype, value))
         self._value = value
         self.has_value = True
 

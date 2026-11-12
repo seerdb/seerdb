@@ -1083,6 +1083,43 @@ class TestVar(unittest.TestCase):
         self.assertEqual(Var(str).size, 32767)
         self.assertEqual(Var(str, 100).size, 100)
 
+    def test_a_longer_value_grows_the_var_to_its_bytes(self):
+        # The size is the bind's announced maximum length, which the server
+        # holds the value to (ORA-01461, #2564). It never shrinks.
+        from seerdb.common.datatypes import (
+            DB_TYPE_LONG,
+            DB_TYPE_NVARCHAR,
+            DB_TYPE_RAW,
+            Var,
+        )
+
+        cases = [
+            (Var(str, 10), 'é' * 10, 20),  # UTF-8 bytes, not characters
+            (Var(str, 10), 'abc', 10),
+            (Var(DB_TYPE_NVARCHAR, 4), 'abc', 6),  # UTF-16
+            (Var(DB_TYPE_RAW, 2), b'\x00' * 9, 9),
+            (Var(DB_TYPE_LONG), 'x' * 40000, 40000),
+            (Var(int), 10**30, 22),
+        ]
+        for var, value, size in cases:
+            with self.subTest(var=var):
+                var.setvalue(0, value)
+                self.assertEqual(var.size, size)
+        array = Var(str, 2, is_array=True, num_elements=3)
+        array.setvalue(0, ['a', 'bbbbb', 'cc'])
+        self.assertEqual(array.size, 5)
+
+    def test_an_array_dmls_oac_is_sized_from_its_largest_declared_row(self):
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _oac_rep_row
+
+        rows = []
+        for text in ('a', 'b' * 150, 'c' * 20):
+            var = Var(str, 10)
+            var.setvalue(0, text)
+            rows.append([1, var])
+        self.assertEqual(_oac_rep_row(rows)[1].size, 150)
+
     def test_var_setget(self):
         from seerdb.common.datatypes import Var
 

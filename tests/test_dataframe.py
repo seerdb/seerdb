@@ -149,9 +149,8 @@ class TestArrowBatches(unittest.TestCase):
                 seerdb.DB_TYPE_TIMESTAMP,
             ),
             (pa.date32(), datetime.date(2026, 1, 2), seerdb.DB_TYPE_DATE),
-            # Declared LONG / LONG RAW, one over 32 KB is refused by 12c+ (#2564).
-            (pa.large_string(), 'a', None),
-            (pa.large_binary(), b'\x01', None),
+            (pa.large_string(), 'a', seerdb.DB_TYPE_LONG),
+            (pa.large_binary(), b'\x01', seerdb.DB_TYPE_LONG_RAW),
         ]
         for arrow_type, value, bound in cases:
             with self.subTest(arrow_type=str(arrow_type)):
@@ -258,7 +257,7 @@ class TestArrowBatches(unittest.TestCase):
     def test_a_pre_12_session_leaves_strings_and_binaries_to_their_values(self):
         # Below 12.1 a declared string or binary goes with the type's 32 KB
         # buffer, which 9i takes for a LONG, and a LONG must be declared to bind
-        # past 4000 bytes; from 12.1 it is the other way round (#2564).
+        # past 4000 bytes. From 12.1 every column is declared.
         import seerdb
         from seerdb.client.dataframe import arrow_batches
         from seerdb.common.tns_consts import FIELD_VERSION_11_2, FIELD_VERSION_12_1
@@ -276,4 +275,12 @@ class TestArrowBatches(unittest.TestCase):
             old, [None, None, seerdb.DB_TYPE_LONG, seerdb.DB_TYPE_LONG_RAW]
         )
         ((new, _),) = arrow_batches(table, FIELD_VERSION_12_1)
-        self.assertEqual(new, [seerdb.DB_TYPE_VARCHAR, seerdb.DB_TYPE_RAW, None, None])
+        self.assertEqual(
+            new,
+            [
+                seerdb.DB_TYPE_VARCHAR,
+                seerdb.DB_TYPE_RAW,
+                seerdb.DB_TYPE_LONG,
+                seerdb.DB_TYPE_LONG_RAW,
+            ],
+        )

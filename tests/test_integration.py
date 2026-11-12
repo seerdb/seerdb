@@ -5000,6 +5000,66 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} WHERE id = :1', [1])
         self.assertEqual(self.cur._inputsizes, ((), {}))
 
+    # ----- a declared bind grows to a longer value (#2564) -----
+    # Its size is the bind's announced maximum length, which the server holds a
+    # value to (ORA-01461). python-oracledb grows the variable to fit.
+
+    def _stored(self, column: str, value: object) -> object:
+        self.cur.execute(f'SELECT {column} FROM {self.TABLE}')
+        got = self.cur.fetchone()[0]
+        return got.read() if hasattr(got, 'read') else got
+
+    def test_a_sized_string_variable_takes_a_longer_value(self):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, s VARCHAR2(200))')
+        text = 'y' * 50
+        var = self.cur.var(str, 10)
+        var.setvalue(0, text)
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, :1)', [var])
+        self.assertEqual(self._stored('s', text), text)
+
+    def test_a_declared_string_size_takes_a_longer_value(self):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, s VARCHAR2(200))')
+        text = 'y' * 50
+        self.cur.setinputsizes(None, 10)
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [1, text])
+        self.assertEqual(self._stored('s', text), text)
+
+    @_requires(
+        _Need(
+            'a 9i server drops the connection on a CLOB bind past 4000 bytes',
+            min_fv=FIELD_VERSION_10_2,
+        )
+    )
+    def test_a_declared_varchar_takes_a_clob_past_32k(self):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB)')
+        text = 'z' * 40000
+        self.cur.setinputsizes(None, seerdb.DB_TYPE_VARCHAR)
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [1, text])
+        self.assertEqual(self._stored('c', text), text)
+
+    def test_a_declared_long_takes_a_value_past_32k(self):
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, l LONG)')
+        text = 'x' * 40000
+        self.cur.setinputsizes(None, seerdb.DB_TYPE_LONG)
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [1, text])
+        self.assertEqual(self._stored('l', text), text)
+        self.cur.execute(f'DELETE FROM {self.TABLE}')
+        var = self.cur.var(seerdb.DB_TYPE_LONG)
+        var.setvalue(0, text)
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', [2, var])
+        self.assertEqual(self._stored('l', text), text)
+
+    @_requires(_ARRAY_DML)
+    def test_an_array_dml_declared_bind_fits_its_longest_row(self):
+        # Each row's declared bind is a variable of its own, and the one OAC an
+        # array DML sends is sized from the largest.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, s VARCHAR2(200))')
+        rows = [(1, 'a'), (2, 'b' * 150), (3, 'c' * 20)]
+        self.cur.setinputsizes(None, 10)
+        self.cur.executemany(f'INSERT INTO {self.TABLE} VALUES (:1, :2)', rows)
+        self.cur.execute(f'SELECT id, s FROM {self.TABLE} ORDER BY id')
+        self.assertEqual(self.cur.fetchall(), rows)
+
     # ----- a wide bind's value comes after the row's others (#705) -----
 
     def test_a_wide_bind_before_a_plain_one_lands_in_its_own_column(self):
