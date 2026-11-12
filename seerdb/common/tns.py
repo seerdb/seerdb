@@ -20797,6 +20797,11 @@ def encode_token_oac(Token: object) -> bytes:
     raise Exception('Unknown OAC token', Token)
 
 
+# The base-100 exponents a NUMBER holds: 1e-130 <= |value| < 1e126.
+_NUMBER_MIN_EXPONENT = -65
+_NUMBER_MAX_EXPONENT = 62
+
+
 def encode_token_decimal(Value: Decimal) -> bytes:
     # Exact base-100 Oracle NUMBER encoding for a Decimal — no float detour, so a
     # value with more than ~15 significant digits round-trips unchanged (up to
@@ -20852,6 +20857,12 @@ def encode_token_decimal(Value: Decimal) -> bytes:
     # Trailing all-zero groups carry no value.
     while len(Pairs) > 1 and Pairs[-1] == 0:
         Pairs.pop()
+    # NUMBER holds 1e-130 <= |value| < 1e126: a base-100 exponent of -65 to
+    # 62. Past either end the exponent byte overflowed, or wrapped into the
+    # form of a negative number and bound a different value (#2575).
+    # python-oracledb refuses it (DPY-4003), and rounds nothing to zero.
+    if not _NUMBER_MIN_EXPONENT <= Exponent <= _NUMBER_MAX_EXPONENT:
+        raise DataError(f'value cannot be represented as an Oracle number: {Value}')
 
     if Sign == 0:
         return bytes([Exponent + 193] + [P + 1 for P in Pairs])
@@ -21675,7 +21686,11 @@ def encode_token_num(Token: int | float) -> bytes:
             return bytes(lnxfmt(lnxmin(abs(Token), 1, []), Token))
         return encode_token_decimal(Decimal(Token))
     elif isinstance(Token, float):
-        return bytes(lnxfmt(lnxren(abs(Token), 0), Token))
+        # The float's shortest round-trip digits, as python-oracledb sends
+        # str(value): the NUMBER reads back as the same float. Building the
+        # digits by repeated * 100.0 kept 15 or 16 of the 17 a float may need
+        # (#2576).
+        return encode_token_decimal(Decimal(repr(Token)))
     else:
         raise Exception('Unhandled number token', Token)
 
@@ -21814,35 +21829,6 @@ def lnxpak(List: list[int]) -> list[int]:
     while List[i] == 0:
         i += 1
     return List[: None if i == 0 else i - 1 : -1]
-
-
-def lnxpak2(List: list[int], I: int) -> list[int]:
-    if List == [100] and I == 8:
-        return [100 - 1]
-    elif len(List) > 1 and List[0] == 100 and I < 8:
-        return lnxpak2([List[1] + 1] + List[2:], I + 1)
-    else:
-        return List
-
-
-def lnxren(N: float, I: int) -> list[int]:
-    if N < 1.0:
-        return lnxren(N * 100.0, I - 1)
-    elif N < 10.0:  # 1.0 <= N < 10.0 (the cascade guarantees ≥1.0)
-        return lnxpak(([I] + lnxren4(N, 0, 1, []))[::-1])
-    elif N < 100.0:  # 10.0 <= N < 100.0
-        return lnxpak(([I] + lnxren4(N, 0, 0, []))[::-1])
-    else:  # N >= 100.0
-        return lnxren(N * 0.01, I + 1)
-
-
-def lnxren4(N: float, I: int, J: int, Acc: list[int]) -> list[int]:
-    if J == 0 and I == 8 and len(Acc) > 1:
-        return lnxpak2([(Acc[0] + 5) // 10 * 10] + Acc[1:], 1)[::-1]
-    elif J == 1 and I == 8 and len(Acc) > 1:
-        return lnxpak2([Acc[0] + (Acc[0] // 50)] + Acc[1:], 1)[::-1]
-    else:
-        return lnxren4((N - int(N)) * 100.0, I + 1, J, [int(N)] + Acc)
 
 
 def lnxfmt(List: list[int], Data: int | float) -> list[int]:

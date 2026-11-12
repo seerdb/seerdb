@@ -5748,6 +5748,41 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(rows[0], (math.inf,))
         self.assertTrue(math.isnan(rows[1][0]))
 
+    def test_a_float_number_bind_keeps_every_digit(self):
+        # A float binds as NUMBER with its shortest round-trip digits, as
+        # python-oracledb sends it, so the server holds the float the client
+        # does: 1/3 kept 15 of its 16 digits and 2**53 + 2 read back as
+        # 9007199254740990 (#2576).
+        for value in (
+            1 / 3,
+            -2 / 3,
+            0.1 + 0.2,
+            float(2**53 + 2),
+            1e15 + 0.25,
+            9.9e125,
+            1.2345678901234566e125,
+            1.5e-130,
+        ):
+            with self.subTest(value=value):
+                self.cur.execute('SELECT :1, TO_CHAR(:1) FROM dual', [value])
+                (got, text) = self.cur.fetchone()
+                self.assertEqual(float(got), value)
+                self.assertEqual(float(text), value)
+
+    def test_a_number_bind_out_of_range_is_refused(self):
+        # Past 1e126 the encoder raised a bare ValueError, and below 1e-130 it
+        # bound a different, negative value: 1e-131 arrived as -9e-129
+        # (#2575). Like python-oracledb, the driver refuses it before sending
+        # anything, and the connection goes on.
+        for value in (1e126, -1e126, 1e-131, 5e-324, Decimal('-1E-131'), 10**126):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    seerdb.DataError, 'cannot be represented as an Oracle number'
+                ):
+                    self.cur.execute('SELECT :1 FROM dual', [value])
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.cur.fetchone(), (1,))
+
     @_requires(_BINARY_FLOAT_SERVER)
     def test_declared_binary_float_and_double_binds_keep_their_type(self):
         # Oracle types a bind by the type the client declared, not by its
