@@ -6458,32 +6458,40 @@ fields — `TTI_DTY` token, charset + national charset (both ISO Latin-1 = 31), 
 to UTC (the `80000000` pad + the `+60`-biased `(60,60,60)` triplet) — followed by the
 conversion-entry list. The 8i **query** path is §19.9–19.10.
 
-#### 19.8.1 The session's OS user on 8i and 9i (SeerODBC #123)
+#### 19.8.1 The session's OS user on 8i and 9i (SeerODBC #123, #2642)
 
-`v$session.osuser` and `USERENV('OS_USER')` come from different places on 8.1.7
-and 9.2.0.4 depending on the login form. Measured on both beds, 2026-11-13, with
-seerdb `connect(osuser='probe_os')` and with ojdbc14 run as `-Duser.name=probe_os`:
+On 8.1.7 and 9.2.0.4, `v$session.osuser` and `USERENV('OS_USER')` come **first
+from the CONNECT descriptor's `(CID=...(USER=...))`**. Only when that is empty do
+they come from the login. Measured on both beds, 2026-11-13, by rewriting nothing
+but the CID `USER` of a seerdb connect with `AUTH_SID=probe_os`, and with ojdbc14
+run as `-Duser.name=probe_os`:
 
-| client and login form | 8.1.7 | 9.2.0.4 | 10.2.0.5 |
+| CID `USER`, login form | 8.1.7 | 9.2.0.4 | 10.2.0.5 |
 |---|---|---|---|
-| seerdb: the OSESSKEY / OAUTH envelope, `AUTH_SID=probe_os` in both phases | `system`, the database user | `pyo`, the database user | `probe_os` |
-| ojdbc14: positional `TTI_3LOGA` / `TTI_3LOGON` | `probe_os` | `probe_os` | — |
+| `cid_os`, the OSESSKEY / OAUTH envelope | `cid_os` | `cid_os` | `probe_os` |
+| empty, the envelope | NULL | `probe_os` | — |
+| empty, positional `TTI_3LOGA` / `TTI_3LOGON` (ojdbc14) | `probe_os` | `probe_os` | — |
 
-**In the key-value envelope, 8.1.7 and 9.2.0.4 ignore `AUTH_SID`.** The session's
-OS user is then the database user. The same calls' `AUTH_MACHINE` and
-`AUTH_PROGRAM_NM` are taken (`v$session.machine`, `program`). From 10g the pair is
-honoured. Other keys for the OS user in this envelope were not tried.
+- **A non-empty CID `USER` wins on 8i and 9i.** Before #2642 seerdb wrote the
+  database user there, so `osuser=` read back as that user on both servers.
+  python-oracledb writes the OS user, and seerdb now does too.
+- **With the CID's `USER` empty, 9.2.0.4 takes `AUTH_SID` from the envelope;
+  8.1.7 doesn't.** 8.1.7 then takes the OS user only from the positional login.
+- **From 10g, `AUTH_SID` wins over the CID.**
+- **8.1.7 reports the program and machine of the envelope's phase one**, the
+  OSESSKEY call's `AUTH_PROGRAM_NM` and `AUTH_MACHINE`. Before #2642 seerdb sent
+  its own name and the host name there, whatever `program=` and `machine=` said.
 
-**The positional form carries it.** ojdbc14 logs in to both servers with
-`TTI_3LOGA` (`0x52`), then `TTI_3LOGON` (`0x51`), in thin's variable-width
+ojdbc14 sends `(CID=(PROGRAM=)(HOST=__jdbc__)(USER=))` and logs in to both servers
+with `TTI_3LOGA` (`0x52`), then `TTI_3LOGON` (`0x51`), in thin's variable-width
 integers. Each call is a run of pointer-and-length fields and then the strings
 back to back:
 - `TTI_3LOGA` carries the user, then four session strings: the terminal, the
   machine, the OS user and the program.
 - `TTI_3LOGON` carries the same, with the encrypted password after the user.
 
-The OS user is the fourth session string, and both servers report it. The
-captured `TTI_3LOGA` to 9.2.0.4 (user `pyo`):
+The OS user is the fourth session string. The captured pair to 9.2.0.4 (user
+`pyo`); both calls have sequence number 0:
 
 ```
 03 52 00 01 01 03 00 00 00 00 00 00 01 01 07 01 01 07 01 01 08 02 10 00 00 00
@@ -6493,14 +6501,19 @@ captured `TTI_3LOGA` to 9.2.0.4 (user `pyo`):
 66 69 72 65 66 6c 79                       firefly            (machine, 7)
 70 72 6f 62 65 5f 6f 73                    probe_os           (OS user, 8)
 4a 44 42 43 20 54 68 69 6e 20 43 6c 69 65 6e 74   JDBC Thin Client (program, 16)
+
+03 51 00 01 01 03 01 01 11 00 00 00 00 01 01 07 01 01 07 01 01 08 02 10 00 00
+00 01 01 10 00 00 00 00 00 01 10 00
+70 79 6f                                   pyo
+38 32 36 36 46 35 35 46 38 34 34 34 34 31 38 35 32
+                                           the password, 16 hex digits and the pad count (17)
+75 6e 6b 6e 6f 77 6e ...                   then the four session strings as above
 ```
 
 8.1.7 is sent the same calls through its listener's redirect, `system` in place
 of `pyo`, and answers them as 9.2.0.4 does: the session key, then a clean status.
-The block around the program's length, `02 10 00 00 00 01 01 10`, is still not
-understood (§4.4 above). seerdb left this form for the envelope in #2342. So
-setting the OS user on 8i and 9i takes the positional login. No pair in the
-envelope is known to do it.
+The block around the program's length, `02 10 00 00 00 01 01 10`, and its
+phase-two form ending `00 01 10 00`, are still not understood (§4.4 above).
 
 ### 19.9 Oracle 8i SELECT — the 9.2-era OALL8 request (#244)
 

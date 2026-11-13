@@ -2228,8 +2228,10 @@ class OracleConnect(_ConnectionLogic):
         import os
 
         return [
-            (b'AUTH_PROGRAM_NM', self.app_name.encode('utf-8')),
-            (b'AUTH_MACHINE', socket.gethostname().encode('utf-8')),
+            # The caller's program and machine, as a 9i and later login sends
+            # them; 8.1.7 reports these, not phase two's (#2642).
+            (b'AUTH_PROGRAM_NM', (self.program or self.app_name or 'seerdb').encode()),
+            (b'AUTH_MACHINE', (self.machine or socket.gethostname()).encode()),
             (b'AUTH_PID', str(os.getpid()).encode('utf-8')),
         ]
 
