@@ -6117,6 +6117,67 @@ token: a decoder that stopped at the `0x04` took the counter for the status and
 turned every successful DDL and DML on an aged 9i into a garbled negative ORA
 code (#711). Captured with the counter at `0x0129c868`.
 
+#### 19.3.1 A value over 4000 bytes (2000 of RAW)
+
+On this dialect a bind is inline in the call, so a text value is held to 4000
+bytes and a RAW to 2000 as in SQL, **unless the statement is a PL/SQL block or
+the column is a LONG**. Into a CLOB or BLOB column, a plain INSERT has no form
+for a larger value at all. The client must go another way. Measured on 9.2.0.4
+with ojdbc14, 9.2's own thin driver, and with seerdb (#2260, SeerODBC #122):
+
+| route | ojdbc14 | result |
+|---|---|---|
+| `INSERT INTO t (clob_col, id) VALUES (?, ?)`, `setString` / `setBytes` past 4000 / 2000 | refused by the driver: "Data size bigger than max size for this type" | nothing is sent |
+| the same, `setCharacterStream` / `setBinaryStream` | sent | **the server closes the connection** |
+| `INSERT INTO t (long_col, id) VALUES (?, ?)`, a stream of 5000 | sent inline, below | stored |
+| `BEGIN INSERT INTO t (clob_col, id) VALUES (?, 7); END;`, `setString` or a stream of 5000 | sent, below | stored |
+| the same block, 40 000 | refused by the driver | nothing is sent |
+| `EMPTY_CLOB()` / `EMPTY_BLOB()`, then a write through the locator (TTI_LOBOPS, §19.5) | — | stored, any size (#2259) |
+
+The forms SeerODBC tried into a CLOB column all failed in the ways the table
+predicts:
+- **A VARCHAR descriptor of 4000:** a 4001-byte value raises `ORA-00600
+  [koklgloblen: arrlen]` and writes a server trace. Don't loop this case. A
+  5000-byte one raises ORA-01483.
+- **A descriptor at the value's size, or a LONG one:** the connection is dropped.
+- **A block whose descriptor declares 4000:** ORA-01460.
+
+**Into a LONG column** the bind is LONG-class (§5.4 *LONG-class binds come
+last*). Its descriptor is type `08` with the maximum `7fffffff`:
+
+```
+08 01 00 00 04 7f ff ff ff 00 00 00 00 01 1f 01   :1  LONG, max 0x7fffffff, charset 31
+06 01 00 00 01 16 00 00 00 00 01 1f 01            :2  VARNUM (setInt), max 22
+07                                                 TTI_RXD, in the same call
+02 c1 08                                           :2 = 7, the short value first
+fe 40 <64 bytes> 40 <64 bytes> … 08 <8 bytes> 00   :1, last: 0xFE, 64-byte chunks, 0
+```
+
+The call is one TTI_ALL7 split across DATA packets at the SDU. Every packet but
+the last carries data flags `0x0020` (§1.3).
+
+**In a PL/SQL block** the parse call carries only the descriptors (§19.6), and
+the values come after it, in one RXD of their own. ojdbc14 declares a text bind
+at **32767**, PL/SQL's own limit, whatever the value's size:
+
+```
+C→S  03 47 … 'BEGIN INSERT INTO seer122 (c, id) VALUES (:1, 7); END;'
+     … 01 01 00 00 02 7f ff 00 00 00 00 01 1f 01       :1  VARCHAR, max 32767
+S→C  0b 05 01 01 00 01 01 00 20                        the server asks for the values
+C→S  07 fe 40 <64 bytes> … 08 <8 bytes> 00             TTI_RXD: 5000 bytes, 78 × 64 + 8
+     (three DATA packets, 2048, 2048 and 1016 bytes; 0x0020, 0x0020, 0x0000)
+```
+
+**The declared maximum is what matters.** seerdb's block path sends the same
+call with the value's descriptor at 4000 and gets ORA-01460. Declared at 32767
+(a `cursor.var(str, 32767)`), the same value is stored. Neither of the other
+differences matters:
+- **The charset field:** seerdb sends AL32UTF8 (873) where ojdbc14 sends 31.
+- **The chunk size:** the value stored in 252-byte chunks as well as in 64-byte
+  ones.
+
+The reference client sends 64-byte chunks.
+
 ### 19.4 Errors, ROWID, and unsupported types (#102)
 
 A parse/execute that fails returns the **short OER** as the response (in place
