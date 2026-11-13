@@ -6017,6 +6017,55 @@ class BindIntegration(_IntegrationBase):
         finally:
             conn.close()
 
+    @_requires(_INTERVAL)
+    def test_timestamp_arithmetic_before_1582_is_julian(self):
+        # TIMESTAMP - TIMESTAMP and TIMESTAMP +/- INTERVAL count Oracle's Julian
+        # days before 1582-10-15, as DATE arithmetic does. Over PostgreSQL each
+        # was off by up to ten days (#2600).
+        f = "'YYYY-MM-DD HH24:MI:SS'"
+        for expr, value in (
+            (
+                "EXTRACT(DAY FROM (TIMESTAMP '1582-10-15 00:00:00' "
+                "- TIMESTAMP '1582-10-04 00:00:00'))",
+                1,
+            ),
+            (
+                "EXTRACT(DAY FROM (TIMESTAMP '1500-03-01 00:00:00' "
+                "- TIMESTAMP '1500-02-28 00:00:00'))",
+                2,
+            ),
+            (
+                "EXTRACT(DAY FROM (TIMESTAMP '2020-01-15 00:00:00' "
+                "- TIMESTAMP '1020-07-04 00:00:00'))",
+                365066,
+            ),
+            (
+                f"TO_CHAR(TIMESTAMP '1582-10-04 12:00:00' + INTERVAL '12' HOUR, {f})",
+                '1582-10-15 00:00:00',
+            ),
+            (
+                "TO_CHAR(TIMESTAMP '1582-10-15 01:00:00' "
+                f"- INTERVAL '1 02:00:00' DAY TO SECOND, {f})",
+                '1582-10-03 23:00:00',
+            ),
+            (
+                f"TO_CHAR(INTERVAL '1' DAY + TIMESTAMP '1582-10-04 08:00:00', {f})",
+                '1582-10-15 08:00:00',
+            ),
+            (
+                "TO_CHAR(TIMESTAMP '1000-01-01 00:00:00' + INTERVAL '365000' DAY(6), "
+                "'YYYY-MM-DD')",
+                '1999-05-09',
+            ),
+            (
+                "TO_CHAR(DATE '1582-10-15' - INTERVAL '1' DAY, 'YYYY-MM-DD')",
+                '1582-10-04',
+            ),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (value,))
+
     def test_a_date_bind_is_a_date(self):
         # seerdb binds a datetime without a fraction as a DATE, as Oracle's
         # clients do, and Oracle types the bind and every expression over it

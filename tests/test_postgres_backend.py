@@ -2255,6 +2255,80 @@ def test_fm_spans_print_as_oracles() -> None:
         backend.close()
 
 
+def test_timestamp_arithmetic_before_1582_is_julian() -> None:
+    # TIMESTAMP - TIMESTAMP and TIMESTAMP +/- INTERVAL by Oracle's days before
+    # 1582-10-15 (#2600), against 23ai's answers: across the gap, a Julian
+    # leap year, a span from one calendar to the other, the 367 days 23ai
+    # counts across the year 0, a fraction of a second.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for expr, expected in (
+            (
+                "TIMESTAMP '1582-10-15 06:00:00' - TIMESTAMP '1582-10-04 18:00:00.5'",
+                datetime.timedelta(seconds=43199, microseconds=500000),
+            ),
+            (
+                "TIMESTAMP '1500-03-01 00:00:00' - TIMESTAMP '1500-02-28 00:00:00'",
+                datetime.timedelta(days=2),
+            ),
+            (
+                "TIMESTAMP '1000-01-01 00:00:00' - TIMESTAMP '2000-01-01 00:00:00'",
+                datetime.timedelta(days=-365237),
+            ),
+            (
+                "TO_TIMESTAMP('0001-01-01', 'SYYYY-MM-DD') "
+                "- TO_TIMESTAMP('-0001-12-31', 'SYYYY-MM-DD')",
+                datetime.timedelta(days=367),
+            ),
+            (
+                "DATE '1582-10-15' - TIMESTAMP '1582-10-04 00:00:00'",
+                datetime.timedelta(days=1),
+            ),
+        ):
+            (row,) = backend.execute(f'SELECT {expr} FROM dual').rows
+            assert row[0] == expected, expr
+        f = "'YYYY-MM-DD HH24:MI:SS'"
+        for expr, label in (
+            (
+                "TIMESTAMP '1582-10-04 23:59:59' + INTERVAL '1' SECOND",
+                '1582-10-15 00:00:00',
+            ),
+            (
+                "TIMESTAMP '1582-10-15 01:00:00' - INTERVAL '2' HOUR",
+                '1582-10-04 23:00:00',
+            ),
+            (
+                "TIMESTAMP '1500-02-28 00:00:00' + INTERVAL '2' DAY",
+                '1500-03-01 00:00:00',
+            ),
+            (
+                "TIMESTAMP '1582-09-15 00:00:00' + INTERVAL '1' MONTH",
+                '1582-10-15 00:00:00',
+            ),
+            (
+                "INTERVAL '1' DAY + TIMESTAMP '1582-10-04 08:00:00'",
+                '1582-10-15 08:00:00',
+            ),
+            ("DATE '1582-10-04' + INTERVAL '1' DAY", '1582-10-15 00:00:00'),
+            (
+                "TIMESTAMP '2020-01-15 10:00:00' + INTERVAL '1' DAY",
+                '2020-01-16 10:00:00',
+            ),
+        ):
+            (row,) = backend.execute(f'SELECT TO_CHAR({expr}, {f}) FROM dual').rows
+            assert row[0] == label, expr
+        # 1500-02-29 is Oracle's, and no PostgreSQL timestamp: refused, saying so.
+        with pytest.raises(BackendError, match='Julian leap day'):
+            backend.execute(
+                "SELECT TIMESTAMP '1500-01-29 00:00:00' + INTERVAL '1' MONTH FROM dual"
+            )
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_day_counting_formats_before_1582_are_oracles() -> None:
     # Before 1582-10-15 TO_CHAR's day-counting elements, TO_DATE's J, TRUNC
     # and ROUND to a week and NEXT_DAY count Oracle's Julian days (#2600),

@@ -586,6 +586,7 @@ def _oracle_number_rounding(name: str) -> str:
 # 367 days from -0001-12-31 to 0001-01-01, across the year 0 no label names.
 # (23ai's -4712, alone, counts no February 29.)
 _JULIAN_START = "'1582-10-15'::timestamp"
+_DAY_MICROSECONDS = '86400000000'
 # Past the switch, 1582's days of the year and its weeks still count from a
 # Julian January, and its last ISO week ends by 1583-01-07.
 _JULIAN_YEAR_END = "'1583-01-08'::timestamp"
@@ -908,6 +909,116 @@ _DATE_ARITHMETIC_DDL = (
         'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
         for number in _DAY_NUMBER_TYPES
     )
+    # TIMESTAMP - TIMESTAMP and TIMESTAMP +/- INTERVAL by Oracle's days before
+    # 1582-10-15 (#2600): 1582-10-04 12:00 + 12 hours is 1582-10-15 00:00.
+    # They shadow PostgreSQL's own operators, of the same types, and are SQL,
+    # not STRICT, so they inline: a TIMESTAMP on either side of 1582-10-15
+    # from then on goes to PostgreSQL's as before. The Julian path counts
+    # microseconds from the day number. An interval's months go on the label,
+    # as PostgreSQL's do, refused where that is a Julian February 29.
+    + 'CREATE OR REPLACE FUNCTION sys.ora_julian_ts_minus(a timestamp, b timestamp) '
+    'RETURNS interval LANGUAGE plpgsql IMMUTABLE STRICT AS $$ BEGIN RETURN '
+    'pg_catalog.justify_hours('
+    + _pg_op(
+        'pg_catalog.make_interval(days => '
+        + _pg_op('sys.ora_day_number(a)', '-', 'sys.ora_day_number(b)')
+        + ')',
+        '+',
+        _pg_op('a::time', '-', 'b::time'),
+    )
+    + '); END $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_ts_minus(timestamp, timestamp) '
+    'RETURNS interval LANGUAGE sql IMMUTABLE AS $$ SELECT CASE '
+    f'WHEN $1 >= {_JULIAN_START} AND $2 >= {_JULIAN_START} THEN '
+    + _pg_op('$1', '-', '$2')
+    + ' ELSE sys.ora_julian_ts_minus($1, $2) END $$;'
+    + 'CREATE OR REPLACE FUNCTION sys.ora_julian_ts_plus(t timestamp, i interval) '
+    'RETURNS timestamp LANGUAGE plpgsql IMMUTABLE STRICT AS $$ '
+    'DECLARE m integer; r timestamp; us bigint; d bigint; BEGIN '
+    'm := '
+    + _pg_op(
+        _pg_op('extract(year FROM i)::integer', '*', '12'),
+        '+',
+        'extract(month FROM i)::integer',
+    )
+    + '; '
+    'r := t; '
+    'IF m <> 0 THEN '
+    'r := ' + _pg_op('t', '+', 'pg_catalog.make_interval(months => m)') + '; '
+    # PostgreSQL ends a month short of the day on its last; a Julian
+    # February 29, which it cannot hold, is refused as a label of one is.
+    'IF extract(day FROM t) = 29 AND extract(day FROM r) = 28 AND extract(month FROM r) = 2 '
+    'AND extract(year FROM r) BETWEEN 1 AND 1582 '
+    'AND ' + _pg_op('extract(year FROM r)::integer', '%', '4') + ' = 0 THEN '
+    "RAISE EXCEPTION USING ERRCODE = '22008', MESSAGE = 'date not valid for month "
+    "specified: a Julian leap day, which the Mirror cannot store'; END IF; END IF; "
+    'us := '
+    + _pg_op(
+        _pg_op(
+            _pg_op('sys.ora_day_number(r)::bigint', '*', _DAY_MICROSECONDS),
+            '+',
+            'pg_catalog.round(extract(epoch FROM r::time) OPERATOR(pg_catalog.*) 1000000)::bigint',
+        ),
+        '+',
+        _pg_op(
+            _pg_op('extract(day FROM i)::bigint', '*', _DAY_MICROSECONDS),
+            '+',
+            _pg_op(
+                _pg_op('extract(hour FROM i)::bigint', '*', '3600000000'),
+                '+',
+                _pg_op(
+                    _pg_op('extract(minute FROM i)::bigint', '*', '60000000'),
+                    '+',
+                    'extract(microseconds FROM i)::bigint',
+                ),
+            ),
+        ),
+    )
+    + '; '
+    'd := pg_catalog.floor('
+    + _pg_op('us::numeric', '/', _DAY_MICROSECONDS)
+    + ')::bigint; '
+    'RETURN '
+    + _pg_op(
+        'sys.ora_day_label(d::integer)',
+        '+',
+        'pg_catalog.make_interval(secs => '
+        + _pg_op(
+            _pg_op('us', '-', _pg_op('d', '*', _DAY_MICROSECONDS)) + '::numeric',
+            '/',
+            '1000000',
+        )
+        + '::double precision)',
+    )
+    + '; END $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_ts_plus(timestamp, interval) '
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT CASE '
+    f'WHEN $1 >= {_JULIAN_START} AND '
+    + _pg_op('$1', '+', '$2')
+    + f' >= {_JULIAN_START} THEN '
+    + _pg_op('$1', '+', '$2')
+    + ' ELSE sys.ora_julian_ts_plus($1, $2) END $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_interval_plus_ts(interval, timestamp) '
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_ts_plus($2, $1) $$;'
+    # A CASE of its own: ora_ts_plus($1, -$2) names a parameter twice with an
+    # expression for it, which PostgreSQL does not inline.
+    'CREATE OR REPLACE FUNCTION sys.ora_ts_less(timestamp, interval) '
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT CASE '
+    f'WHEN $1 >= {_JULIAN_START} AND '
+    + _pg_op('$1', '-', '$2')
+    + f' >= {_JULIAN_START} THEN '
+    + _pg_op('$1', '-', '$2')
+    + ' ELSE sys.ora_julian_ts_plus($1, OPERATOR(pg_catalog.-) $2) END $$;'
+    'DO $$ BEGIN '
+    'CREATE OPERATOR sys.- (LEFTARG = timestamp, RIGHTARG = timestamp, '
+    'FUNCTION = sys.ora_ts_minus); '
+    'CREATE OPERATOR sys.+ (LEFTARG = timestamp, RIGHTARG = interval, '
+    'FUNCTION = sys.ora_ts_plus); '
+    'CREATE OPERATOR sys.+ (LEFTARG = interval, RIGHTARG = timestamp, '
+    'FUNCTION = sys.ora_interval_plus_ts); '
+    'CREATE OPERATOR sys.- (LEFTARG = timestamp, RIGHTARG = interval, '
+    'FUNCTION = sys.ora_ts_less); '
+    'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
 )
 
 # Oracle scalar functions the backend installs as real PostgreSQL functions,

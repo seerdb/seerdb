@@ -265,8 +265,14 @@ would cost far more than anyone gains from it.
   later date. TRUNC or ROUND of a date in AD 1's first week to a week, which
   would land in the year before AD 1, is refused; 23ai returns a day late in
   AD 1. For 1582-12-31, 23ai gives ISO week 53 of 1582, where the Mirror
-  counts week 1 of 1583. TIMESTAMP and INTERVAL arithmetic still counts those
-  days the Gregorian way
+  counts week 1 of 1583. TIMESTAMP − TIMESTAMP and TIMESTAMP or DATE ±
+  INTERVAL count Oracle's days too, at about 2 to 5 µs a row on those dates;
+  a later date costs what it did. An interval's months go on the label, so
+  1500-01-29 plus a month, a Julian February 29, is refused. A result in the
+  year 0 is refused as a DATE's is: 23ai counts 367 days from -0001-12-31 to
+  0001-01-01, yet adds one day to the first to reach the second, and 11g
+  reaches a year 0. TIMESTAMP WITH TIME ZONE and WITH LOCAL TIME ZONE
+  arithmetic still counts those days the Gregorian way
   ([#2600](https://github.com/seerdb/seerdb/issues/2600)).
 - **The digits of NUMBER math functions.** `SQRT`, `EXP`, `LN`, `LOG`,
   `POWER`, the trigonometric and the hyperbolic functions of a NUMBER return a
