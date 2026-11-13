@@ -61,6 +61,7 @@ from seerdb.server import (
     Capability,
     ColumnMeta,
     Credentials,
+    DateValue,
     Result,
     credential_lookup,
 )
@@ -82,6 +83,9 @@ def _adapt_int(value: int) -> int | float:
 def _register_codecs() -> None:
     sqlite3.register_adapter(datetime.date, datetime.date.isoformat)
     sqlite3.register_adapter(datetime.datetime, lambda dt: dt.isoformat(sep=' '))
+    # A DATE bind is a DateValue, a datetime that says so; sqlite3 looks an
+    # adapter up by the exact type, so it needs one of its own.
+    sqlite3.register_adapter(DateValue, lambda dt: dt.isoformat(sep=' '))
     # A DATE bind arrives over the wire as a midnight datetime, so a DATE column
     # may hold 'YYYY-MM-DD HH:MM:SS'; keep only the date part (leading 10 chars).
     sqlite3.register_converter(
