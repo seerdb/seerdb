@@ -12,6 +12,9 @@ TNS_DATA = 6
 TNS_NULL = 7
 TNS_ABORT = 9
 TNS_RESEND = 11
+# A packet header's flag: in a RESEND, the listener has handed the connection
+# to a dedicated server, which runs its own TLS handshake on it (#2645).
+TNS_PACKET_FLAG_TLS_RENEGOTIATE = 0x08
 TNS_MARKER = 12
 # A server reads at most this many bytes of connect data from the CONNECT packet
 # itself; a longer descriptor follows in a DATA packet of its own (#1768).

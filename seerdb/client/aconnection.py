@@ -158,6 +158,7 @@ from seerdb.common.tns_consts import (
     TNS_MARKER,
     TNS_MARKER_TYPE_INTERRUPT,
     TNS_MARKER_TYPE_RESET,
+    TNS_PACKET_FLAG_TLS_RENEGOTIATE,
     TNS_PIPELINE_MODE_CONTINUE_ON_ERROR,
     TNS_REDIRECT,
     TNS_REFUSE,
@@ -422,6 +423,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         # with exactly one reset then drain the rest silently (2:1 ratio).
         self._pending = b''
         self._in_break = False
+        # The header flags of the last packet recv() assembled, and, over TLS,
+        # the TCP transport and stream protocol under it, which a renegotiation
+        # runs its new handshake on (#2645).
+        self._packet_flags = 0
+        self._raw_transport: asyncio.BaseTransport | None = None
+        self._stream_protocol: asyncio.BaseProtocol | None = None
         # Query cancellation / call_timeout (#123), mirrors OracleConnect.
         self._break_in_progress = False
         self._call_timeout = 0
@@ -622,19 +629,60 @@ class AsyncOracleConnect(_ConnectionLogic):
             except BaseException:
                 Sock.close()
                 raise
-        self._reader, self._writer = await asyncio.open_connection(
-            sock=Sock,
-            ssl=SslArg,
-            server_hostname=self.host if SslArg else None,
-        )
+        self._reader, self._writer = await asyncio.open_connection(sock=Sock)
+        self._raw_transport = self._stream_protocol = None
         if SslArg is not None:
-            SslObj = self._writer.get_extra_info('ssl_object')
-            try:
-                self._check_server_dn(SslObj.getpeercert() if SslObj else None)
-            except BaseException:
-                self._writer.close()
-                raise
+            await self._start_tls(SslArg)
         await self._send_connect()
+
+    async def _start_tls(self, SslArg) -> None:
+        # TLS on the open connection, through the loop, keeping the TCP
+        # transport under it. A listener that hands the connection to a
+        # dedicated server asks for TLS again in its RESEND, and the new
+        # handshake runs on that transport (#2645), as python-oracledb's does.
+        # StreamWriter.start_tls, which would do the first, is 3.11+.
+        import ssl as _ssl
+
+        if SslArg is None or self._writer is None:
+            return  # no TLS to renegotiate: a plain listener sets no such flag
+        Loop = asyncio.get_running_loop()
+        Context = _ssl.create_default_context() if SslArg is True else SslArg
+        Writer = self._writer
+        if self._raw_transport is None:
+            self._raw_transport = Writer.transport
+            self._stream_protocol = Writer.transport.get_protocol()
+        assert self._stream_protocol is not None
+        await Writer.drain()
+        Previous = Writer.transport
+        Tls = await Loop.start_tls(
+            cast(asyncio.WriteTransport, self._raw_transport),
+            self._stream_protocol,
+            Context,
+            server_hostname=self.host,
+        )
+        if Tls is None:
+            raise OperationalError('the TLS handshake did not complete')
+        # The writer and the stream protocol go on over the TLS transport, as
+        # StreamWriter.start_tls moves them; the writer is kept, not replaced,
+        # since a dropped writer closes the transport it held.
+        setattr(Writer, '_transport', Tls)
+        if Previous is not self._raw_transport:
+            # The session with the listener is over, but closing it would
+            # close the TCP connection under it: it is only marked closed.
+            setattr(Previous, '_closed', True)
+        Replace = getattr(self._stream_protocol, '_replace_transport', None)
+        if Replace is not None:  # 3.12+
+            Replace(Tls)
+        else:
+            ReplaceWriter = getattr(self._stream_protocol, '_replace_writer', None)
+            if ReplaceWriter is not None:  # 3.11
+                ReplaceWriter(Writer)
+        SslObj = Tls.get_extra_info('ssl_object')
+        try:
+            self._check_server_dn(SslObj.getpeercert() if SslObj else None)
+        except BaseException:
+            Writer.close()
+            raise
 
     async def _open_ws_transport(self) -> None:
         # The seerdb WebSocket byte pipe (#1988), presented as the asyncio
@@ -843,6 +891,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 if Flag is True:
                     # A full packet was assembled, so type/body/rest are set.
                     assert Type is not None and Body is not None and Rest is not None
+                    self._packet_flags = Acc[5]
                     if Type == TNS_MARKER:
                         self._pending = Rest
                         return (TNS_MARKER, b'')
@@ -1160,6 +1209,8 @@ class AsyncOracleConnect(_ConnectionLogic):
                         'connection refused by the listener during login'
                     )
                 case t if t == TNS_RESEND:
+                    if self._packet_flags & TNS_PACKET_FLAG_TLS_RENEGOTIATE:
+                        await self._start_tls(self._ssl_kwarg())
                     self.conn_state = CONN_STATE_AUTH_NEGOTIATE
                     await self._send_connect()
                     continue

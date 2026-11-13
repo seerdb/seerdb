@@ -133,6 +133,7 @@ from seerdb.common.tns_consts import (
     TNS_MARKER,
     TNS_MARKER_TYPE_INTERRUPT,
     TNS_MARKER_TYPE_RESET,
+    TNS_PACKET_FLAG_TLS_RENEGOTIATE,
     TNS_PIPELINE_MODE_CONTINUE_ON_ERROR,
     TNS_REDIRECT,
     TNS_REFUSE,
@@ -1220,6 +1221,8 @@ class OracleConnect(_ConnectionLogic):
         # Bytes received past a marker packet, held for the next recv() so a
         # coalesced break|reset|error is not lost (#45). Empty between calls.
         self._pending = b''
+        # The header flags of the last packet recv() assembled (#2645).
+        self._packet_flags = 0
         # True while a server break/reset handshake is in progress: we answer a
         # server break with exactly ONE reset, then drain the server's terminal
         # reset (and any straggler markers) WITHOUT replying, matching
@@ -1649,6 +1652,24 @@ class OracleConnect(_ConnectionLogic):
         self._open_transport()
         self.handle_login()
 
+    def _renegotiate_tls(self) -> None:
+        # The listener handed the connection to a dedicated server, which runs
+        # its own TLS handshake on the same TCP connection; the session with the
+        # listener cannot read it (#2645). A new handshake on the raw socket,
+        # checked as the first was, as python-oracledb renegotiates.
+        import ssl as _ssl
+
+        if not isinstance(self.sock, _ssl.SSLSocket):
+            return  # no TLS to renegotiate: a plain listener sets no such flag
+        Raw = socket.socket(fileno=self.sock.detach())
+        try:
+            self.sock = self._wrap_socket_tls(Raw)
+        except BaseException:
+            Raw.close()
+            self.sock = None
+            raise
+        self._apply_socket_timeout()
+
     def _wrap_socket_tls(self, RawSock: socket.socket) -> socket.socket:
         # Promote the freshly-connected TCP socket to TLS before any TNS bytes
         # are exchanged. The ``ssl`` constructor argument accepts:
@@ -1993,6 +2014,8 @@ class OracleConnect(_ConnectionLogic):
                     )
                 case t if t == TNS_RESEND:
                     logger.debug('handle_login: resend')
+                    if self._packet_flags & TNS_PACKET_FLAG_TLS_RENEGOTIATE:
+                        self._renegotiate_tls()
                     self.conn_state = CONN_STATE_AUTH_NEGOTIATE
                     self._send_connect()
                     continue
@@ -4421,6 +4444,7 @@ class OracleConnect(_ConnectionLogic):
                 if Flag is True:
                     # A full packet was assembled, so type/body/rest are set.
                     assert Type is not None and Body is not None and Rest is not None
+                    self._packet_flags = Acc[5]
                     if Type == TNS_MARKER:
                         # Preserve everything after the marker (the coalesced
                         # reset / error DATA) for the next recv() rather than
