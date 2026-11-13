@@ -5962,6 +5962,31 @@ class BindIntegration(_IntegrationBase):
                 self.cur.execute(f'SELECT {expr} FROM dual')
                 self.assertEqual(self.cur.fetchone(), (value,))
 
+    def test_day_counting_formats_before_1582_are_julian(self):
+        # TO_CHAR's day-counting elements, TO_DATE's J, TRUNC and ROUND to an
+        # ISO week and NEXT_DAY count Julian days before 1582-10-15. Over
+        # PostgreSQL the weekday was ten days off and the day of the year a
+        # Julian February 29 short (#2600).
+        d = "TO_DATE('1582-10-04 13:45:06', 'YYYY-MM-DD HH24:MI:SS')"
+        for expr, value in (
+            (f"TO_CHAR({d}, 'DY J DDD WW IW IYYY')", 'THU 2299160 277 40 40 1582'),
+            (
+                "TO_CHAR(TO_DATE('1500-12-31', 'YYYY-MM-DD'), 'Dy DDD WW IW')",
+                'Thu 366 53 53',
+            ),
+            (f"TO_CHAR(TRUNC({d}, 'IW'), 'YYYY-MM-DD')", '1582-10-01'),
+            (f"TO_CHAR(TRUNC({d}, 'WW'), 'YYYY-MM-DD')", '1582-10-01'),
+            (f"TO_CHAR(ROUND({d}, 'IW'), 'YYYY-MM-DD')", '1582-10-18'),
+            (
+                f"TO_CHAR(NEXT_DAY({d}, 'FRIDAY'), 'YYYY-MM-DD HH24:MI:SS')",
+                '1582-10-15 13:45:06',
+            ),
+            ("TO_CHAR(TO_DATE('2299160', 'J'), 'YYYY-MM-DD')", '1582-10-04'),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (value,))
+
     def test_a_date_bind_is_a_date(self):
         # seerdb binds a datetime without a fraction as a DATE, as Oracle's
         # clients do, and Oracle types the bind and every expression over it

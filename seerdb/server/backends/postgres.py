@@ -586,6 +586,18 @@ def _oracle_number_rounding(name: str) -> str:
 # 367 days from -0001-12-31 to 0001-01-01, across the year 0 no label names.
 # (23ai's -4712, alone, counts no February 29.)
 _JULIAN_START = "'1582-10-15'::timestamp"
+# Past the switch, 1582's days of the year and its weeks still count from a
+# Julian January, and its last ISO week ends by 1583-01-07.
+_JULIAN_YEAR_END = "'1583-01-08'::timestamp"
+
+
+# TO_DATE with a J in its format, quoted text aside (#2600): orafce reads the
+# number as PostgreSQL's Julian day, the Gregorian one, so its result is the
+# twin of Oracle's, and maps back. Its `call` reads the value and format.
+_JULIAN_DAY_FORMAT = (
+    "CASE WHEN regexp_replace($2, '\"[^\"]*\"', '', 'g') ~* 'j' "
+    'THEN sys.ora_julian_from_twin({call}) ELSE {call} END'
+)
 
 
 def _pg_op(left: str, op: str, right: str) -> str:
@@ -633,6 +645,123 @@ _ORACLE_CALENDAR_DDL = (
     f"t >= '1582-10-05'::timestamp AND t < {_JULIAN_START} THEN "
     + _pg_op(_JULIAN_START, '+', _pg_op('t', '-', "pg_catalog.date_trunc('day', t)"))
     + ' ELSE t END $$;'
+    # A label's twin: the Gregorian timestamp of the same day and time, which
+    # PostgreSQL's weekday and week functions read rightly (#2600). From
+    # 1582-10-15 on a label is its own twin.
+    + 'CREATE OR REPLACE FUNCTION sys.ora_julian_twin(t timestamp) RETURNS timestamp '
+    'LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT '
+    + _pg_op(
+        "pg_catalog.to_date(sys.ora_day_number(t)::text, 'J')::timestamp",
+        '+',
+        _pg_op('t', '-', "pg_catalog.date_trunc('day', t)"),
+    )
+    + ' $$;'
+    + 'CREATE OR REPLACE FUNCTION sys.ora_julian_from_twin(g timestamp) '
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT '
+    + _pg_op(
+        'sys.ora_day_label(pg_catalog.floor(extract(julian FROM g))::integer)',
+        '+',
+        _pg_op('g', '-', "pg_catalog.date_trunc('day', g)"),
+    )
+    + ' $$;'
+    # TO_CHAR of a date before 1582-10-15: the format's elements that count
+    # days -- J, D, DY and DAY in their cases, DDD, WW, IW and the ISO year --
+    # are Oracle's, from the day number, and go into the format as quoted
+    # text; the weekday ones are PostgreSQL's own, of the label's twin, so
+    # their case and padding are as ever. An FM before one is spent on it.
+    # Words that hold the letters but count nothing (DD, MI, AD, DL, TZD, ...)
+    # are kept whole.
+    + 'CREATE OR REPLACE FUNCTION sys.ora_to_char_julian(t timestamp, f text) '
+    'RETURNS text LANGUAGE plpgsql STABLE AS $$ DECLARE '
+    "o text := ''; i integer := 1; j integer; k text; fm boolean := false; "
+    'dn integer; yr integer; ord integer; dow integer; w integer; iy integer; '
+    'piece text; tw timestamp; BEGIN '
+    'dn := sys.ora_day_number(t); tw := sys.ora_julian_twin(t); '
+    # The day of the year, ISO week and ISO year only for a format with them.
+    "yr := extract(year FROM t)::integer; IF f ~* 'ddd|ww|i' THEN ord := sys.ora_ordinal(t); END IF; "
+    "IF strpos(upper(f), 'I') > 0 THEN dow := sys.ora_iso_weekday(yr, ord); "
+    f'w := {_pg_op("ord - dow + 10", "/", "7")}; iy := yr; '
+    'IF w < 1 THEN iy := yr - 1; w := sys.ora_iso_weeks(iy); '
+    'ELSIF w > sys.ora_iso_weeks(yr) THEN iy := yr + 1; w := 1; END IF; END IF; '
+    'WHILE i <= length(f) LOOP piece := NULL; '
+    "IF substr(f, i, 1) = '\"' THEN j := strpos(substr(f, i + 1), '\"'); "
+    'IF j = 0 THEN o := o || substr(f, i); EXIT; END IF; '
+    'o := o || substr(f, i, j + 1); i := i + j + 1; CONTINUE; END IF; '
+    # A run of letters no element here begins with goes over at once.
+    "k := substring(f FROM i FOR 64); piece := substring(k FROM '^[^abdfijmtwABDFIJMTW\"]+'); "
+    "IF piece IS NOT NULL THEN o := o || CASE WHEN fm THEN 'FM' ELSE '' END || piece; "
+    'i := i + length(piece); fm := false; CONTINUE; END IF; '
+    'k := upper(substr(k, 1, 4)); '
+    "IF upper(substr(f, i, 2)) = 'FM' THEN fm := true; i := i + 2; CONTINUE; END IF; "
+    "IF k IN ('A.D.', 'B.C.') THEN piece := '='; j := 4; "
+    "ELSIF k = 'IYYY' THEN piece := lpad(iy::text, 4, '0'); j := 4; "
+    "ELSIF substr(k, 1, 3) IN ('TZD', 'DDD', 'IYY', 'DAY') THEN j := 3; "
+    "IF substr(k, 1, 3) = 'TZD' THEN piece := '='; "
+    "ELSIF substr(k, 1, 3) = 'DDD' THEN piece := CASE WHEN fm THEN ord::text "
+    "ELSE lpad(ord::text, 3, '0') END; "
+    "ELSIF substr(k, 1, 3) = 'IYY' THEN piece := right(lpad(iy::text, 4, '0'), 3); "
+    "ELSE piece := pg_catalog.to_char(tw, CASE WHEN fm THEN 'FM' ELSE '' END "
+    '|| substr(f, i, 3)); END IF; '
+    "ELSIF substr(k, 1, 2) IN ('AD', 'BC', 'DL', 'DS', 'MI', 'DD') THEN "
+    "piece := '='; j := 2; "
+    "ELSIF substr(k, 1, 2) = 'DY' THEN piece := pg_catalog.to_char(tw, "
+    "CASE WHEN fm THEN 'FM' ELSE '' END || substr(f, i, 2)); j := 2; "
+    "ELSIF substr(k, 1, 2) = 'IW' THEN piece := CASE WHEN fm THEN w::text "
+    "ELSE lpad(w::text, 2, '0') END; j := 2; "
+    "ELSIF substr(k, 1, 2) = 'IY' THEN piece := right(lpad(iy::text, 4, '0'), 2); j := 2; "
+    "ELSIF substr(k, 1, 2) = 'WW' THEN piece := "
+    f'({_pg_op("ord - 1", "/", "7")} + 1)::text; '
+    "IF NOT fm THEN piece := lpad(piece, 2, '0'); END IF; j := 2; "
+    "ELSIF substr(k, 1, 1) = 'D' THEN piece := pg_catalog.to_char(tw, 'D'); j := 1; "
+    "ELSIF substr(k, 1, 1) = 'J' THEN piece := dn::text; j := 1; "
+    "ELSIF substr(k, 1, 1) = 'I' THEN piece := right(iy::text, 1); j := 1; "
+    'END IF; '
+    "IF piece = '=' THEN o := o || CASE WHEN fm THEN 'FM' ELSE '' END || substr(f, i, j); "
+    'i := i + j; fm := false; '
+    "ELSIF piece IS NOT NULL THEN o := o || '\"' || piece || '\"'; "
+    'i := i + j; fm := false; '
+    "ELSE o := o || CASE WHEN fm THEN 'FM' ELSE '' END || substr(f, i, 1); "
+    'fm := false; i := i + 1; END IF; END LOOP; '
+    "IF o ~* 'ff|x' THEN RETURN sys.ora_to_char(t, o, 6); END IF; "
+    'RETURN pg_catalog.to_char(t, o); END $$;'
+    # Oracle's day of the year is the label's, counted by the calendar's month
+    # lengths -- a Julian February 29 included, the days of the 1582 gap too:
+    # 1582-10-15 is its 288th day (#2600). Its ISO weekday for a day of the
+    # year runs on from January 1's, and a year's ISO weeks are the week of
+    # its December 28. A year is the astronomical one, so year 0, before AD 1,
+    # has a January 1 though no label: its day number is the formula's.
+     + 'CREATE OR REPLACE FUNCTION sys.ora_julian_jdn(y integer, m integer, d integer) '
+    'RETURNS integer LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT '
+    f'd + {_pg_op("153 * (m + 12 * " + _pg_op("14 - m", "/", "12") + " - 3) + 2", "/", "5")} '
+    f'+ 365 * (y + 4800 - {_pg_op("14 - m", "/", "12")}) '
+    f'+ {_pg_op("y + 4800 - " + _pg_op("14 - m", "/", "12"), "/", "4")} - 32083 $$;'
+    + 'CREATE OR REPLACE FUNCTION sys.ora_ordinal(t timestamp) RETURNS integer '
+    'LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT '
+    'extract(doy FROM t)::integer + CASE WHEN extract(year FROM t) BETWEEN 1 AND 1582 '
+    'AND extract(month FROM t) > 2 '
+    f'AND {_pg_op("extract(year FROM t)::integer", "%", "100")} = 0 '
+    f'AND {_pg_op("extract(year FROM t)::integer", "%", "400")} <> 0 THEN 1 ELSE 0 END $$;'
+    + 'CREATE OR REPLACE FUNCTION sys.ora_iso_weekday(y integer, ord integer) '
+    'RETURNS integer LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT '
+    + _pg_op(
+        '(CASE WHEN y >= 1583 THEN sys.ora_day_number(pg_catalog.make_timestamp(y, 1, 1, 0, 0, 0)) '
+        'ELSE sys.ora_julian_jdn(y, 1, 1) END) + ord - 1',
+        '%',
+        '7',
+    )
+    + ' + 1 $$;'
+    # plpgsql, not a SQL function with a FROM: that one is planned on every
+    # call, 40 us a row.
+    + 'CREATE OR REPLACE FUNCTION sys.ora_iso_weeks(y integer) RETURNS integer '
+    'LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ DECLARE o integer := 362; BEGIN '
+    'IF '
+    + _pg_op('y', '%', '4')
+    + ' = 0 AND (y < 1583 OR '
+    + _pg_op('y', '%', '100')
+    + ' <> 0 OR '
+    + _pg_op('y', '%', '400')
+    + ' = 0) THEN o := 363; END IF; '
+    'RETURN ' + _pg_op('o - sys.ora_iso_weekday(y, o) + 10', '/', '7') + '; END $$;'
 )
 
 _DATE_ARITHMETIC_DDL = (
@@ -867,8 +996,12 @@ _HELPER_FUNCTIONS_DDL = (
     'RETURN pg_catalog.to_char($1, o); END $$;'
     # PostgreSQL's to_char(timestamp, text) but for those elements, ahead of
     # it on the search path: a TIMESTAMP's FF at its default precision, 6.
+    # Before 1582-10-15 the elements that count days are Oracle's (#2600),
+    # and through the rest of 1582, whose days of the year, weeks and ISO
+    # weeks were counted from a Julian January.
     'CREATE OR REPLACE FUNCTION to_char(timestamp, text) RETURNS text '
-    "LANGUAGE sql STABLE AS $$ SELECT CASE WHEN $2 ~* 'ff|x' "
+    f'LANGUAGE sql STABLE AS $$ SELECT CASE WHEN $1 < {_JULIAN_YEAR_END} '
+    "AND $2 ~* '[dijw]' THEN sys.ora_to_char_julian($1, $2) WHEN $2 ~* 'ff|x' "
     'THEN sys.ora_to_char($1, $2, 6) ELSE pg_catalog.to_char($1, $2) END $$;'
     # A DATE's or a TIMESTAMP(p)'s text where Oracle converts it without a
     # format (#2162): a DATE, $2 = -1, in the session's NLS_DATE_FORMAT, a
@@ -2092,7 +2225,8 @@ _ORAFCE_HELPERS_DDL = (
     'EXCEPTION WHEN dependent_objects_still_exist THEN NULL; END $$;'
     'DO $$ BEGIN '
     'CREATE OR REPLACE FUNCTION to_date(numeric, text) RETURNS ora_date '
-    'LANGUAGE sql STABLE STRICT AS $f$ SELECT sys.ora_past_the_gap(oracle.to_date($1::text, $2))::ora_date $f$; '
+    'LANGUAGE sql STABLE STRICT AS $f$ SELECT sys.ora_past_the_gap('
+    f'{_JULIAN_DAY_FORMAT.format(call="oracle.to_date($1::text, $2)")})::ora_date $f$; '
     'EXCEPTION WHEN invalid_function_definition THEN NULL; END $$;'
     # TO_DATE gives orafce's DATE, a domain of its own beside ora_date, the
     # Mirror's: NVL, COALESCE, CASE or DECODE of a DATE column and a TO_DATE
@@ -2102,7 +2236,13 @@ _ORAFCE_HELPERS_DDL = (
     + ''.join(
         f'CREATE OR REPLACE FUNCTION sys.to_date({args}) RETURNS ora_date '
         'LANGUAGE sql STABLE STRICT AS '
-        f'$$ SELECT sys.ora_past_the_gap(oracle.to_date({params}))::ora_date $$;'
+        '$$ SELECT sys.ora_past_the_gap('
+        + (
+            _JULIAN_DAY_FORMAT.format(call=f'oracle.to_date({params})')
+            if ',' in params
+            else f'oracle.to_date({params})'
+        )
+        + ')::ora_date $$;'
         for args, params in (
             ('text', '$1'),
             ('text, text', '$1, $2'),
@@ -2120,10 +2260,33 @@ _ORAFCE_HELPERS_DDL = (
     # interval. The DATE domain reaches these through its base type, and they
     # come before orafce's on the search path.
     + ''.join(
-        f'CREATE OR REPLACE FUNCTION {fn}(timestamp{arg}) RETURNS {_DATE_TYPE} '
-        f'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT oracle.{fn}($1{use}) $$;'
+        f'CREATE OR REPLACE FUNCTION {fn}(timestamp) RETURNS {_DATE_TYPE} '
+        f'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT oracle.{fn}($1) $$;'
         for fn in ('trunc', 'round')
-        for arg, use in (('', ''), (', text', ', $2'))
+    )
+    # To a week before 1583, the week is Oracle's (#2600): IW, D, DY and DAY
+    # go by the twin's weekday, WW by the label's day of the year.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION {fn}(timestamp, text) RETURNS {_DATE_TYPE} '
+        # Not STRICT, so it inlines: every branch is NULL on a NULL argument.
+        'LANGUAGE sql IMMUTABLE AS $$ SELECT CASE '
+        f'WHEN $1 >= {_JULIAN_YEAR_END} THEN oracle.{fn}($1, $2) '
+        "WHEN upper(trim($2)) IN ('IW', 'D', 'DY', 'DAY') THEN "
+        f'sys.ora_julian_from_twin(oracle.{fn}(sys.ora_julian_twin($1), $2)) '
+        + (
+            "WHEN upper(trim($2)) = 'WW' THEN sys.ora_day_label("
+            + _pg_op(
+                'sys.ora_day_number($1)',
+                '-',
+                # Weeks from the label's day of the year, as Oracle's WW.
+                _pg_op('sys.ora_ordinal($1) - 1', '%', '7'),
+            )
+            + ') '
+            if fn == 'trunc'
+            else ''
+        )
+        + f'ELSE oracle.{fn}($1, $2) END $$;'
+        for fn in ('trunc', 'round')
     )
     # ADD_MONTHS, LAST_DAY and NEXT_DAY of a DATE return a DATE, its time of
     # day kept (#2095). orafce's take a date, losing the time, or a
@@ -2133,8 +2296,22 @@ _ORAFCE_HELPERS_DDL = (
     # fractional month count is truncated, as Oracle's is.
     + ''.join(
         f'CREATE OR REPLACE FUNCTION {fn}(timestamp, {arg}) RETURNS {_DATE_TYPE} '
-        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '
-        f"(oracle.{fn}($1::pg_catalog.date, {use}) + date_trunc('second', $1)::time) $$;"
+        # NEXT_DAY's CASE inlines only in a function that is not STRICT.
+        + (
+            'LANGUAGE sql IMMUTABLE AS $$ SELECT '
+            if fn == 'next_day'
+            else 'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '
+        )
+        + (
+            "CASE WHEN $1 < '1582-10-15'::timestamp THEN sys.ora_julian_from_twin("
+            f'oracle.{fn}(sys.ora_julian_twin($1)::pg_catalog.date, {use}) '
+            "+ date_trunc('second', $1)::time) ELSE "
+            if fn == 'next_day'
+            else ''
+        )
+        + f"(oracle.{fn}($1::pg_catalog.date, {use}) + date_trunc('second', $1)::time)"
+        + (' END' if fn == 'next_day' else '')
+        + ' $$;'
         for fn, arg, use in (
             ('add_months', 'integer', '$2'),
             ('add_months', 'numeric', 'trunc($2)::integer'),

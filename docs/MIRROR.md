@@ -258,8 +258,14 @@ would cost far more than anyone gains from it.
   DATE *bind* in the gap is kept as sent; Oracle keeps it too, then counts
   from it inconsistently. A BC date is counted by its astronomical year, as
   23ai counts it across the missing year 0, except that 23ai's -4712 has no
-  February 29. TO_CHAR's `J` and day-of-week formats, TO_DATE's `J`, TRUNC to
-  a week, NEXT_DAY, and TIMESTAMP and INTERVAL arithmetic still count those
+  February 29. TO_CHAR's day-counting elements (`J`, `D`, `DY`, `DAY`, `DDD`,
+  `WW`, `IW` and the ISO year), TO_DATE's `J`, TRUNC and ROUND to a week, and
+  NEXT_DAY count Oracle's days too. They cost more on those dates: TO_CHAR
+  with one of the elements takes about 13 µs a row there, against 0.3 µs on a
+  later date. TRUNC or ROUND of a date in AD 1's first week to a week, which
+  would land in the year before AD 1, is refused; 23ai returns a day late in
+  AD 1. For 1582-12-31, 23ai gives ISO week 53 of 1582, where the Mirror
+  counts week 1 of 1583. TIMESTAMP and INTERVAL arithmetic still counts those
   days the Gregorian way
   ([#2600](https://github.com/seerdb/seerdb/issues/2600)).
 - **The digits of NUMBER math functions.** `SQRT`, `EXP`, `LN`, `LOG`,

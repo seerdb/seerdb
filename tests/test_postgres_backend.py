@@ -2206,6 +2206,62 @@ def test_oracle_day_numbers_and_date_arithmetic_before_1582() -> None:
         backend.close()
 
 
+def test_day_counting_formats_before_1582_are_oracles() -> None:
+    # Before 1582-10-15 TO_CHAR's day-counting elements, TO_DATE's J, TRUNC
+    # and ROUND to a week and NEXT_DAY count Oracle's Julian days (#2600),
+    # against 23ai's answers: the weekday ten days off PostgreSQL's, the day
+    # of the year with a Julian February 29 in it, the weeks from it.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for label, fmt, expected in (
+            ('1582-10-04 13:45:06', 'DY D J', 'THU 5 2299160'),
+            ('1582-10-04 13:45:06', 'DDD WW IW IYYY', '277 40 40 1582'),
+            ('1582-10-04 13:45:06', '"Date "DD" day "D', 'Date 04 day 5'),
+            (
+                '1500-06-15 08:00:00',
+                'Dy dy DDD WW IW IYY IY I',
+                'Mon mon 167 24 25 500 00 0',
+            ),
+            ('1500-12-31 00:00:00', 'DDD WW IW', '366 53 53'),
+            ('1500-06-15 08:00:00', 'DD-MON-YYYY AD HH24:MI', '15-JUN-1500 AD 08:00'),
+        ):
+            (row,) = backend.execute(
+                f"SELECT TO_CHAR(TO_DATE('{label}', 'YYYY-MM-DD HH24:MI:SS'), '{fmt}') FROM dual"
+            ).rows
+            assert row[0] == expected, (label, fmt)
+        for expr, expected in (
+            ("TRUNC(d, 'IW')", ' 1582-10-01 00:00:00'),
+            ("TRUNC(d, 'D')", ' 1582-09-30 00:00:00'),
+            ("TRUNC(d, 'WW')", ' 1582-10-01 00:00:00'),
+            ("ROUND(d, 'IW')", ' 1582-10-18 00:00:00'),
+            ("ROUND(d, 'D')", ' 1582-10-17 00:00:00'),
+            ("NEXT_DAY(d, 'FRIDAY')", ' 1582-10-15 13:45:06'),
+            ("NEXT_DAY(d, 'SUNDAY')", ' 1582-10-17 13:45:06'),
+            ("TO_DATE('2299160 13:00', 'J HH24:MI')", ' 1582-10-04 13:00:00'),
+            ("TO_DATE(1705061, 'J')", '-0044-03-15 00:00:00'),
+        ):
+            (row,) = backend.execute(
+                f"SELECT TO_CHAR({expr}, 'SYYYY-MM-DD HH24:MI:SS') FROM (SELECT "
+                "TO_DATE('1582-10-04 13:45:06', 'YYYY-MM-DD HH24:MI:SS') AS d FROM dual) q"
+            ).rows
+            assert row[0] == expected, expr
+        # A modern date is PostgreSQL's as before.
+        (row,) = backend.execute(
+            "SELECT TO_CHAR(TRUNC(DATE '2020-01-15', 'IW'), 'DY DDD IW YYYY-MM-DD') FROM dual"
+        ).rows
+        assert row[0] == 'MON 013 03 2020-01-13'
+        # The week before AD 1 January would fall in a year no label names.
+        with pytest.raises(BackendError):
+            backend.execute(
+                "SELECT TRUNC(TO_DATE('0001-01-01', 'YYYY-MM-DD'), 'IW') FROM dual"
+            )
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_translate_idioms_keeps_nullifs_type() -> None:
     # PostgreSQL's NULLIF resolves a domain to its base type, so the NULLIF of
     # two DATEs was a timestamp (#2596); sys.ora_nullif keeps it. Nested,
