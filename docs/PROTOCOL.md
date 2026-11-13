@@ -416,7 +416,7 @@ fails fast rather than spinning. Sync and async (`§handle_login`).
 
 ### 2.5 TNS_RESEND (Server -> Client)
 
-Requests the client to re-send the TNS_CONNECT packet. If using TLS, the client renegotiates the TLS session before resending.
+Requests the client to re-send the TNS_CONNECT packet. If using TLS, the client renegotiates the TLS session before resending. Write the resent packet in one `send`: 18c's DRCP broker closes a connection whose resent CONNECT arrives in pieces (§30).
 
 ### 2.6 Server-side handshake — a captured 11g exchange (the Mirror)
 
@@ -8381,7 +8381,47 @@ trailing `ORA-01403` on a fetch is the normal end-of-data marker, not an error.
 
 Verified on 21c and 23ai (sync + async): connections route through the broker
 (`v$cpool_stats` / `v$cpool_conn_info` show the connection class). Needs the
-server pool started (`DBMS_CONNECTION_POOL.START_POOL`).
+server pool started (`DBMS_CONNECTION_POOL.START_POOL`). The integration
+suite's DRCP tests pass on 11g, 18c, 21c and 23ai, and on 26ai with native
+encryption required.
+
+**Write a resent CONNECT in one piece (18c).** The listener of 11g, 18c and
+21c answers the first CONNECT with RESEND (`00 08 00 00 0b 00 00 00`), and
+the client sends the same CONNECT again (§2.5). 23ai and 26ai accept the first
+one. On 18c the resent CONNECT goes to the pool's broker (the `N000` process),
+and the broker closes the connection when that packet arrives as more than one
+segment. The other listeners take a split CONNECT, the first or the resent one,
+and so does 18c on a dedicated connect. Measured on 18c XE 18.4, from 2026-11-13:
+
+| the resent CONNECT | dedicated | pooled |
+|---|---|---|
+| one write | ACCEPT | ACCEPT |
+| 8-byte header, then the body | ACCEPT | the broker closes the connection |
+
+Splitting the *first* CONNECT does no harm on any server. The pooled 18c
+failure looks like this:
+
+```
+C2S 238   00ee 0000 01 00 0000  013f 012c 0401 2000 2000 4f98 …  (header + body, one write)
+S2C 8     0008 0000 0b 00 0000                                     RESEND
+C2S 8     00ee 0000 01 00 0000                                     the header alone
+C2S 230   013f 012c 0401 2000 2000 4f98 …                          the body
+          (the connection is closed)
+```
+
+Sometimes the ACCEPT arrives before the close. It is the dedicated ACCEPT,
+version 317, `0029000002000000013d04010000000001000000002941010000000000000000000020000000200000`,
+and the connection is closed whatever the client sends next. The broker's
+trace (`XE_n000_*.trc`) logs `Error while answering connection`, with
+`NS Primary Error: TNS-<garbage>` or `TNS-12637` / `TNS-12532`. Nothing else
+in the CONNECT matters. A connect that the broker accepts carries the same
+global service options, 0x0401, as seerdb's and SeerODBC's do. sqlplus 23.26,
+at 0x0c41 and version 320, works, and so does seerdb with only the service
+options replaced by any of 0x0004, 0x0401, 0x0404, 0x0801, 0x0c00, 0x0c01,
+0x0c04 or 0x0c41. After the ACCEPT, seerdb's ANO packet (161 bytes, 4-byte
+framing) and the rest of its login are served as on a dedicated connect. So
+**a client writes each CONNECT, the resent one too, as one packet in one
+`send`**. seerdb builds the whole packet before writing it.
 
 **Implicit connection pooling** (#2542, 23ai): `pool_boundary='statement'` or
 `'transaction'` adds `(POOL_BOUNDARY=<value>)` to CONNECT_DATA, after
