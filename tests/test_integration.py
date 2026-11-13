@@ -1939,6 +1939,35 @@ class TypesIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT r FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchone()[0], bytes(range(256)) * 195)
 
+    def test_a_block_takes_a_plain_value_up_to_32512_bytes(self):
+        # A plain str or bytes past the SQL limits binds in a PL/SQL block up to
+        # 32512 bytes, into a CLOB and a BLOB: on 8i and 9i, where it was refused
+        # up front, as on every later server (#2637). One byte more is ORA-01460
+        # on 8i and 9i.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB, b BLOB)')
+        for size in (5000, 32512):
+            self.cur.execute(
+                f'BEGIN INSERT INTO {self.TABLE} (id, c) VALUES ({size}, :1); END;',
+                ['q' * size],
+            )
+            self.cur.execute(
+                f'BEGIN INSERT INTO {self.TABLE} (id, b) VALUES (-{size}, :1); END;',
+                [bytes(range(256)) * (size // 256) + bytes(size % 256)],
+            )
+        self.cur.execute(
+            f'SELECT id, DBMS_LOB.GETLENGTH(c), DBMS_LOB.GETLENGTH(b) FROM {self.TABLE} '
+            'ORDER BY id'
+        )
+        self.assertEqual(
+            self.cur.fetchall(),
+            [
+                (-32512, None, 32512),
+                (-5000, None, 5000),
+                (5000, 5000, None),
+                (32512, 32512, None),
+            ],
+        )
+
     def test_sql_text_that_is_not_ascii(self):
         # Non-ASCII characters in the statement itself: 9i hung on any (#2275),
         # and 8i took a Latin-1 one's text as a byte longer than it is (#2276).

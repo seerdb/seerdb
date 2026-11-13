@@ -6131,6 +6131,7 @@ with ojdbc14, 9.2's own thin driver, and with seerdb (#2260, SeerODBC #122):
 | the same, `setCharacterStream` / `setBinaryStream` | sent | **the server closes the connection** |
 | `INSERT INTO t (long_col, id) VALUES (?, ?)`, a stream of 5000 | sent inline, below | stored |
 | `BEGIN INSERT INTO t (clob_col, id) VALUES (?, 7); END;`, `setString` or a stream of 5000 | sent, below | stored |
+| the same block, 32 512 bytes; 32 513 | sent | stored; ORA-01460 |
 | the same block, 40 000 | refused by the driver | nothing is sent |
 | `EMPTY_CLOB()` / `EMPTY_BLOB()`, then a write through the locator (TTI_LOBOPS, §19.5) | — | stored, any size (#2259) |
 
@@ -6158,7 +6159,10 @@ the last carries data flags `0x0020` (§1.3).
 
 **In a PL/SQL block** the parse call carries only the descriptors (§19.6), and
 the values come after it, in one RXD of their own. ojdbc14 declares a text bind
-at **32767**, PL/SQL's own limit, whatever the value's size:
+at **32767**, PL/SQL's own limit, whatever the value's size. The server takes
+at most **32512** bytes, text or RAW, on 9.2.0.4 and 8.1.7 alike: one byte more
+is ORA-01460, whatever the declaration (#2637). A RAW is declared the same way,
+as type `17`. The text bind:
 
 ```
 C→S  03 47 … 'BEGIN INSERT INTO seer122 (c, id) VALUES (:1, 7); END;'
@@ -6177,6 +6181,11 @@ differences matters:
   ones.
 
 The reference client sends 64-byte chunks.
+
+seerdb binds a plain `str` or `bytes` this way in a 9i block, declared at 32767
+once it is past 4000 / 2000 bytes, and refuses one past 32512 bytes up front
+(#2637). On 8i, whose descriptor is sized to the value (§19.11), the same block
+takes it as it is.
 
 ### 19.4 Errors, ROWID, and unsupported types (#102)
 

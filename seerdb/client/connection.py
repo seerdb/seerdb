@@ -62,7 +62,7 @@ from seerdb.common.exceptions import (
     OperationalError,
     Truncated,
 )
-from seerdb.common.sqltext import is_reusable_dml, statement_head
+from seerdb.common.sqltext import is_plsql, is_reusable_dml, statement_head
 from seerdb.common.tns import (
     _DTY_8I,
     assemble_packet,
@@ -632,16 +632,22 @@ def _nego_cache_del(key: tuple[str, int, str]) -> None:
 # column a large value works when it is declared so (a DB_TYPE_LONG /
 # DB_TYPE_LONG_RAW Var, which this check does not see): it goes inline as a
 # LONG-class bind. The driver cannot tell the column type from the SQL, so an
-# undeclared value past the limits is refused up front, naming both routes.
+# undeclared value past the limits is refused up front, naming the routes.
+# A PL/SQL block takes a value up to 32512 bytes, text or RAW, on 8i and 9i
+# alike: one byte more is ORA-01460 (#2637, measured on 8.1.7 and 9.2.0.4).
 _FV2_MAX_RAW_BIND = 2000
 _FV2_MAX_VARCHAR_BIND = 4000
+_FV2_MAX_BLOCK_BIND = 32512
 
 # Oracle 8i data types LONG (8) and LONG RAW (24): fetched one row per round trip
 # and truncated to the fetch request's long-size field (#377).
 
 
-def _check_fv2_bind_sizes(Bind, Batch=None, Tier: str = '9i') -> None:
-    # Tier: the server the refusal names (_pre10_tier_name_for).
+def _check_fv2_bind_sizes(
+    Bind, Batch=None, Tier: str = '9i', Block: bool = False
+) -> None:
+    # Tier: the server the refusal names (_pre10_tier_name_for). Block: the
+    # statement is a PL/SQL block, which takes a value up to 32512 bytes (#2637).
     from seerdb.common.exceptions import NotSupportedError
 
     Rows = [Bind] if Bind else []
@@ -651,21 +657,37 @@ def _check_fv2_bind_sizes(Bind, Batch=None, Tier: str = '9i') -> None:
         Values = Row.values() if isinstance(Row, dict) else (Row or [])
         for Value in Values:
             if isinstance(Value, (bytes, bytearray)):
-                if len(Value) > _FV2_MAX_RAW_BIND:
-                    raise NotSupportedError(
-                        f'Oracle {Tier} cannot bind a bytes value larger than '
-                        f'{_FV2_MAX_RAW_BIND} bytes (got {len(Value)}): declare a '
-                        f"LONG RAW column's value DB_TYPE_LONG_RAW, and write a "
-                        f'BLOB through its locator (#2260)'
-                    )
+                Size, Limit, Kind = len(Value), _FV2_MAX_RAW_BIND, 'bytes'
+                Routes = (
+                    "declare a LONG RAW column's value DB_TYPE_LONG_RAW, and write a "
+                    'BLOB through its locator (#2260)'
+                )
             elif isinstance(Value, str):
-                if len(Value.encode('utf-8')) > _FV2_MAX_VARCHAR_BIND:
+                Size, Limit, Kind = (
+                    len(Value.encode('utf-8')),
+                    _FV2_MAX_VARCHAR_BIND,
+                    'str',
+                )
+                Routes = (
+                    "declare a LONG column's value DB_TYPE_LONG, and write a CLOB "
+                    'through its locator (#2260)'
+                )
+            else:
+                continue
+            if Block:
+                if Size > _FV2_MAX_BLOCK_BIND:
                     raise NotSupportedError(
-                        f'Oracle {Tier} cannot bind a str value larger than '
-                        f'{_FV2_MAX_VARCHAR_BIND} bytes (utf-8): declare a LONG '
-                        f"column's value DB_TYPE_LONG, and write a CLOB through "
-                        f'its locator (#2260)'
+                        f'Oracle {Tier} cannot bind a {Kind} value larger than '
+                        f'{_FV2_MAX_BLOCK_BIND} bytes in a PL/SQL block (got {Size}): '
+                        f'write a {"BLOB" if Kind == "bytes" else "CLOB"} through '
+                        'its locator (#2637)'
                     )
+            elif Size > Limit:
+                raise NotSupportedError(
+                    f'Oracle {Tier} cannot bind a {Kind} value larger than {Limit} '
+                    f'bytes in SQL (got {Size}): bind it in a PL/SQL block, which '
+                    f'takes up to {_FV2_MAX_BLOCK_BIND} bytes (#2637), or {Routes}'
+                )
 
 
 def _run_pipeline_op(conn, cur, op, T):
@@ -2310,7 +2332,9 @@ class OracleConnect(_ConnectionLogic):
                     + _pre10_tier_name_for(self._dialect)
                 )
             if CAP_WIDE_BINDS not in self._dialect.capabilities():
-                _check_fv2_bind_sizes(Bind, Batch, _pre10_tier_name_for(self._dialect))
+                _check_fv2_bind_sizes(
+                    Bind, Batch, _pre10_tier_name_for(self._dialect), is_plsql(Query)
+                )
             Native = bool(ReturnBinds) and native_returning(
                 self._dialect, Bind, ReturnBinds
             )
