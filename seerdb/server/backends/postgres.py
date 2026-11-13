@@ -439,6 +439,9 @@ from seerdb.server.redact import redact_passwords
 # the instant (a real timestamptz, so the instant is stored correctly) and `off`
 # is the entered offset in seconds, which the read path uses to re-tag the value.
 _TSTZ_TYPE = 'ora_tstz'
+# A WITH TIME ZONE value's UTC instant as a TIMESTAMP, for SQL that takes it
+# as its first argument.
+_UTC_LABEL = "(($1).utc AT TIME ZONE 'UTC')"
 # The database time zone, what DBTIMEZONE answers: the zone TIMESTAMP WITH LOCAL
 # TIME ZONE travels in (#1208). A PostgreSQL timestamptz stores the instant, so any
 # fixed zone would do; UTC is Oracle's own default.
@@ -609,6 +612,44 @@ def _pg_op(left: str, op: str, right: str) -> str:
     return f'(({left}) OPERATOR(pg_catalog.{op}) ({right}))'
 
 
+# A DATE or TIMESTAMP plus an interval's months on a day its month lacks,
+# 01-31 plus a month: Oracle refuses it, where PostgreSQL ends the month short
+# (#2611). ADD_MONTHS is Oracle's way to end it short, and stays so.
+_MONTH_LACKS_DAY = 'ORA-01839: date not valid for month specified'
+_JULIAN_LEAP_DAY = (
+    f'{_MONTH_LACKS_DAY}: a Julian leap day, which the Mirror cannot store'
+)
+
+
+def _ts_shift(t: str, i: str, op: str, *, julian: bool = True) -> str:
+    # TIMESTAMP `t` plus or minus (`op`) INTERVAL `i`, by Oracle's calendar: an
+    # SQL expression that inlines. Both sides from 1582-10-15 on go to
+    # PostgreSQL's operator, unless its months may have ended the month short:
+    # a day before the 29th, an interval of no months, or a day that came out
+    # the same cannot have. The rest take the counted path, which refuses a
+    # day the month lacks (#2600, #2611). Not `julian`, every date is
+    # Gregorian, as a WITH TIME ZONE value's still are, and only the check
+    # is Oracle's.
+    shifted = _pg_op(t, op, i)
+    day = f"pg_catalog.date_part('day', {t})"
+    plain = (
+        _pg_op(day, '<', '29')
+        + ' OR '
+        + _pg_op(f"pg_catalog.date_part('month', {i})", '=', '0')
+        + ' AND '
+        + _pg_op(f"pg_catalog.date_part('year', {i})", '=', '0')
+        + ' OR '
+        + _pg_op(f"pg_catalog.date_part('day', {shifted})", '=', day)
+    )
+    by = i if op == '+' else f'OPERATOR(pg_catalog.-) {i}'
+    if not julian:
+        return f'CASE WHEN {plain} THEN {shifted} ELSE sys.ora_gregorian_ts_plus({t}, {by}) END'
+    return (
+        f'CASE WHEN {t} >= {_JULIAN_START} AND {shifted} >= {_JULIAN_START} '
+        f'AND ({plain}) THEN {shifted} ELSE sys.ora_julian_ts_plus({t}, {by}) END'
+    )
+
+
 _ORACLE_CALENDAR_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_day_number(t timestamp) RETURNS integer '
     'LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ '
@@ -637,8 +678,7 @@ _ORACLE_CALENDAR_DDL = (
     f'm + 3 - 12 * {_pg_op("m", "/", "10")}, '
     f'e - {_pg_op("153 * m + 2", "/", "5")} + 1, 0, 0, 0); '
     'EXCEPTION WHEN datetime_field_overflow THEN '
-    "RAISE EXCEPTION USING ERRCODE = '22008', MESSAGE = 'date not valid for month "
-    "specified: a Julian leap day, which the Mirror cannot store'; END $$;"
+    f"RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = '{_JULIAN_LEAP_DAY}'; END $$;"
     # Oracle's calendar has no 1582-10-05 to 10-14: TO_DATE and a literal of
     # one give 1582-10-15 at the same time of day (#2600).
     'CREATE OR REPLACE FUNCTION sys.ora_past_the_gap(t timestamp) RETURNS timestamp '
@@ -913,9 +953,11 @@ _DATE_ARITHMETIC_DDL = (
     # 1582-10-15 (#2600): 1582-10-04 12:00 + 12 hours is 1582-10-15 00:00.
     # They shadow PostgreSQL's own operators, of the same types, and are SQL,
     # not STRICT, so they inline: a TIMESTAMP on either side of 1582-10-15
-    # from then on goes to PostgreSQL's as before. The Julian path counts
-    # microseconds from the day number. An interval's months go on the label,
-    # as PostgreSQL's do, refused where that is a Julian February 29.
+    # from then on goes to PostgreSQL's as before, unless its months may land
+    # on a day the month lacks (#2611). The other path counts microseconds
+    # from the day number. An interval's months go on the label, as
+    # PostgreSQL's do, refused where the month lacks the day, as Oracle
+    # refuses it, or where that is a Julian February 29.
     + 'CREATE OR REPLACE FUNCTION sys.ora_julian_ts_minus(a timestamp, b timestamp) '
     'RETURNS interval LANGUAGE plpgsql IMMUTABLE STRICT AS $$ BEGIN RETURN '
     'pg_catalog.justify_hours('
@@ -950,8 +992,12 @@ _DATE_ARITHMETIC_DDL = (
     'IF extract(day FROM t) = 29 AND extract(day FROM r) = 28 AND extract(month FROM r) = 2 '
     'AND extract(year FROM r) BETWEEN 1 AND 1582 '
     'AND ' + _pg_op('extract(year FROM r)::integer', '%', '4') + ' = 0 THEN '
-    "RAISE EXCEPTION USING ERRCODE = '22008', MESSAGE = 'date not valid for month "
-    "specified: a Julian leap day, which the Mirror cannot store'; END IF; END IF; "
+    f"RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = '{_JULIAN_LEAP_DAY}'; "
+    # Any other day the month lacks is Oracle's ORA-01839 (#2611): PostgreSQL
+    # would end the month short, as ADD_MONTHS does.
+    'ELSIF extract(day FROM r) <> extract(day FROM t) THEN '
+    f"RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = '{_MONTH_LACKS_DAY}'; "
+    'END IF; END IF; '
     'us := '
     + _pg_op(
         _pg_op(
@@ -991,24 +1037,40 @@ _DATE_ARITHMETIC_DDL = (
         + '::double precision)',
     )
     + '; END $$;'
-    'CREATE OR REPLACE FUNCTION sys.ora_ts_plus(timestamp, interval) '
-    'RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT CASE '
-    f'WHEN $1 >= {_JULIAN_START} AND '
-    + _pg_op('$1', '+', '$2')
-    + f' >= {_JULIAN_START} THEN '
-    + _pg_op('$1', '+', '$2')
-    + ' ELSE sys.ora_julian_ts_plus($1, $2) END $$;'
+    # The Gregorian calendar's counted path: PostgreSQL's sum, once the
+    # interval's months are known to keep the day (#2611). A timestamptz, a
+    # WITH LOCAL TIME ZONE value, keeps the day in the session's zone, as
+    # Oracle's does.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_gregorian_ts_plus(t {kind}, i interval) '
+        f'RETURNS {kind} LANGUAGE plpgsql {volatility} STRICT AS $$ '
+        'DECLARE m integer; BEGIN '
+        'm := '
+        + _pg_op(
+            _pg_op('extract(year FROM i)::integer', '*', '12'),
+            '+',
+            'extract(month FROM i)::integer',
+        )
+        + '; '
+        'IF m <> 0 AND extract(day FROM '
+        + _pg_op('t', '+', 'pg_catalog.make_interval(months => m)')
+        + ') <> extract(day FROM t) THEN '
+        f"RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = '{_MONTH_LACKS_DAY}'; END IF; "
+        'RETURN ' + _pg_op('t', '+', 'i') + '; END $$;'
+        for kind, volatility in (('timestamp', 'IMMUTABLE'), ('timestamptz', 'STABLE'))
+    )
+    + 'CREATE OR REPLACE FUNCTION sys.ora_ts_plus(timestamp, interval) '
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT '
+    + _ts_shift('$1', '$2', '+')
+    + ' $$;'
     'CREATE OR REPLACE FUNCTION sys.ora_interval_plus_ts(interval, timestamp) '
     'RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_ts_plus($2, $1) $$;'
     # A CASE of its own: ora_ts_plus($1, -$2) names a parameter twice with an
     # expression for it, which PostgreSQL does not inline.
     'CREATE OR REPLACE FUNCTION sys.ora_ts_less(timestamp, interval) '
-    'RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT CASE '
-    f'WHEN $1 >= {_JULIAN_START} AND '
-    + _pg_op('$1', '-', '$2')
-    + f' >= {_JULIAN_START} THEN '
-    + _pg_op('$1', '-', '$2')
-    + ' ELSE sys.ora_julian_ts_plus($1, OPERATOR(pg_catalog.-) $2) END $$;'
+    'RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT '
+    + _ts_shift('$1', '$2', '-')
+    + ' $$;'
     'DO $$ BEGIN '
     'CREATE OPERATOR sys.- (LEFTARG = timestamp, RIGHTARG = timestamp, '
     'FUNCTION = sys.ora_ts_minus); '
@@ -1018,6 +1080,28 @@ _DATE_ARITHMETIC_DDL = (
     'FUNCTION = sys.ora_interval_plus_ts); '
     'CREATE OPERATOR sys.- (LEFTARG = timestamp, RIGHTARG = interval, '
     'FUNCTION = sys.ora_ts_less); '
+    'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    # A WITH LOCAL TIME ZONE value, a timestamptz, plus an interval's
+    # months on a day the month lacks in the session's zone: ORA-01839, as
+    # for a TIMESTAMP (#2611). Shadowing PostgreSQL's operators of the same
+    # types; its own DO block, for a database that already ran the one above.
+    'CREATE OR REPLACE FUNCTION sys.ora_ltz_plus(timestamptz, interval) '
+    'RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT '
+    + _ts_shift('$1', '$2', '+', julian=False)
+    + ' $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_interval_plus_ltz(interval, timestamptz) '
+    'RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT sys.ora_ltz_plus($2, $1) $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_ltz_less(timestamptz, interval) '
+    'RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT '
+    + _ts_shift('$1', '$2', '-', julian=False)
+    + ' $$;'
+    'DO $$ BEGIN '
+    'CREATE OPERATOR sys.+ (LEFTARG = timestamptz, RIGHTARG = interval, '
+    'FUNCTION = sys.ora_ltz_plus); '
+    'CREATE OPERATOR sys.+ (LEFTARG = interval, RIGHTARG = timestamptz, '
+    'FUNCTION = sys.ora_interval_plus_ltz); '
+    'CREATE OPERATOR sys.- (LEFTARG = timestamptz, RIGHTARG = interval, '
+    'FUNCTION = sys.ora_ltz_less); '
     'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
 )
 
@@ -1514,15 +1598,25 @@ _HELPER_FUNCTIONS_DDL = (
     # timestamptz, which lost the offset and did not fit a WITH TIME ZONE column.
     # They get their own DO block: one that already ran on a database raises
     # duplicate_function at its first operator and would never reach new ones.
+    # Oracle moves it in UTC: its months land on UTC's day, refused where the
+    # month lacks it as a TIMESTAMP's are (#2611). PostgreSQL's timestamptz
+    # would move them in the session's zone. Its days are still Gregorian
+    # before 1582 (#2600). The CASE is written out, not called: a call on an
+    # expression would not inline, at about 2.5 us a row. Not STRICT, which
+    # would also stop it inlining.
     f'CREATE OR REPLACE FUNCTION ora_tstz_add_interval({_TSTZ_TYPE}, interval) '
-    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE STRICT AS $$ '
-    f'SELECT ROW(($1).utc + $2, ($1).off)::{_TSTZ_TYPE} $$;'
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE AS $$ '
+    'SELECT CASE WHEN $1 IS NOT NULL AND $2 IS NOT NULL THEN ROW(('
+    + _ts_shift(_UTC_LABEL, '$2', '+', julian=False)
+    + f") AT TIME ZONE 'UTC', ($1).off)::{_TSTZ_TYPE} END $$;"
     f'CREATE OR REPLACE FUNCTION ora_interval_add_tstz(interval, {_TSTZ_TYPE}) '
-    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE STRICT AS $$ '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE AS $$ '
     'SELECT ora_tstz_add_interval($2, $1) $$;'
     f'CREATE OR REPLACE FUNCTION ora_tstz_sub_interval({_TSTZ_TYPE}, interval) '
-    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE STRICT AS $$ '
-    f'SELECT ROW(($1).utc - $2, ($1).off)::{_TSTZ_TYPE} $$;'
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE AS $$ '
+    'SELECT CASE WHEN $1 IS NOT NULL AND $2 IS NOT NULL THEN ROW(('
+    + _ts_shift(_UTC_LABEL, '$2', '-', julian=False)
+    + f") AT TIME ZONE 'UTC', ($1).off)::{_TSTZ_TYPE} END $$;"
     'DO $$ BEGIN '
     f'CREATE OPERATOR + (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = interval, '
     'FUNCTION = ora_tstz_add_interval, COMMUTATOR = +); '
