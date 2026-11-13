@@ -6149,8 +6149,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # and hyperbolic functions, ATAN2, SQRT, EXP and LN, with SQRT of a real
     # (#2585), and DUMP in Oracle's terms: sys.dump for 16 types at each of
     # its four arities, sys.ora_dump_text and five encoders (#2568), and
-    # sys.ora_nullif, a NULLIF keeping a domain (#2596).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 364
+    # sys.ora_nullif, a NULLIF keeping a domain (#2596), and TO_CHAR of a
+    # TIMESTAMP WITH TIME ZONE at its own offset, two sys.ora_to_char, a
+    # to_char and two ora_to_char_signed (#2613).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 369
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
