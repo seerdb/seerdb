@@ -6393,8 +6393,9 @@ BFILE) and, with §19.6 / §19.7, the PL/SQL surface (IN, OUT, IN OUT).
 ### 19.8 Oracle 8i login — the OSESSKEY-envelope O3LOGON (#244)
 
 Oracle **8i (8.1.7)** also negotiates field version 2 and uses the same DES
-**O3LOGON crypto** as 9i, but it does **not** speak 9i's positional
-`TTI_3LOGA`/`TTI_3LOGON` messages — sending those draws a `TTI_OER`. Instead 8i
+**O3LOGON crypto** as 9i. seerdb's own attempt at 9i's positional
+`TTI_3LOGA`/`TTI_3LOGON` messages drew a `TTI_OER` from it. The Oracle JDBC thin
+driver's positional login is taken, though (§19.8.1). seerdb instead
 wraps the O3LOGON exchange in the **OSESSKEY (`0x76`) / OAUTH (`0x73`, `TTI_AUTH`)**
 function envelope with key-value `AUTH_` pairs, the same envelope 10g+ uses for
 O5LOGON but carrying the 8i-era DES crypto. Reverse-engineered from a live
@@ -6456,6 +6457,50 @@ fields — `TTI_DTY` token, charset + national charset (both ISO Latin-1 = 31), 
 26-byte fv2 capability vector (captured 8i identity), and the DB time-zone block set
 to UTC (the `80000000` pad + the `+60`-biased `(60,60,60)` triplet) — followed by the
 conversion-entry list. The 8i **query** path is §19.9–19.10.
+
+#### 19.8.1 The session's OS user on 8i and 9i (SeerODBC #123)
+
+`v$session.osuser` and `USERENV('OS_USER')` come from different places on 8.1.7
+and 9.2.0.4 depending on the login form. Measured on both beds, 2026-11-13, with
+seerdb `connect(osuser='probe_os')` and with ojdbc14 run as `-Duser.name=probe_os`:
+
+| client and login form | 8.1.7 | 9.2.0.4 | 10.2.0.5 |
+|---|---|---|---|
+| seerdb: the OSESSKEY / OAUTH envelope, `AUTH_SID=probe_os` in both phases | `system`, the database user | `pyo`, the database user | `probe_os` |
+| ojdbc14: positional `TTI_3LOGA` / `TTI_3LOGON` | `probe_os` | `probe_os` | — |
+
+**In the key-value envelope, 8.1.7 and 9.2.0.4 ignore `AUTH_SID`.** The session's
+OS user is then the database user. The same calls' `AUTH_MACHINE` and
+`AUTH_PROGRAM_NM` are taken (`v$session.machine`, `program`). From 10g the pair is
+honoured. Other keys for the OS user in this envelope were not tried.
+
+**The positional form carries it.** ojdbc14 logs in to both servers with
+`TTI_3LOGA` (`0x52`), then `TTI_3LOGON` (`0x51`), in thin's variable-width
+integers. Each call is a run of pointer-and-length fields and then the strings
+back to back:
+- `TTI_3LOGA` carries the user, then four session strings: the terminal, the
+  machine, the OS user and the program.
+- `TTI_3LOGON` carries the same, with the encrypted password after the user.
+
+The OS user is the fourth session string, and both servers report it. The
+captured `TTI_3LOGA` to 9.2.0.4 (user `pyo`):
+
+```
+03 52 00 01 01 03 00 00 00 00 00 00 01 01 07 01 01 07 01 01 08 02 10 00 00 00
+01 01 10 00 00 00 00 01 01 10 01
+70 79 6f                                   pyo
+75 6e 6b 6e 6f 77 6e                       unknown            (terminal, 7)
+66 69 72 65 66 6c 79                       firefly            (machine, 7)
+70 72 6f 62 65 5f 6f 73                    probe_os           (OS user, 8)
+4a 44 42 43 20 54 68 69 6e 20 43 6c 69 65 6e 74   JDBC Thin Client (program, 16)
+```
+
+8.1.7 is sent the same calls through its listener's redirect, `system` in place
+of `pyo`, and answers them as 9.2.0.4 does: the session key, then a clean status.
+The block around the program's length, `02 10 00 00 00 01 01 10`, is still not
+understood (§4.4 above). seerdb left this form for the envelope in #2342. So
+setting the OS user on 8i and 9i takes the positional login. No pair in the
+envelope is known to do it.
 
 ### 19.9 Oracle 8i SELECT — the 9.2-era OALL8 request (#244)
 
