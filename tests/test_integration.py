@@ -703,6 +703,15 @@ if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
 # is the native form. The server's pool must be started.
 if os.environ.get('SEERDB_TEST_SERVER_TYPE'):
     _FV_KW['server_type'] = os.environ['SEERDB_TEST_SERVER_TYPE']
+# Run the suite over TCPS, trusting this CA's certificate (#2645): the port is
+# then the listener's TCPS endpoint.
+if os.environ.get('SEERDB_TEST_SSL_CA'):
+    _FV_KW['ssl'] = {'ca_certs': os.environ['SEERDB_TEST_SSL_CA']}
+# A test that puts a listener or a TLS proxy of its own, speaking plain TCP to
+# the server, in front of it has nothing to talk to on a TCPS run.
+_PLAIN_FIXTURE = unittest.skipIf(
+    'ssl' in _FV_KW, 'its own listener speaks plain TCP, and this run is TCPS'
+)
 
 _SKIP_REASON = (
     'integration tests require a real DB connection; '
@@ -8198,7 +8207,7 @@ class ErrorAndRowcountIntegration(_IntegrationBase):
             user=_USER,
             password=_PASSWORD,
             service_name=_SERVICE,
-            field_version=FIELD_VERSION_12_2,
+            **{**_FV_KW, 'field_version': FIELD_VERSION_12_2},
         )
         try:
             if conn._server_field_version() < FIELD_VERSION_20_1:
@@ -10878,6 +10887,7 @@ class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+@_PLAIN_FIXTURE
 class RedirectIntegration(_ThrottleRetry, unittest.TestCase):
     """Follow a TNS_REDIRECT to reconnect to the address the server hands back
     (#23). A RedirectListener stands in for a shared-server / RAC listener: it
@@ -15167,6 +15177,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
+    @_PLAIN_FIXTURE
     async def test_follows_redirect(self):
         # Async mirror of RedirectIntegration: follow a TNS_REDIRECT to the
         # backend the listener hands back (#23).
@@ -16643,6 +16654,7 @@ class AsyncPoolIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
+@_PLAIN_FIXTURE
 class SSLIntegration(_ThrottleRetry, unittest.TestCase):
     """Verify the TLS wrap by talking to Oracle through a local TLS proxy.
 
