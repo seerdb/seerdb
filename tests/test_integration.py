@@ -1497,6 +1497,64 @@ class TypesIntegration(_IntegrationBase):
             Conn.close()
 
     @_requires(_TSTZ)
+    def test_a_zoned_timestamp_formatted_is_at_its_own_offset(self):
+        # TO_CHAR(tstz, fmt) prints the wall clock and TZH:TZM at the value's
+        # own offset; through the Mirror-over-PG both were the session's, and
+        # FF failed as sys.ora_to_char(ora_tstz, ...) (#2613). 23ai's text, the
+        # session at +01:00.
+        Conn = _connect()
+        try:
+            Cur = Conn.cursor()
+            Cur.execute("ALTER SESSION SET TIME_ZONE = '+01:00'")
+            Utc = "FROM_TZ(TIMESTAMP '2020-10-04 12:00:00', '+00:00')"
+            Literal = "TIMESTAMP '2020-10-04 12:00:00.5 +03:00'"
+            Minute = "'YYYY-MM-DD HH24:MI TZH:TZM'"
+            Cases = [
+                (f'TO_CHAR({Utc}, {Minute})', '2020-10-04 12:00 +00:00'),
+                (
+                    f"TO_CHAR({Utc} + INTERVAL '1' DAY, {Minute})",
+                    '2020-10-05 12:00 +00:00',
+                ),
+                (f'TO_CHAR({Literal}, {Minute})', '2020-10-04 12:00 +03:00'),
+                (
+                    f"TO_CHAR({Literal}, 'YYYY-MM-DD HH24:MI:SS.FF3 TZR')",
+                    '2020-10-04 12:00:00.500 +03:00',
+                ),
+                (f"TO_CHAR({Literal}, 'HH24:MI:SS.FF TZH')", '12:00:00.500000000 +03'),
+                (
+                    "TO_CHAR(FROM_TZ(CAST(TIMESTAMP '2020-10-04 12:00:00.5' AS TIMESTAMP(3)),"
+                    " '-04:30'), 'HH24:MI:SS.FF TZH:TZM')",
+                    '12:00:00.500 -04:30',
+                ),
+                (
+                    "TO_CHAR(TO_TIMESTAMP_TZ('2020-10-04 12:00 -04:30',"
+                    f" 'YYYY-MM-DD HH24:MI TZH:TZM'), {Minute})",
+                    '2020-10-04 12:00 -04:30',
+                ),
+                (f"TO_CHAR({Literal}, 'fmDD.MM.YYYY HH24:MI')", '4.10.2020 12:0'),
+                (
+                    f"TO_CHAR({Literal}, 'SYYYY-MM-DD HH24:MI TZH')",
+                    ' 2020-10-04 12:00 +03',
+                ),
+                (
+                    "TO_CHAR(CAST(TIMESTAMP '2020-10-04 12:00:00' AS TIMESTAMP WITH LOCAL"
+                    " TIME ZONE), 'SYYYY-MM-DD HH24:MI')",
+                    ' 2020-10-04 12:00',
+                ),
+                (
+                    f"TO_CHAR(CAST(TIMESTAMP '2020-10-04 12:00:00' AS TIMESTAMP WITH TIME"
+                    f' ZONE), {Minute})',
+                    '2020-10-04 12:00 +01:00',
+                ),
+            ]
+            for Expression, Expected in Cases:
+                with self.subTest(Expression):
+                    Cur.execute(f'SELECT {Expression} FROM dual')
+                    self.assertEqual(Cur.fetchone()[0], Expected)
+        finally:
+            Conn.close()
+
+    @_requires(_TSTZ)
     def test_a_to_timestamp_result_made_text_is_a_timestamp(self):
         # TO_TIMESTAMP(...) made text without a format follows
         # NLS_TIMESTAMP_FORMAT at precision 9, and TO_TIMESTAMP_TZ(...) follows

@@ -1543,6 +1543,25 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_tstz_text(timestamptz, integer) '
     'RETURNS text LANGUAGE sql STABLE AS $$ '
     'SELECT sys.ora_tstz_text(ora_tstz_of_instant($1), $2) $$;'
+    # TO_CHAR(tstz, fmt): the wall clock at the value's own offset, and TZH,
+    # TZM and TZR that offset's (#2613), where the cast to timestamptz printed
+    # both at the session's. FF as $3 digits, the value's precision where
+    # the statement's text gives it, 6 where it does not. A WITH TIME ZONE
+    # value a CAST made, a timestamptz, is at the session's offset.
+    f'CREATE OR REPLACE FUNCTION sys.ora_to_char({_TSTZ_TYPE}, text, integer) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT sys.ora_zone_text(('
+    '$1).utc AT TIME ZONE make_interval(secs => ($1).off), ($1).off, $2, $3) $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_to_char(timestamptz, text, integer) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ '
+    'SELECT sys.ora_to_char(ora_tstz_of_instant($1), $2, $3) $$;'
+    f'CREATE OR REPLACE FUNCTION to_char({_TSTZ_TYPE}, text) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT sys.ora_to_char($1, $2, 6) $$;'
+    # A format with SYYYY, which the signed-year rewrite makes this call:
+    # sys.ora_to_char signs the year too, at the value's offset (#2612).
+    f'CREATE OR REPLACE FUNCTION ora_to_char_signed({_TSTZ_TYPE}, text) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT sys.ora_to_char($1, $2, 6) $$;'
+    'CREATE OR REPLACE FUNCTION ora_to_char_signed(timestamptz, text) RETURNS text '
+    'LANGUAGE sql STABLE AS $$ SELECT sys.ora_to_char($1, $2, 6) $$;'
     'DO $$ BEGIN '
     f'CREATE CAST (timestamptz AS {_TSTZ_TYPE}) '
     'WITH FUNCTION ora_tstz_of_instant(timestamptz) AS ASSIGNMENT; '
@@ -19937,10 +19956,18 @@ class PostgresBackend:
                     else None
                 )
             if converted is None:
-                computed = self._computed_precision(value, tables)
+                computed = self._computed_datetime(value, tables)
                 if computed is not None:
-                    converted = (_DATETIME_TEXT, computed)
-            if converted is None or converted[0] != _DATETIME_TEXT or converted[1] < 0:
+                    (precision, zones) = computed
+                    zone = next(iter(zones)) if len(zones) == 1 else None
+                    converted = (_DATETIME_TEXT if not zones else zone or '', precision)
+            # A WITH TIME ZONE one too, its sys.ora_to_char at its own offset
+            # (#2613).
+            if (
+                converted is None
+                or converted[0] not in (_DATETIME_TEXT, _TSTZ_TEXT)
+                or converted[1] < 0
+            ):
                 continue
             out[name] = 'sys.ora_to_char'
             out[close] = f', {converted[1]})'
