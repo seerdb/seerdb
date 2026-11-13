@@ -1432,6 +1432,70 @@ class TypesIntegration(_IntegrationBase):
         )
         self.assertEqual(v.utcoffset(), datetime.timedelta(hours=-4))
 
+    @_requires(_TSTZ)
+    def test_a_computed_zoned_timestamp_made_text_follows_the_nls_formats(self):
+        # A computed TIMESTAMP WITH [LOCAL] TIME ZONE made text without a format,
+        # by TO_CHAR(x) and by ||: through the Mirror-over-PG one failed as
+        # to_char(ora_tstz) or printed the composite holding it (#2615). 23ai's
+        # text, the session at +05:00 and the default formats; 11g's is the same.
+        Conn = _connect()
+        try:
+            Cur = Conn.cursor()
+            for Setting in (
+                "TIME_ZONE = '+05:00'",
+                "NLS_DATE_FORMAT = 'DD-MON-RR'",
+                "NLS_TIMESTAMP_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM'",
+                "NLS_TIMESTAMP_TZ_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM TZR'",
+            ):
+                Cur.execute(f'ALTER SESSION SET {Setting}')
+            Literal = "TIMESTAMP '2020-01-15 10:00:00.5 +03:00'"
+            Plain = "TIMESTAMP '2020-01-15 10:00:00.5'"
+            Cases = [
+                (
+                    f"{Literal} + INTERVAL '1' DAY",
+                    '16-JAN-20 10.00.00.500000000 AM +03:00',
+                ),
+                (
+                    f"{Literal} - INTERVAL '2' HOUR",
+                    '15-JAN-20 08.00.00.500000000 AM +03:00',
+                ),
+                (f'{Literal} + 1', '16-JAN-20'),
+                (
+                    f"FROM_TZ({Plain}, '+03:00')",
+                    '15-JAN-20 10.00.00.500000000 AM +03:00',
+                ),
+                (
+                    f"FROM_TZ(CAST({Plain} AS TIMESTAMP(3)), '+03:00')",
+                    '15-JAN-20 10.00.00.500 AM +03:00',
+                ),
+                (
+                    f'CAST({Literal} AS TIMESTAMP WITH LOCAL TIME ZONE)',
+                    '15-JAN-20 12.00.00.500000 PM',
+                ),
+                (
+                    f'CAST({Plain} AS TIMESTAMP(2) WITH TIME ZONE)',
+                    '15-JAN-20 10.00.00.50 AM +05:00',
+                ),
+                (
+                    f'CAST({Plain} AS TIMESTAMP(3) WITH LOCAL TIME ZONE)',
+                    '15-JAN-20 10.00.00.500 AM',
+                ),
+                (
+                    f"CAST({Literal} AS TIMESTAMP WITH LOCAL TIME ZONE) + INTERVAL '1' DAY",
+                    '16-JAN-20 12.00.00.500000000 PM',
+                ),
+                (f'NVL({Literal}, NULL)', '15-JAN-20 10.00.00.500000000 AM +03:00'),
+                (f'TRUNC({Literal})', '15-JAN-20'),
+            ]
+            for Expression, Expected in Cases:
+                with self.subTest(Expression):
+                    Cur.execute(
+                        f"SELECT TO_CHAR({Expression}), ({Expression}) || '|' FROM dual"
+                    )
+                    self.assertEqual(Cur.fetchone(), (Expected, Expected + '|'))
+        finally:
+            Conn.close()
+
     # ----- BINARY_FLOAT / BINARY_DOUBLE -----
 
     def test_binary_float(self):
