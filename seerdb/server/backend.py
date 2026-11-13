@@ -189,7 +189,9 @@ class DateValue(datetime.datetime):
     ``datetime``, but Oracle types the bind, and every expression over it, by
     the type the client declared: the difference of two DATEs is a NUMBER of
     days, of two TIMESTAMPs an INTERVAL DAY TO SECOND. It IS a ``datetime``, so
-    a backend that does not care needs nothing new.
+    a backend that does not care needs nothing new -- unless its driver looks a
+    value's type up exactly, as sqlite3's adapters do: that one registers
+    ``DateValue`` too (``examples/sqlite_backend.py``).
     """
 
     __slots__ = ()
