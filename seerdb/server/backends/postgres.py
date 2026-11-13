@@ -1567,6 +1567,34 @@ _HELPER_FUNCTIONS_DDL = (
     "WHEN 'timezone_hour' THEN div(($2).off, 3600) "
     "WHEN 'timezone_minute' THEN div(($2).off % 3600, 60) "
     "ELSE pg_catalog.extract($1, ($2).utc AT TIME ZONE 'UTC') END $$;"
+    # x AT TIME ZONE z and x AT LOCAL, which the translator makes these calls
+    # (#2617): the same instant, a WITH TIME ZONE value at the zone's offset
+    # then, a numeric zone read the ISO way (east positive), a region by its
+    # rules, the offset to the minute as Oracle keeps it; a TIMESTAMP read in
+    # the session's zone first. PostgreSQL's AT TIME ZONE gave a plain
+    # timestamp and read '+01:00' as west of UTC.
+    'CREATE OR REPLACE FUNCTION sys.ora_zone_offset(timestamptz, text) RETURNS integer '
+    'LANGUAGE sql STABLE AS $$ SELECT CASE '
+    "WHEN btrim($2) ~ '^[+-]?[0-9]{1,2}:[0-9]{2}$' "
+    'THEN extract(epoch FROM btrim($2)::interval)::integer '
+    'ELSE (pg_catalog.round(extract(epoch FROM '
+    "($1 AT TIME ZONE $2) OPERATOR(pg_catalog.-) ($1 AT TIME ZONE 'UTC')) "
+    'OPERATOR(pg_catalog./) 60) OPERATOR(pg_catalog.*) 60)::integer END $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_at_time_zone({_TSTZ_TYPE}, text) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql STABLE AS $$ '
+    f'SELECT ROW(($1).utc, sys.ora_zone_offset(($1).utc, $2))::{_TSTZ_TYPE} $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_at_time_zone(timestamptz, text) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql STABLE AS $$ '
+    f'SELECT ROW($1, sys.ora_zone_offset($1, $2))::{_TSTZ_TYPE} $$;'
+    'CREATE OR REPLACE FUNCTION sys.ora_at_time_zone(timestamp, text) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql STABLE AS $$ '
+    'SELECT sys.ora_at_time_zone($1::timestamptz, $2) $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_at_local({_TSTZ_TYPE}) RETURNS {_TSTZ_TYPE} '
+    'LANGUAGE sql STABLE AS $$ SELECT ora_tstz_of_instant(($1).utc) $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_at_local(timestamptz) RETURNS {_TSTZ_TYPE} '
+    'LANGUAGE sql STABLE AS $$ SELECT ora_tstz_of_instant($1) $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_at_local(timestamp) RETURNS {_TSTZ_TYPE} '
+    'LANGUAGE sql STABLE AS $$ SELECT ora_tstz_of_instant($1::timestamptz) $$;'
     # TO_CHAR(tstz, fmt): the wall clock at the value's own offset, and TZH,
     # TZM and TZR that offset's (#2613), where the cast to timestamptz printed
     # both at the session's. FF as $3 digits, the value's precision where
@@ -9651,6 +9679,119 @@ def _translate_extract(sql: str) -> str:
     return _rewrite_calls(sql, _EXTRACT_NAMES, rewrite, '_.')
 
 
+_NAME_TOKEN = re.compile(r'(?:"[^"]+"|[A-Za-z_][\w$#]*)')
+# The words a primary cannot end with, so a ')' after one closes no call.
+_NOT_A_CALL = frozenset({'AND', 'OR', 'NOT', 'IN', 'SELECT', 'WHERE', 'ON', 'AS', 'BY'})
+
+
+def _translate_at_time_zone(sql: str) -> str:
+    """`x AT TIME ZONE z` as sys.ora_at_time_zone(x, z), `x AT LOCAL` as
+    sys.ora_at_local(x) (#2617).
+
+    Oracle's result is a TIMESTAMP WITH TIME ZONE, the same instant at the
+    zone's offset, a numeric zone read the ISO way, east positive, and a
+    TIMESTAMP read in the session's zone. PostgreSQL's AT TIME ZONE gave a
+    plain timestamp, read a numeric zone the POSIX way, west positive, and
+    has no AT LOCAL. x is the primary right before AT: a name, a bind, a
+    typed literal, a call or a group; z the one right after ZONE.
+    """
+    if not re.search(r'(?i)\bAT\s+(?:TIME\s+ZONE|LOCAL)\b', sql):
+        return sql
+    while True:
+        spans = _bind_spans(sql)
+        sig = [i for i, span in enumerate(spans) if span[0] not in ('space', 'comment')]
+
+        def text(k: int) -> str:
+            return spans[sig[k]][1] if 0 <= k < len(sig) else ''
+
+        def opening(close: int) -> int | None:
+            depth = 0
+            for j in range(close, -1, -1):
+                depth += (text(j) == ')') - (text(j) == '(')
+                if depth == 0:
+                    return j
+            return None
+
+        def closing(start: int) -> int | None:
+            depth = 0
+            for j in range(start, len(sig)):
+                depth += (text(j) == '(') - (text(j) == ')')
+                if depth == 0:
+                    return j
+            return None
+
+        def name_start(j: int) -> int:
+            # The first token of a dotted name ending at j.
+            while text(j - 1) == '.' and _NAME_TOKEN.fullmatch(text(j - 2)):
+                j -= 2
+            return j
+
+        found = None
+        for k in range(1, len(sig)):
+            if text(k).upper() != 'AT':
+                continue
+            if text(k + 1).upper() == 'TIME' and text(k + 2).upper() == 'ZONE':
+                (local, zone_at) = (False, k + 3)
+            elif text(k + 1).upper() == 'LOCAL':
+                (local, zone_at) = (True, k + 1)
+            else:
+                continue
+            # The operand before AT.
+            last = k - 1
+            first: int | None
+            if text(last) == ')':
+                first = opening(last)
+                if first is None:
+                    continue
+                if _NAME_TOKEN.fullmatch(text(first - 1)) and (
+                    text(first - 1).upper() not in _NOT_A_CALL
+                ):
+                    first = name_start(first - 1)
+            elif text(last).startswith("'"):
+                first = last
+                # A typed literal, a DATE one as the date-type rule spells it.
+                if text(last - 1).upper() in ('TIMESTAMP', 'DATE', _DATE_TYPE.upper()):
+                    first = last - 1
+            elif text(last).startswith(':') or _NAME_TOKEN.fullmatch(text(last)):
+                first = name_start(last)
+            else:
+                continue
+            # The zone after it.
+            end: int | None
+            if local:
+                end = zone_at
+            elif text(zone_at) == '(':
+                end = closing(zone_at)
+            elif text(zone_at).startswith(("'", ':')):
+                end = zone_at
+            elif _NAME_TOKEN.fullmatch(text(zone_at)):
+                end = zone_at
+                while text(end + 1) == '.' and _NAME_TOKEN.fullmatch(text(end + 2)):
+                    end += 2
+                if text(end + 1) == '(':
+                    end = closing(end + 1)
+            else:
+                continue
+            if end is None:
+                continue
+            found = (first, last, zone_at, end, local)
+            break
+        if found is None:
+            return sql
+        (first, last, zone_at, end, local) = found
+        operand = ''.join(span[1] for span in spans[sig[first] : sig[last] + 1])
+        if local:
+            call = f'sys.ora_at_local({operand})'
+        else:
+            zone = ''.join(span[1] for span in spans[sig[zone_at] : sig[end] + 1])
+            call = f'sys.ora_at_time_zone({operand}, {zone})'
+        sql = (
+            ''.join(span[1] for span in spans[: sig[first]])
+            + call
+            + ''.join(span[1] for span in spans[sig[end] + 1 :])
+        )
+
+
 # DECODE(expr, search1, result1, ..., [default]) becomes a CASE (#822). orafce's
 # decode is declared over polymorphic parameters, which PostgreSQL resolves from
 # the argument types: all-untyped literals give it nothing to resolve from, and
@@ -11976,6 +12117,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('connect-by', _translate_connect_by(sql), sql)
     sql = _ruled('fm-toggle', _translate_fm_toggle(sql), sql)
     sql = _ruled('extract', _translate_extract(sql), sql)
+    sql = _ruled('at-time-zone', _translate_at_time_zone(sql), sql)
     sql = _ruled('signed-year', _translate_signed_year(sql), sql)
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
