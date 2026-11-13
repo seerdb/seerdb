@@ -271,8 +271,16 @@ would cost far more than anyone gains from it.
   1500-01-29 plus a month, a Julian February 29, is refused. A result in the
   year 0 is refused as a DATE's is: 23ai counts 367 days from -0001-12-31 to
   0001-01-01, yet adds one day to the first to reach the second, and 11g
-  reaches a year 0. TIMESTAMP WITH TIME ZONE and WITH LOCAL TIME ZONE
-  arithmetic still counts those days the Gregorian way
+  reaches a year 0. TIMESTAMP WITH TIME ZONE and WITH LOCAL TIME ZONE values
+  plus or minus an interval, and their differences, count Oracle's days too: a
+  WITH TIME ZONE value's in UTC, a WITH LOCAL TIME ZONE value's interval in
+  the session's zone. Months that land in the gap, `TIMESTAMP '1582-09-10
+  12:00:00' + INTERVAL '1' MONTH`, end the month short at 09-30. 23ai keeps
+  1582-10-10 and counts from it as the Julian day after 10-09, and its DATE
+  of the same prints as `0000-00-00`. Converting a value between its offset
+  and UTC across 1582-10-15 is still Gregorian:
+  `SYS_EXTRACT_UTC(TIMESTAMP '1582-10-15 01:00:00 +03:00')` is 1582-10-14
+  22:00, where Oracle's is 10-04
   ([#2600](https://github.com/seerdb/seerdb/issues/2600)).
 - **The digits of NUMBER math functions.** `SQRT`, `EXP`, `LN`, `LOG`,
   `POWER`, the trigonometric and the hyperbolic functions of a NUMBER return a
