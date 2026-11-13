@@ -12067,6 +12067,38 @@ def _to_nchar_as_to_char(sql: str) -> str:
 _DATE_LITERAL_WORD = re.compile(r"\bDATE(?=\s*')", re.IGNORECASE)
 _CAST_AS_DATE = re.compile(r'\b(AS\s+)DATE\b', re.IGNORECASE)
 
+# A DATE or TIMESTAMP literal's text with a BC year, Oracle's signed year
+# right at the start ('-0044-03-15', '-44-03-15'), and the zone at its end.
+_BC_LITERAL_TEXT = re.compile(
+    r"'-(\d{1,4})(-[^']*?)(\s+(?:[+-]\d{1,2}:\d{2}|UTC|[A-Za-z]\w*/[\w/+-]+))?'"
+)
+
+
+def _bc_literals(sql: str) -> str:
+    """A DATE or TIMESTAMP literal with a BC year spelt as PostgreSQL reads it
+    (#2620): DATE '-0044-03-15' as DATE '0044-03-15 BC', the zone kept last.
+    PostgreSQL read the leading '-' as a time zone displacement and refused
+    the literal. The year is the label's, -44 read back as -44, as TO_DATE's
+    with SYYYY is. A space before the sign is Oracle's ORA-01841 and is left.
+    """
+    if "'-" not in sql:
+        return sql
+    spans = _bind_spans(sql)
+    out = [span[1] for span in spans]
+    word = ''
+    for i, (kind, text, _name) in enumerate(spans):
+        if kind in ('space', 'comment'):
+            continue
+        if kind == 'string' and word in ('DATE', 'TIMESTAMP'):
+            literal = _BC_LITERAL_TEXT.fullmatch(text)
+            if literal is not None:
+                out[i] = (
+                    f"'{literal.group(1).zfill(4)}{literal.group(2)} BC"
+                    f"{literal.group(3) or ''}'"
+                )
+        word = text.upper()
+    return ''.join(out)
+
 
 def _mirror_date_type(sql: str) -> str:
     (masked, contents) = _mask_quoted(sql)
@@ -12102,6 +12134,7 @@ def _past_the_gap(sql: str) -> str:
 
 def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('to-nchar', _to_nchar_as_to_char(sql), sql)
+    sql = _ruled('bc-literal', _bc_literals(sql), sql)
     sql = _ruled('date-type', _mirror_date_type(sql), sql)
     sql = _ruled('past-the-gap', _past_the_gap(sql), sql)
     sql = _ruled('hash-identifier', _quote_hash_identifiers(sql), sql)

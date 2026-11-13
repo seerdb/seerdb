@@ -6228,6 +6228,40 @@ class BindIntegration(_IntegrationBase):
                 self.assertEqual(self.cur.fetchone(), (days,))
                 self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
 
+    @_requires(_TSTZ)
+    def test_a_bc_date_or_timestamp_literal_is_read(self):
+        # A DATE or TIMESTAMP literal with a negative, BC, year is read as
+        # Oracle reads it: DATE '-0044-03-15'. Through the Mirror-over-PG
+        # PostgreSQL read the sign as a time zone displacement and refused the
+        # literal (#2620). 23ai's answers.
+        for expr, value in (
+            (
+                "TO_CHAR(DATE '-0044-03-15', 'SYYYY-MM-DD HH24:MI:SS')",
+                '-0044-03-15 00:00:00',
+            ),
+            ("TO_CHAR(DATE '-44-03-15', 'SYYYY-MM-DD')", '-0044-03-15'),
+            ("TO_CHAR(DATE '-4712-01-01', 'SYYYY-MM-DD')", '-4712-01-01'),
+            (
+                "TO_CHAR(TIMESTAMP '-0044-03-15 10:00:00.25', 'SYYYY-MM-DD HH24:MI:SS.FF2')",
+                '-0044-03-15 10:00:00.25',
+            ),
+            (
+                "TO_CHAR(TIMESTAMP '-0044-03-15 10:00:00 -05:30', 'SYYYY-MM-DD HH24:MI TZH:TZM')",
+                '-0044-03-15 10:00 -05:30',
+            ),
+            ("TO_CHAR(DATE '-0044-03-15', 'YYYY-MM-DD BC')", '0044-03-15 BC'),
+            ("TO_CHAR(DATE '-0044-03-15' + 1, 'SYYYY-MM-DD')", '-0044-03-16'),
+            ("DATE '-0001-12-31' - DATE '-0044-03-15'", 15996),
+            ("EXTRACT(YEAR FROM DATE '-0044-03-15')", -44),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (value,))
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (d DATE)')
+        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (DATE '-0044-03-15')")
+        self.cur.execute(f"SELECT TO_CHAR(d, 'SYYYY-MM-DD') FROM {self.TABLE}")
+        self.assertEqual(self.cur.fetchone(), ('-0044-03-15',))
+
     def test_dates_before_1582_are_julian(self):
         # Oracle's DATE follows the Julian calendar before 1582-10-15: no days
         # between 10-04 and 10-15, a leap year every fourth year, and a day
