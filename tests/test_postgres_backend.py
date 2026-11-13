@@ -76,6 +76,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _translate_binds,
     _translate_connect_by,
     _translate_ddl,
+    _translate_extract,
     _translate_idioms,
     _translate_json_constructor_values,
     _translate_plsql_block,
@@ -6151,8 +6152,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # its four arities, sys.ora_dump_text and five encoders (#2568), and
     # sys.ora_nullif, a NULLIF keeping a domain (#2596), and TO_CHAR of a
     # TIMESTAMP WITH TIME ZONE at its own offset, two sys.ora_to_char, a
-    # to_char and two ora_to_char_signed (#2613).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 369
+    # to_char and two ora_to_char_signed (#2613), and EXTRACT's five
+    # sys.ora_extract overloads (#2627).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 374
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -17738,3 +17740,30 @@ def test_to_timestamp_says_its_type_and_precision() -> None:
     assert found(
         "SELECT TO_TIMESTAMP_TZ('2020-03-07 +03:00', 'YYYY-MM-DD TZH:TZM') || 'x' FROM dual"
     ) == [('sys.ora_tstz_text', 9)]
+
+
+def test_extract_of_a_datetime_field_is_sys_ora_extract() -> None:
+    # EXTRACT(field FROM x) is sys.ora_extract('field', x), nested ones too, so
+    # a WITH TIME ZONE value's overload gives its UTC time (#2627). XMLType's
+    # EXTRACT(xml, path) and the fields the Mirror cannot give are left.
+    assert _translate_extract('SELECT EXTRACT(HOUR FROM t) FROM x') == (
+        "SELECT sys.ora_extract('hour', t) FROM x"
+    )
+    assert (
+        _translate_extract(
+            'SELECT extract(timezone_hour FROM (SELECT t FROM x)) FROM dual'
+        )
+        == "SELECT sys.ora_extract('timezone_hour', (SELECT t FROM x)) FROM dual"
+    )
+    assert _translate_extract(
+        "SELECT EXTRACT(DAY FROM t + NUMTODSINTERVAL(EXTRACT(HOUR FROM u), 'HOUR')) FROM x"
+    ) == (
+        "SELECT sys.ora_extract('day', t + NUMTODSINTERVAL(sys.ora_extract('hour', u), "
+        "'HOUR')) FROM x"
+    )
+    for kept in (
+        "SELECT EXTRACT(doc, '/a/b') FROM x",
+        'SELECT EXTRACT(TIMEZONE_REGION FROM t) FROM x',
+        'SELECT my_extract(HOUR FROM t) FROM x',
+    ):
+        assert _translate_extract(kept) == kept

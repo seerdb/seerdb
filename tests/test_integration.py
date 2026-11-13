@@ -5747,6 +5747,64 @@ class BindIntegration(_IntegrationBase):
         self.assertEqual(Got, Value)
         self.assertEqual(Got.utcoffset(), Value.utcoffset())
 
+    @_requires(_TSTZ, _INTERVAL)
+    def test_extract_from_a_zoned_timestamp_is_its_utc_time(self):
+        # EXTRACT from a WITH TIME ZONE value gives its UTC time's fields and
+        # its own offset, a column's as a literal's. Through the Mirror-over-PG
+        # it gave them in the session's zone (#2627). A WITH LOCAL TIME ZONE
+        # value's are its session's wall clock, a TIMESTAMP's and an
+        # interval's their own.
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (t TIMESTAMP WITH TIME ZONE)')
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (TIMESTAMP '2020-07-01 03:15:09.5 -04:30')"
+        )
+        Fields = (
+            'YEAR',
+            'MONTH',
+            'DAY',
+            'HOUR',
+            'MINUTE',
+            'SECOND',
+            'TIMEZONE_HOUR',
+            'TIMEZONE_MINUTE',
+        )
+        Expected = (2020, 7, 1, 7, 45, 9.5, -4, -30)
+        self.cur.execute(
+            'SELECT '
+            + ', '.join(f'EXTRACT({f} FROM t)' for f in Fields)
+            + f' FROM {self.TABLE}'
+        )
+        self.assertEqual(tuple(float(v) for v in self.cur.fetchone()), Expected)
+        for Expression, Value in (
+            ("EXTRACT(DAY FROM TIMESTAMP '2020-01-15 01:30:00 +03:00')", 14),
+            ("EXTRACT(HOUR FROM TIMESTAMP '2020-01-15 01:30:00 +03:00')", 22),
+            ("EXTRACT(TIMEZONE_HOUR FROM TIMESTAMP '2020-01-15 01:30:00 +03:00')", 3),
+            (
+                "EXTRACT(HOUR FROM TIMESTAMP '2020-01-15 01:30:00 +03:00' + INTERVAL '1' HOUR)",
+                23,
+            ),
+            (
+                "EXTRACT(HOUR FROM FROM_TZ(TIMESTAMP '2020-07-01 12:00:00', 'Europe/Berlin'))",
+                10,
+            ),
+            (
+                "EXTRACT(TIMEZONE_HOUR FROM FROM_TZ(TIMESTAMP '2020-07-01 12:00:00', "
+                "'Europe/Berlin'))",
+                2,
+            ),
+            (
+                "EXTRACT(HOUR FROM CAST(TIMESTAMP '2020-01-15 01:30:00' "
+                'AS TIMESTAMP WITH LOCAL TIME ZONE))',
+                1,
+            ),
+            ("EXTRACT(HOUR FROM TIMESTAMP '2020-01-15 01:30:00')", 1),
+            ("EXTRACT(MONTH FROM INTERVAL '1-2' YEAR TO MONTH)", 2),
+            ("EXTRACT(SECOND FROM INTERVAL '3 04:05:06.5' DAY TO SECOND)", 6.5),
+        ):
+            with self.subTest(Expression):
+                self.cur.execute(f'SELECT {Expression} FROM dual')
+                self.assertEqual(float(self.cur.fetchone()[0]), Value)
+
     def test_to_timestamp_is_a_timestamp(self):
         # TO_TIMESTAMP gives a TIMESTAMP, fractional seconds and all. A
         # Mirror-over-PG gave a timestamptz, which described as WITH LOCAL TIME

@@ -1543,6 +1543,27 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_tstz_text(timestamptz, integer) '
     'RETURNS text LANGUAGE sql STABLE AS $$ '
     'SELECT sys.ora_tstz_text(ora_tstz_of_instant($1), $2) $$;'
+    # EXTRACT(field FROM x), which the translator makes sys.ora_extract (#2627):
+    # a WITH TIME ZONE value's fields are its UTC time's, and TIMEZONE_HOUR and
+    # TIMEZONE_MINUTE its own offset's, as Oracle gives them, where the cast to
+    # timestamptz read both in the session's zone. Any other value is
+    # PostgreSQL's extract, of the type it already was; a DATE or a YEAR TO
+    # MONTH interval, domains, goes to its base type's.
+    + ''.join(
+        f'CREATE OR REPLACE FUNCTION sys.ora_extract(text, {kind}) RETURNS numeric '
+        f'LANGUAGE sql {volatility} AS $$ SELECT pg_catalog.extract($1, $2) $$;'
+        for kind, volatility in (
+            ('timestamp', 'IMMUTABLE'),
+            ('date', 'IMMUTABLE'),
+            ('interval', 'IMMUTABLE'),
+            ('timestamptz', 'STABLE'),
+        )
+    )
+    + f'CREATE OR REPLACE FUNCTION sys.ora_extract(text, {_TSTZ_TYPE}) RETURNS numeric '
+    'LANGUAGE sql IMMUTABLE AS $$ SELECT CASE lower($1) '
+    "WHEN 'timezone_hour' THEN div(($2).off, 3600) "
+    "WHEN 'timezone_minute' THEN div(($2).off % 3600, 60) "
+    "ELSE pg_catalog.extract($1, ($2).utc AT TIME ZONE 'UTC') END $$;"
     # TO_CHAR(tstz, fmt): the wall clock at the value's own offset, and TZH,
     # TZM and TZR that offset's (#2613), where the cast to timestamptz printed
     # both at the session's. FF as $3 digits, the value's precision where
@@ -9593,6 +9614,40 @@ def _translate_fm_toggle(sql: str) -> str:
     return _rewrite_format_calls(sql, rewrite, '_.')
 
 
+_EXTRACT_NAMES = frozenset({'EXTRACT'})
+# EXTRACT's datetime fields; TIMEZONE_REGION and TIMEZONE_ABBR are left, as
+# the Mirror keeps no region (#2627).
+_EXTRACT_FIELD = re.compile(
+    r'\s*(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|TIMEZONE_HOUR|TIMEZONE_MINUTE)'
+    r'\s+FROM\s+(.+?)\s*',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _translate_extract(sql: str) -> str:
+    """EXTRACT(field FROM x) as sys.ora_extract('field', x) (#2627).
+
+    PostgreSQL's EXTRACT names pg_catalog's function, which no overload can
+    stand in front of, and it took a WITH TIME ZONE value through the cast to
+    timestamptz: its fields in the session's zone, where Oracle gives its UTC
+    time's and its own offset. sys.ora_extract has an overload for each type,
+    the others PostgreSQL's own. XMLType's EXTRACT(xml, path) has no FROM and
+    is left.
+    """
+    if 'extract' not in sql.lower():
+        return sql
+
+    def rewrite(name: str, args: list[str]) -> str | None:
+        if len(args) != 1:
+            return None
+        field = _EXTRACT_FIELD.fullmatch(args[0])
+        if field is None:
+            return None
+        return f"sys.ora_extract('{field.group(1).lower()}', {_translate_extract(field.group(2))})"
+
+    return _rewrite_calls(sql, _EXTRACT_NAMES, rewrite, '_.')
+
+
 # DECODE(expr, search1, result1, ..., [default]) becomes a CASE (#822). orafce's
 # decode is declared over polymorphic parameters, which PostgreSQL resolves from
 # the argument types: all-untyped literals give it nothing to resolve from, and
@@ -11917,6 +11972,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('attribute-access', _translate_attribute_access(sql), sql)
     sql = _ruled('connect-by', _translate_connect_by(sql), sql)
     sql = _ruled('fm-toggle', _translate_fm_toggle(sql), sql)
+    sql = _ruled('extract', _translate_extract(sql), sql)
     sql = _ruled('signed-year', _translate_signed_year(sql), sql)
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)
