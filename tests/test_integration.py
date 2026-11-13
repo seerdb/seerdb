@@ -5484,6 +5484,31 @@ class BindIntegration(_IntegrationBase):
         self.assertIsInstance(caught.exception, ValueError)
         self.assertNotIn('malformed', str(caught.exception))
 
+    def test_a_julian_leap_day_is_out_of_range_not_malformed(self):
+        # Oracle's DATE is Julian before 1582-10-15, so 1500-02-29 is a valid
+        # date that Python's Gregorian datetime cannot hold. It was reported as
+        # "malformed" (#2601), and a passthrough Mirror could not relay it. A
+        # server that cannot hold the date -- Mirror-over-PostgreSQL (#2600) --
+        # is skipped, asked as text first.
+        from seerdb.common.exceptions import DataError, DateOutOfRangeError
+
+        try:
+            self.cur.execute(
+                "SELECT TO_CHAR(TO_DATE('1500-02-29', 'YYYY-MM-DD'), 'YYYY-MM-DD') "
+                'FROM dual'
+            )
+            (AsText,) = self.cur.fetchone()
+        except seerdb.DatabaseError as exc:
+            self.skipTest(f'this server does not hold 1500-02-29: {exc}')
+        if AsText != '1500-02-29':
+            self.skipTest(f'this server does not hold 1500-02-29: it says {AsText!r}')
+        with self.assertRaises(DateOutOfRangeError) as caught:
+            self.cur.execute("SELECT TO_DATE('1500-02-29', 'YYYY-MM-DD') FROM dual")
+            self.cur.fetchone()
+        self.assertIsInstance(caught.exception, DataError)
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertNotIn('malformed', str(caught.exception))
+
     def test_db_charset_varchar_roundtrip(self):
         # VARCHAR2 non-ASCII that the database charset can represent round-trips
         # (#174). On 9i (WE8ISO8859P1) the server converts the AL32UTF8 session

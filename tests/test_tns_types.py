@@ -126,6 +126,17 @@ class TestBcDateCarriedOn(unittest.TestCase):
         token = set_decode_bc_dates(True)
         self.addCleanup(_DECODE_BC_DATES.reset, token)
 
+    def test_a_julian_leap_day_becomes_a_bcdate(self):
+        # Oracle's DATE is Julian before 1582-10-15, so it has 1500-02-29,
+        # which no Gregorian datetime has; carried on byte for byte (#2601).
+        from seerdb.common.datatypes import BcDate
+        from seerdb.common.tns import _encode_temporal
+        from seerdb.common.tns_consts import TNS_TYPE_DATE
+
+        leap = bytes.fromhex('7364021d010101')
+        self.assertEqual(decode_date(leap), BcDate(1500, 2, 29))
+        self.assertEqual(_encode_temporal(decode_date(leap), TNS_TYPE_DATE), leap)
+
     def test_a_bc_date_becomes_a_bcdate(self):
         from seerdb.common.datatypes import BcDate
 
@@ -173,6 +184,35 @@ class TestBcDate(unittest.TestCase):
     # to_date('-4712-01-01', 'SYYYY-MM-DD'), as a live 23ai sends it: century
     # byte 53 and year byte 88 are (53-100)*100 + (88-100) = -4712.
     MIN_ORACLE_DATE = bytes.fromhex('35580101010101')
+
+    def test_a_julian_leap_day_is_out_of_range_not_malformed(self):
+        # 1500-02-29 is a valid Oracle date, Julian before 1582-10-15, that a
+        # Gregorian datetime cannot hold; it was reported "malformed" (#2601).
+        # A Gregorian leap day decodes, and February 29 of a year neither
+        # calendar leaps -- 1700, after the switch -- is still malformed.
+        from seerdb.common.exceptions import DataError, DateOutOfRangeError
+
+        with self.assertRaises(DateOutOfRangeError) as caught:
+            decode_date(bytes.fromhex('7364021d010101'))
+        self.assertIsInstance(caught.exception, DataError)
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertIn('1500-02-29 is a Julian leap day', str(caught.exception))
+        self.assertNotIn('malformed', str(caught.exception))
+        self.assertEqual(
+            decode_date(bytes.fromhex('7464021d010101')),
+            datetime.datetime(1600, 2, 29),
+        )
+        with self.assertRaises(DataError) as caught:
+            decode_date(bytes.fromhex('7564021d010101'))
+        self.assertNotIsInstance(caught.exception, DateOutOfRangeError)
+
+    def test_a_bcdate_takes_a_julian_leap_day(self):
+        from seerdb.common.datatypes import BcDate
+
+        self.assertEqual(BcDate(1500, 2, 29).year, 1500)
+        for year, month, day in ((1500, 2, 28), (1600, 2, 29), (1, 1, 1)):
+            with self.assertRaises(ValueError):
+                BcDate(year, month, day)
 
     def test_the_earliest_oracle_date_is_out_of_range_not_malformed(self):
         from seerdb.common.exceptions import DateOutOfRangeError

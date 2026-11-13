@@ -253,6 +253,17 @@ def decode_date(Data: bytes) -> datetime.datetime | BcDate | None:
         )
         return Utc.astimezone(Tz)
     except (ValueError, OverflowError) as Exc:
+        if _is_julian_leap_day(Year, Month, Day, Hour, Minute, Second):
+            # Oracle's DATE is Julian before 1582-10-15, so 1500-02-29 is a day
+            # it has and Python's Gregorian datetime has not: valid data, like
+            # a BC date (#2601). The passthrough carries it on as one.
+            if _DECODE_BC_DATES.get() and Tz is None:
+                return BcDate(Year, Month, Day, Hour, Minute, Second, Microsecond)
+            raise DateOutOfRangeError(
+                f'{Exc}: the Oracle date {Year}-{Month:02d}-{Day:02d} is a '
+                "Julian leap day, which a Python datetime's Gregorian calendar "
+                'does not have'
+            ) from Exc
         if _is_bc_date(Year, Month, Day, Hour, Minute, Second):
             if _DECODE_BC_DATES.get() and Tz is None:
                 return BcDate(Year, Month, Day, Hour, Minute, Second, Microsecond)
@@ -288,6 +299,25 @@ def _is_bc_date(
         _ORACLE_MIN_YEAR <= Year <= -1
         and 1 <= Month <= 12
         and 1 <= Day <= 31
+        and 0 <= Hour <= 23
+        and 0 <= Minute <= 59
+        and 0 <= Second <= 59
+    )
+
+
+def _is_julian_leap_day(
+    Year: int, Month: int, Day: int, Hour: int, Minute: int, Second: int
+) -> bool:
+    # True for February 29 of a year that is a leap year in the Julian
+    # calendar Oracle keeps before 1582-10-15 but not in the Gregorian one a
+    # datetime keeps: 100, 200, 300, 500, ... 1500 (#2601). The time must be in
+    # range too, as for a BC date.
+    return (
+        Month == 2
+        and Day == 29
+        and 1 <= Year <= 1582
+        and Year % 100 == 0
+        and Year % 400 != 0
         and 0 <= Hour <= 23
         and 0 <= Minute <= 59
         and 0 <= Second <= 59
