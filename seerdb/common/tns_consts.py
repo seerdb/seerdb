@@ -470,6 +470,20 @@ TNS_EXEC_OPTION_COMMIT_REEXECUTE = 0x1
 TNS_FUNC_SESSION_GET = 162  # DRCP pooled-session acquire (#130)
 TNS_FUNC_SESSION_RELEASE = 163  # DRCP pooled-session release (#130)
 TNS_FUNC_NOTIFY = 187  # CQN / AQ notification delivery (#129)
+# Subscriptions (#2460), as python-oracledb thin sends them: TTI_KPN (125)
+# registers or unregisters one; NOTIFY, on a second connection made with
+# (SERVER=emon), asks for its notifications.
+TNS_SUBSCR_OP_REGISTER = 1
+TNS_SUBSCR_OP_UNREGISTER = 2
+TNS_SUBSCR_MODE_CLIENT_INITIATED = 4
+TNS_SUBSCR_CLIENT_ID_LEN = 29
+TNS_SUBSCR_STOP_NOTIF = 0x04
+TNS_SUBSCR_QOS_RELIABLE = 0x01
+TNS_SUBSCR_QOS_SECURE = 0x08
+TNS_SUBSCR_QOS_PURGE_ON_NTFN = 0x10
+TNS_SUBSCR_FLAGS_INCLUDE_ROWIDS = 0x10
+TNS_SUBSCR_FLAGS_QUERY = 0x20
+TNS_INIT_KPNDRREQ = 1
 TNS_MSG_TYPE_ONEWAY_FN = 26  # fire-and-forget call, no response expected
 TNS_MSG_TYPE_RENEGOTIATE = 28  # server asks the client to renegotiate (TLS / caps)
 

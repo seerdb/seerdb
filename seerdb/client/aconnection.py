@@ -3013,6 +3013,19 @@ class AsyncOracleConnect(_ConnectionLogic):
         if Result != TNS_TPC_TXN_STATE_ABORTED:
             raise DatabaseError(f'unexpected TPC rollback state {Result}')
 
+    def subscribe(self, *args: object, **kwargs: object) -> None:
+        """Not on an asyncio connection: python-oracledb's has no
+        subscriptions either. A sync connection subscribes (#2460)."""
+        from seerdb.client.connection import _reject_cqn
+
+        _reject_cqn()
+
+    def unsubscribe(self, *args: object, **kwargs: object) -> None:
+        """Not on an asyncio connection, as subscribe() is not (#2460)."""
+        from seerdb.client.connection import _reject_cqn
+
+        _reject_cqn()
+
     async def tpc_recover(self) -> list[Xid]:
         """Async port of `OracleConnect.tpc_recover` (#2457)."""
         Cursor = self.cursor()

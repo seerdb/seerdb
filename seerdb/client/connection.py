@@ -791,8 +791,8 @@ def _reject_cqn() -> None:
     rather than an AttributeError on a missing method.
     """
     raise NotSupportedError(
-        'Continuous Query Notification / server-initiated subscriptions are not '
-        'supported: they require the OCI-based client'
+        'subscriptions are made on a sync connection, as in python-oracledb: an '
+        'asyncio connection has none'
     )
 
 
@@ -1047,6 +1047,11 @@ class OracleConnect(_ConnectionLogic):
         shardingkey: object = None,
         supershardingkey: object = None,
     ):
+        # The arguments as given, for a connection made like this one: a
+        # subscription's second connection (#2460).
+        self._connect_arguments = {
+            Name: Value for (Name, Value) in locals().items() if Name != 'self'
+        }
         # Sharding keys are an OCI-only routing capability (#164); accept the
         # oracledb-compatible parameters but reject them with NotSupportedError.
         _reject_sharding(shardingkey, supershardingkey)
@@ -1228,6 +1233,11 @@ class OracleConnect(_ConnectionLogic):
         # Bytes received past a marker packet, held for the next recv() so a
         # coalesced break|reset|error is not lost (#45). Empty between calls.
         self._pending = b''
+        # A subscription's registration while it registers a query, written into
+        # that execute (#2460), and a server type no address may change: a
+        # subscription's second connection is (SERVER=emon).
+        self._registration_id = 0
+        self._server_type_override: str | None = None
         # The header flags of the last packet recv() assembled (#2645).
         self._packet_flags = 0
         # True while a server break/reset handshake is in progress: we answer a
@@ -1593,6 +1603,8 @@ class OracleConnect(_ConnectionLogic):
         (self.service_name, self.sid) = (address.service_name, address.sid)
         if address.server_type is not None:
             self.server_type = address.server_type
+        if self._server_type_override is not None:
+            self.server_type = self._server_type_override
         if address.instance_name:
             self._instance_name_requested = address.instance_name
         if address.pool_boundary:
@@ -2499,6 +2511,8 @@ class OracleConnect(_ConnectionLogic):
             'def': Def,
             'batcherrors': BatchErrors,
             'arraydmlrowcounts': ArrayDmlRowCounts,
+            # A query a subscription registers (#2460).
+            'registration_id': self._registration_id,
             'return_binds': ReturnBinds or None,
             # Server-side scrollable cursor open (#181): mark the cursor
             # scrollable and position it at CURRENT (a describe-only open — the
@@ -4058,11 +4072,115 @@ class OracleConnect(_ConnectionLogic):
 
     def _direct_path_call(self, Data: bytes) -> bytes:
         # One direct path call and its reply, whole.
+        return self._function_call(Data)
+
+    def _function_call(self, Data: bytes) -> bytes:
+        # One function call and its reply, whole.
         self.send(TNS_DATA, Data)
         Received = self._next_data_packet(b'', b'')
         if Received is False:
-            raise OperationalError('connection closed during a direct path load')
+            raise OperationalError('the connection closed during the call')
         return Received[1]
+
+    def _function_reply(self, Packet: bytes, Decode) -> tuple:
+        # A call's reply: TTI_RPA and the return parameters ``Decode`` reads,
+        # the status last, or the status alone, the server's error raised.
+        from seerdb.common.exceptions import from_ora_code
+
+        if Packet[:1] == bytes([TTI_RPA]):
+            Result = Decode(Packet[1:])
+            Status = Result[-1]
+        else:
+            (Result, Status) = ((), Packet)
+        (Code, Message) = decode_error_reply(Status)
+        if Code:
+            raise from_ora_code(Code)(Message or f'ORA-{Code:05d}', code=Code)
+        if not Result:
+            raise DatabaseError(f'unexpected reply 0x{Packet[:1].hex()}')
+        return Result
+
+    # --- Subscriptions (#2460) ---
+
+    def subscribe(
+        self,
+        namespace: int = 2,
+        protocol: int = 0,
+        callback=None,
+        timeout: int = 0,
+        operations: int = 0,
+        port: int = 0,
+        qos: int = 0,
+        ip_address: str | None = None,
+        grouping_class: int = 0,
+        grouping_value: int = 0,
+        grouping_type: int = 1,
+        name: str | None = None,
+        client_initiated: bool = False,
+        *,
+        ipAddress: str | None = None,  # noqa: N803 - python-oracledb's alias
+        groupingClass: int = 0,  # noqa: N803 - python-oracledb's alias
+        groupingValue: int = 0,  # noqa: N803 - python-oracledb's alias
+        groupingType: int = 1,  # noqa: N803 - python-oracledb's alias
+        clientInitiated: bool = False,  # noqa: N803 - python-oracledb's alias
+    ):
+        """Subscribe to database-change or AQ notifications, as in
+        python-oracledb's thin mode (#2460): client-initiated only
+        (``client_initiated=True``). The ``callback`` receives a
+        :class:`seerdb.Message` for each notification, on a thread of the
+        subscription's own. Needs an Oracle 12.1+ server, CHANGE NOTIFICATION
+        for a database-change subscription, and a sharded queue for an AQ
+        one."""
+        from seerdb.client.subscr import Subscription, subscription_arguments
+
+        Arguments = subscription_arguments(
+            client_initiated or clientInitiated,
+            protocol,
+            ip_address=ip_address or ipAddress,
+            grouping_class=grouping_class or groupingClass,
+            grouping_value=grouping_value or groupingValue,
+            grouping_type=groupingType if groupingType != 1 else grouping_type,
+        )
+        if self._dialect is not None or self.field_version < FIELD_VERSION_12_1:
+            raise NotSupportedError('subscriptions require an Oracle 12.1+ server')
+        Sub = Subscription(
+            self,
+            namespace,
+            Arguments['protocol'],
+            callback,
+            timeout,
+            operations,
+            port,
+            qos,
+            Arguments['ip_address'],
+            Arguments['grouping_class'],
+            Arguments['grouping_value'],
+            Arguments['grouping_type'],
+            name,
+        )
+        Sub._start()
+        return Sub
+
+    def unsubscribe(self, subscr) -> None:
+        """Unregister a subscription subscribe() made, and close its second
+        connection (#2460)."""
+        from seerdb.client.subscr import Subscription
+
+        if not isinstance(subscr, Subscription):
+            raise ProgrammingError('unsubscribe takes a subscription subscribe() made')
+        subscr._close()
+
+    def _emon_connection(self) -> 'OracleConnect':
+        # A subscription's second connection (#2460): made as this one was,
+        # with (SERVER=emon), which the server streams notifications down.
+        Arguments = dict(self._connect_arguments)
+        for Name in ('cclass', 'pool_boundary'):
+            Arguments[Name] = None
+        Arguments['purity'] = PURITY_DEFAULT
+        Conn = OracleConnect(**Arguments)
+        Conn._server_type_override = 'emon'
+        Conn.server_type = 'emon'
+        Conn.connect()
+        return Conn
 
     def direct_path_load(
         self,

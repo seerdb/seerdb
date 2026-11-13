@@ -358,7 +358,7 @@ exercise.
 | **Request pipelining** — `create_pipeline()` batches operations into one round trip (23ai) | ✅ |
 | **Async** — full `asyncio` API (connection, cursor, pool) at parity with the sync API | ✅ |
 | **Character sets** — AL32UTF8 and others; national-charset (`DB_TYPE_NVARCHAR` / `NCHAR`) binds | ✅ |
-| Continuous Query Notification (CQN) and AQ notifications | ❌ not yet — python-oracledb 4.0 added them to its thin mode, and seerdb will follow (#2460); until then `conn.subscribe(...)` raises `NotSupportedError` |
+| **Continuous Query Notification (CQN) and AQ notifications** — `subscribe(client_initiated=True, ...)`, `registerquery`, `unsubscribe`, as in python-oracledb's thin mode: client-initiated only; on a sync connection; AQ on a sharded queue. 12c and later | ✅ |
 | Sharding keys | ❌ not supported — a thick-only (OCI) capability absent from the thin protocol; `shardingkey=` / `supershardingkey=` are accepted but raise `NotSupportedError`, matching the thin reference |
 
 Most of the above works across every supported server version; a few features

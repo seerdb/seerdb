@@ -22,22 +22,21 @@ from seerdb.common.exceptions import DatabaseError, NotSupportedError, Operation
 
 
 class TestCqnRejected(unittest.TestCase):
-    # Continuous Query Notification (#129) registers a server-initiated
-    # subscription — the DB opens a callback channel back to the client, an
-    # OCI-only capability outside the thin request/response protocol. seerdb
-    # exposes subscribe / unsubscribe for API parity but raises
-    # NotSupportedError, so ported thin code gets that rather than an
-    # AttributeError on a missing method.
+    # A sync connection subscribes client-initiated only, as python-oracledb's
+    # thin mode does (#2460); an asyncio connection has no subscriptions, as
+    # python-oracledb's has none. Both refuse before anything is sent.
     def test_helper_raises(self):
         with self.assertRaises(NotSupportedError):
             _reject_cqn()
 
-    def test_subscribe_unsubscribe_reject_any_args(self):
+    def test_a_server_initiated_subscription_is_refused(self):
+        from seerdb.common.exceptions import ProgrammingError
+
         c = OracleConnect(host='x', port=1, user='pyo', password='p')
         with self.assertRaises(NotSupportedError):
             c.subscribe(callback=lambda m: None)
-        with self.assertRaises(NotSupportedError):
-            c.unsubscribe()
+        with self.assertRaises(ProgrammingError):
+            c.unsubscribe(None)
 
     def test_async_subscribe_unsubscribe_reject(self):
         # Sync/async parity: regular (non-coroutine) methods that raise before
