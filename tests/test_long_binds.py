@@ -305,3 +305,50 @@ class TestArrayDmlOacRepresentative(unittest.TestCase):
         from seerdb.common.tns import _oac_rep_row
 
         self.assertEqual(_oac_rep_row([[None], [None]]), [None])
+
+
+class TestAPre10BlockTakesAWideValue(unittest.TestCase):
+    """8i and 9i take a plain value past the SQL limits in a PL/SQL block, up to
+    32512 bytes, where it was refused up front; 9i's descriptor declares it at
+    32767, as ojdbc14 does (#2637, PROTOCOL.md 19.3.1)."""
+
+    def test_the_check_lets_a_block_value_through_to_32512_bytes(self):
+        from seerdb.client.connection import _check_fv2_bind_sizes
+        from seerdb.common.exceptions import NotSupportedError
+
+        _check_fv2_bind_sizes(['q' * 32512, bytes(32512)], Tier='9i', Block=True)
+        with self.assertRaisesRegex(
+            NotSupportedError, r'32512 bytes in a PL/SQL block.*CLOB'
+        ):
+            _check_fv2_bind_sizes(['q' * 32513], Tier='9i', Block=True)
+        with self.assertRaisesRegex(
+            NotSupportedError, r'32512 bytes in a PL/SQL block.*BLOB'
+        ):
+            _check_fv2_bind_sizes([bytes(32513)], Tier='8i', Block=True)
+
+    def test_sql_still_refuses_one_and_names_the_block_route(self):
+        from seerdb.client.connection import _check_fv2_bind_sizes
+        from seerdb.common.exceptions import NotSupportedError
+
+        _check_fv2_bind_sizes(['q' * 4000, bytes(2000)], Tier='9i')
+        with self.assertRaisesRegex(
+            NotSupportedError, r'4000 bytes in SQL.*PL/SQL block'
+        ):
+            _check_fv2_bind_sizes(['q' * 4001], Tier='9i')
+        with self.assertRaisesRegex(NotSupportedError, r'2000 bytes in SQL.*LONG RAW'):
+            _check_fv2_bind_sizes([bytes(2001)], Tier='9i')
+
+    def test_a_9i_block_declares_a_wide_value_at_32767(self):
+        from seerdb.common.tns import encode_o7_block, encode_o7_parse
+
+        block = 'BEGIN INSERT INTO t VALUES (:1, :2); END;'
+        wide = encode_o7_block(3, block, ['q' * 5000, bytes(3000)])
+        # VARCHAR (01) and RAW (17), each declared 02 7f ff.
+        self.assertIn(bytes([0x01, 0x01, 0, 0, 0x02, 0x7F, 0xFF]), wide)
+        self.assertIn(bytes([0x17, 0x01, 0, 0, 0x02, 0x7F, 0xFF]), wide)
+        narrow = encode_o7_block(3, block, ['q' * 100, bytes(100)])
+        self.assertIn(bytes([0x01, 0x01, 0, 0, 0x02, 0x0F, 0xA0]), narrow)
+        self.assertNotIn(bytes([0x02, 0x7F, 0xFF]), narrow)
+        # A plain statement keeps 4000: its values are inline in the parse.
+        statement = encode_o7_parse(3, 'INSERT INTO t VALUES (:1)', ['q' * 5000])
+        self.assertNotIn(bytes([0x01, 0x01, 0, 0, 0x02, 0x7F, 0xFF]), statement)

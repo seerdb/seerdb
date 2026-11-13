@@ -95,7 +95,7 @@ from seerdb.common.exceptions import (
     OperationalError,
     Truncated,
 )
-from seerdb.common.sqltext import is_reusable_dml, statement_head
+from seerdb.common.sqltext import is_plsql, is_reusable_dml, statement_head
 from seerdb.common.tns import (
     _DTY_8I,
     FLUSH_OUT_BINDS,
@@ -1508,7 +1508,9 @@ class AsyncOracleConnect(_ConnectionLogic):
                     + _pre10_tier_name_for(self._dialect)
                 )
             if CAP_WIDE_BINDS not in self._dialect.capabilities():
-                _check_fv2_bind_sizes(Bind, Batch, _pre10_tier_name_for(self._dialect))
+                _check_fv2_bind_sizes(
+                    Bind, Batch, _pre10_tier_name_for(self._dialect), is_plsql(Query)
+                )
             Native = bool(ReturnBinds) and native_returning(
                 self._dialect, Bind, ReturnBinds
             )

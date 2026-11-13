@@ -13929,10 +13929,15 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
         else:
             Type, MaxSize, Csfrm = VType, Value.size, Vcsfrm
         return _oac(Type, MaxSize, Csfrm)
+    # In a PL/SQL block a value past the SQL limits is declared at 32767, as
+    # ojdbc14 declares it; at 4000 / 2000 the server refused it with ORA-01460
+    # (#2637, PROTOCOL.md 19.3.1). A smaller value keeps its old declaration.
     if isinstance(Value, str):
-        Type, MaxSize, Csfrm = TNS_TYPE_VARCHAR, 4000, 1
+        Wide = not Statement and len(Value.encode('utf-8')) > 4000
+        Type, MaxSize, Csfrm = TNS_TYPE_VARCHAR, 32767 if Wide else 4000, 1
     elif isinstance(Value, (bytes, bytearray)):
-        Type, MaxSize, Csfrm = TNS_TYPE_RAW, 2000, 0
+        Wide = not Statement and len(Value) > 2000
+        Type, MaxSize, Csfrm = TNS_TYPE_RAW, 32767 if Wide else 2000, 0
     elif isinstance(Value, bool) or isinstance(Value, (int, float, Decimal)):
         Type, MaxSize, Csfrm = 0x06, 22, 1  # VARNUM
     elif isinstance(Value, datetime.datetime):
