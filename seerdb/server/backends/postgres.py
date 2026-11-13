@@ -1511,6 +1511,12 @@ _HELPER_FUNCTIONS_DDL = (
     f'SELECT ROW($1, extract(timezone FROM $1)::integer)::{_TSTZ_TYPE} $$;'
     f'CREATE OR REPLACE FUNCTION ora_tstz_of_local(timestamp) RETURNS {_TSTZ_TYPE} '
     'LANGUAGE sql STABLE STRICT AS $$ SELECT ora_tstz_of_instant($1::timestamptz) $$;'
+    # A WITH TIME ZONE value a CAST made, PostgreSQL's timestamptz, at the
+    # session's offset, as Oracle's CAST gives it (#2615);
+    # after ora_tstz_of_instant, which its body names.
+    'CREATE OR REPLACE FUNCTION sys.ora_tstz_text(timestamptz, integer) '
+    'RETURNS text LANGUAGE sql STABLE AS $$ '
+    'SELECT sys.ora_tstz_text(ora_tstz_of_instant($1), $2) $$;'
     'DO $$ BEGIN '
     f'CREATE CAST (timestamptz AS {_TSTZ_TYPE}) '
     'WITH FUNCTION ora_tstz_of_instant(timestamptz) AS ASSIGNMENT; '
@@ -1675,12 +1681,18 @@ _HELPER_FUNCTIONS_DDL = (
     'THEN sys.ora_number_text($1::text::numeric) ELSE $1::text END $$;'
     # A computed value that may be a DATE or a TIMESTAMP (#2162): a timestamp
     # in its NLS format at the precision $2 the statement's text gave it, -1
-    # for a DATE; any other value as || writes it. Inlined, the argument keeps
-    # the DATE domain as its type.
+    # for a DATE; a WITH TIME ZONE one at its own offset and a WITH LOCAL
+    # TIME ZONE one at the session's, as a column of each is (#2615); any
+    # other value as || writes it. Inlined, the argument keeps the DATE
+    # domain as its type.
     'CREATE OR REPLACE FUNCTION sys.ora_computed_text(anynonarray, integer) '
     'RETURNS text LANGUAGE sql STABLE AS $$ SELECT CASE WHEN pg_typeof($1) IN '
     f"('timestamp'::regtype, '{_DATE_TYPE}'::regtype) "
     'THEN sys.ora_datetime_text($1::text::timestamp, $2) '
+    f"WHEN pg_typeof($1) = '{_TSTZ_TYPE}'::regtype "
+    f'THEN sys.ora_tstz_text($1::text::{_TSTZ_TYPE}, $2) '
+    "WHEN pg_typeof($1) = 'timestamptz'::regtype "
+    'THEN sys.ora_ltz_text($1::text::timestamptz, $2) '
     'ELSE sys.ora_text($1) END $$;'
     'CREATE OR REPLACE FUNCTION to_char(numeric) RETURNS text '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_number_text($1) $$;'
@@ -10645,6 +10657,9 @@ def _typed_datetime_at(
             return (close, _DATETIME_TEXT, -1)
         if text(close - 1).upper() == 'TIMESTAMP':
             return (close, _DATETIME_TEXT, 6)
+    zoned = _zoned_cast_type(text, close)
+    if zoned is not None:
+        return (close, *zoned)
     if (
         text(close - 1) == ')'
         and text(close - 3) == '('
@@ -10654,6 +10669,39 @@ def _typed_datetime_at(
     ):
         return (close, _DATETIME_TEXT, int(text(close - 2)))
     return None
+
+
+def _closing_at(sig: list[str], start: int) -> int | None:
+    # The index in `sig` of the parenthesis closing the one at `start`.
+    depth = 0
+    for k in range(start, len(sig)):
+        depth += (sig[k] == '(') - (sig[k] == ')')
+        if depth == 0:
+            return k
+    return None
+
+
+def _zoned_cast_type(text: Callable[[int], str], close: int) -> tuple[str, int] | None:
+    # The call that makes CAST(... AS TIMESTAMP[(p)] WITH [LOCAL] TIME ZONE)
+    # text, the CAST's closing parenthesis at `close`, and its precision: p,
+    # or 6 (#2615). Measured on 23ai.
+    if text(close - 1).upper() != 'ZONE' or text(close - 2).upper() != 'TIME':
+        return None
+    local = text(close - 3).upper() == 'LOCAL'
+    with_at = close - 4 if local else close - 3
+    if text(with_at).upper() != 'WITH':
+        return None
+    if (
+        text(with_at - 1) == ')'
+        and text(with_at - 3) == '('
+        and text(with_at - 2).isdigit()
+    ):
+        (precision, stamp_at) = (int(text(with_at - 2)), with_at - 4)
+    else:
+        (precision, stamp_at) = (6, with_at - 1)
+    if text(stamp_at).upper() != 'TIMESTAMP' or text(stamp_at - 1).upper() != 'AS':
+        return None
+    return (_LTZ_TEXT if local else _TSTZ_TEXT, precision)
 
 
 def _typed_datetime_value(item: str) -> tuple[str, int] | None:
@@ -10824,6 +10872,25 @@ def _computed_operands(sql: str) -> list[tuple[int, int]]:
         )
         if joined or argument:
             found.append((sig[first], sig[last]))
+    # TO_CHAR(x + INTERVAL '1' DAY): its one argument, an expression of more
+    # than one operand, is made text whole (#2615).
+    for k in range(len(sig) - 2):
+        if text(k).upper() != 'TO_CHAR' or text(k + 1) != '(' or text(k - 1) == '.':
+            continue
+        close = closes.get(k + 1)
+        if close is None or close - k < 4:
+            continue
+        depth = 0
+        top_level = False
+        for j in range(k + 2, close):
+            depth += (text(j) == '(') - (text(j) == ')')
+            if depth == 0 and text(j) in (',',):
+                break
+            if depth == 0 and text(j) in ('+', '-', '*', '/', '||'):
+                top_level = True
+        else:
+            if top_level:
+                found.append((sig[k + 2], sig[close - 1]))
     return found
 
 
@@ -19664,12 +19731,12 @@ class PostgresBackend:
                 wraps.append((first, last, *converted))
         spans = _bind_spans(sql)
         for first, last in _computed_operands(sql):
-            precision = self._computed_precision(
+            computed = self._computed_text(
                 ''.join(span[1] for span in spans[first : last + 1]),
                 tables or _from_tables(sql),
             )
-            if precision is not None:
-                wraps.append((first, last, 'sys.ora_computed_text', precision))
+            if computed is not None:
+                wraps.append((first, last, *computed))
         if not wraps:
             return sql
         out = [span[1] for span in spans]
@@ -19687,14 +19754,51 @@ class PostgresBackend:
         with an interval is a TIMESTAMP(9); with a number, or under TRUNC,
         ROUND, ADD_MONTHS, LAST_DAY or NEXT_DAY, a DATE; under NVL, GREATEST,
         MAX and the like, its own precision. With only DATE operands, a DATE."""
+        computed = self._computed_datetime(expression, tables)
+        if computed is None or computed[1]:
+            return None
+        return computed[0]
+
+    def _computed_text(
+        self, expression: str, tables: list[tuple[str | None, str, str | None]]
+    ) -> tuple[str, int] | None:
+        """The call that makes a computed datetime Oracle's text without a
+        format, and its precision, -1 for a DATE: _computed_datetime's, a
+        zoned one too (#2615). sys.ora_computed_text picks the text by the
+        value's type; a WITH TIME ZONE value a CAST made is PostgreSQL's
+        timestamptz, the type a WITH LOCAL TIME ZONE one has, so it is named."""
+        computed = self._computed_datetime(expression, tables)
+        if computed is None:
+            return None
+        (precision, zones) = computed
+        if precision >= 0 and _TSTZ_TEXT in zones:
+            return (_TSTZ_TEXT, precision)
+        return ('sys.ora_computed_text', precision)
+
+    def _computed_datetime(
+        self, expression: str, tables: list[tuple[str | None, str, str | None]]
+    ) -> tuple[int, frozenset[str]] | None:
+        """The precision Oracle gives a computed datetime, a group or a call,
+        by its operands (#2162), -1 for a DATE, and the zoned text calls of
+        those operands that are WITH [LOCAL] TIME ZONE (#2615); None where
+        none of its operands is a datetime. Measured on 23ai: a TIMESTAMP,
+        zoned or not, with an interval is a TIMESTAMP(9); with a number, or
+        under TRUNC, ROUND, ADD_MONTHS, LAST_DAY or NEXT_DAY, a DATE; under
+        NVL, GREATEST, MAX, FROM_TZ and the like, its own precision. With only
+        DATE operands, a DATE. A typed value's own operands -- the literal a
+        CAST converts -- count no further."""
         spans = _bind_spans(expression)
         sig = [span[1] for span in spans if span[0] not in ('space', 'comment')]
+        # (expression) is the expression.
+        while len(sig) > 2 and sig[0] == '(' and _closing_at(sig, 0) == len(sig) - 1:
+            sig = sig[1:-1]
 
         def text(k: int) -> str:
             return sig[k] if 0 <= k < len(sig) else ''
 
-        (dates, stamps, interval) = (False, [], False)
-        for k in range(len(sig)):
+        (dates, stamps, interval, zones) = (False, [], False, set())
+        k = 0
+        while k < len(sig):
             word = text(k).upper()
             if (word == 'INTERVAL' and text(k + 1).startswith("'")) or (
                 word in _INTERVAL_CALLS and text(k + 1) == '('
@@ -19702,12 +19806,14 @@ class PostgresBackend:
                 interval = True
             typed = _typed_datetime_at(text, k) if text(k - 1) != '.' else None
             if typed is not None:
-                if typed[1] != _DATETIME_TEXT:
-                    return None
                 if typed[2] < 0:
                     dates = True
                 else:
                     stamps.append(typed[2])
+                    if typed[1] != _DATETIME_TEXT:
+                        zones.add(typed[1])
+                k = typed[0]
+            k += 1
         for name in _column_operands(expression):
             column = (
                 self._concatenated_column(tables, name.split('.')) if tables else None
@@ -19723,26 +19829,27 @@ class PostgresBackend:
             converted = self._datetime_text_call(column)
             if converted is None:
                 continue
-            if converted[0] != _DATETIME_TEXT:
-                return None
             if converted[1] < 0:
                 dates = True
             else:
                 stamps.append(converted[1])
+                if converted[0] != _DATETIME_TEXT:
+                    zones.add(converted[0])
         if not dates and not stamps:
             return None
+        frozen = frozenset(zones)
         if text(0).upper() in _DATE_RESULT_CALLS:
-            return -1
+            return (-1, frozen)
         if not stamps:
-            return -1
+            return (-1, frozen)
         if interval:
-            return 9
+            return (9, frozen)
         depth = 0
         for word in sig:
             depth += (word == '(') - (word == ')')
             if depth <= 1 and word in ('+', '-'):
-                return -1
-        return max(stamps)
+                return (-1, frozen)
+        return (max(stamps), frozen)
 
     def _datetime_text_call(
         self, column: _TableColumn | None
@@ -19856,9 +19963,7 @@ class PostgresBackend:
                 )
             if converted is None:
                 # A computed one, the whole value made text (#2162).
-                computed = self._computed_precision(value, sources)
-                if computed is not None:
-                    converted = ('sys.ora_computed_text', computed)
+                converted = self._computed_text(value, sources)
             if converted is None:
                 continue
             at = start + sql[start:end].index(value)

@@ -46,11 +46,13 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _backend_error,
     _bc_date_loader,
     _bind_slots,
+    _bind_spans,
     _call_argument_error,
     _call_arguments,
     _checked_error_rows,
     _column_annotations,
     _computed_column_types,
+    _computed_operands,
     _declared_columns,
     _idioms_and_rules,
     _interval_leaf,
@@ -6113,7 +6115,7 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # (#2585), and DUMP in Oracle's terms: sys.dump for 16 types at each of
     # its four arities, sys.ora_dump_text and five encoders (#2568), and
     # sys.ora_nullif, a NULLIF keeping a domain (#2596).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 363
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 364
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -17656,3 +17658,32 @@ def test_a_connect_names_the_database_or_a_service_given() -> None:
         assert backend.session_info().instance_name == database
     finally:
         backend.close()
+
+
+def test_a_zoned_cast_says_its_type_and_precision() -> None:
+    # CAST(... AS TIMESTAMP[(p)] WITH [LOCAL] TIME ZONE) is made text by its
+    # zone's call at p, 6 when none is given (#2615), as 23ai prints it.
+    def found(sql: str) -> list:
+        return [hit[2:] for hit in _typed_datetime_operands(sql)]
+
+    assert found(
+        "SELECT CAST(TIMESTAMP '2020-01-15 10:00:00.5' AS TIMESTAMP(2) WITH TIME ZONE)"
+        " || 'x' FROM dual"
+    ) == [('sys.ora_tstz_text', 2)]
+    assert found(
+        "SELECT CAST(TIMESTAMP '2020-01-15 10:00:00.5' AS TIMESTAMP WITH LOCAL TIME"
+        " ZONE) || 'x' FROM dual"
+    ) == [('sys.ora_ltz_text', 6)]
+
+
+def test_an_expression_to_char_converts_is_one_computed_operand() -> None:
+    # TO_CHAR(x + INTERVAL '1' DAY) makes the whole expression text, where
+    # only a group or a call was found before (#2615); TO_CHAR(x, f) is not
+    # one.
+    sql = "SELECT TO_CHAR(TIMESTAMP '2020-01-15 10:00:00 +03:00' + INTERVAL '1' DAY) FROM dual"
+    spans = _bind_spans(sql)
+    assert [
+        ''.join(span[1] for span in spans[first : last + 1])
+        for (first, last) in _computed_operands(sql)
+    ] == ["TIMESTAMP '2020-01-15 10:00:00 +03:00' + INTERVAL '1' DAY"]
+    assert not _computed_operands("SELECT TO_CHAR(SYSDATE + 1, 'YYYY') FROM dual")
