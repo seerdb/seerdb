@@ -5987,6 +5987,36 @@ class BindIntegration(_IntegrationBase):
                 self.cur.execute(f'SELECT {expr} FROM dual')
                 self.assertEqual(self.cur.fetchone(), (value,))
 
+    def test_fm_is_a_toggle(self):
+        # Oracle's FM turns fill mode off for every element after it, and a
+        # second FM back on; quoted text and punctuation are left as they are.
+        # Over PostgreSQL FM applied to the next element alone (#2607).
+        d = "TO_DATE('2020-03-07 01:05:09', 'YYYY-MM-DD HH24:MI:SS')"
+        for fmt, value in (
+            ('fmHH:MI:SS', '1:5:9'),
+            ('HH:fmMI:SS', '01:5:9'),
+            ('fmDD fmMM', '7 03'),
+            ('fmDay, DD Month YYYY', 'Saturday, 7 March 2020'),
+            ('FMDD"x"MM', '7x3'),
+            ('DD-fm-MM', '07--3'),
+            ('fmyyyy-mm-dd', '2020-3-7'),
+        ):
+            with self.subTest(fmt=fmt):
+                self.cur.execute(f"SELECT TO_CHAR({d}, '{fmt}') FROM dual")
+                self.assertEqual(self.cur.fetchone(), (value,))
+        # A number format's FM is its own, and the session's date format
+        # toggles as a TO_CHAR's does.
+        self.cur.execute("SELECT TO_CHAR(5, 'FM009') FROM dual")
+        self.assertEqual(self.cur.fetchone(), ('005',))
+        conn = _connect_with()
+        try:
+            cur = conn.cursor()
+            cur.execute("ALTER SESSION SET NLS_DATE_FORMAT = 'fmDD.MM.YYYY HH24:MI'")
+            cur.execute(f'SELECT TO_CHAR({d}) FROM dual')
+            self.assertEqual(cur.fetchone(), ('7.3.2020 1:5',))
+        finally:
+            conn.close()
+
     def test_a_date_bind_is_a_date(self):
         # seerdb binds a datetime without a fraction as a DATE, as Oracle's
         # clients do, and Oracle types the bind and every expression over it

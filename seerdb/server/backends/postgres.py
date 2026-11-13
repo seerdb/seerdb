@@ -694,12 +694,12 @@ _ORACLE_CALENDAR_DDL = (
     'k := upper(substr(k, 1, 4)); '
     "IF upper(substr(f, i, 2)) = 'FM' THEN fm := true; i := i + 2; CONTINUE; END IF; "
     "IF k IN ('A.D.', 'B.C.') THEN piece := '='; j := 4; "
-    "ELSIF k = 'IYYY' THEN piece := lpad(iy::text, 4, '0'); j := 4; "
+    "ELSIF k = 'IYYY' THEN piece := CASE WHEN fm THEN iy::text ELSE lpad(iy::text, 4, '0') END; j := 4; "
     "ELSIF substr(k, 1, 3) IN ('TZD', 'DDD', 'IYY', 'DAY') THEN j := 3; "
     "IF substr(k, 1, 3) = 'TZD' THEN piece := '='; "
     "ELSIF substr(k, 1, 3) = 'DDD' THEN piece := CASE WHEN fm THEN ord::text "
     "ELSE lpad(ord::text, 3, '0') END; "
-    "ELSIF substr(k, 1, 3) = 'IYY' THEN piece := right(lpad(iy::text, 4, '0'), 3); "
+    "ELSIF substr(k, 1, 3) = 'IYY' THEN piece := right(lpad(iy::text, 4, '0'), 3); IF fm THEN piece := piece::integer::text; END IF; "
     "ELSE piece := pg_catalog.to_char(tw, CASE WHEN fm THEN 'FM' ELSE '' END "
     '|| substr(f, i, 3)); END IF; '
     "ELSIF substr(k, 1, 2) IN ('AD', 'BC', 'DL', 'DS', 'MI', 'DD') THEN "
@@ -708,7 +708,7 @@ _ORACLE_CALENDAR_DDL = (
     "CASE WHEN fm THEN 'FM' ELSE '' END || substr(f, i, 2)); j := 2; "
     "ELSIF substr(k, 1, 2) = 'IW' THEN piece := CASE WHEN fm THEN w::text "
     "ELSE lpad(w::text, 2, '0') END; j := 2; "
-    "ELSIF substr(k, 1, 2) = 'IY' THEN piece := right(lpad(iy::text, 4, '0'), 2); j := 2; "
+    "ELSIF substr(k, 1, 2) = 'IY' THEN piece := right(lpad(iy::text, 4, '0'), 2); IF fm THEN piece := piece::integer::text; END IF; j := 2; "
     "ELSIF substr(k, 1, 2) = 'WW' THEN piece := "
     f'({_pg_op("ord - 1", "/", "7")} + 1)::text; '
     "IF NOT fm THEN piece := lpad(piece, 2, '0'); END IF; j := 2; "
@@ -963,11 +963,12 @@ _HELPER_FUNCTIONS_DDL = (
     'LANGUAGE plpgsql VOLATILE AS $$ BEGIN RETURN $1::numeric; END $$;'
     # TO_CHAR(d, '..SYYYY..') → the year signed as Oracle prints it: '-' before
     # a BC year, a space before any other (#1063). The sign goes where SYYYY
-    # stood, as quoted literal text in PostgreSQL's format.
+    # stood, as quoted literal text in PostgreSQL's format, and an FM before
+    # it goes on to the year (#2607).
     'CREATE OR REPLACE FUNCTION ora_to_char_signed(timestamp, text) RETURNS text '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT to_char($1, regexp_replace($2, '
-    "'syyyy', CASE WHEN $1 < '0001-01-01'::timestamp THEN '\"-\"YYYY' "
-    "ELSE '\" \"YYYY' END, 'gi')) $$;"
+    "'(fm)?syyyy', CASE WHEN $1 < '0001-01-01'::timestamp THEN '\"-\"\\1YYYY' "
+    "ELSE '\" \"\\1YYYY' END, 'gi')) $$;"
     # TO_CHAR(ts, fmt) with Oracle's fractional-second elements (#2167), which
     # PostgreSQL prints as written: FFn is n digits, truncated -- PostgreSQL's
     # own up to 6, and zeros past its microseconds -- FF alone the value's
@@ -7063,6 +7064,114 @@ _ORAFCE_SESSION_SETTINGS_BASE: Final = (
     'SET orafce.oracle_compatibility_date_limit = off'
 )
 
+# Oracle's datetime format elements, longest first, and the suffixes that
+# follow one (#2607). FX, the format-exact toggle, is copied as it is.
+_DATETIME_ELEMENTS = (
+    'SYYYY',
+    'Y,YYY',
+    'SYEAR',
+    'YEAR',
+    'IYYY',
+    'RRRR',
+    'YYYY',
+    'MONTH',
+    'SSSSS',
+    'A.D.',
+    'B.C.',
+    'A.M.',
+    'P.M.',
+    'HH24',
+    'HH12',
+    'DAY',
+    'DDD',
+    'IYY',
+    'YYY',
+    'MON',
+    'TZD',
+    'TZH',
+    'TZM',
+    'TZR',
+    'SCC',
+    *(f'FF{n}' for n in range(1, 10)),
+    'FF',
+    'HH',
+    'MI',
+    'MM',
+    'SS',
+    'DD',
+    'DY',
+    'IY',
+    'YY',
+    'RR',
+    'WW',
+    'IW',
+    'CC',
+    'RM',
+    'AM',
+    'PM',
+    'AD',
+    'BC',
+    'DL',
+    'DS',
+    'TS',
+    'EE',
+    'D',
+    'I',
+    'Y',
+    'W',
+    'J',
+    'Q',
+    'E',
+    'X',
+)
+_DATETIME_SUFFIXES = ('SPTH', 'THSP', 'SP', 'TH')
+
+
+def _fm_spans(fmt: str) -> str | None:
+    # A datetime format with Oracle's FM, a toggle -- fill mode off from one FM
+    # to the next, for every element between -- spelt in PostgreSQL's, where FM
+    # is a prefix of the one element after it. None for a format that is not
+    # one: with no FM, or a letter no datetime element has, as a number
+    # format's 9s and 0s.
+    out: list[str] = []
+    fill = True
+    i = 0
+    seen = False
+    while i < len(fmt):
+        if fmt[i] == '"':
+            end = fmt.find('"', i + 1)
+            end = len(fmt) if end < 0 else end + 1
+            out.append(fmt[i:end])
+            i = end
+            continue
+        head = fmt[i : i + 5].upper()
+        if head.startswith('FM'):
+            fill = not fill
+            seen = True
+            i += 2
+            continue
+        if head.startswith('FX'):
+            out.append(fmt[i : i + 2])
+            i += 2
+            continue
+        element = next((e for e in _DATETIME_ELEMENTS if head.startswith(e)), None)
+        if element is None:
+            if fmt[i].isalnum():
+                return None
+            out.append(fmt[i])
+            i += 1
+            continue
+        end = i + len(element)
+        suffix = next(
+            (x for x in _DATETIME_SUFFIXES if fmt[end : end + 4].upper().startswith(x)),
+            '',
+        )
+        end += len(suffix)
+        out.append(('' if fill else 'FM') + fmt[i:end])
+        i = end
+    return ''.join(out) if seen else None
+
+
 # A session's NLS_DATE_FORMAT (#1616): orafce's one-argument TO_CHAR and TO_DATE
 # follow orafce.nls_date_format, and seerdb.nls_date_format keeps the format as
 # Oracle spells it, for NLS_SESSION_PARAMETERS. PostgreSQL's formats have no RR
@@ -7077,6 +7186,7 @@ _RR_YEAR = re.compile(r'RR(RR)?', re.IGNORECASE)
 
 def _nls_date_format_settings(oracle_format: str) -> str:
     printed = _RR_YEAR.sub(lambda m: 'YYYY' if m.group(1) else 'YY', oracle_format)
+    printed = _fm_spans(printed) or printed  # FM a toggle, as in a TO_CHAR (#2607)
     quoted = oracle_format.replace("'", "''")
     printed = printed.replace("'", "''")
     return (
@@ -7098,6 +7208,7 @@ _ALTER_SESSION_NLS_TIMESTAMP_FORMAT = re.compile(
 
 def _nls_timestamp_format_settings(oracle_format: str, zoned: bool = False) -> str:
     printed = _RR_YEAR.sub(lambda m: 'YYYY' if m.group(1) else 'YY', oracle_format)
+    printed = _fm_spans(printed) or printed  # FM a toggle, as in a TO_CHAR (#2607)
     quoted = oracle_format.replace("'", "''")
     printed = printed.replace("'", "''")
     name = 'seerdb.nls_timestamp_tz' if zoned else 'seerdb.nls_timestamp'
@@ -9192,6 +9303,30 @@ def _translate_rr_year(sql: str) -> str:
         parsing = name.lower() != 'to_char'
         call = f'{name}({", ".join([inner[0], _rr_format(fmt, parsing), *inner[2:]])})'
         return f'sys.ora_rr_year({call})' if parsing else call
+
+    return _rewrite_format_calls(sql, rewrite, '_.')
+
+
+def _translate_fm_toggle(sql: str) -> str:
+    """Give Oracle's FM in a TO_CHAR datetime format its meaning (#2607).
+
+    Oracle's FM turns fill mode off for the rest of the format, and a second
+    FM turns it back on; PostgreSQL's applies to the next element alone, so
+    ``fmHH:MI:SS`` printed ``1:05:09`` where Oracle prints ``1:5:9``. A
+    literal format's FM goes before each element of its span instead.
+    """
+    if 'fm' not in sql.lower():
+        return sql
+
+    def rewrite(name: str, args: list[str], fmt: str) -> str | None:
+        if name.lower() != 'to_char':
+            return None
+        spelt = _fm_spans(fmt[1:-1].replace("''", "'"))
+        if spelt is None:
+            return None
+        inner = [_translate_fm_toggle(a) for a in args]
+        literal = "'" + spelt.replace("'", "''") + "'"
+        return f'{name}({", ".join([inner[0], literal, *inner[2:]])})'
 
     return _rewrite_format_calls(sql, rewrite, '_.')
 
@@ -11456,6 +11591,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('deref', _translate_deref(sql), sql)
     sql = _ruled('attribute-access', _translate_attribute_access(sql), sql)
     sql = _ruled('connect-by', _translate_connect_by(sql), sql)
+    sql = _ruled('fm-toggle', _translate_fm_toggle(sql), sql)
     sql = _ruled('signed-year', _translate_signed_year(sql), sql)
     sql = _ruled('rr-year', _translate_rr_year(sql), sql)
     sql = _ruled('decode', _translate_decode(sql), sql)

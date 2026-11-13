@@ -2206,6 +2206,55 @@ def test_oracle_day_numbers_and_date_arithmetic_before_1582() -> None:
         backend.close()
 
 
+def test_translate_idioms_spells_an_fm_span_per_element() -> None:
+    # Oracle's FM is a toggle, PostgreSQL's the prefix of one element (#2607):
+    # a literal TO_CHAR format's FM goes before each element of its span, a
+    # suffix kept with its element. A number format, a format with no FM, a
+    # TO_DATE and a format that is no literal are left as they are.
+    assert _translate_idioms(
+        "SELECT TO_CHAR(d, 'fmHH:MI:SS'), TO_CHAR(d, 'DD-fm\"x\"DDth fmMM') FROM t"
+    ) == ("SELECT TO_CHAR(d, 'FMHH:FMMI:FMSS'), TO_CHAR(d, 'DD-\"x\"FMDDth MM') FROM t")
+    assert _translate_idioms("SELECT TO_CHAR(d, 'fmSYYYY') FROM t") == (
+        "SELECT ora_to_char_signed(d, 'FMSYYYY') FROM t"
+    )
+    for untouched in (
+        "SELECT TO_CHAR(n, 'FM999.00') FROM t",
+        "SELECT TO_CHAR(n, 'FM9G999D99') FROM t",
+        "SELECT TO_CHAR(d, 'DD MM') FROM t",
+        "SELECT TO_DATE('1 3', 'fmDD MM') FROM t",
+        'SELECT TO_CHAR(d, f) FROM t',
+    ):
+        assert _translate_idioms(untouched) == untouched
+
+
+def test_fm_spans_print_as_oracles() -> None:
+    # The FM toggle (#2607) against 23ai's answers: a DATE, a TIMESTAMP's
+    # fraction, a year before 1583 through the Julian formats, a signed year.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for value, fmt, expected in (
+            (
+                "TO_DATE('2020-03-07 01:05:09', 'YYYY-MM-DD HH24:MI:SS')",
+                'fmDD MM HH24',
+                '7 3 1',
+            ),
+            ("TO_DATE('0005-03-07', 'YYYY-MM-DD')", 'fmYYY YY Y Q CC', '5 5 5 1 1'),
+            ("TO_DATE('0005-03-07', 'YYYY-MM-DD')", 'fmSYYYY', ' 5'),
+            ("TO_DATE('1500-03-07', 'YYYY-MM-DD')", 'fmDDD IW IYYY IY', '67 10 1500 0'),
+            (
+                "TO_TIMESTAMP('2020-03-07 01:05:09.0123', 'YYYY-MM-DD HH24:MI:SS.FF')",
+                'fmHH24:MI:SS.FF3',
+                '1:5:9.012',
+            ),
+            ("TO_DATE('2020-03-07', 'YYYY-MM-DD')", 'fmfmDD MM', '07 03'),
+        ):
+            (row,) = backend.execute(f"SELECT TO_CHAR({value}, '{fmt}') FROM dual").rows
+            assert row[0] == expected, fmt
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_day_counting_formats_before_1582_are_oracles() -> None:
     # Before 1582-10-15 TO_CHAR's day-counting elements, TO_DATE's J, TRUNC
     # and ROUND to a week and NEXT_DAY count Oracle's Julian days (#2600),
