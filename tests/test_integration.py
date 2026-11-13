@@ -265,6 +265,14 @@ def _target_is_8i() -> bool:
     return _TARGET_IS_8I
 
 
+def _own_session_predicate(version: str) -> str:
+    # This session's row of v$session: USERENV's SID arrived in 10g, and
+    # before it the audit session id finds it (ORA-02003 on 8i and 9i).
+    if int(version.split('.')[0]) < 10:
+        return "audsid = USERENV('SESSIONID')"
+    return "sid = sys_context('userenv', 'sid')"
+
+
 # What the server a test runs against can do (#1339): one table of the facts
 # the suite used to restate in each test body, each with the server or field
 # version that has it and the error or reason that rules it out. A test or a
@@ -272,6 +280,8 @@ def _target_is_8i() -> bool:
 # the test does, against its own connection, or a probe one for a class that
 # makes its own. What a test meets at run time -- a privilege the bed's user
 # lacks, an ORA code the server answers -- stays a skip in the test body.
+
+
 class _Target(NamedTuple):
     field_version: int
     is_8i: bool
@@ -3977,8 +3987,8 @@ class CursorIntegration(_IntegrationBase):
             cur = conn.cursor()
             try:
                 cur.execute(
-                    'SELECT program, machine, osuser FROM v$session '
-                    "WHERE sid = sys_context('userenv', 'sid')"
+                    'SELECT program, machine, osuser FROM v$session WHERE '
+                    + _own_session_predicate(conn.version)
                 )
             except DatabaseError as exc:
                 if exc.code in (942, 2003):
@@ -13684,8 +13694,8 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             async with Conn.cursor() as Cur:
                 try:
                     await Cur.execute(
-                        'SELECT program, machine, osuser FROM v$session '
-                        "WHERE sid = sys_context('userenv', 'sid')"
+                        'SELECT program, machine, osuser FROM v$session WHERE '
+                        + _own_session_predicate(Conn.version)
                     )
                 except DatabaseError as exc:
                     if exc.code in (942, 2003):

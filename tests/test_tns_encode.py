@@ -3510,6 +3510,51 @@ class TestTnsCommandEncodersDict(unittest.TestCase):
         self.assertEqual(encode_dictionary_description(Dict), Ret)
 
     @patch('socket.gethostname')
+    def test_tns_description_carries_the_session_identity(self, mock_gethostname):
+        # The CID names the session as the login does, since 8i reports its
+        # PROGRAM, HOST and USER in v$session and 9i its USER (#2642). Each
+        # falls back as the login's does.
+        mock_gethostname.return_value = 'ExampleHost'
+        EnvOpts = {
+            'host': 'localhost',
+            'port': 1521,
+            'user': 'system',
+            'sid': 'XE',
+            'app_name': 'oratest',
+            'program': 'pyo-program',
+            'machine': 'pyo-machine',
+            'osuser': 'probe_os',
+        }
+        Dict = {'type': DictionaryType.description, 'env': EnvOpts, 'seq': 3}
+        self.assertIn(
+            b'(CID=(PROGRAM=pyo-program)(HOST=pyo-machine)(USER=probe_os)))',
+            encode_dictionary_description(Dict),
+        )
+        EnvOpts.update(program=None, machine=None, osuser=None)
+        self.assertIn(
+            b'(CID=(PROGRAM=oratest)(HOST=ExampleHost)(USER=system)))',
+            encode_dictionary_description(Dict),
+        )
+
+    @patch('socket.gethostname')
+    def test_tns_description_cid_values_stay_inside_it(self, mock_gethostname):
+        # A CID value is unquoted: what could end or nest it, a space, or a
+        # character outside ASCII becomes '?', and the descriptor still parses.
+        mock_gethostname.return_value = 'ExampleHost'
+        EnvOpts = {
+            'host': 'localhost',
+            'port': 1521,
+            'user': 'system',
+            'sid': 'XE',
+            'program': 'my (app)=1',
+            'osuser': 'Jörg\\',
+        }
+        Dict = {'type': DictionaryType.description, 'env': EnvOpts, 'seq': 3}
+        Out = encode_dictionary_description(Dict)
+        self.assertIn(b'(CID=(PROGRAM=my??app??1)(HOST=ExampleHost)(USER=J?rg?)))', Out)
+        self.assertEqual(Out.count(b'('), Out.count(b')'))
+
+    @patch('socket.gethostname')
     def test_tns_login_0(self, mock_gethostname):
         mock_gethostname.return_value = 'ExampleHost'
         EnvOpts = {

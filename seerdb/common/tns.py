@@ -139,6 +139,7 @@ import math
 import os
 import re
 import socket
+import string
 import struct
 
 from seerdb.common.tns_consts import (
@@ -8938,15 +8939,29 @@ def encode_tpc_change_state(
     return Out
 
 
+_CID_CHARS = frozenset(string.ascii_letters + string.digits + '<>/,.:;-_$+*#&!%?@')
+
+
+def _cid_value(Value: str) -> bytes:
+    # A CID value goes into the descriptor unquoted, so a character that could
+    # end or nest it, or fall outside the network character set, becomes '?'
+    # (python-oracledb's rule).
+    return ''.join(c if c in _CID_CHARS else '?' for c in Value).encode('ascii')
+
+
 def encode_dictionary_description(Dictionary: dict) -> bytes:
     logger.debug('encode_dictionary_description: %s', _redacted(Dictionary))
-    Hostname = socket.gethostname().encode('utf-8')
-    User = Dictionary['env']['user'].encode('utf-8')
-    Host = Dictionary['env'].get('host', DEFAULT_HOST).encode('utf-8')
-    Port = str(Dictionary['env'].get('port', DEFAULT_PORT)).encode('utf-8')
-    SID = Dictionary['env'].get('sid', DEFAULT_SID).encode('utf-8')
-    ServiceName = Dictionary['env'].get('service_name', None)
-    AppName = Dictionary['env'].get('app_name', 'seerdb').encode('utf-8')
+    Env = Dictionary['env']
+    # The CID names the session as the login does, with the same fallbacks:
+    # 8i reports its PROGRAM, HOST and USER as v$session's program, machine and
+    # osuser, and 9i its USER, ahead of the login's own (#2642).
+    Hostname = _cid_value(Env.get('machine') or socket.gethostname())
+    User = _cid_value(Env.get('osuser') or Env['user'])
+    Host = Env.get('host', DEFAULT_HOST).encode('utf-8')
+    Port = str(Env.get('port', DEFAULT_PORT)).encode('utf-8')
+    SID = Env.get('sid', DEFAULT_SID).encode('utf-8')
+    ServiceName = Env.get('service_name', None)
+    AppName = _cid_value(Env.get('program') or Env.get('app_name') or 'seerdb')
     SslOpts = Dictionary['env'].get('ssl', None)
     Sn = (
         b'SID=' + SID
