@@ -1263,6 +1263,19 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **Invalid UTF-8** cannot be stored in a string column (#1659).
 - **Fractional seconds** stop at six digits; a `TIMESTAMP(9)` is a
   `TIMESTAMP(6)`.
+- **A WITH TIME ZONE value keeps no region.** It keeps its instant and its
+  offset, so a value made at `'Europe/Berlin'` is one at `+02:00` from then on.
+  `TZR` in a format prints the offset where Oracle prints `EUROPE/BERLIN`;
+  `EXTRACT(TIMEZONE_REGION ...)` and `EXTRACT(TIMEZONE_ABBR ...)` are refused,
+  where Oracle gives the region and its abbreviation. Arithmetic across a
+  daylight-saving change keeps the offset:
+  `FROM_TZ(TIMESTAMP '2020-03-28 12:00:00', 'Europe/Berlin') + INTERVAL '1' DAY`
+  is 2020-03-29 12:00 +01:00, the instant 23ai shows as 13:00 +02:00.
+  Lifting this means a region field in the stored value
+  ([#2628](https://github.com/seerdb/seerdb/issues/2628)). A TIMESTAMP
+  literal with a region, `TIMESTAMP '2020-03-28 12:00:00 Europe/Berlin'`, is
+  read at +00:00, a wrong instant; `FROM_TZ` with the region gets it right
+  ([#2633](https://github.com/seerdb/seerdb/issues/2633)).
 - **A WITH TIME ZONE value's UTC time by 1582-10-15.** Where a value's
   offset puts its UTC time on the other side of 1582-10-15 from its wall
   clock, the UTC time is PostgreSQL's, a day in the gap ten days from
