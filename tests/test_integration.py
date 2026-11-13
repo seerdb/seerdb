@@ -1921,6 +1921,18 @@ class TypesIntegration(_IntegrationBase):
         v = self.cur.fetchone()[0]
         self.assertEqual(v, 'X' * 4000 + 'Y' * 1000)
 
+    def test_a_block_binds_a_large_value_into_a_clob(self):
+        # A value past 4000 bytes reaches a CLOB column through a PL/SQL block,
+        # declared at 32767 -- on 9i's TTI_ALL7 too, where a plain INSERT has no
+        # form for it and a block whose bind declares 4000 is ORA-01460
+        # (PROTOCOL.md 19.3.1, SeerODBC #122).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB)')
+        text = self.cur.var(str, 32767)
+        text.setvalue(0, 'q' * 5000)
+        self.cur.execute(f'BEGIN INSERT INTO {self.TABLE} VALUES (1, :1); END;', [text])
+        self.cur.execute(f'SELECT DBMS_LOB.GETLENGTH(c) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchone()[0], 5000)
+
     def test_a_declared_long_bind_takes_a_large_value(self):
         # Declared DB_TYPE_LONG / DB_TYPE_LONG_RAW, a value past 4000 bytes goes
         # in -- on 9i too, where an undeclared one is refused because a LOB
