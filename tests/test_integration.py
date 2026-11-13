@@ -507,6 +507,9 @@ _LTZ_SESSION_ARITHMETIC = _Need(
     '9i PL/SQL does LTZ + n on the database clock (#1241)', min_fv=_FV
 )
 _PING_ROUND_TRIP = _Need('9i pings with a query, which already raises', min_fv=_FV)
+_LTZ_PLUS_INTERVAL = _Need(
+    "9i's LTZ + INTERVAL is a WITH TIME ZONE value (#2639)", min_fv=_FV
+)
 _BINARY_DOUBLE_AND_INTERVAL = _Need(
     'BINARY_DOUBLE / INTERVAL are 10g+ types; Oracle 9i lacks them', min_fv=_FV
 )
@@ -1483,12 +1486,7 @@ class TypesIntegration(_IntegrationBase):
                     f'CAST({Plain} AS TIMESTAMP(3) WITH LOCAL TIME ZONE)',
                     '15-JAN-20 10.00.00.500 AM',
                 ),
-                (
-                    f"CAST({Literal} AS TIMESTAMP WITH LOCAL TIME ZONE) + INTERVAL '1' DAY",
-                    '16-JAN-20 12.00.00.500000000 PM',
-                ),
                 (f'NVL({Literal}, NULL)', '15-JAN-20 10.00.00.500000000 AM +03:00'),
-                (f'TRUNC({Literal})', '15-JAN-20'),
             ]
             for Expression, Expected in Cases:
                 with self.subTest(Expression):
@@ -1496,6 +1494,47 @@ class TypesIntegration(_IntegrationBase):
                         f"SELECT TO_CHAR({Expression}), ({Expression}) || '|' FROM dual"
                     )
                     self.assertEqual(Cur.fetchone(), (Expected, Expected + '|'))
+        finally:
+            Conn.close()
+
+    @_requires(_TSTZ, _TRUNC_TIMESTAMP)
+    def test_a_truncated_zoned_timestamp_made_text_is_a_date(self):
+        # TRUNC of a TIMESTAMP WITH TIME ZONE is a DATE, made text in
+        # NLS_DATE_FORMAT (#2615). 9i's TRUNC takes no TIMESTAMP (#2639).
+        Conn = _connect()
+        try:
+            Cur = Conn.cursor()
+            Cur.execute("ALTER SESSION SET NLS_DATE_FORMAT = 'DD-MON-RR'")
+            Expression = "TRUNC(TIMESTAMP '2020-01-15 10:00:00.5 +03:00')"
+            Cur.execute(
+                f"SELECT TO_CHAR({Expression}), ({Expression}) || '|' FROM dual"
+            )
+            self.assertEqual(Cur.fetchone(), ('15-JAN-20', '15-JAN-20|'))
+        finally:
+            Conn.close()
+
+    @_requires(_TSTZ, _LTZ_PLUS_INTERVAL)
+    def test_a_local_zoned_timestamp_plus_an_interval_made_text_stays_local(self):
+        # An LTZ plus an interval is an LTZ, made text in NLS_TIMESTAMP_FORMAT at
+        # precision 9 (#2615). 9i's is a WITH TIME ZONE value, its offset
+        # printed (#2639). 23ai's text, the session at +05:00.
+        Conn = _connect()
+        try:
+            Cur = Conn.cursor()
+            for Setting in (
+                "TIME_ZONE = '+05:00'",
+                "NLS_TIMESTAMP_FORMAT = 'DD-MON-RR HH.MI.SSXFF AM'",
+            ):
+                Cur.execute(f'ALTER SESSION SET {Setting}')
+            Expression = (
+                "CAST(TIMESTAMP '2020-01-15 10:00:00.5 +03:00' AS TIMESTAMP WITH LOCAL "
+                "TIME ZONE) + INTERVAL '1' DAY"
+            )
+            Cur.execute(
+                f"SELECT TO_CHAR({Expression}), ({Expression}) || '|' FROM dual"
+            )
+            Expected = '16-JAN-20 12.00.00.500000000 PM'
+            self.assertEqual(Cur.fetchone(), (Expected, Expected + '|'))
         finally:
             Conn.close()
 
@@ -1515,10 +1554,12 @@ class TypesIntegration(_IntegrationBase):
             Cases = [
                 (f"{Value} AT TIME ZONE '+01:00'", '2020-01-15 08:00:00.500 +01:00'),
                 (f"{Value} AT TIME ZONE '-05:30'", '2020-01-15 01:30:00.500 -05:30'),
-                (f"{Value} AT TIME ZONE 'UTC'", '2020-01-15 07:00:00.500 +00:00'),
+                # Zones 9.2's default time-zone file holds; it has no 'UTC' and
+                # no 'Europe/Berlin' (ORA-01882, #2639).
+                (f"{Value} AT TIME ZONE 'GMT'", '2020-01-15 07:00:00.500 +00:00'),
                 (
-                    f"{Value} AT TIME ZONE 'Europe/Berlin'",
-                    '2020-01-15 08:00:00.500 +01:00',
+                    f"{Value} AT TIME ZONE 'US/Eastern'",
+                    '2020-01-15 02:00:00.500 -05:00',
                 ),
                 (
                     f'{Value} AT TIME ZONE SESSIONTIMEZONE',
@@ -5934,14 +5975,16 @@ class BindIntegration(_IntegrationBase):
                 "EXTRACT(HOUR FROM TIMESTAMP '2020-01-15 01:30:00 +03:00' + INTERVAL '1' HOUR)",
                 23,
             ),
+            # A region 9.2's default time-zone file holds (#2639), at its
+            # summer offset.
             (
-                "EXTRACT(HOUR FROM FROM_TZ(TIMESTAMP '2020-07-01 12:00:00', 'Europe/Berlin'))",
-                10,
+                "EXTRACT(HOUR FROM FROM_TZ(TIMESTAMP '2020-07-01 12:00:00', 'US/Eastern'))",
+                16,
             ),
             (
                 "EXTRACT(TIMEZONE_HOUR FROM FROM_TZ(TIMESTAMP '2020-07-01 12:00:00', "
-                "'Europe/Berlin'))",
-                2,
+                "'US/Eastern'))",
+                -4,
             ),
             (
                 "EXTRACT(HOUR FROM CAST(TIMESTAMP '2020-01-15 01:30:00' "
