@@ -45,6 +45,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     PostgresBackend,
     _backend_error,
     _bc_date_loader,
+    _bc_literals,
     _bind_slots,
     _bind_spans,
     _call_argument_error,
@@ -17806,3 +17807,31 @@ def test_at_time_zone_is_sys_ora_at_time_zone() -> None:
         'SELECT at, local FROM x',
     ):
         assert _translate_at_time_zone(kept) == kept
+
+
+def test_a_bc_literal_is_spelt_as_postgresql_reads_it() -> None:
+    # DATE '-0044-03-15' is DATE '0044-03-15 BC', the year padded and a zone
+    # kept last (#2620). A string that is no DATE or TIMESTAMP literal, and
+    # one with a space before the sign (Oracle's ORA-01841), are left.
+    for sql, spelt in (
+        (
+            "SELECT DATE '-0044-03-15' FROM dual",
+            "SELECT DATE '0044-03-15 BC' FROM dual",
+        ),
+        ("SELECT date '-44-03-15' FROM dual", "SELECT date '0044-03-15 BC' FROM dual"),
+        (
+            "SELECT TIMESTAMP '-0044-03-15 10:00:00 +01:00' FROM dual",
+            "SELECT TIMESTAMP '0044-03-15 10:00:00 BC +01:00' FROM dual",
+        ),
+        (
+            "SELECT TIMESTAMP '-0044-03-15 10:00:00 Europe/Berlin' FROM dual",
+            "SELECT TIMESTAMP '0044-03-15 10:00:00 BC Europe/Berlin' FROM dual",
+        ),
+    ):
+        assert _bc_literals(sql) == spelt
+    for kept in (
+        "SELECT '-0044-03-15' FROM dual",
+        "SELECT DATE ' -0044-03-15' FROM dual",
+        "SELECT x FROM t WHERE note = 'DATE ''-0044-03-15'' was'",
+    ):
+        assert _bc_literals(kept) == kept
