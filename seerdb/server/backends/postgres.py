@@ -576,15 +576,89 @@ def _oracle_number_rounding(name: str) -> str:
     )
 
 
+# Oracle's calendar (#2600): Julian before 1582-10-15, Gregorian from then
+# on, where PostgreSQL's is Gregorian throughout. The Mirror keeps a DATE's
+# label -- its year, month and day, as the wire carries them -- and counts
+# days by Oracle's day number, the Julian Day Number of the label in its own
+# calendar: 2299160 for 1582-10-04, 2299161 for 1582-10-15. A BC year is
+# Oracle's label as PostgreSQL's extract gives it, -44 for -0044, read as the
+# astronomical year: that gives 23ai's J (1705061 for -0044-03-15), and its
+# 367 days from -0001-12-31 to 0001-01-01, across the year 0 no label names.
+# (23ai's -4712, alone, counts no February 29.)
+_JULIAN_START = "'1582-10-15'::timestamp"
+
+
+def _pg_op(left: str, op: str, right: str) -> str:
+    # `left op right` by PostgreSQL's own operator, parenthesised: the Mirror's
+    # own `/` of two integers is a NUMBER's, and every OPERATOR(...) binds
+    # alike -- below `+` and `*` -- so one unparenthesised read
+    # `a + b OPERATOR(/) c` as (a + b) / c.
+    return f'(({left}) OPERATOR(pg_catalog.{op}) ({right}))'
+
+
+_ORACLE_CALENDAR_DDL = (
+    'CREATE OR REPLACE FUNCTION sys.ora_day_number(t timestamp) RETURNS integer '
+    'LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ '
+    'DECLARE y integer; m integer; a integer; BEGIN '
+    f'IF t >= {_JULIAN_START} THEN '
+    'RETURN pg_catalog.floor(extract(julian FROM t))::integer; END IF; '
+    'y := extract(year FROM t)::integer; m := extract(month FROM t)::integer; '
+    f'a := {_pg_op("14 - m", "/", "12")}; y := y + 4800 - a; m := m + 12 * a - 3; '
+    f'RETURN extract(day FROM t)::integer + {_pg_op("153 * m + 2", "/", "5")} '
+    f'+ 365 * y + {_pg_op("y", "/", "4")} - 32083; END $$;'
+    # The label of a day number: Gregorian from 2299161 on, Julian before it,
+    # a negative year BC. Year 0 has no label: Oracle refuses its days
+    # (ORA-01841). A Julian leap day the Gregorian calendar lacks, 1500-02-29,
+    # has no timestamp to be.
+    'CREATE OR REPLACE FUNCTION sys.ora_day_label(j integer) RETURNS timestamp '
+    'LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ '
+    'DECLARE c integer; d integer; e integer; m integer; y integer; BEGIN '
+    'IF j >= 2299161 THEN '
+    "RETURN pg_catalog.to_date(j::text, 'J')::timestamp; END IF; "
+    f'c := j + 32082; d := {_pg_op("4 * c + 3", "/", "1461")}; '
+    f'e := c - {_pg_op("1461 * d", "/", "4")}; m := {_pg_op("5 * e + 2", "/", "153")}; '
+    f'y := d - 4800 + {_pg_op("m", "/", "10")}; '
+    "IF y = 0 THEN RAISE EXCEPTION USING ERRCODE = '22007', MESSAGE = "
+    "'(full) year must be between -4713 and +9999, and not be 0'; END IF; "
+    'RETURN pg_catalog.make_timestamp(y, '
+    f'm + 3 - 12 * {_pg_op("m", "/", "10")}, '
+    f'e - {_pg_op("153 * m + 2", "/", "5")} + 1, 0, 0, 0); '
+    'EXCEPTION WHEN datetime_field_overflow THEN '
+    "RAISE EXCEPTION USING ERRCODE = '22008', MESSAGE = 'date not valid for month "
+    "specified: a Julian leap day, which the Mirror cannot store'; END $$;"
+    # Oracle's calendar has no 1582-10-05 to 10-14: TO_DATE and a literal of
+    # one give 1582-10-15 at the same time of day (#2600).
+    'CREATE OR REPLACE FUNCTION sys.ora_past_the_gap(t timestamp) RETURNS timestamp '
+    'LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$ SELECT CASE WHEN '
+    f"t >= '1582-10-05'::timestamp AND t < {_JULIAN_START} THEN "
+    + _pg_op(_JULIAN_START, '+', _pg_op('t', '-', "pg_catalog.date_trunc('day', t)"))
+    + ' ELSE t END $$;'
+)
+
 _DATE_ARITHMETIC_DDL = (
     # A DATE difference in days, computed at fifty decimals and rounded as
     # Oracle's: 14.430902777... to 38 decimals, where PostgreSQL's default
-    # scale kept 16 (#2597).
+    # scale kept 16 (#2597). Before 1582-10-15 the days are Oracle's, Julian
+    # (#2600): 1582-10-15 - 1582-10-04 is 1.
     'CREATE OR REPLACE FUNCTION sys.ora_date_minus(timestamp, timestamp) '
     'RETURNS numeric LANGUAGE plpgsql IMMUTABLE STRICT '
     'AS $$ DECLARE x numeric; e integer; BEGIN '
-    'x := pg_catalog.round(extract(epoch FROM $1 OPERATOR(pg_catalog.-) $2), 50) '
-    f'{_PG_DIV} 86400; {_oracle_number_rounding("x")}RETURN x; END $$;'
+    f'IF $1 < {_JULIAN_START} OR $2 < {_JULIAN_START} THEN '
+    'x := '
+    + _pg_op(
+        _pg_op(
+            _pg_op('sys.ora_day_number($1)', '-', 'sys.ora_day_number($2)')
+            + '::numeric',
+            '*',
+            '86400',
+        ),
+        '+',
+        _pg_op('extract(epoch FROM $1::time)', '-', 'extract(epoch FROM $2::time)'),
+    )
+    + '; '
+    'ELSE x := extract(epoch FROM ' + _pg_op('$1', '-', '$2') + '); END IF; '
+    f'x := pg_catalog.round(x, 50) {_PG_DIV} 86400; '
+    f'{_oracle_number_rounding("x")}RETURN x; END $$;'
     # MONTHS_BETWEEN by Oracle's rule (#2597), where orafce's kept 15 digits:
     # whole months when the two are the same day of the month or both a
     # month's last day, else the day and time difference over a 31-day month.
@@ -616,9 +690,37 @@ _DATE_ARITHMETIC_DDL = (
         for right in _DATE_TYPES + ('timestamp',)
         if (left == 'timestamp') == (right == 'timestamp')
     )
+    # DATE + n, by Oracle's days before 1582-10-15 (#2600): 1582-10-04 + 1 is
+    # 1582-10-15. A result on either side of it is the same path's.
     + 'CREATE OR REPLACE FUNCTION sys.ora_date_plus(timestamp, numeric) '
-    'RETURNS ora_date LANGUAGE sql IMMUTABLE STRICT SET search_path = pg_catalog '
-    "AS $$ SELECT ($1 OPERATOR(pg_catalog.+) $2 * interval '1 day')::timestamp(0) $$;"
+    'RETURNS ora_date LANGUAGE plpgsql IMMUTABLE STRICT AS $$ '
+    'DECLARE r timestamp; s numeric; d integer; BEGIN '
+    'r := ' + _pg_op('$1', '+', _pg_op('$2', '*', "interval '1 day'")) + '; '
+    f'IF $1 >= {_JULIAN_START} AND r >= {_JULIAN_START} THEN '
+    'RETURN r::timestamp(0); END IF; '
+    's := '
+    + _pg_op(
+        _pg_op(
+            _pg_op('sys.ora_day_number($1)::numeric', '*', '86400'),
+            '+',
+            'extract(epoch FROM $1::time)',
+        ),
+        '+',
+        _pg_op('$2', '*', '86400'),
+    )
+    + '; '
+    'd := pg_catalog.floor(' + _pg_op('s', '/', '86400') + ')::integer; '
+    'RETURN '
+    + _pg_op(
+        'sys.ora_day_label(d)',
+        '+',
+        _pg_op(
+            _pg_op('s', '-', _pg_op('d::numeric', '*', '86400')),
+            '*',
+            "interval '1 second'",
+        ),
+    )
+    + '::timestamp(0); END $$;'
     + ''.join(
         'DO $$ BEGIN '
         f'CREATE FUNCTION sys.ora_date_minus({left}, {right}) RETURNS numeric '
@@ -1990,7 +2092,7 @@ _ORAFCE_HELPERS_DDL = (
     'EXCEPTION WHEN dependent_objects_still_exist THEN NULL; END $$;'
     'DO $$ BEGIN '
     'CREATE OR REPLACE FUNCTION to_date(numeric, text) RETURNS ora_date '
-    'LANGUAGE sql STABLE STRICT AS $f$ SELECT oracle.to_date($1::text, $2)::ora_date $f$; '
+    'LANGUAGE sql STABLE STRICT AS $f$ SELECT sys.ora_past_the_gap(oracle.to_date($1::text, $2))::ora_date $f$; '
     'EXCEPTION WHEN invalid_function_definition THEN NULL; END $$;'
     # TO_DATE gives orafce's DATE, a domain of its own beside ora_date, the
     # Mirror's: NVL, COALESCE, CASE or DECODE of a DATE column and a TO_DATE
@@ -2000,7 +2102,7 @@ _ORAFCE_HELPERS_DDL = (
     + ''.join(
         f'CREATE OR REPLACE FUNCTION sys.to_date({args}) RETURNS ora_date '
         'LANGUAGE sql STABLE STRICT AS '
-        f'$$ SELECT oracle.to_date({params})::ora_date $$;'
+        f'$$ SELECT sys.ora_past_the_gap(oracle.to_date({params}))::ora_date $$;'
         for args, params in (
             ('text', '$1'),
             ('text, text', '$1, $2'),
@@ -11140,9 +11242,32 @@ def _mirror_date_type(sql: str) -> str:
     return _unmask_quoted(masked, contents)
 
 
+# A DATE or TIMESTAMP literal of a day Oracle's calendar lacks, 1582-10-05 to
+# 10-14, is 1582-10-15 at the same time of day, as 23ai reads it (#2600). The
+# literal's text is rewritten, so it costs nothing when the statement runs.
+_TEMPORAL_LITERAL = re.compile(
+    rf"\b(?:{_DATE_TYPE}|DATE|TIMESTAMP)\s*'\x00(\d+)\x00'", re.IGNORECASE
+)
+_GAP_DAY = re.compile(r'(\s*)1582-10-(?:0[5-9]|1[0-4])(?![0-9])')
+
+
+def _past_the_gap(sql: str) -> str:
+    if '1582-10-' not in sql:
+        return sql
+    (masked, contents) = _mask_quoted(sql)
+    moved = False
+    for literal in _TEMPORAL_LITERAL.finditer(masked):
+        index = int(literal.group(1))
+        text = _GAP_DAY.sub(r'\g<1>1582-10-15', contents[index], count=1)
+        if text != contents[index]:
+            (contents[index], moved) = (text, True)
+    return _unmask_quoted(masked, contents) if moved else sql
+
+
 def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('to-nchar', _to_nchar_as_to_char(sql), sql)
     sql = _ruled('date-type', _mirror_date_type(sql), sql)
+    sql = _ruled('past-the-gap', _past_the_gap(sql), sql)
     sql = _ruled('hash-identifier', _quote_hash_identifiers(sql), sql)
     # Not a rule: it types a select-list literal as Oracle describes one, which
     # portable SQL needs as much as Oracle SQL does.
@@ -16113,6 +16238,7 @@ _INSTALLATION_DIGEST: Final = hashlib.sha256(
             _INTERVALYM_TYPE_DDL,
             _DATE_TYPE_DDL,
             _ROWID_TYPE_DDL,
+            _ORACLE_CALENDAR_DDL,
             _DATE_ARITHMETIC_DDL,
             _HELPER_FUNCTIONS_DDL,
             _ORAFCE_HELPERS_DDL,
@@ -16598,6 +16724,7 @@ class PostgresBackend:
                 _LOB_TYPE_DDL,
                 _INTERVALYM_TYPE_DDL,
                 _DATE_TYPE_DDL,
+                _ORACLE_CALENDAR_DDL,
                 _DATE_ARITHMETIC_DDL,
                 _ROWID_TYPE_DDL,
             )

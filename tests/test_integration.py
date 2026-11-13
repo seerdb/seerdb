@@ -514,6 +514,11 @@ _BINARY_FLOAT = _Need('BINARY_FLOAT / BINARY_DOUBLE are 10g+', min_fv=_FV)
 _BINARY_FLOAT_SERVER = _Need(
     'BINARY_FLOAT / BINARY_DOUBLE are Oracle 10g+', min_server=10
 )
+_GAP_DATE_LITERAL = _Need(
+    'a DATE literal in the 1582 gap is 1582-10-15 from 18c; 11g and older keep '
+    'the day the calendar lacks',
+    min_server=18,
+)
 _MOD_FLOAT_BY_ZERO = _Need(
     'MOD of a BINARY_FLOAT / BINARY_DOUBLE by 0 is the dividend from 18c; '
     '10g and 11g give 0',
@@ -5914,6 +5919,48 @@ class BindIntegration(_IntegrationBase):
                 self.cur.execute(f'SELECT {expr} FROM {self.TABLE}', binds)
                 self.assertEqual(self.cur.fetchone(), (days,))
                 self.assertIs(self.cur.description[0][1], seerdb.DB_TYPE_NUMBER)
+
+    def test_dates_before_1582_are_julian(self):
+        # Oracle's DATE follows the Julian calendar before 1582-10-15: no days
+        # between 10-04 and 10-15, a leap year every fourth year, and a day
+        # literal in the gap read as 10-15. Over PostgreSQL, Gregorian
+        # throughout, each was off by up to ten days (#2600).
+        for expr, value in (
+            ("DATE '1582-10-15' - DATE '1582-10-04'", 1),
+            ("DATE '1500-03-01' - DATE '1500-02-28'", 2),
+            ("DATE '1600-01-01' - DATE '1500-01-01'", 36515),
+            ("DATE '2020-01-15' - DATE '1020-07-04'", 365066),
+            ("TO_CHAR(DATE '1582-10-04' + 1, 'YYYY-MM-DD')", '1582-10-15'),
+            (
+                "TO_CHAR(DATE '1582-10-15' - 0.25, 'YYYY-MM-DD HH24:MI')",
+                '1582-10-04 18:00',
+            ),
+            ("TO_CHAR(DATE '1000-01-01' + 365000, 'YYYY-MM-DD')", '1999-05-09'),
+            (
+                "TO_CHAR(TO_DATE('1582-10-05 13:00', 'YYYY-MM-DD HH24:MI'), "
+                "'YYYY-MM-DD HH24:MI')",
+                '1582-10-15 13:00',
+            ),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (value,))
+
+    @_requires(_GAP_DATE_LITERAL)
+    def test_a_date_literal_in_the_1582_gap_is_1582_10_15(self):
+        # From 18c, a DATE or TIMESTAMP literal of a day the calendar lacks is
+        # 1582-10-15 at the same time, as TO_DATE's is everywhere (#2600).
+        for expr, value in (
+            ("TO_CHAR(DATE '1582-10-10', 'YYYY-MM-DD')", '1582-10-15'),
+            (
+                "TO_CHAR(TIMESTAMP '1582-10-10 01:02:03', 'YYYY-MM-DD HH24:MI:SS')",
+                '1582-10-15 01:02:03',
+            ),
+            ("TO_CHAR(DATE '1582-10-14' + 1, 'YYYY-MM-DD')", '1582-10-16'),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (value,))
 
     def test_a_date_bind_is_a_date(self):
         # seerdb binds a datetime without a fraction as a DATE, as Oracle's
