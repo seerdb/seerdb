@@ -249,6 +249,14 @@ would cost far more than anyone gains from it.
   The Mirror gives the exact result in each case. A zero result is +0 on both,
   and from 18c `MOD(x, 0)` is `x`
   ([#2572](https://github.com/seerdb/seerdb/issues/2572)).
+- **`AT TIME ZONE`.** `x AT TIME ZONE z` and `x AT LOCAL` give a TIMESTAMP
+  WITH TIME ZONE at the zone's offset, as on Oracle. A TIMESTAMP operand is
+  read in the session's zone first, as 18c and later read it; 11g reads it at
+  `z` itself. The Mirror also takes two forms Oracle refuses: a chain without
+  parentheses, `x AT TIME ZONE 'a' AT TIME ZONE 'b'` (ORA-00907), and a DATE
+  operand, which is read as a TIMESTAMP (ORA-30084). The zone's region is not
+  kept: `TZR` shows its offset
+  ([#2628](https://github.com/seerdb/seerdb/issues/2628)).
 - **Dates before 1582-10-15.** Oracle's DATE follows the Julian calendar
   before 1582-10-15 and the Gregorian from then on, and so does the Mirror's
   DATE arithmetic: `DATE '1582-10-15' - DATE '1582-10-04'` is 1, and a DATE

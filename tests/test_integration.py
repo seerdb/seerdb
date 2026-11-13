@@ -638,6 +638,9 @@ _DOMAINS = _Need(
 del _FV
 # By the server.
 _SODA = _Need('SODA needs an Oracle 18c+ server (DBMS_SODA)', min_server=18)
+_TIMESTAMP_AT_SESSION_ZONE = _Need(
+    'a TIMESTAMP AT TIME ZONE is read in the session zone from 18c', min_server=18
+)
 _LTZ = _Need('8i has no TIMESTAMP WITH LOCAL TIME ZONE', not_8i=True)
 _TSTZ = _Need('8i has no TIMESTAMP WITH TIME ZONE', not_8i=True)
 _INTERVAL = _Need('INTERVAL is a 9i+ type; Oracle 8i lacks it', not_8i=True)
@@ -1493,6 +1496,86 @@ class TypesIntegration(_IntegrationBase):
                         f"SELECT TO_CHAR({Expression}), ({Expression}) || '|' FROM dual"
                     )
                     self.assertEqual(Cur.fetchone(), (Expected, Expected + '|'))
+        finally:
+            Conn.close()
+
+    @_requires(_TSTZ)
+    def test_at_time_zone_is_the_same_instant_at_the_zones_offset(self):
+        # x AT TIME ZONE z and x AT LOCAL are a WITH TIME ZONE value: the same
+        # instant at the zone's offset, '+01:00' east of UTC, a TIMESTAMP read
+        # in the session's zone first. Through the Mirror-over-PG a numeric zone
+        # was read west of UTC, the result was a plain timestamp, and AT LOCAL
+        # did not parse (#2617). 23ai's answers, the session at +05:00.
+        Conn = _connect()
+        try:
+            Cur = Conn.cursor()
+            Cur.execute("ALTER SESSION SET TIME_ZONE = '+05:00'")
+            Value = "TIMESTAMP '2020-01-15 10:00:00.5 +03:00'"
+            Format = "'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'"
+            Cases = [
+                (f"{Value} AT TIME ZONE '+01:00'", '2020-01-15 08:00:00.500 +01:00'),
+                (f"{Value} AT TIME ZONE '-05:30'", '2020-01-15 01:30:00.500 -05:30'),
+                (f"{Value} AT TIME ZONE 'UTC'", '2020-01-15 07:00:00.500 +00:00'),
+                (
+                    f"{Value} AT TIME ZONE 'Europe/Berlin'",
+                    '2020-01-15 08:00:00.500 +01:00',
+                ),
+                (
+                    f'{Value} AT TIME ZONE SESSIONTIMEZONE',
+                    '2020-01-15 12:00:00.500 +05:00',
+                ),
+                (f'{Value} AT LOCAL', '2020-01-15 12:00:00.500 +05:00'),
+                (
+                    "CAST(TIMESTAMP '2020-01-15 10:00:00.5' AS TIMESTAMP WITH LOCAL TIME ZONE) "
+                    "AT TIME ZONE '+01:00'",
+                    '2020-01-15 06:00:00.500 +01:00',
+                ),
+                (
+                    f"({Value} AT TIME ZONE '+01:00') + INTERVAL '1' HOUR",
+                    '2020-01-15 09:00:00.500 +01:00',
+                ),
+                (
+                    f"({Value} AT TIME ZONE '+01:00') AT TIME ZONE '-02:00'",
+                    '2020-01-15 05:00:00.500 -02:00',
+                ),
+            ]
+            for Expression, Expected in Cases:
+                with self.subTest(Expression):
+                    Cur.execute(f'SELECT TO_CHAR({Expression}, {Format}) FROM dual')
+                    self.assertEqual(Cur.fetchone()[0], Expected)
+            for Expression, Expected in (
+                (f"EXTRACT(TIMEZONE_HOUR FROM {Value} AT TIME ZONE '+01:00')", 1),
+                (f"EXTRACT(HOUR FROM {Value} AT TIME ZONE '+01:00')", 7),
+                (
+                    f"CASE WHEN {Value} AT TIME ZONE '+01:00' = {Value} THEN 1 ELSE 0 END",
+                    1,
+                ),
+            ):
+                with self.subTest(Expression):
+                    Cur.execute(f'SELECT {Expression} FROM dual')
+                    self.assertEqual(Cur.fetchone()[0], Expected)
+            Cur.execute(
+                f"SELECT TO_CHAR(CAST({Value} AT TIME ZONE '+01:00' AS TIMESTAMP), "
+                "'YYYY-MM-DD HH24:MI:SS') FROM dual"
+            )
+            self.assertEqual(Cur.fetchone()[0], '2020-01-15 08:00:00')
+        finally:
+            Conn.close()
+
+    @_requires(_TIMESTAMP_AT_SESSION_ZONE)
+    def test_a_timestamp_at_time_zone_is_read_in_the_sessions_zone(self):
+        # TIMESTAMP AT TIME ZONE z reads the TIMESTAMP in the session's zone,
+        # then shows that instant at z, from 18c on; 11g reads it at z itself
+        # (#2617). The Mirror follows 18c and later.
+        Conn = _connect()
+        try:
+            Cur = Conn.cursor()
+            Cur.execute("ALTER SESSION SET TIME_ZONE = '+05:00'")
+            Cur.execute(
+                "SELECT TO_CHAR(TIMESTAMP '2020-01-15 10:00:00.5' AT TIME ZONE '+01:00', "
+                "'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM') FROM dual"
+            )
+            self.assertEqual(Cur.fetchone()[0], '2020-01-15 06:00:00.500 +01:00')
         finally:
             Conn.close()
 

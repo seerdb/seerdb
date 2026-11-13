@@ -73,6 +73,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _through_synonyms,
     _to_interval_ym,
     _translate_admin,
+    _translate_at_time_zone,
     _translate_binds,
     _translate_connect_by,
     _translate_ddl,
@@ -6153,8 +6154,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_nullif, a NULLIF keeping a domain (#2596), and TO_CHAR of a
     # TIMESTAMP WITH TIME ZONE at its own offset, two sys.ora_to_char, a
     # to_char and two ora_to_char_signed (#2613), and EXTRACT's five
-    # sys.ora_extract overloads (#2627).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 374
+    # sys.ora_extract overloads (#2627), and AT TIME ZONE's: sys.ora_zone_offset
+    # and three overloads each of sys.ora_at_time_zone and sys.ora_at_local
+    # (#2617).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 381
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -17767,3 +17770,39 @@ def test_extract_of_a_datetime_field_is_sys_ora_extract() -> None:
         'SELECT my_extract(HOUR FROM t) FROM x',
     ):
         assert _translate_extract(kept) == kept
+
+
+def test_at_time_zone_is_sys_ora_at_time_zone() -> None:
+    # x AT TIME ZONE z is sys.ora_at_time_zone(x, z) and x AT LOCAL
+    # sys.ora_at_local(x), x the primary before AT, z the one after ZONE
+    # (#2617). A chain nests, left first.
+    for sql, translated in (
+        (
+            "SELECT t AT TIME ZONE '+01:00' FROM x",
+            "SELECT sys.ora_at_time_zone(t, '+01:00') FROM x",
+        ),
+        (
+            'SELECT p.t AT TIME ZONE z, f(t, 1) AT LOCAL FROM x p',
+            'SELECT sys.ora_at_time_zone(p.t, z), sys.ora_at_local(f(t, 1)) FROM x p',
+        ),
+        (
+            "SELECT TIMESTAMP '2020-01-15 10:00:00 +03:00' AT TIME ZONE 'UTC' FROM dual",
+            "SELECT sys.ora_at_time_zone(TIMESTAMP '2020-01-15 10:00:00 +03:00', 'UTC') "
+            'FROM dual',
+        ),
+        (
+            "SELECT (t + i) AT TIME ZONE SESSIONTIMEZONE + INTERVAL '1' HOUR FROM x",
+            'SELECT sys.ora_at_time_zone((t + i), SESSIONTIMEZONE) '
+            "+ INTERVAL '1' HOUR FROM x",
+        ),
+        (
+            "SELECT t AT TIME ZONE '+01:00' AT TIME ZONE :z FROM x",
+            "SELECT sys.ora_at_time_zone(sys.ora_at_time_zone(t, '+01:00'), :z) FROM x",
+        ),
+    ):
+        assert _translate_at_time_zone(sql) == translated
+    for kept in (
+        "SELECT 'AT TIME ZONE' FROM dual",
+        'SELECT at, local FROM x',
+    ):
+        assert _translate_at_time_zone(kept) == kept
