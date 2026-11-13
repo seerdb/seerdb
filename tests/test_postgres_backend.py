@@ -2134,6 +2134,78 @@ def test_translate_idioms_makes_a_date_literal_and_cast_the_mirror_date() -> Non
     )
 
 
+def test_translate_idioms_moves_a_literal_past_the_1582_gap() -> None:
+    # Oracle's calendar has no 1582-10-05 to 10-14: a DATE or TIMESTAMP literal
+    # of one is 1582-10-15, its time kept (#2600). Other days, and a string
+    # that is no literal of a date, are left as they are.
+    assert _translate_idioms(
+        "SELECT DATE '1582-10-10', TIMESTAMP '1582-10-14 01:02:03', "
+        "DATE '1582-10-04', DATE '1582-10-15', 'x 1582-10-10' FROM dual"
+    ) == (
+        "SELECT ora_date '1582-10-15', TIMESTAMP '1582-10-15 01:02:03', "
+        "ora_date '1582-10-04', ora_date '1582-10-15', "
+        "CAST('x 1582-10-10' AS char(12)) FROM dual"
+    )
+
+
+def test_oracle_day_numbers_and_date_arithmetic_before_1582() -> None:
+    # Oracle's DATE is Julian before 1582-10-15 (#2600). Its day numbers --
+    # 23ai's J -- and the arithmetic over them, against 23ai's answers: the
+    # gap closed, a Julian century leap year, spans across the switch, a BC
+    # year counted astronomically across the year 0 no label names.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for label, number in (
+            ('1582-10-04', 2299160),
+            ('1582-10-15', 2299161),
+            ('1000-01-01', 2086308),
+            ('0001-01-01', 1721424),
+            ('0100-02-28', 1757641),
+            ('-0044-03-15', 1705061),
+            ('-0001-12-31', 1721057),
+        ):
+            (row,) = backend.execute(
+                f"SELECT sys.ora_day_number(TO_DATE('{label}', 'SYYYY-MM-DD')) FROM dual"
+            ).rows
+            assert row[0] == number, label
+        for expr, expected in (
+            ("DATE '1582-10-15' - DATE '1582-10-04'", 1),
+            ("DATE '1500-03-01' - DATE '1500-02-28'", 2),
+            ("DATE '1600-01-01' - DATE '1500-01-01'", 36515),
+            ("DATE '2020-01-15' - DATE '1020-07-04'", 365066),
+            (
+                "TO_DATE('0001-01-01', 'SYYYY-MM-DD') "
+                "- TO_DATE('-0001-12-31', 'SYYYY-MM-DD')",
+                367,
+            ),
+            ("TO_CHAR(DATE '1582-10-04' + 1, 'YYYY-MM-DD')", '1582-10-15'),
+            (
+                "TO_CHAR(DATE '1582-10-15' - 0.25, 'YYYY-MM-DD HH24:MI')",
+                '1582-10-04 18:00',
+            ),
+            ("TO_CHAR(DATE '1000-01-01' + 365000, 'YYYY-MM-DD')", '1999-05-09'),
+            (
+                "TO_CHAR(TIMESTAMP '1582-10-04 12:00:00' + 1, 'YYYY-MM-DD HH24:MI')",
+                '1582-10-15 12:00',
+            ),
+            (
+                "TO_CHAR(TO_DATE('1582-10-10 13:00', 'YYYY-MM-DD HH24:MI'), 'YYYY-MM-DD HH24:MI')",
+                '1582-10-15 13:00',
+            ),
+            ("TO_CHAR(DATE '1582-10-14' + 1, 'YYYY-MM-DD')", '1582-10-16'),
+        ):
+            (row,) = backend.execute(f'SELECT {expr} FROM dual').rows
+            assert row[0] == expected, expr
+        # 1500-02-29 is Oracle's, and no PostgreSQL timestamp: refused, saying so.
+        with pytest.raises(BackendError, match='Julian leap day'):
+            backend.execute("SELECT DATE '1500-02-28' + 1 FROM dual")
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_translate_idioms_keeps_nullifs_type() -> None:
     # PostgreSQL's NULLIF resolves a domain to its base type, so the NULLIF of
     # two DATEs was a timestamp (#2596); sys.ora_nullif keeps it. Nested,

@@ -249,6 +249,19 @@ would cost far more than anyone gains from it.
   The Mirror gives the exact result in each case. A zero result is +0 on both,
   and from 18c `MOD(x, 0)` is `x`
   ([#2572](https://github.com/seerdb/seerdb/issues/2572)).
+- **Dates before 1582-10-15.** Oracle's DATE follows the Julian calendar
+  before 1582-10-15 and the Gregorian from then on, and so does the Mirror's
+  DATE arithmetic: `DATE '1582-10-15' - DATE '1582-10-04'` is 1, and a DATE
+  literal or `TO_DATE` of a day in the gap is 1582-10-15. PostgreSQL stores
+  dates in the Gregorian calendar, so February 29 of 100, 200, ... 1500, a
+  Julian leap day, cannot be stored: a result that would be one is refused. A
+  DATE *bind* in the gap is kept as sent; Oracle keeps it too, then counts
+  from it inconsistently. A BC date is counted by its astronomical year, as
+  23ai counts it across the missing year 0, except that 23ai's -4712 has no
+  February 29. TO_CHAR's `J` and day-of-week formats, TO_DATE's `J`, TRUNC to
+  a week, NEXT_DAY, and TIMESTAMP and INTERVAL arithmetic still count those
+  days the Gregorian way
+  ([#2600](https://github.com/seerdb/seerdb/issues/2600)).
 - **The digits of NUMBER math functions.** `SQRT`, `EXP`, `LN`, `LOG`,
   `POWER`, the trigonometric and the hyperbolic functions of a NUMBER return a
   NUMBER, as Oracle's do, with about 17 significant digits. Oracle's have 38 to
