@@ -1496,6 +1496,51 @@ class TypesIntegration(_IntegrationBase):
         finally:
             Conn.close()
 
+    @_requires(_TSTZ)
+    def test_a_to_timestamp_result_made_text_is_a_timestamp(self):
+        # TO_TIMESTAMP(...) made text without a format follows
+        # NLS_TIMESTAMP_FORMAT at precision 9, and TO_TIMESTAMP_TZ(...) follows
+        # NLS_TIMESTAMP_TZ_FORMAT. Through the Mirror-over-PG, the first printed
+        # a DATE and the second failed as to_char(ora_tstz) (#2609). 23ai's text,
+        # with the session at +05:00.
+        Conn = _connect()
+        try:
+            Cur = Conn.cursor()
+            for Setting in (
+                "TIME_ZONE = '+05:00'",
+                "NLS_DATE_FORMAT = 'DD.MM.YYYY'",
+                "NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF'",
+                "NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'",
+            ):
+                Cur.execute(f'ALTER SESSION SET {Setting}')
+            Stamp = "TO_TIMESTAMP('2020-03-07 01:05:09.5', 'YYYY-MM-DD HH24:MI:SS.FF')"
+            Cases = [
+                (Stamp, '2020-03-07 01:05:09.500000000'),
+                (
+                    "TO_TIMESTAMP('2020-03-07', 'YYYY-MM-DD')",
+                    '2020-03-07 00:00:00.000000000',
+                ),
+                (f"{Stamp} + INTERVAL '1' DAY", '2020-03-08 01:05:09.500000000'),
+                (f'{Stamp} + 1', '08.03.2020'),
+                (
+                    "TO_TIMESTAMP_TZ('2020-03-07 01:05:09.5 +03:00',"
+                    " 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')",
+                    '2020-03-07 01:05:09.500000000 +03:00',
+                ),
+                (
+                    "TO_TIMESTAMP_TZ('2020-03-07 01:05:09.5', 'YYYY-MM-DD HH24:MI:SS.FF')",
+                    '2020-03-07 01:05:09.500000000 +05:00',
+                ),
+            ]
+            for Expression, Expected in Cases:
+                with self.subTest(Expression):
+                    Cur.execute(
+                        f"SELECT TO_CHAR({Expression}), ({Expression}) || '|' FROM dual"
+                    )
+                    self.assertEqual(Cur.fetchone(), (Expected, Expected + '|'))
+        finally:
+            Conn.close()
+
     # ----- BINARY_FLOAT / BINARY_DOUBLE -----
 
     def test_binary_float(self):

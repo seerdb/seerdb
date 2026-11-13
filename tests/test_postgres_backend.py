@@ -2248,6 +2248,14 @@ def test_fm_spans_print_as_oracles() -> None:
                 'fmHH24:MI:SS.FF3',
                 '1:5:9.012',
             ),
+            # A TIMESTAMP whose FF sends it to sys.ora_to_char keeps the toggle,
+            # where FM covered the first element alone (#2609).
+            ("TIMESTAMP '2020-03-07 01:05:09.0123'", 'fmHH24:MI:SS.FF3', '1:5:9.012'),
+            (
+                "CAST(TIMESTAMP '2020-03-07 01:05:09.0123' AS TIMESTAMP(4))",
+                'fmHH24:fmMI:SS.FF',
+                '1:05:09.0123',
+            ),
             ("TO_DATE('2020-03-07', 'YYYY-MM-DD')", 'fmfmDD MM', '07 03'),
         ):
             (row,) = backend.execute(f"SELECT TO_CHAR({value}, '{fmt}') FROM dual").rows
@@ -17687,3 +17695,17 @@ def test_an_expression_to_char_converts_is_one_computed_operand() -> None:
         for (first, last) in _computed_operands(sql)
     ] == ["TIMESTAMP '2020-01-15 10:00:00 +03:00' + INTERVAL '1' DAY"]
     assert not _computed_operands("SELECT TO_CHAR(SYSDATE + 1, 'YYYY') FROM dual")
+
+
+def test_to_timestamp_says_its_type_and_precision() -> None:
+    # TO_TIMESTAMP(...) is a TIMESTAMP(9) and TO_TIMESTAMP_TZ(...) a TIMESTAMP(9)
+    # WITH TIME ZONE, made text by their own calls (#2609), as 23ai prints them.
+    def found(sql: str) -> list:
+        return [hit[2:] for hit in _typed_datetime_operands(sql)]
+
+    assert found(
+        "SELECT TO_CHAR(TO_TIMESTAMP('2020-03-07', 'YYYY-MM-DD')) FROM dual"
+    ) == [('sys.ora_datetime_text', 9)]
+    assert found(
+        "SELECT TO_TIMESTAMP_TZ('2020-03-07 +03:00', 'YYYY-MM-DD TZH:TZM') || 'x' FROM dual"
+    ) == [('sys.ora_tstz_text', 9)]

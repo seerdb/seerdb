@@ -10616,10 +10616,12 @@ def _typed_datetime_at(
 ) -> tuple[int, str, int] | None:
     """Whether the significant token `k` that `text` gives starts a datetime
     value whose type the text says -- a DATE or TIMESTAMP literal, SYSDATE,
-    SYSTIMESTAMP, TO_DATE(...), CAST(... AS DATE | TIMESTAMP[(p)]) -- and if
-    so, its last token, the call that makes it text and its precision: -1 for
-    a DATE, 9 for a TIMESTAMP literal (#2162). A literal with a zone is a
-    TIMESTAMP WITH TIME ZONE, as SYSTIMESTAMP is."""
+    SYSTIMESTAMP, TO_DATE(...), TO_TIMESTAMP[_TZ](...), CAST(... AS DATE |
+    TIMESTAMP[(p)]) -- and if so, its last token, the call that makes it text
+    and its precision: -1 for a DATE, 9 for a TIMESTAMP literal (#2162). A
+    literal with a zone is a TIMESTAMP WITH TIME ZONE, as SYSTIMESTAMP and
+    TO_TIMESTAMP_TZ are. TO_TIMESTAMP[_TZ] gives precision 9 (#2609),
+    measured on 23ai."""
 
     def closing(start: int) -> int | None:
         depth = 0
@@ -10645,13 +10647,19 @@ def _typed_datetime_at(
         if text(k + 1) == '(':
             return None
         return (k, _DATETIME_TEXT, -1) if word == 'SYSDATE' else (k, _TSTZ_TEXT, 6)
-    if word not in ('TO_DATE', 'CAST') or text(k + 1) != '(':
+    if word not in ('TO_DATE', 'TO_TIMESTAMP', 'TO_TIMESTAMP_TZ', 'CAST') or (
+        text(k + 1) != '('
+    ):
         return None
     close = closing(k + 1)
     if close is None:
         return None
     if word == 'TO_DATE':
         return (close, _DATETIME_TEXT, -1)
+    if word == 'TO_TIMESTAMP':
+        return (close, _DATETIME_TEXT, 9)
+    if word == 'TO_TIMESTAMP_TZ':
+        return (close, _TSTZ_TEXT, 9)
     if text(close - 2).upper() == 'AS':
         if text(close - 1).upper() == 'DATE':
             return (close, _DATETIME_TEXT, -1)
@@ -19730,7 +19738,12 @@ class PostgresBackend:
             if converted is not None:
                 wraps.append((first, last, *converted))
         spans = _bind_spans(sql)
+        # A call already wrapped as a typed value -- TO_DATE(...),
+        # TO_TIMESTAMP_TZ(...) -- is not wrapped again (#2609).
+        wrapped = {(first, last) for (first, last, *_rest) in wraps}
         for first, last in _computed_operands(sql):
+            if (first, last) in wrapped:
+                continue
             computed = self._computed_text(
                 ''.join(span[1] for span in spans[first : last + 1]),
                 tables or _from_tables(sql),
@@ -19905,6 +19918,15 @@ class PostgresBackend:
                 continue
             out[name] = 'sys.ora_to_char'
             out[close] = f', {converted[1]})'
+            # The FM toggle's rewrite finds no to_char here any more, so a
+            # literal format's FM spans are spelt here (#2607, #2609).
+            at = close - 1
+            while at > name and spans[at][0] in ('space', 'comment'):
+                at -= 1
+            if spans[at][0] == 'string':
+                spelt = _fm_spans(spans[at][1][1:-1].replace("''", "'"))
+                if spelt is not None:
+                    out[at] = "'" + spelt.replace("'", "''") + "'"
             changed = True
         return ''.join(out) if changed else sql
 
