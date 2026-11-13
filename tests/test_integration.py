@@ -6314,6 +6314,45 @@ class BindIntegration(_IntegrationBase):
                 cur.execute(f'SELECT {expr} FROM dual')
                 self.assertEqual(cur.fetchone(), (value,))
 
+    @_requires(_INTERVAL, _TSTZ)
+    def test_a_zoned_timestamp_by_1582_shows_its_own_wall_clock(self):
+        # A WITH TIME ZONE value whose offset puts its UTC time on the other side
+        # of 1582-10-15 from its wall clock is shown by that wall clock, by
+        # TO_CHAR with a format and without, by || and by a CAST. Over
+        # PostgreSQL a sum that moved its UTC time past 10-15 was shown ten
+        # days off, 1582-10-14 23:00 for 10-04 23:00 (#2600). The session is
+        # pinned at +02:00.
+        conn = _connect()
+        self.addCleanup(conn.close)
+        cur = conn.cursor()
+        for setting in (
+            "TIME_ZONE = '+02:00'",
+            "NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS TZH:TZM'",
+        ):
+            cur.execute(f'ALTER SESSION SET {setting}')
+        late = "TIMESTAMP '1582-10-04 22:00:00 -03:00' + INTERVAL '1' HOUR"
+        early = "TIMESTAMP '1582-10-15 02:00:00 +03:00' - INTERVAL '1' HOUR"
+        for expr, value in (
+            (
+                f"TO_CHAR({late}, 'YYYY-MM-DD HH24:MI TZH:TZM')",
+                '1582-10-04 23:00 -03:00',
+            ),
+            (f'TO_CHAR({late})', '1582-10-04 23:00:00 -03:00'),
+            (f"({late}) || '|'", '1582-10-04 23:00:00 -03:00|'),
+            (
+                f"TO_CHAR(CAST({late} AS TIMESTAMP), 'YYYY-MM-DD HH24:MI')",
+                '1582-10-04 23:00',
+            ),
+            (
+                f"TO_CHAR({early}, 'YYYY-MM-DD HH24:MI TZH:TZM')",
+                '1582-10-15 01:00 +03:00',
+            ),
+            (f"({early}) || '|'", '1582-10-15 01:00:00 +03:00|'),
+        ):
+            with self.subTest(expr=expr):
+                cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(cur.fetchone(), (value,))
+
     @_requires(_INTERVAL)
     def test_an_intervals_months_on_a_missing_day_are_refused(self):
         # A DATE or TIMESTAMP plus an interval's months on a day the month

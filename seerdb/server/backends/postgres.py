@@ -442,6 +442,10 @@ _TSTZ_TYPE = 'ora_tstz'
 # A WITH TIME ZONE value's UTC instant as a TIMESTAMP, for SQL that takes it
 # as its first argument.
 _UTC_LABEL = "(($1).utc AT TIME ZONE 'UTC')"
+# Its wall clock: the UTC label moved by its offset by Oracle's days (#2600).
+# PostgreSQL's AT TIME ZONE moved it the Gregorian way, ten days off where
+# the offset crosses 1582-10-15.
+_TSTZ_WALL = f'sys.ora_ts_plus({_UTC_LABEL}, make_interval(secs => ($1).off))'
 # The database time zone, what DBTIMEZONE answers: the zone TIMESTAMP WITH LOCAL
 # TIME ZONE travels in (#1208). A PostgreSQL timestamptz stores the instant, so any
 # fixed zone would do; UTC is Oracle's own default.
@@ -1251,8 +1255,8 @@ _HELPER_FUNCTIONS_DDL = (
     # offset, and a WITH LOCAL TIME ZONE one's, in NLS_TIMESTAMP_FORMAT at the
     # session's zone (#2162).
     f'CREATE OR REPLACE FUNCTION sys.ora_tstz_text({_TSTZ_TYPE}, integer) '
-    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT sys.ora_zone_text(('
-    '$1).utc AT TIME ZONE make_interval(secs => ($1).off), ($1).off, '
+    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT sys.ora_zone_text('
+    f'{_TSTZ_WALL}, ($1).off, '
     "coalesce(nullif(current_setting('seerdb.nls_timestamp_tz_print', true), ''), "
     "'DD-MON-YY HH.MI.SSXFF AM TZR'), $2) $$;"
     'CREATE OR REPLACE FUNCTION sys.ora_ltz_text(timestamptz, integer) '
@@ -1515,8 +1519,7 @@ _HELPER_FUNCTIONS_DDL = (
     f'CREATE OR REPLACE FUNCTION ora_tstz_instant({_TSTZ_TYPE}) RETURNS timestamptz '
     'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT ($1).utc $$;'
     f'CREATE OR REPLACE FUNCTION ora_tstz_local({_TSTZ_TYPE}) RETURNS timestamp '
-    "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT (($1).utc AT TIME ZONE 'UTC') "
-    '+ make_interval(secs => ($1).off) $$;'
+    f'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT {_TSTZ_WALL} $$;'
     'DO $$ BEGIN '
     f'CREATE CAST ({_TSTZ_TYPE} AS timestamptz) '
     f'WITH FUNCTION ora_tstz_instant({_TSTZ_TYPE}) AS IMPLICIT; '
@@ -1549,8 +1552,8 @@ _HELPER_FUNCTIONS_DDL = (
     # the statement's text gives it, 6 where it does not. A WITH TIME ZONE
     # value a CAST made, a timestamptz, is at the session's offset.
     f'CREATE OR REPLACE FUNCTION sys.ora_to_char({_TSTZ_TYPE}, text, integer) '
-    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT sys.ora_zone_text(('
-    '$1).utc AT TIME ZONE make_interval(secs => ($1).off), ($1).off, $2, $3) $$;'
+    'RETURNS text LANGUAGE sql STABLE AS $$ SELECT sys.ora_zone_text('
+    f'{_TSTZ_WALL}, ($1).off, $2, $3) $$;'
     'CREATE OR REPLACE FUNCTION sys.ora_to_char(timestamptz, text, integer) '
     'RETURNS text LANGUAGE sql STABLE AS $$ '
     'SELECT sys.ora_to_char(ora_tstz_of_instant($1), $2, $3) $$;'

@@ -277,11 +277,10 @@ would cost far more than anyone gains from it.
   the session's zone. Months that land in the gap, `TIMESTAMP '1582-09-10
   12:00:00' + INTERVAL '1' MONTH`, end the month short at 09-30. 23ai keeps
   1582-10-10 and counts from it as the Julian day after 10-09, and its DATE
-  of the same prints as `0000-00-00`. Converting a value between its offset
-  and UTC across 1582-10-15 is still Gregorian:
-  `SYS_EXTRACT_UTC(TIMESTAMP '1582-10-15 01:00:00 +03:00')` is 1582-10-14
-  22:00, where Oracle's is 10-04
-  ([#2600](https://github.com/seerdb/seerdb/issues/2600)).
+  of the same prints as `0000-00-00`. A WITH TIME ZONE value whose offset
+  puts its UTC time on the other side of 1582-10-15 from its wall clock is
+  shown by that wall clock, by TO_CHAR, `||` and a CAST to TIMESTAMP or DATE.
+  Its UTC time is a known difference (*Known limits*).
 - **The digits of NUMBER math functions.** `SQRT`, `EXP`, `LN`, `LOG`,
   `POWER`, the trigonometric and the hyperbolic functions of a NUMBER return a
   NUMBER, as Oracle's do, with about 17 significant digits. Oracle's have 38 to
@@ -1256,6 +1255,19 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **Invalid UTF-8** cannot be stored in a string column (#1659).
 - **Fractional seconds** stop at six digits; a `TIMESTAMP(9)` is a
   `TIMESTAMP(6)`.
+- **A WITH TIME ZONE value's UTC time by 1582-10-15.** Where a value's
+  offset puts its UTC time on the other side of 1582-10-15 from its wall
+  clock, the UTC time is PostgreSQL's, a day in the gap ten days from
+  Oracle's. That happens only within 14 hours of the switch, and only to the
+  UTC time, not to the wall clock (*Dates before 1582-10-15* above).
+  `SYS_EXTRACT_UTC(TIMESTAMP '1582-10-15 01:00:00 +03:00')` and
+  `AT TIME ZONE 'UTC'` give 1582-10-14 22:00, where Oracle gives 10-04 22:00.
+  The bytes the value is sent as carry the same UTC time. A cast to WITH LOCAL
+  TIME ZONE after a crossing the other way, `TIMESTAMP '1582-10-04 23:00:00
+  -03:00'`, is ten days off too: 1582-10-05 04:00 at +02:00, where Oracle gives
+  10-15 04:00. Lifting this means storing the UTC time in Oracle's form
+  wherever a value is built
+  ([#2600](https://github.com/seerdb/seerdb/issues/2600)).
 - **`MEDIAN`** works as an aggregate, exact over a `NUMBER` and a `DATE`. As an
   analytic function (`MEDIAN(x) OVER (PARTITION BY ...)`) it is refused, since
   PostgreSQL has no exact median it can window.
