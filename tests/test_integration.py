@@ -5819,6 +5819,62 @@ class BindIntegration(_IntegrationBase):
             (datetime.datetime(2026, 5, 23, 10, 11, 12, 345678),),
         )
 
+    @_requires(_INTERVAL)
+    def test_an_interval_made_text_is_oracles_text(self):
+        # An INTERVAL made text without a format, by TO_CHAR(x) and by ||, is
+        # Oracle's: a sign, the leading field to its precision, the time and
+        # the fraction to its digits where the value has SECOND. A literal's
+        # precisions are its own, a column's as declared, a computed one's
+        # DAY(9) TO SECOND(9) or YEAR(9). Through the Mirror-over-PG
+        # TO_CHAR(i) failed and || wrote PostgreSQL's '1 day' (#2621).
+        Cases = [
+            ("INTERVAL '1' DAY", '+01 00:00:00'),
+            ("INTERVAL '3 04:05:06.5' DAY TO SECOND", '+03 04:05:06.500000'),
+            ("INTERVAL '3 04:05:06.5' DAY(3) TO SECOND(2)", '+003 04:05:06.50'),
+            ("INTERVAL '4' HOUR", '+00 04:00:00'),
+            ("INTERVAL '1.5' SECOND", '+00 00:00:01.500000'),
+            ("INTERVAL '-3 04:05:06' DAY TO SECOND", '-03 04:05:06.000000'),
+            ("INTERVAL '1-2' YEAR TO MONTH", '+01-02'),
+            ("INTERVAL '-1-2' YEAR TO MONTH", '-01-02'),
+            ("INTERVAL '123-2' YEAR(3) TO MONTH", '+123-02'),
+            ("INTERVAL '14' MONTH", '+01-02'),
+            (
+                "TIMESTAMP '2020-01-02 00:00:00.5' - TIMESTAMP '2020-01-01 06:30:00'",
+                '+000000000 17:30:00.500000000',
+            ),
+            ("NUMTODSINTERVAL(1.5, 'DAY')", '+000000001 12:00:00.000000000'),
+            ("NUMTOYMINTERVAL(14, 'MONTH')", '+000000001-02'),
+            ("INTERVAL '1' DAY + INTERVAL '2' HOUR", '+000000001 02:00:00.000000000'),
+        ]
+        for Expression, Expected in Cases:
+            with self.subTest(Expression):
+                self.cur.execute(
+                    f"SELECT TO_CHAR({Expression}), ({Expression}) || '|' FROM dual"
+                )
+                self.assertEqual(self.cur.fetchone(), (Expected, Expected + '|'))
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (a INTERVAL DAY TO SECOND, b INTERVAL YEAR TO MONTH, '
+            'c INTERVAL DAY(4) TO SECOND(3), d INTERVAL YEAR(4) TO MONTH)'
+        )
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (INTERVAL '3 04:05:06.5' DAY TO SECOND, "
+            "INTERVAL '1-2' YEAR TO MONTH, INTERVAL '3 04:05:06.5' DAY TO SECOND, "
+            "INTERVAL '1-2' YEAR TO MONTH)"
+        )
+        self.cur.execute(
+            f"SELECT TO_CHAR(a), a || '|', TO_CHAR(b), TO_CHAR(c), TO_CHAR(d) FROM {self.TABLE}"
+        )
+        self.assertEqual(
+            self.cur.fetchone(),
+            (
+                '+03 04:05:06.500000',
+                '+03 04:05:06.500000|',
+                '+01-02',
+                '+0003 04:05:06.500',
+                '+0001-02',
+            ),
+        )
+
     def test_timestamptz_round_trip(self):
         Tz = datetime.timezone(datetime.timedelta(hours=-5, minutes=-30))
         Value = datetime.datetime(2026, 5, 23, 10, 11, 12, 345678, tzinfo=Tz)

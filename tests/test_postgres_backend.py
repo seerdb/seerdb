@@ -6157,8 +6157,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # to_char and two ora_to_char_signed (#2613), and EXTRACT's five
     # sys.ora_extract overloads (#2627), and AT TIME ZONE's: sys.ora_zone_offset
     # and three overloads each of sys.ora_at_time_zone and sys.ora_at_local
-    # (#2617).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 381
+    # (#2617), and an interval's text: sys.ora_interval_text and
+    # sys.ora_intervalym_text (#2621).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 383
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -17835,3 +17836,23 @@ def test_a_bc_literal_is_spelt_as_postgresql_reads_it() -> None:
         "SELECT x FROM t WHERE note = 'DATE ''-0044-03-15'' was'",
     ):
         assert _bc_literals(kept) == kept
+
+
+def test_an_interval_literal_says_its_text_call_and_precisions() -> None:
+    # INTERVAL '...' <fields> is made text by its own call at a code of its
+    # precisions: the leading one times 100, plus the fractional digits plus
+    # one where SECOND is a field (#2621), as 23ai prints it.
+    def found(sql: str) -> list:
+        return [hit[2:] for hit in _typed_datetime_operands(sql)]
+
+    for literal, call, code in (
+        ("INTERVAL '1' DAY", 'sys.ora_interval_text', 200),
+        ("INTERVAL '3 04:05:06.5' DAY TO SECOND", 'sys.ora_interval_text', 207),
+        ("INTERVAL '3 04:05:06.5' DAY(3) TO SECOND(2)", 'sys.ora_interval_text', 303),
+        ("INTERVAL '1.5' SECOND", 'sys.ora_interval_text', 207),
+        ("INTERVAL '4' HOUR", 'sys.ora_interval_text', 200),
+        ("INTERVAL '1-2' YEAR TO MONTH", 'sys.ora_intervalym_text', 200),
+        ("INTERVAL '123-2' YEAR(3) TO MONTH", 'sys.ora_intervalym_text', 300),
+        ("INTERVAL '14' MONTH", 'sys.ora_intervalym_text', 200),
+    ):
+        assert found(f"SELECT {literal} || 'x' FROM dual") == [(call, code)], literal

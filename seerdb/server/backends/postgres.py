@@ -498,6 +498,12 @@ _LOB_TYPE_DDL = (
 # survive via a custom interval loader (see OraInterval below); psycopg's default
 # loader flattens a year-month interval to a `timedelta`, dropping the months.
 _INTERVALYM_TYPE = 'ora_intervalym'
+# An interval's precisions as its text needs them, in one code (#2621): the
+# leading precision times 100, plus the fractional digits plus one -- 0 for
+# no fraction, a value without SECOND. A computed interval is DAY(9) TO
+# SECOND(9) or YEAR(9) TO MONTH, measured on 23ai.
+_COMPUTED_INTERVAL_CODE = 910
+_COMPUTED_INTERVALYM_CODE = 900
 _INTERVALYM_TYPE_DDL = (
     'DO $$ BEGIN CREATE DOMAIN ora_intervalym AS interval; '
     'EXCEPTION WHEN duplicate_object THEN NULL; END $$'
@@ -1776,12 +1782,46 @@ _HELPER_FUNCTIONS_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_text(anynonarray) RETURNS text '
     "LANGUAGE sql STABLE AS $$ SELECT CASE WHEN pg_typeof($1) = 'numeric'::regtype "
     'THEN sys.ora_number_text($1::text::numeric) ELSE $1::text END $$;'
+    # An INTERVAL DAY TO SECOND as Oracle writes it without a format (#2621):
+    # a sign, the days to the leading precision, the time, and the fraction
+    # to its digits where the value has SECOND. $2 is the code: the leading
+    # precision times 100, plus the fractional digits plus one (0: no
+    # fraction). Measured on 23ai: '+01 00:00:00' for INTERVAL '1' DAY.
+    'CREATE OR REPLACE FUNCTION sys.ora_interval_text(i interval, c integer) '
+    'RETURNS text LANGUAGE plpgsql IMMUTABLE STRICT AS $$ DECLARE '
+    'lead integer := div(c, 100); f integer := c % 100 - 1; '
+    "neg boolean := i < interval '0'; us numeric; d numeric; h numeric; "
+    'm numeric; s numeric; o text; BEGIN '
+    'us := extract(epoch FROM CASE WHEN neg THEN -i ELSE i END) * 1000000; '
+    'd := div(us, 86400000000); us := us - d * 86400000000; '
+    'h := div(us, 3600000000); us := us - h * 3600000000; '
+    'm := div(us, 60000000); us := us - m * 60000000; '
+    's := div(us, 1000000); us := us - s * 1000000; '
+    "o := CASE WHEN neg THEN '-' ELSE '+' END "
+    "|| lpad(d::text, greatest(lead, length(d::text)), '0') || ' ' "
+    "|| lpad(h::text, 2, '0') || ':' || lpad(m::text, 2, '0') || ':' "
+    "|| lpad(s::text, 2, '0'); "
+    'IF f > 0 THEN '
+    "o := o || '.' || rpad(lpad(us::bigint::text, 6, '0'), f, '0'); END IF; "
+    'RETURN o; END $$;'
+    # An INTERVAL YEAR TO MONTH so: a sign, the years to the leading
+    # precision, the months (#2621): '+01-02'.
+    'CREATE OR REPLACE FUNCTION sys.ora_intervalym_text(i interval, c integer) '
+    'RETURNS text LANGUAGE plpgsql IMMUTABLE STRICT AS $$ DECLARE '
+    'lead integer := div(c, 100); '
+    't integer := (extract(year FROM i) * 12 + extract(month FROM i))::integer; '
+    'y integer; BEGIN '
+    "y := div(abs(t), 12); RETURN CASE WHEN t < 0 THEN '-' ELSE '+' END "
+    "|| lpad(y::text, greatest(lead, length(y::text)), '0') || '-' "
+    "|| lpad((abs(t) % 12)::text, 2, '0'); END $$;"
     # A computed value that may be a DATE or a TIMESTAMP (#2162): a timestamp
     # in its NLS format at the precision $2 the statement's text gave it, -1
     # for a DATE; a WITH TIME ZONE one at its own offset and a WITH LOCAL
-    # TIME ZONE one at the session's, as a column of each is (#2615); any
-    # other value as || writes it. Inlined, the argument keeps the DATE
-    # domain as its type.
+    # TIME ZONE one at the session's, as a column of each is (#2615); an
+    # interval as Oracle writes it, at the code $2 gives, else DAY(9) TO
+    # SECOND(9) or YEAR(9) TO MONTH, a computed one's (#2621); any other
+    # value as || writes it. Inlined, the argument keeps the DATE domain as
+    # its type.
     'CREATE OR REPLACE FUNCTION sys.ora_computed_text(anynonarray, integer) '
     'RETURNS text LANGUAGE sql STABLE AS $$ SELECT CASE WHEN pg_typeof($1) IN '
     f"('timestamp'::regtype, '{_DATE_TYPE}'::regtype) "
@@ -1790,6 +1830,14 @@ _HELPER_FUNCTIONS_DDL = (
     f'THEN sys.ora_tstz_text($1::text::{_TSTZ_TYPE}, $2) '
     "WHEN pg_typeof($1) = 'timestamptz'::regtype "
     'THEN sys.ora_ltz_text($1::text::timestamptz, $2) '
+    f"WHEN pg_typeof($1) = '{_INTERVALYM_TYPE}'::regtype "
+    'OR pg_typeof($1) = '
+    f"'interval'::regtype AND $2 = {_COMPUTED_INTERVALYM_CODE} "
+    'THEN sys.ora_intervalym_text($1::text::interval, '
+    f'CASE WHEN $2 >= 100 THEN $2 ELSE {_COMPUTED_INTERVALYM_CODE} END) '
+    "WHEN pg_typeof($1) = 'interval'::regtype "
+    'THEN sys.ora_interval_text($1::text::interval, '
+    f'CASE WHEN $2 >= 100 THEN $2 ELSE {_COMPUTED_INTERVAL_CODE} END) '
     'ELSE sys.ora_text($1) END $$;'
     'CREATE OR REPLACE FUNCTION to_char(numeric) RETURNS text '
     'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_number_text($1) $$;'
@@ -10853,6 +10901,56 @@ _ZONED_LITERAL = re.compile(r"(?i)'.*(?:[+-]\d{1,2}:\d{2}|[a-z]\w*/\w+|\bUTC)\s*
 _DATETIME_TEXT = 'sys.ora_datetime_text'
 _TSTZ_TEXT = 'sys.ora_tstz_text'
 _LTZ_TEXT = 'sys.ora_ltz_text'
+# The calls that make an INTERVAL DAY TO SECOND and a YEAR TO MONTH Oracle's
+# text (#2621), their precisions in one code (_COMPUTED_INTERVAL_CODE).
+_INTERVAL_TEXT = 'sys.ora_interval_text'
+_INTERVALYM_TEXT = 'sys.ora_intervalym_text'
+_INTERVAL_FIELDS = frozenset({'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND'})
+
+
+def _interval_literal_at(
+    text: Callable[[int], str], k: int
+) -> tuple[int, str, int] | None:
+    # INTERVAL '...' <field>[(p[, f])] [TO <field>[(f)]] starting at token `k`:
+    # its last token, its text call and code (#2621). Oracle's defaults: a
+    # leading precision of 2, six fractional digits where SECOND is a field.
+    if text(k).upper() != 'INTERVAL' or not text(k + 1).startswith("'"):
+        return None
+    j = k + 2
+
+    def precisions(at: int) -> tuple[list[int], int]:
+        # The (n[, m]) after a field at `at`, and the token after it.
+        if text(at) != '(':
+            return ([], at)
+        found = []
+        j = at + 1
+        while text(j).isdigit():
+            found.append(int(text(j)))
+            j += 1
+            if text(j) == ',':
+                j += 1
+        return (found, j + 1) if text(j) == ')' else ([], at)
+
+    first = text(j).upper()
+    if first not in _INTERVAL_FIELDS:
+        return None
+    (lead, after) = precisions(j + 1)
+    last_field, last = (first, after - 1)
+    fraction = lead[1] if first == 'SECOND' and len(lead) > 1 else 6
+    if text(after).upper() == 'TO' and text(after + 1).upper() in _INTERVAL_FIELDS:
+        last_field = text(after + 1).upper()
+        (trail, end) = precisions(after + 2)
+        last = end - 1
+        if last_field == 'SECOND' and trail:
+            fraction = trail[0]
+    width = lead[0] if lead and first in ('YEAR', 'DAY') else 2
+    if first in ('YEAR', 'MONTH'):
+        return (last, _INTERVALYM_TEXT, width * 100)
+    return (
+        last,
+        _INTERVAL_TEXT,
+        width * 100 + (fraction + 1 if last_field == 'SECOND' else 0),
+    )
 
 
 def _typed_datetime_at(
@@ -10878,6 +10976,8 @@ def _typed_datetime_at(
         return None
 
     word = text(k).upper()
+    if word == 'INTERVAL':
+        return _interval_literal_at(text, k)
     if word in ('DATE', 'TIMESTAMP'):
         literal = text(k + 1)
         if not literal.startswith("'"):
@@ -11288,11 +11388,13 @@ def _concat_width(
                 'ora_tstz_text',
                 'ora_ltz_text',
                 'ora_computed_text',
+                'ora_interval_text',
+                'ora_intervalym_text',
             )
             and text(3) == '('
         ):
-            # A datetime column made its text (#2162) counts as the column
-            # does.
+            # A datetime or interval column made its text (#2162, #2621)
+            # counts as the column does.
             at += 3
             close = at
             depth = 0
@@ -20063,6 +20165,8 @@ class PostgresBackend:
         if computed is None:
             return None
         (precision, zones) = computed
+        if zones in ({_INTERVAL_TEXT}, {_INTERVALYM_TEXT}):
+            return (next(iter(zones)), precision)
         if precision >= 0 and _TSTZ_TEXT in zones:
             return (_TSTZ_TEXT, precision)
         return ('sys.ora_computed_text', precision)
@@ -20089,6 +20193,9 @@ class PostgresBackend:
             return sig[k] if 0 <= k < len(sig) else ''
 
         (dates, stamps, interval, zones) = (False, [], False, set())
+        # The intervals' own (call, code), and whether one is YEAR TO MONTH
+        # (#2621).
+        (intervals, year_month) = ([], False)
         k = 0
         while k < len(sig):
             word = text(k).upper()
@@ -20096,7 +20203,16 @@ class PostgresBackend:
                 word in _INTERVAL_CALLS and text(k + 1) == '('
             ):
                 interval = True
+                year_month = year_month or word in ('NUMTOYMINTERVAL', 'TO_YMINTERVAL')
             typed = _typed_datetime_at(text, k) if text(k - 1) != '.' else None
+            if typed is not None and typed[1] in (_INTERVAL_TEXT, _INTERVALYM_TEXT):
+                intervals.append((typed[1], typed[2]))
+                year_month = year_month or typed[1] == _INTERVALYM_TEXT
+                if k == 0 and typed[0] == len(sig) - 1:
+                    # The expression is the literal: its own precisions.
+                    return (typed[2], frozenset({typed[1]}))
+                k = typed[0] + 1
+                continue
             if typed is not None:
                 if typed[2] < 0:
                     dates = True
@@ -20117,6 +20233,7 @@ class PostgresBackend:
                 and column.type_oid == self._intervalym_oid
             ):
                 interval = True
+                year_month = year_month or column.type_oid != _INTERVAL_OID
                 continue
             converted = self._datetime_text_call(column)
             if converted is None:
@@ -20128,7 +20245,13 @@ class PostgresBackend:
                 if converted[0] != _DATETIME_TEXT:
                     zones.add(converted[0])
         if not dates and not stamps:
-            return None
+            if not interval and not intervals:
+                return None
+            # An interval computed from intervals: DAY(9) TO SECOND(9) or
+            # YEAR(9) TO MONTH (#2621). Made text by the value's type at run
+            # time, as an EXTRACT of one is a number.
+            code = _COMPUTED_INTERVALYM_CODE if year_month else _COMPUTED_INTERVAL_CODE
+            return (code, frozenset({'interval'}))
         frozen = frozenset(zones)
         if text(0).upper() in _DATE_RESULT_CALLS:
             return (-1, frozen)
@@ -20160,6 +20283,16 @@ class PostgresBackend:
         if self._tstz_oid is not None and column.type_oid == self._tstz_oid:
             precision = column.tstz_precision
             return (_TSTZ_TEXT, 6 if precision is None else precision)
+        # An interval at its declared precisions, Oracle's defaults DAY(2) TO
+        # SECOND(6) and YEAR(2) (#2621).
+        declared = column.declared
+        (lead, fraction) = (2, 6)
+        if declared and declared[2] is not None:
+            (lead, fraction) = (int(declared[2]), int(declared[3] or 0))
+        if self._intervalym_oid is not None and column.type_oid == self._intervalym_oid:
+            return (_INTERVALYM_TEXT, lead * 100)
+        if column.type_oid == _INTERVAL_OID:
+            return (_INTERVAL_TEXT, lead * 100 + fraction + 1)
         return None
 
     def _formatted_fractions(self, sql: str) -> str:
