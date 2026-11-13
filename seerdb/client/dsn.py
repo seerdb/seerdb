@@ -26,6 +26,8 @@ suffix or (SERVER=...) in CONNECT_DATA sets the server type (#1977). A third
 segment or (INSTANCE_NAME=...) names the instance, and ``?expire_time=`` or
 (EXPIRE_TIME=...) turns TCP keepalive on (#2456). ``?pool_boundary=`` or
 (POOL_BOUNDARY=...) sets the DRCP implicit pooling boundary (#2542).
+``?use_sni=on`` or (USE_SNI=ON) sends the service as the TLS server name
+(#2467).
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from seerdb.client.netconfig import (
     Address,
     NetConfigError,
     Route,
+    bool_value,
     parse_descriptor,
     pool_boundary_value,
     proxy_address,
@@ -68,6 +71,7 @@ class DsnTarget:
     instance_name: str = ''
     expire_time: int = 0
     pool_boundary: str | None = None
+    use_sni: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,8 @@ class ConnectArguments:
     expire_time: int = 0
     # The DRCP implicit pooling boundary, (POOL_BOUNDARY=...) (#2542).
     pool_boundary: str | None = None
+    # Whether TLS names the service as its server name, (USE_SNI=ON) (#2467).
+    use_sni: bool = False
 
     def as_tuple(self) -> tuple:
         # In field order, for a constructor to unpack into its own arguments.
@@ -156,6 +162,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             instance_name=found.instance_name,
             expire_time=found.expire_time,
             pool_boundary=found.pool_boundary,
+            use_sni=found.use_sni,
         )
     protocol = 'tcp'
     scheme, separator, after = text.partition('://')
@@ -204,6 +211,7 @@ def parse_dsn(dsn: str, config_dir: str | None = None) -> DsnTarget:
             instance_name=found.instance_name,
             expire_time=found.expire_time,
             pool_boundary=found.pool_boundary,
+            use_sni=found.use_sni,
         )
     port = _DEFAULT_PORT
     if rest.startswith(':'):
@@ -274,6 +282,7 @@ def _apply_parameters(
             'https_proxy_port',
             'expire_time',
             'pool_boundary',
+            'use_sni',
         }
     )
     if unread:
@@ -301,6 +310,13 @@ def _apply_parameters(
                 f'dsn {dsn!r}: expire_time={parameters["expire_time"]!r} is not a number'
             )
         args = replace(args, expire_time=int(parameters['expire_time']))
+    if 'use_sni' in parameters:
+        try:
+            args = replace(args, use_sni=bool_value(parameters['use_sni'], 'use_sni'))
+        except NetConfigError:
+            raise ProgrammingError(
+                f'dsn {dsn!r}: use_sni={parameters["use_sni"]!r} is not on or off'
+            ) from None
     if 'pool_boundary' in parameters:
         try:
             boundary = pool_boundary_value(parameters['pool_boundary'])
@@ -382,6 +398,8 @@ def resolve_dsn_arguments(
         args = replace(args, expire_time=info.expire_time)
     if info.pool_boundary:
         args = replace(args, pool_boundary=info.pool_boundary)
+    if info.use_sni:
+        args = replace(args, use_sni=True)
     if info.service_name:
         args = replace(args, service_name=info.service_name, sid='')
     elif info.sid:

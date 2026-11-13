@@ -17913,5 +17913,45 @@ class AsyncDirectPathLoadIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTes
         self.assertEqual(await self._rows(), [])
 
 
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@unittest.skipUnless('ssl' in _FV_KW, 'use_sni needs a TCPS run (SEERDB_TEST_SSL_CA)')
+class UseSniIntegration(_ThrottleRetry, unittest.TestCase):
+    """use_sni over TCPS (#2467): the service as the TLS server name, and the
+    host matched against the certificate by seerdb, sync and async."""
+
+    def _kwargs(self) -> dict:
+        return {
+            'host': _HOST,
+            'port': _PORT,
+            'user': _USER,
+            'password': _PASSWORD,
+            'service_name': _SERVICE,
+            **_FV_KW,
+            'use_sni': True,
+        }
+
+    def test_a_session_over_tcps(self):
+        with seerdb.connect(**self._kwargs()) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT sys_context('userenv', 'network_protocol') FROM dual")
+            self.assertEqual(cur.fetchall(), [('tcps',)])
+
+    def test_an_async_session_over_tcps(self):
+        import asyncio
+
+        async def run():
+            conn = await seerdb.connect_async(**self._kwargs())
+            try:
+                cur = conn.cursor()
+                await cur.execute(
+                    "SELECT sys_context('userenv', 'network_protocol') FROM dual"
+                )
+                return await cur.fetchall()
+            finally:
+                await conn.close()
+
+        self.assertEqual(asyncio.run(run()), [('tcps',)])
+
+
 if __name__ == '__main__':
     unittest.main()

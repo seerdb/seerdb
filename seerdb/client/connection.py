@@ -60,6 +60,7 @@ from seerdb.common.exceptions import (
     InterfaceError,
     NotSupportedError,
     OperationalError,
+    ProgrammingError,
     Truncated,
 )
 from seerdb.common.sqltext import is_plsql, is_reusable_dml, statement_head
@@ -1034,6 +1035,7 @@ class OracleConnect(_ConnectionLogic):
         instance_name: str | None = None,
         expire_time: int = 0,
         pool_boundary: str | None = None,
+        use_sni: bool = False,
         wallet_location: str | None = None,
         wallet_password: str | None = None,
         config_dir: str | None = None,
@@ -1086,6 +1088,7 @@ class OracleConnect(_ConnectionLogic):
                 instance_name=instance_name or '',
                 expire_time=expire_time,
                 pool_boundary=pool_boundary,
+                use_sni=use_sni,
             )
             (
                 host,
@@ -1107,6 +1110,7 @@ class OracleConnect(_ConnectionLogic):
                 instance_name,
                 expire_time,
                 pool_boundary,
+                use_sni,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # field_version is the highest TTC field version seerdb advertises;
         # the server negotiates it down (min(client, server)). The default is the
@@ -1134,6 +1138,9 @@ class OracleConnect(_ConnectionLogic):
         # server reports at login is `instance_name`, set from its reply.
         self._instance_name_requested = instance_name or ''
         self.expire_time = expire_time
+        # Over TCPS, send the service as the TLS server name, which a listener
+        # can route on before the CONNECT (#2467).
+        self.use_sni = bool(use_sni)
         # The DRCP implicit pooling boundary, written into (POOL_BOUNDARY=...)
         # after (SERVER=...); the server does the pooling (#2542).
         self.pool_boundary = pool_boundary_value(pool_boundary)
@@ -1683,8 +1690,15 @@ class OracleConnect(_ConnectionLogic):
         import ssl as _ssl
 
         Server = self.host
+        Sni = self._sni()
         if isinstance(self.ssl, _ssl.SSLContext):
             Ctx = self.ssl
+            if Sni is not None and Ctx.check_hostname:
+                raise ProgrammingError(
+                    'use_sni sends the service as the TLS server name, so an '
+                    'ssl context given with it must have check_hostname off; '
+                    'seerdb does not change a context it is given'
+                )
         elif isinstance(self.ssl, dict):
             Opts = dict(self.ssl)
             Server = Opts.pop('server_hostname', Server)
@@ -1703,9 +1717,17 @@ class OracleConnect(_ConnectionLogic):
         else:
             Ctx = _ssl.create_default_context()
             Ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+        # use_sni (#2467): the TLS server name is the service, so a context
+        # seerdb built checks the host itself instead, after the handshake.
+        CheckHost = False
+        if Sni is not None:
+            (CheckHost, Server) = (Ctx.check_hostname, Sni)
+            Ctx.check_hostname = False
         Wrapped = Ctx.wrap_socket(RawSock, server_hostname=Server)
         try:
             self._check_server_dn(Wrapped.getpeercert())
+            if CheckHost:
+                self._check_server_host(Wrapped.getpeercert())
         except BaseException:
             Wrapped.close()
             raise
