@@ -1300,6 +1300,12 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **Sessionless transactions** resume only within the same Mirror process.
 - **Transaction priority** is recorded and reported, but has no effect.
 - **A quoted lower-case identifier**, such as `"t1"`, comes back upper-case.
+- **`FM` in a datetime format** is a toggle on Oracle: fill mode stays off for
+  every element after it, until a second `FM`. The Mirror applies it this way
+  in a `TO_CHAR` format written as a literal, and in a session's
+  `NLS_DATE_FORMAT` and `NLS_TIMESTAMP_FORMAT`. A format from a bind or a
+  column takes PostgreSQL's reading, where `FM` affects only the next element
+  ([#2607](https://github.com/seerdb/seerdb/issues/2607)).
 
 The full list, with the reasons, is in the backend module's docstring
 (`seerdb/server/backends/postgres.py`). Where the backend accepts more than
