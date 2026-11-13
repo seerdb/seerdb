@@ -1169,15 +1169,22 @@ _HELPER_FUNCTIONS_DDL = (
     # own up to 6, and zeros past its microseconds -- FF alone the value's
     # precision, $3, and X the radix point, left out at precision 0. FX is
     # the format-exact modifier, and quoted text stays as it is. RR and RRRR
-    # print as YY and YYYY, as TO_CHAR prints them (#1638): a call made this
-    # one is no longer a to_char for that rewrite to find.
+    # print as YY and YYYY, as TO_CHAR prints them (#1638), and SYYYY as
+    # ora_to_char_signed prints it, an FM before it going on to the year
+    # (#2612): a call made this one is no longer a to_char for those
+    # rewrites to find.
     'CREATE OR REPLACE FUNCTION sys.ora_to_char(timestamp, text, integer) '
     'RETURNS text LANGUAGE plpgsql STABLE AS $$ DECLARE f text := $2; '
-    "o text := ''; i integer := 1; j integer; d integer; BEGIN "
+    "o text := ''; i integer := 1; j integer; d integer; m text; BEGIN "
     'WHILE i <= length(f) LOOP '
     "IF substr(f, i, 1) = '\"' THEN j := strpos(substr(f, i + 1), '\"'); "
     'IF j = 0 THEN o := o || substr(f, i); EXIT; END IF; '
     'o := o || substr(f, i, j + 1); i := i + j + 1; '
+    "ELSIF upper(substr(f, i, 5)) = 'SYYYY' THEN m := ''; "
+    "IF upper(right(o, 2)) = 'FM' THEN m := right(o, 2); "
+    'o := left(o, length(o) - 2); END IF; '
+    "o := o || CASE WHEN $1 < '0001-01-01'::timestamp THEN '\"-\"' "
+    "ELSE '\" \"' END || m || 'YYYY'; i := i + 5; "
     "ELSIF upper(substr(f, i, 4)) = 'RRRR' THEN o := o || 'YYYY'; i := i + 4; "
     "ELSIF upper(substr(f, i, 2)) = 'RR' THEN o := o || 'YY'; i := i + 2; "
     "ELSIF upper(substr(f, i, 2)) = 'FX' THEN o := o || substr(f, i, 2); i := i + 2; "

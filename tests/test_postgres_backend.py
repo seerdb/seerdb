@@ -2265,6 +2265,33 @@ def test_fm_spans_print_as_oracles() -> None:
         backend.close()
 
 
+def test_a_signed_year_beside_a_fraction_prints_its_sign() -> None:
+    # SYYYY in a TIMESTAMP's format that has FF or X too, which sends it to
+    # sys.ora_to_char, against 23ai's answers: a space before an AD year, '-'
+    # before a BC one, an FM going on to the year, quoted text left (#2612).
+    # It printed a literal S.
+    stamp = "TIMESTAMP '2020-01-15 10:00:00.25'"
+    early = "TO_TIMESTAMP('0005-03-07 01:05:09.5', 'YYYY-MM-DD HH24:MI:SS.FF')"
+    bc = "TO_TIMESTAMP('-0044-03-15 10:00:00.25', 'SYYYY-MM-DD HH24:MI:SS.FF')"
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for value, fmt, expected in (
+            (stamp, 'SYYYY-MM-DD HH24:MI:SS.FF3', ' 2020-01-15 10:00:00.250'),
+            (stamp, 'syyyy-mm-dd hh24:mi:ss.ff', ' 2020-01-15 10:00:00.250000000'),
+            (stamp, 'YYYY "SYYYY" SYYYY.FF2', '2020 SYYYY  2020.25'),
+            (stamp, 'SYYYY.X', ' 2020..'),
+            (early, 'fmSYYYY-MM-DD HH24:MI:SS.FF3', ' 5-3-7 1:5:9.500'),
+            (early, 'SYYYY.FF2 fmSYYYY', ' 0005.50  5'),
+            (bc, 'SYYYY-MM-DD HH24:MI:SS.FF3', '-0044-03-15 10:00:00.250'),
+            (bc, 'fmSYYYY-MM-DD HH24:MI:SS.FF3', '-44-3-15 10:0:0.250'),
+        ):
+            (row,) = backend.execute(f"SELECT TO_CHAR({value}, '{fmt}') FROM dual").rows
+            assert row[0] == expected, (value, fmt)
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_timestamp_arithmetic_before_1582_is_julian() -> None:
     # TIMESTAMP - TIMESTAMP and TIMESTAMP +/- INTERVAL by Oracle's days before
     # 1582-10-15 (#2600), against 23ai's answers: across the gap, a Julian
