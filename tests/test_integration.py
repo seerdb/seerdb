@@ -6130,6 +6130,87 @@ class BindIntegration(_IntegrationBase):
                 self.cur.execute(f'SELECT {expr} FROM dual')
                 self.assertEqual(self.cur.fetchone(), (value,))
 
+    @_requires(_INTERVAL, _TSTZ)
+    def test_zoned_timestamp_arithmetic_before_1582_is_julian(self):
+        # WITH TIME ZONE and WITH LOCAL TIME ZONE values plus or minus an
+        # interval, and their differences, count Oracle's Julian days before
+        # 1582-10-15, a TSTZ's in UTC. Over PostgreSQL each was off by up to
+        # ten days (#2600). The session is at +02:00, which a TIMESTAMP minus
+        # a TSTZ reads the TIMESTAMP at. A TSTZ is shown by its own wall
+        # clock, CAST to a TIMESTAMP: TO_CHAR's TZH reads the session's offset
+        # through the Mirror (#2613).
+        conn = _connect()
+        self.addCleanup(conn.close)
+        cur = conn.cursor()
+        cur.execute("ALTER SESSION SET TIME_ZONE = '+02:00'")
+        lf = "'YYYY-MM-DD HH24:MI:SS'"
+
+        def ltz(text):
+            return f"CAST(TIMESTAMP '{text}' AS TIMESTAMP WITH LOCAL TIME ZONE)"
+
+        def wall(expression):
+            return f'TO_CHAR(CAST({expression} AS TIMESTAMP), {lf})'
+
+        for expr, value in (
+            (
+                wall("TIMESTAMP '1582-10-04 12:00:00 +03:00' + INTERVAL '1' DAY"),
+                '1582-10-15 12:00:00',
+            ),
+            (
+                wall("TIMESTAMP '1582-10-15 01:00:00 +03:00' - INTERVAL '2' HOUR"),
+                '1582-10-04 23:00:00',
+            ),
+            (
+                wall("TIMESTAMP '1582-10-04 23:00:00 -03:00' + INTERVAL '2' HOUR"),
+                '1582-10-15 01:00:00',
+            ),
+            (
+                wall("TIMESTAMP '1000-01-01 00:00:00 +05:00' + INTERVAL '100' DAY(3)"),
+                '1000-04-10 00:00:00',
+            ),
+            (
+                "EXTRACT(DAY FROM (TIMESTAMP '1582-10-15 00:00:00 +00:00' "
+                "- TIMESTAMP '1582-10-04 00:00:00 +00:00'))",
+                1,
+            ),
+            (
+                "EXTRACT(HOUR FROM (TIMESTAMP '1582-10-15 00:00:00 +03:00' "
+                "- TIMESTAMP '1582-10-04 00:00:00 -03:00'))",
+                18,
+            ),
+            (
+                "EXTRACT(DAY FROM (TIMESTAMP '2020-01-01 00:00:00 +00:00' "
+                "- TIMESTAMP '1500-01-01 00:00:00 +00:00'))",
+                189917,
+            ),
+            (
+                "EXTRACT(DAY FROM (TIMESTAMP '1582-10-15 00:00:00 +00:00' "
+                "- TIMESTAMP '1582-10-04 00:00:00'))",
+                1,
+            ),
+            (
+                "EXTRACT(HOUR FROM (TIMESTAMP '1582-10-15 00:00:00 +00:00' "
+                "- TIMESTAMP '1582-10-04 00:00:00'))",
+                2,
+            ),
+            (
+                f"TO_CHAR({ltz('1582-10-04 12:00:00')} + INTERVAL '1' DAY, {lf})",
+                '1582-10-15 12:00:00',
+            ),
+            (
+                f"TO_CHAR({ltz('1582-10-15 12:00:00')} - INTERVAL '1' DAY, {lf})",
+                '1582-10-04 12:00:00',
+            ),
+            (
+                f'EXTRACT(DAY FROM ({ltz("1582-10-15 00:00:00")} '
+                f'- {ltz("1582-10-04 00:00:00")}))',
+                1,
+            ),
+        ):
+            with self.subTest(expr=expr):
+                cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(cur.fetchone(), (value,))
+
     @_requires(_INTERVAL)
     def test_an_intervals_months_on_a_missing_day_are_refused(self):
         # A DATE or TIMESTAMP plus an interval's months on a day the month

@@ -654,7 +654,13 @@ _ORACLE_CALENDAR_DDL = (
     'CREATE OR REPLACE FUNCTION sys.ora_day_number(t timestamp) RETURNS integer '
     'LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$ '
     'DECLARE y integer; m integer; a integer; BEGIN '
-    f'IF t >= {_JULIAN_START} THEN '
+    # A label in the gap, 1582-10-05 to 10-14, is PostgreSQL's: its Gregorian
+    # conversion makes one, a WITH TIME ZONE value's UTC label shifted from
+    # its wall clock by an offset of 14 hours at most (#2600). Shifted forward
+    # from a Julian 10-04, a label early in the gap is the Julian days after
+    # it, 10-05 Oracle's 10-15; shifted back from 10-15, one late in the gap is
+    # the Gregorian day it is, 10-14 Oracle's 10-04. 10-10 parts them.
+    f"IF t >= '1582-10-10'::timestamp THEN "
     'RETURN pg_catalog.floor(extract(julian FROM t))::integer; END IF; '
     'y := extract(year FROM t)::integer; m := extract(month FROM t)::integer; '
     f'a := {_pg_op("14 - m", "/", "12")}; y := y + 4800 - a; m := m + 12 * a - 3; '
@@ -1085,16 +1091,18 @@ _DATE_ARITHMETIC_DDL = (
     # months on a day the month lacks in the session's zone: ORA-01839, as
     # for a TIMESTAMP (#2611). Shadowing PostgreSQL's operators of the same
     # types; its own DO block, for a database that already ran the one above.
+    # Moved on its label in the session's zone, by Oracle's days before
+    # 1582-10-15 (#2600).
     'CREATE OR REPLACE FUNCTION sys.ora_ltz_plus(timestamptz, interval) '
-    'RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT '
-    + _ts_shift('$1', '$2', '+', julian=False)
-    + ' $$;'
+    'RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT ('
+    + _ts_shift('$1::timestamp', '$2', '+')
+    + ')::timestamptz $$;'
     'CREATE OR REPLACE FUNCTION sys.ora_interval_plus_ltz(interval, timestamptz) '
     'RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT sys.ora_ltz_plus($2, $1) $$;'
     'CREATE OR REPLACE FUNCTION sys.ora_ltz_less(timestamptz, interval) '
-    'RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT '
-    + _ts_shift('$1', '$2', '-', julian=False)
-    + ' $$;'
+    'RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT ('
+    + _ts_shift('$1::timestamp', '$2', '-')
+    + ')::timestamptz $$;'
     'DO $$ BEGIN '
     'CREATE OPERATOR sys.+ (LEFTARG = timestamptz, RIGHTARG = interval, '
     'FUNCTION = sys.ora_ltz_plus); '
@@ -1102,6 +1110,17 @@ _DATE_ARITHMETIC_DDL = (
     'FUNCTION = sys.ora_interval_plus_ltz); '
     'CREATE OPERATOR sys.- (LEFTARG = timestamptz, RIGHTARG = interval, '
     'FUNCTION = sys.ora_ltz_less); '
+    'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
+    # The difference of two instants -- WITH LOCAL TIME ZONE values, and WITH
+    # TIME ZONE ones and TIMESTAMPs by their implicit casts to timestamptz --
+    # by Oracle's days between their UTC labels (#2600). A UTC label is exact:
+    # no offset moves it across 1582-10-15. Its own DO block, as above.
+    'CREATE OR REPLACE FUNCTION sys.ora_instant_minus(timestamptz, timestamptz) '
+    "RETURNS interval LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_ts_minus($1 AT TIME ZONE 'UTC', "
+    "$2 AT TIME ZONE 'UTC') $$;"
+    'DO $$ BEGIN '
+    'CREATE OPERATOR sys.- (LEFTARG = timestamptz, RIGHTARG = timestamptz, '
+    'FUNCTION = sys.ora_instant_minus); '
     'EXCEPTION WHEN duplicate_function THEN NULL; END $$;'
 )
 
@@ -1606,14 +1625,14 @@ _HELPER_FUNCTIONS_DDL = (
     # duplicate_function at its first operator and would never reach new ones.
     # Oracle moves it in UTC: its months land on UTC's day, refused where the
     # month lacks it as a TIMESTAMP's are (#2611). PostgreSQL's timestamptz
-    # would move them in the session's zone. Its days are still Gregorian
-    # before 1582 (#2600). The CASE is written out, not called: a call on an
-    # expression would not inline, at about 2.5 us a row. Not STRICT, which
-    # would also stop it inlining.
+    # would move them in the session's zone. Its days are Oracle's before
+    # 1582-10-15, counted on the UTC label (#2600). The CASE is written out,
+    # not called: a call on an expression would not inline, at about 2.5 us a
+    # row. Not STRICT, which would also stop it inlining.
     f'CREATE OR REPLACE FUNCTION ora_tstz_add_interval({_TSTZ_TYPE}, interval) '
     f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE AS $$ '
     'SELECT CASE WHEN $1 IS NOT NULL AND $2 IS NOT NULL THEN ROW(('
-    + _ts_shift(_UTC_LABEL, '$2', '+', julian=False)
+    + _ts_shift(_UTC_LABEL, '$2', '+')
     + f") AT TIME ZONE 'UTC', ($1).off)::{_TSTZ_TYPE} END $$;"
     f'CREATE OR REPLACE FUNCTION ora_interval_add_tstz(interval, {_TSTZ_TYPE}) '
     f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE AS $$ '
@@ -1621,7 +1640,7 @@ _HELPER_FUNCTIONS_DDL = (
     f'CREATE OR REPLACE FUNCTION ora_tstz_sub_interval({_TSTZ_TYPE}, interval) '
     f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE AS $$ '
     'SELECT CASE WHEN $1 IS NOT NULL AND $2 IS NOT NULL THEN ROW(('
-    + _ts_shift(_UTC_LABEL, '$2', '-', julian=False)
+    + _ts_shift(_UTC_LABEL, '$2', '-')
     + f") AT TIME ZONE 'UTC', ($1).off)::{_TSTZ_TYPE} END $$;"
     'DO $$ BEGIN '
     f'CREATE OPERATOR + (LEFTARG = {_TSTZ_TYPE}, RIGHTARG = interval, '
