@@ -70,6 +70,7 @@ from seerdb.common.tns_consts import (
     TNS_SESSION_STATE_REQUEST_BEGIN,
     TNS_VERSION_10_2,
     TNS_VERSION_11_2,
+    TNS_VERSION_23_1,
     DictionaryType,
 )
 
@@ -88,6 +89,43 @@ SESSION_SHUTDOWN_MESSAGE = (
 if TYPE_CHECKING:
     from seerdb.client.connection import Xid
     from seerdb.common.ano_session import AnoChannel
+
+
+def certificate_names_host(PeerCert: dict | None, Host: str) -> bool:
+    """Whether a certificate, as getpeercert() gives it, names ``Host`` (#2467):
+    an IP address among its subjectAltName addresses, else a name among its
+    DNS names, a leading ``*.`` matching one label, else, with no DNS name at
+    all, its subject's common name -- the stdlib's own rule."""
+    import ipaddress
+
+    if not PeerCert:
+        return False
+    Names = PeerCert.get('subjectAltName', ())
+    try:
+        Address = ipaddress.ip_address(Host)
+    except ValueError:
+        Address = None
+    if Address is not None:
+        return any(
+            Kind == 'IP Address' and ipaddress.ip_address(Value.strip()) == Address
+            for (Kind, Value) in Names
+        )
+    Wanted = Host.lower().rstrip('.')
+    Dns = [Value.lower().rstrip('.') for (Kind, Value) in Names if Kind == 'DNS']
+    if not Dns:
+        Dns = [
+            Value.lower()
+            for Rdn in PeerCert.get('subject', ())
+            for (Key, Value) in Rdn
+            if Key == 'commonName'
+        ]
+    for Name in Dns:
+        if Name == Wanted:
+            return True
+        if Name.startswith('*.') and '.' in Wanted:
+            if Wanted.split('.', 1)[1] == Name[2:]:
+                return True
+    return False
 
 
 class _ConnectionLogic:
@@ -112,6 +150,7 @@ class _ConnectionLogic:
     serial_num: int | None
     _instance_name_requested: str
     expire_time: int
+    use_sni: bool
     pool_boundary: str | None
     socket_options: object
     conn_state: int
@@ -882,6 +921,7 @@ class _ConnectionLogic:
                 'server_type': self.server_type,
                 'instance_name': self._instance_name_requested,
                 'expire_time': self.expire_time,
+                'use_sni': self.use_sni,
                 'pool_boundary': self.pool_boundary,
                 'password': self.password,
                 'sid': self.sid,
@@ -956,6 +996,29 @@ class _ConnectionLogic:
             if Info.dn_match and Info.server_dn:
                 self._wallet_server_dn = Info.server_dn
         self.ssl = _wallet.build_client_context(Wal)
+
+    def _sni(self) -> str | None:
+        # The TLS server name use_sni sends (#2467), as python-oracledb writes
+        # it: S, the service's length and name, the server type's initial after
+        # T1 when one is asked for, then V3 and the TNS version. None without
+        # use_sni or a service name, when the host goes as usual.
+        if not self.use_sni or not self.service_name:
+            return None
+        Kind = f'.T1.{self.server_type[0]}' if self.server_type else ''
+        return (
+            f'S{len(self.service_name)}.{self.service_name}{Kind}.V3.{TNS_VERSION_23_1}'
+        )
+
+    def _check_server_host(self, PeerCert: dict | None) -> None:
+        # With use_sni the TLS server name is not the host, so the stdlib's
+        # hostname check is off for it and the host is matched here, against
+        # the certificate's names (#2467).
+        import ssl as _ssl
+
+        if not certificate_names_host(PeerCert, self.host):
+            raise _ssl.SSLCertVerificationError(
+                f'the server certificate does not name the host {self.host!r}'
+            )
 
     def _check_server_dn(self, PeerCert: dict | None) -> None:
         # Oracle SSL_SERVER_DN_MATCH (#127): the server is authenticated by its

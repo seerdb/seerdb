@@ -9435,6 +9435,9 @@ def encode_dictionary_description(Dictionary: dict) -> bytes:
     ExpirePart = (
         b'(EXPIRE_TIME=' + str(Expire).encode('ascii') + b')' if Expire > 0 else b''
     )
+    # use_sni (#2467) is written after it, where python-oracledb writes it.
+    if Dictionary['env'].get('use_sni'):
+        ExpirePart += b'(USE_SNI=ON)'
     return (
         b'(DESCRIPTION='
         + ExpirePart

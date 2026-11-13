@@ -310,6 +310,41 @@ second TNS-level TLS; `ws://` is unencrypted and for local testing. The DSN
 is outside the Mirror's stated threat model and is gated on the security
 milestone (#52).
 
+#### 1.5.1 TCPS: the second handshake, and the server name (#2645, #2467)
+
+Measured against Oracle 26ai Free with a TCPS endpoint, and against python-oracledb
+26.1 thin through a relay that counts TLS ClientHellos.
+
+**The second handshake.** A listener that hands a TCPS connection to a dedicated
+server answers the CONNECT with a RESEND whose header flags (byte 5) carry
+**`0x08`**. The dedicated server then runs its own TLS handshake on the same TCP
+connection. The client handshakes again on the raw socket, a new session with
+nothing of the first, checks the server's certificate again, and then resends
+the CONNECT. A client that resends over its first session reads records it can't
+decrypt (OpenSSL's `RECORD_LAYER_FAILURE`). seerdb renegotiates since #2645.
+
+**The server name, `use_sni`.** With `use_sni`, the client sends the service as
+the TLS server name (SNI) on both handshakes, in python-oracledb's form:
+
+```
+S<length of the service name>.<service name>[.T1.<d|s|p>].V3.<TNS version>
+S8.freepdb1.V3.319                     service freepdb1, no server type asked for
+S8.freepdb1.T1.d.V3.319                server_type=dedicated
+```
+
+- The descriptor gains `(USE_SNI=ON)` at the DESCRIPTION level, after
+  `(EXPIRE_TIME=...)`.
+- Without a service name, no SNI is sent.
+- The name lets a listener configured for it route the connection before the
+  CONNECT, and skip the second handshake. Free's default listener doesn't: it
+  asked python-oracledb for the second handshake with `use_sni` on as with it
+  off. Two ClientHellos either way, both carrying the name.
+- Since the server name is not the host, the TLS stack's hostname check is off
+  for it. The client matches the certificate against the host itself: a
+  subjectAltName IP address for an address, else a DNS name (with a leading
+  `*.` for one label), else, with no DNS names, the subject's common name.
+  python-oracledb does the same.
+
 ## 2. Connection Phase
 
 ### 2.1 TNS_CONNECT (Client -> Server)

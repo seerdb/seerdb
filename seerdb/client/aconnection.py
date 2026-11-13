@@ -93,6 +93,7 @@ from seerdb.common.exceptions import (
     InterfaceError,
     NotSupportedError,
     OperationalError,
+    ProgrammingError,
     Truncated,
 )
 from seerdb.common.sqltext import is_plsql, is_reusable_dml, statement_head
@@ -233,6 +234,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         instance_name: str | None = None,
         expire_time: int = 0,
         pool_boundary: str | None = None,
+        use_sni: bool = False,
         wallet_location: str | None = None,
         wallet_password: str | None = None,
         config_dir: str | None = None,
@@ -287,6 +289,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 instance_name=instance_name or '',
                 expire_time=expire_time,
                 pool_boundary=pool_boundary,
+                use_sni=use_sni,
             )
             (
                 host,
@@ -308,6 +311,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 instance_name,
                 expire_time,
                 pool_boundary,
+                use_sni,
             ) = resolve_dsn_arguments(dsn, given, config_dir).as_tuple()
         # The transport in force (#1988); a route address can repoint it.
         self.protocol = protocol
@@ -338,6 +342,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         # server reports at login is `instance_name`, set from its reply.
         self._instance_name_requested = instance_name or ''
         self.expire_time = expire_time
+        # Over TCPS, send the service as the TLS server name, which a listener
+        # can route on before the CONNECT (#2467).
+        self.use_sni = bool(use_sni)
         # The DRCP implicit pooling boundary, written into (POOL_BOUNDARY=...)
         # after (SERVER=...); the server does the pooling (#2542).
         self.pool_boundary = pool_boundary_value(pool_boundary)
@@ -647,6 +654,20 @@ class AsyncOracleConnect(_ConnectionLogic):
             return  # no TLS to renegotiate: a plain listener sets no such flag
         Loop = asyncio.get_running_loop()
         Context = _ssl.create_default_context() if SslArg is True else SslArg
+        # use_sni (#2467): the TLS server name is the service, so a context
+        # seerdb built checks the host itself instead, after the handshake; a
+        # context it was given is not changed.
+        (Server, CheckHost) = (self.host, False)
+        Sni = self._sni()
+        if Sni is not None:
+            if isinstance(self.ssl, _ssl.SSLContext) and Context.check_hostname:
+                raise ProgrammingError(
+                    'use_sni sends the service as the TLS server name, so an '
+                    'ssl context given with it must have check_hostname off; '
+                    'seerdb does not change a context it is given'
+                )
+            (Server, CheckHost) = (Sni, Context.check_hostname)
+            Context.check_hostname = False
         Writer = self._writer
         if self._raw_transport is None:
             self._raw_transport = Writer.transport
@@ -658,7 +679,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             cast(asyncio.WriteTransport, self._raw_transport),
             self._stream_protocol,
             Context,
-            server_hostname=self.host,
+            server_hostname=Server,
         )
         if Tls is None:
             raise OperationalError('the TLS handshake did not complete')
@@ -680,6 +701,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         SslObj = Tls.get_extra_info('ssl_object')
         try:
             self._check_server_dn(SslObj.getpeercert() if SslObj else None)
+            if CheckHost:
+                self._check_server_host(SslObj.getpeercert() if SslObj else None)
         except BaseException:
             Writer.close()
             raise

@@ -214,6 +214,8 @@ class DescriptorTarget:
     expire_time: int = 0
     # The DRCP implicit pooling boundary CONNECT_DATA names (#2542).
     pool_boundary: str | None = None
+    # Whether the DESCRIPTION asks for the TLS server name use_sni sends (#2467).
+    use_sni: bool = False
 
 
 @dataclass(frozen=True)
@@ -267,6 +269,23 @@ def server_type_value(value: str | None) -> str | None:
     return lowered
 
 
+_TRUE_WORDS = frozenset({'on', 'yes', 'true'})
+_FALSE_WORDS = frozenset({'off', 'no', 'false'})
+
+
+def bool_value(value: str, name: str) -> bool:
+    """A yes-or-no parameter as a descriptor or an Easy Connect string writes
+    it: ON, YES or TRUE, or OFF, NO or FALSE, in any case (#2467).
+    python-oracledb reads any other word as no; seerdb refuses it, as it refuses
+    a parameter it does not read."""
+    lowered = value.strip().lower()
+    if lowered in _TRUE_WORDS:
+        return True
+    if lowered in _FALSE_WORDS:
+        return False
+    raise NetConfigError(f'{name}={value!r} is not ON or OFF')
+
+
 _POOL_BOUNDARIES = frozenset({'statement', 'transaction'})
 
 
@@ -296,6 +315,7 @@ _DESCRIPTION_KEYS = _ROUTE_KEYS | {
     'expire_time',
     'retry_count',
     'retry_delay',
+    'use_sni',
 }
 _ADDRESS_LIST_KEYS = _ROUTE_KEYS | {'address'}
 _ADDRESS_KEYS = frozenset(
@@ -470,6 +490,7 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         )
     addresses: list[Address] = []
     expire_time: int | None = None
+    use_sni: bool | None = None
     for node in descriptions:
         description = _branch(node, 'description')
         _refuse_unread(description, _DESCRIPTION_KEYS, 'DESCRIPTION parameter')
@@ -490,6 +511,11 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
                 if not number >= 0:
                     raise NetConfigError(f'EXPIRE_TIME={child!r} is not a number')
                 expire_time = int(number)
+            elif key == 'use_sni' and use_sni is None:
+                # The first description's holds for the connection (#2467).
+                if not isinstance(child, str):
+                    raise NetConfigError('USE_SNI must be ON or OFF')
+                use_sni = bool_value(child, 'USE_SNI')
         data = _connect_data(description)
         for key, child in description:
             if key == 'address':
@@ -526,6 +552,7 @@ def descriptor_target(name: str, value: Node) -> DescriptorTarget:
         first.instance_name,
         expire_time or 0,
         first.pool_boundary,
+        bool(use_sni),
     )
 
 
