@@ -11120,8 +11120,29 @@ def _to_nchar_as_to_char(sql: str) -> str:
     return _unmask_quoted(_TO_NCHAR_CALL.sub(r'to_char\1', masked), contents)
 
 
+# A DATE literal, `DATE '2020-01-01'`, and a CAST(x AS DATE) named PostgreSQL's
+# `date`, which the Mirror's search_path finds as orafce's DATE domain: beside
+# the Mirror's own, ora_date -- a column's, a bind's, TO_DATE's -- NVL, COALESCE,
+# CASE, GREATEST of the two resolved to a timestamp, and a difference with a
+# date was an interval; NVL2 found no function (#2603). A DDL statement's and a
+# routine's DATE are ora_date already (_DDL_DATE_COLUMN).
+_DATE_LITERAL_WORD = re.compile(r"\bDATE(?=\s*')", re.IGNORECASE)
+_CAST_AS_DATE = re.compile(r'\b(AS\s+)DATE\b', re.IGNORECASE)
+
+
+def _mirror_date_type(sql: str) -> str:
+    (masked, contents) = _mask_quoted(sql)
+    if not (_DATE_LITERAL_WORD.search(masked) or _CAST_AS_DATE.search(masked)):
+        return sql
+    masked = _CAST_AS_DATE.sub(
+        rf'\1{_DATE_TYPE}', _DATE_LITERAL_WORD.sub(_DATE_TYPE, masked)
+    )
+    return _unmask_quoted(masked, contents)
+
+
 def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('to-nchar', _to_nchar_as_to_char(sql), sql)
+    sql = _ruled('date-type', _mirror_date_type(sql), sql)
     sql = _ruled('hash-identifier', _quote_hash_identifiers(sql), sql)
     # Not a rule: it types a select-list literal as Oracle describes one, which
     # portable SQL needs as much as Oracle SQL does.

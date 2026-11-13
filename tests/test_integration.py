@@ -5903,6 +5903,12 @@ class BindIntegration(_IntegrationBase):
             (f'DECODE(1, 1, {to_date}, d) - e', [], -9),
             (f'NVL(:1, {to_date}) - e', [bind], -5),
             ('GREATEST(:1, e) - :1', [bind], 5),
+            # A DATE literal and a CAST to DATE were orafce's DATE (#2603).
+            ("NVL(d, DATE '2020-01-01') - e", [], Decimal('5.5')),
+            ("GREATEST(d, DATE '2020-01-01') - e", [], Decimal('5.5')),
+            ("NVL2(d, DATE '2020-01-01', e) - e", [], -9),
+            ('DECODE(1, 1, CAST(d AS DATE), e) - e', [], Decimal('5.5')),
+            (f'NVL(CAST(d AS DATE), {to_date}) - e', [], Decimal('5.5')),
         ):
             with self.subTest(expr=expr):
                 self.cur.execute(f'SELECT {expr} FROM {self.TABLE}', binds)

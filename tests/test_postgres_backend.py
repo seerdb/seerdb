@@ -2121,6 +2121,19 @@ def test_translate_idioms_makes_greatest_and_least_null_with_a_null() -> None:
         assert _translate_idioms(untouched) == untouched
 
 
+def test_translate_idioms_makes_a_date_literal_and_cast_the_mirror_date() -> None:
+    # A DATE literal and CAST(x AS DATE) are the Mirror's DATE, ora_date, as a
+    # column's is: named `date` they were orafce's, and a mix of the two a
+    # timestamp (#2603). A string or a quoted identifier saying DATE is not one.
+    assert _translate_idioms(
+        "SELECT CAST(x AS DATE), DATE '2020-01-01', CAST(x AS TIMESTAMP) FROM t "
+        "WHERE d > DATE'2020-01-02' AND c = 'DATE x' AND \"DATE\" = 1"
+    ) == (
+        "SELECT CAST(x AS ora_date), ora_date '2020-01-01', CAST(x AS TIMESTAMP) "
+        "FROM t WHERE d > ora_date'2020-01-02' AND c = 'DATE x' AND \"DATE\" = 1"
+    )
+
+
 def test_translate_idioms_keeps_nullifs_type() -> None:
     # PostgreSQL's NULLIF resolves a domain to its base type, so the NULLIF of
     # two DATEs was a timestamp (#2596); sys.ora_nullif keeps it. Nested,
@@ -2157,6 +2170,10 @@ def test_a_date_mixed_with_another_stays_a_date() -> None:
         'ADD_MONTHS(e, 1)',
         'LAST_DAY(e)',
         '(e + 1)',
+        # A DATE literal and a CAST to DATE (#2603).
+        "DATE '2020-01-01'",
+        "CAST(TIMESTAMP '2020-01-01 10:00:00' AS DATE)",
+        "CAST('2020-01-01' AS DATE)",
     )
     forms = (
         'NVL({a}, {b})',
