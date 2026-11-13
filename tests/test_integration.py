@@ -17953,5 +17953,184 @@ class UseSniIntegration(_ThrottleRetry, unittest.TestCase):
         self.assertEqual(asyncio.run(run()), [('tcps',)])
 
 
+# Subscriptions (#2460): client-initiated, as python-oracledb thin makes them,
+# from 12.1; the Mirror serves none. The bed's user needs CHANGE NOTIFICATION,
+# and for AQ a sharded queue of its own.
+_SUBSCRIPTIONS = _Need(
+    'subscriptions need a 12.1+ server, and the Mirror does not serve them',
+    min_fv=FIELD_VERSION_12_1,
+    not_mirror=('*',),
+)
+# The errors a bed without the grant or the feature answers.
+_SUBSCRIPTION_REFUSALS = (29972, 1031, 24900)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_SUBSCRIPTIONS)
+class SubscriptionIntegration(_IntegrationBase):
+    """Connection.subscribe, end to end (#2460)."""
+
+    TABLE = 'PYO_SUBSCRIPTION'
+
+    def setUp(self):
+        super().setUp()
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+        import threading
+
+        self.messages: list = []
+        self.arrived = threading.Event()
+
+    def _callback(self, message):
+        self.messages.append(message)
+        self.arrived.set()
+
+    def _subscribe(self, **kw):
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            return self.conn.subscribe(
+                client_initiated=True, callback=self._callback, **kw
+            )
+        except DatabaseError as exc:
+            if exc.code in _SUBSCRIPTION_REFUSALS:
+                self.skipTest(f'the bed refuses the subscription: ORA-{exc.code:05d}')
+            raise
+
+    def _change(self, n: int = 5):
+        with _connect() as other:
+            other.cursor().execute(f'INSERT INTO {self.TABLE} VALUES ({n})')
+            other.commit()
+
+    def _wait(self) -> list:
+        self.assertTrue(self.arrived.wait(60), 'no notification within 60 s')
+        return self.messages
+
+    def test_a_table_change_notifies_with_its_rows(self):
+        sub = self._subscribe(qos=seerdb.SUBSCR_QOS_ROWIDS)
+        try:
+            self.assertGreater(sub.id, 0)
+            self.assertIsNone(sub.registerquery(f'SELECT n FROM {self.TABLE}'))
+            self._change()
+            message = self._wait()[0]
+            self.assertEqual(message.type, seerdb.EVENT_OBJCHANGE)
+            (table,) = message.tables
+            self.assertTrue(table.name.endswith(f'.{self.TABLE}'))
+            self.assertTrue(table.operation & seerdb.OPCODE_INSERT)
+            (row,) = table.rows
+            self.cur.execute(f'SELECT rowidtochar(rowid) FROM {self.TABLE}')
+            self.assertEqual(row.rowid, self.cur.fetchone()[0])
+        finally:
+            self.conn.unsubscribe(sub)
+
+    def test_a_registered_query_notifies_with_its_id(self):
+        sub = self._subscribe(qos=seerdb.SUBSCR_QOS_QUERY)
+        try:
+            query_id = sub.registerquery(
+                f'SELECT n FROM {self.TABLE} WHERE n > :1', [0]
+            )
+            self.assertIsNotNone(query_id)
+            self._change()
+            message = self._wait()[0]
+            self.assertEqual(message.type, seerdb.EVENT_QUERYCHANGE)
+            self.assertEqual([q.id for q in message.queries], [query_id])
+            self.assertTrue(message.registered)
+        finally:
+            self.conn.unsubscribe(sub)
+
+    def test_unsubscribe_ends_the_stream(self):
+        sub = self._subscribe()
+        sub.registerquery(f'SELECT n FROM {self.TABLE}')
+        self.conn.unsubscribe(sub)
+        self.assertFalse(sub._thread.is_alive())
+        self._change()
+        self.assertFalse(self.arrived.wait(3))
+        self.assertIsNone(sub.error)
+
+    def test_only_a_query_registers(self):
+        from seerdb.common.exceptions import ProgrammingError
+
+        sub = self._subscribe()
+        try:
+            with self.assertRaises(ProgrammingError):
+                sub.registerquery(f'DELETE FROM {self.TABLE}')
+        finally:
+            self.conn.unsubscribe(sub)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_SUBSCRIPTIONS)
+class AqSubscriptionIntegration(_IntegrationBase):
+    """An AQ subscription on a sharded queue (#2460): a classic queue table
+    answers ORA-24900 to a client-initiated one, as in python-oracledb's own
+    tests."""
+
+    QUEUE = 'PYO_NTF_QUEUE'
+
+    def setUp(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        super().setUp()
+        self._drop_queue()
+        try:
+            self.cur.execute(
+                'BEGIN dbms_aqadm.create_sharded_queue('
+                f"'{self.QUEUE}', queue_payload_type => 'RAW'); END;"
+            )
+            self.cur.execute(f"BEGIN dbms_aqadm.start_queue('{self.QUEUE}'); END;")
+        except DatabaseError as exc:
+            self.skipTest(f'no sharded queue here: ORA-{exc.code:05d}')
+
+    def tearDown(self):
+        self._drop_queue()
+        super().tearDown()
+
+    def _drop_queue(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        for statement in (
+            f"BEGIN dbms_aqadm.stop_queue('{self.QUEUE}'); END;",
+            f"BEGIN dbms_aqadm.drop_sharded_queue('{self.QUEUE}'); END;",
+        ):
+            try:
+                self.cur.execute(statement)
+            except DatabaseError:
+                pass  # not there, or already stopped
+
+    def test_an_enqueue_notifies(self):
+        import threading
+
+        from seerdb.common.exceptions import DatabaseError
+
+        messages: list = []
+        arrived = threading.Event()
+
+        def callback(message):
+            messages.append(message)
+            arrived.set()
+
+        try:
+            sub = self.conn.subscribe(
+                client_initiated=True,
+                namespace=seerdb.SUBSCR_NAMESPACE_AQ,
+                name=self.QUEUE,
+                callback=callback,
+            )
+        except DatabaseError as exc:
+            if exc.code in _SUBSCRIPTION_REFUSALS:
+                self.skipTest(f'the bed refuses the subscription: ORA-{exc.code:05d}')
+            raise
+        try:
+            with _connect() as other:
+                other.queue(self.QUEUE).enqone(other.msgproperties(payload=b'hi'))
+                other.commit()
+            self.assertTrue(arrived.wait(60), 'no notification within 60 s')
+            (message,) = messages
+            self.assertEqual(message.type, seerdb.EVENT_AQ)
+            self.assertTrue(message.queue_name.endswith(f'"{self.QUEUE}"'))
+            self.assertEqual(len(message.msgid), 16)
+        finally:
+            self.conn.unsubscribe(sub)
+
+
 if __name__ == '__main__':
     unittest.main()

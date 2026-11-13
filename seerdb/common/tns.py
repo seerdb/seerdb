@@ -246,6 +246,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_DIRECT_PATH_OP,
     TNS_FUNC_DIRECT_PATH_PREPARE,
     TNS_FUNC_END_USER_SECURITY_CTX,
+    TNS_FUNC_NOTIFY,
     TNS_FUNC_PIPELINE_BEGIN,
     TNS_FUNC_PIPELINE_END,
     TNS_FUNC_REEXECUTE,
@@ -254,6 +255,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_SET_END_TO_END_ATTR,
     TNS_FUNC_TPC_TXN_CHANGE_STATE,
     TNS_FUNC_TPC_TXN_SWITCH,
+    TNS_INIT_KPNDRREQ,
     TNS_KEYWORD_NUM_TXN_PRIORITY,
     TNS_KPD_AQ_BUFMSG,
     TNS_KPD_AQ_EITHER,
@@ -280,6 +282,9 @@ from seerdb.common.tns_consts import (
     TNS_SERVER_PIGGYBACK_SYNC,
     TNS_SERVER_PIGGYBACK_TRACE_EVENT,
     TNS_SESSION_STATE_EXPLICIT_BOUNDARY,
+    TNS_SUBSCR_CLIENT_ID_LEN,
+    TNS_SUBSCR_MODE_CLIENT_INITIATED,
+    TNS_SUBSCR_STOP_NOTIF,
     TNS_TYPE_ADT,
     TNS_TYPE_BDOUBLE,
     TNS_TYPE_BFILE,
@@ -323,6 +328,7 @@ from seerdb.common.tns_consts import (
     TTI_IOV,
     TTI_IRD,
     TTI_KOD,
+    TTI_KPN,
     TTI_LOB,
     TTI_LOBOPS,
     TTI_LOGOFF,
@@ -682,6 +688,15 @@ def set_decode_dml_rowcounts(Flag: bool) -> None:
     decode_token_rpa_piggyback knows whether to expect the array-DML row-count
     block. Reset every execute so a stale flag never leaks into another call."""
     _DECODE_DML_ROWCOUNTS.set(bool(Flag))
+
+
+# The query ids an execute's reply names (#2460): a query registered for change
+# notification gets one, at the end of the reply's registration bytes. While a
+# subscription registers a query it points this at a list of its own, and the
+# decoder appends the id there; otherwise it is None and the bytes are skipped.
+_DECODE_QUERY_IDS: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    'decode_query_ids', default=None
+)
 
 
 # Session state the server reports in a SYNC piggyback's keyword-value pairs,
@@ -7508,6 +7523,12 @@ def _skip_rpa_tail_fields(Rest: bytes) -> bytes | None:
         (RegLen, Rest) = decode_ub4(Rest)  # registration, raw bytes
     except (IndexError, Truncated):
         return None
+    # A query registered for change notification (#2460): the registration
+    # bytes end with its id, a big-endian low word then high word.
+    Sink = _DECODE_QUERY_IDS.get()
+    if Sink is not None and RegLen >= 8 and len(Rest) >= RegLen:
+        (Low, High) = struct.unpack_from('>II', Rest, RegLen - 8)
+        Sink.append(High << 32 | Low)
     Rest = Rest[RegLen:]
     if not Rest or Rest[0] in _KNOWN_TTI_TOKENS or _DECODE_DML_ROWCOUNTS.get():
         return Rest
@@ -8940,6 +8961,292 @@ def encode_tpc_change_state(
     if Parts is not None:
         Out += Parts[3]
     return Out
+
+
+# Subscriptions (#2460), as python-oracledb 26.1 thin sends them, measured
+# against 23ai and cross-checked with its subscribe and notification messages.
+# TTI_KPN (125) registers a subscription, or unregisters it; its reply names the
+# registration and the client id. NOTIFY (187), on a second connection made with
+# (SERVER=emon), sends that client id once; the server answers with an OAC
+# token, then a record per notification, as they happen, and a STOP record.
+SUBSCR_NAMESPACE_AQ = 1
+SUBSCR_NAMESPACE_DBCHANGE = 2
+_SUBSCRIBE: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TTI_KPN])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('u8', 'operation'),
+    ('n4', 'mode'),
+    ('ptr', 'user_present'),
+    ('n4', 'user_length'),
+    ('ptr', 'client_id_present'),
+    ('n4', 'client_id_length'),
+    ('ptr', 'registrations_present'),
+    ('n4', 'registration_count'),
+    ('n2', 'presentation'),
+    ('n2', 'notification_version'),
+    ('ptr', 'namespace_out_present'),
+    ('ptr', 'namespace_count_present'),
+    ('ptr', 'generic_out_present'),
+    ('ptr', 'generic_count_present'),
+    ('ptr', 'instances_present'),
+    ('ptr', 'instances_length_present'),
+    ('ptr', 'client_ids_present'),
+    ('ptr', 'client_ids_length_present'),
+    ('ptr', 'client_id_out_present'),
+    ('n4', 'client_id_out_length'),
+    ('ptr', 'client_id_out_length_present'),
+    ('when', 'user_present', (('value', 'user'),)),
+    ('when', 'client_id_present', (('value', 'client_id'),)),
+    ('n4', 'namespace'),
+    ('n4', 'name_length'),
+    ('when', 'name_length', (('value', 'name'),)),
+    ('n4', 'context_length'),
+    ('n4', 'payload_type'),
+    ('n4', 'qos'),
+    ('n4', 'payload_callback_length'),
+    ('n4', 'timeout'),
+    ('n4', 'kpdnsd'),
+    ('n4', 'flags'),
+    ('n4', 'change_lag'),
+    ('n4', 'change_registration'),
+    ('u8', 'grouping_class'),
+    ('n4', 'grouping_value'),
+    ('u8', 'grouping_type'),
+    ('n4', 'grouping_start'),
+    ('n4', 'grouping_repeat'),
+    ('n8', 'registration_id'),
+)
+_NOTIFY: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TNS_FUNC_NOTIFY])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('n4', 'client_id_length'),
+    ('value', 'client_id'),
+    ('u8', 'request'),
+    ('n4', 'reserved'),
+)
+_SUBSCRIBE_THIN = wire_schema.compile_encoder(_SUBSCRIBE, _THIN)
+_NOTIFY_THIN = wire_schema.compile_encoder(_NOTIFY, _THIN)
+
+
+def encode_subscribe(
+    Seq: int,
+    FieldVersion: int,
+    Operation: int,
+    User: bytes | None,
+    ClientId: bytes | None,
+    Namespace: int,
+    Name: bytes | None,
+    Qos: int,
+    Timeout: int,
+    Flags: int,
+    GroupingClass: int = 0,
+    GroupingValue: int = 0,
+    GroupingType: int = 0,
+    RegistrationId: int = 0,
+) -> bytes:
+    """The TTI_KPN call (125) that registers a client-initiated subscription,
+    or unregisters one (#2460): register with no client id or registration
+    id, unregister with those the registration's reply gave. ``Qos`` and
+    ``Flags`` are the wire's (TNS_SUBSCR_QOS_* / TNS_SUBSCR_FLAGS_*, the
+    operations among the flags). A grouping type goes only with a grouping
+    class, as the server takes it."""
+    return _direct_path_encode(
+        _SUBSCRIBE_THIN,
+        FieldVersion,
+        {
+            'seq': Seq,
+            'token_number': _direct_path_token(FieldVersion),
+            'operation': Operation,
+            'mode': TNS_SUBSCR_MODE_CLIENT_INITIATED,
+            'user_present': User is not None,
+            'user_length': len(User or b''),
+            'client_id_present': ClientId is not None,
+            'client_id_length': len(ClientId or b''),
+            'registrations_present': True,
+            'registration_count': 1,
+            'presentation': 1,  # raw
+            'notification_version': 6,
+            'namespace_out_present': False,
+            'namespace_count_present': True,
+            'generic_out_present': False,
+            'generic_count_present': True,
+            'instances_present': True,
+            'instances_length_present': True,
+            'client_ids_present': True,
+            'client_ids_length_present': True,
+            'client_id_out_present': True,
+            'client_id_out_length': TNS_SUBSCR_CLIENT_ID_LEN,
+            'client_id_out_length_present': True,
+            'user': User or b'',
+            'client_id': ClientId or b'',
+            'namespace': Namespace,
+            'name_length': len(Name or b''),
+            'name': Name or b'',
+            'context_length': 0,
+            'payload_type': 0,
+            'qos': Qos,
+            'payload_callback_length': 0,
+            'timeout': Timeout,
+            'kpdnsd': 0,
+            'flags': Flags,
+            'change_lag': 0,
+            'change_registration': 0,
+            'grouping_class': GroupingClass,
+            'grouping_value': GroupingValue,
+            'grouping_type': GroupingType if GroupingClass else 0,
+            'grouping_start': 0,
+            'grouping_repeat': 0,
+            'registration_id': RegistrationId,
+        },
+    )
+
+
+def decode_subscribe_reply(Data: bytes) -> tuple[int, bytes, bytes]:
+    """The TTI_KPN reply's return parameters (#2460), ``Data`` from past the
+    TTI_RPA token: the registration id, the client id -- empty in the reply to
+    an unregister -- and what follows, the call's status. Between them, short
+    registration ids, the subscriber's name and the instances and listener
+    addresses the server could be reached at, which a client-initiated
+    subscription does not need."""
+    (Count, Rest) = decode_ub4(Data)
+    for _ in range(2 * Count):  # their out parameters, then short ids
+        (_, Rest) = decode_ub4(Rest)
+    (Count, Rest) = decode_ub4(Rest)
+    Registration = 0
+    for _ in range(Count):
+        (Registration, Rest) = decode_ub4(Rest)  # a ub8, the same width rule
+        (_, Rest) = _read_str_with_length(Rest)  # subscriber name
+    for _ in range(2):  # instances, then listener addresses
+        (Count, Rest) = decode_ub4(Rest)
+        for _ in range(Count):
+            (_, Rest) = _read_str_with_length(Rest)
+    (ClientId, Rest) = _read_str_with_length(Rest)
+    return (Registration, ClientId, Rest)
+
+
+def encode_notify(Seq: int, FieldVersion: int, ClientId: bytes) -> bytes:
+    """The NOTIFY call (187) a subscription's second connection, made with
+    (SERVER=emon), sends once: the client id its registration was given
+    (#2460). The server answers it with the notifications, as they happen."""
+    return _direct_path_encode(
+        _NOTIFY_THIN,
+        FieldVersion,
+        {
+            'seq': Seq,
+            'token_number': _direct_path_token(FieldVersion),
+            'client_id_length': len(ClientId),
+            'client_id': ClientId,
+            'request': TNS_INIT_KPNDRREQ,
+            'reserved': 0,
+        },
+    )
+
+
+def decode_notification(
+    Data: bytes, Namespace: int, SkipProperties: Callable[[bytes], bytes]
+) -> tuple[dict | None, bytes]:
+    """One notification record from the NOTIFY reply's stream (#2460), past
+    its leading TTI_OAC: a dict of its parts, or None for the STOP record that
+    ends the stream, and the bytes after it. An AQ record carries a message's
+    properties, passed over with ``SkipProperties``; a database-change one, a
+    payload decode_cqn_payload reads, None when the registration is gone.
+    Raises Truncated, IndexError or ValueError while the record is not whole."""
+    (Kind, Rest) = decode_ub4(Data)
+    if Kind == TNS_SUBSCR_STOP_NOTIF:
+        return (None, Rest)
+    (_Error, Rest) = decode_ub4(Rest)
+    (Registration, Rest) = decode_ub4(Rest)
+    (Queue, Rest) = _read_str_with_length(Rest)
+    (Consumer, Rest) = _read_str_with_length(Rest)
+    (MessageId, Rest) = _read_str_with_length(Rest)
+    (Properties, Rest) = decode_ub4(Rest)
+    if Properties > 0:
+        Rest = SkipProperties(Rest[1:])  # past the length byte, never valid
+    (_Jms, Rest) = _read_str_with_length(Rest)
+    Payload: bytes | None = None
+    if Namespace != SUBSCR_NAMESPACE_AQ:
+        for _ in range(3):  # payload type, flags, chunk number
+            (_, Rest) = decode_ub4(Rest)
+        (Payload, Rest) = _read_str_with_length(Rest)
+        (_Object, Rest) = _read_str_with_length(Rest)
+    return (
+        {
+            'registration_id': Registration,
+            'queue_name': Queue.decode('utf-8') if Queue else None,
+            'consumer_name': Consumer.decode('utf-8') if Consumer else None,
+            'msgid': MessageId or None,
+            'payload': Payload or None,
+        },
+        Rest,
+    )
+
+
+def _cqn_tables(Data: bytes, At: int) -> tuple[list, int]:
+    # The tables of a database-change payload: a big-endian count, then each
+    # table's operation, name and object number, then its rows unless the
+    # operation says all rows changed (0x01, OPCODE_ALLROWS).
+    (Count,) = struct.unpack_from('>H', Data, At)
+    At += 2
+    Tables = []
+    for _ in range(Count):
+        (Operation, Length) = struct.unpack_from('>IH', Data, At)
+        At += 6
+        Name = Data[At : At + Length].decode('utf-8')
+        At += Length + 4  # the object number after it
+        Rows: list = []
+        if not Operation & 0x01:
+            (Rows, At) = _cqn_rows(Data, At)
+        Tables.append({'operation': Operation, 'name': Name, 'rows': Rows})
+    return (Tables, At)
+
+
+def _cqn_rows(Data: bytes, At: int) -> tuple[list, int]:
+    (Count,) = struct.unpack_from('>H', Data, At)
+    At += 2
+    Rows = []
+    for _ in range(Count):
+        (Operation, Length) = struct.unpack_from('>IH', Data, At)
+        At += 6
+        Rows.append(
+            {'operation': Operation, 'rowid': Data[At : At + Length].decode('ascii')}
+        )
+        At += Length
+    return (Rows, At)
+
+
+def decode_cqn_payload(Payload: bytes) -> dict:
+    """A database-change notification's payload (#2460), big-endian: a version,
+    the registration id, the event type, the database name, the transaction id
+    and SCN (14 bytes, passed over), then for an object change (6) its tables
+    and for a query change (7) its queries, each with the query id and its
+    tables."""
+    (_Version, Registration, Event, Length) = struct.unpack_from('>HIIH', Payload, 0)
+    At = 12
+    Name = Payload[At : At + Length].decode('utf-8')
+    At += Length + 14
+    Tables: list = []
+    Queries = []
+    if Event == 6:
+        (Tables, At) = _cqn_tables(Payload, At)
+    elif Event == 7:
+        (Count,) = struct.unpack_from('>H', Payload, At)
+        At += 2
+        for _ in range(Count):
+            (Low, High, Operation) = struct.unpack_from('>III', Payload, At)
+            At += 12
+            (QueryTables, At) = _cqn_tables(Payload, At)
+            Queries.append(
+                {'id': High << 32 | Low, 'operation': Operation, 'tables': QueryTables}
+            )
+    return {
+        'registration_id': Registration,
+        'type': Event,
+        'dbname': Name,
+        'tables': Tables,
+        'queries': Queries,
+    }
 
 
 _CID_CHARS = frozenset(string.ascii_letters + string.digits + '<>/,.:;-_$+*#&!%?@')
@@ -14243,7 +14550,14 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
         # reads the SQL/al8i4 array from the wrong offset and returns ORA-03120
         # (two-task conversion routine: integer overflow). See oracledb
         # execute.pyx _write_execute_message.
-        Middle = bytes([0, 0, 1]) + bytes([0, 0, 0, 0, 0])  # reg_lsb .. reg_msb
+        # A query a subscription registers carries the registration, its low
+        # word first and its high word after four empty fields (#2460).
+        Registration = int(Dictionary['query'].get('registration_id') or 0)
+        Middle = (
+            encode_sb4(Registration & 0xFFFFFFFF)
+            + bytes([0, 1, 0, 0, 0, 0])
+            + encode_sb4(Registration >> 32)
+        )
         if ArrayDmlRowCounts:
             # al8pidmlrc = pointer(1) + ub4 iteration count + 1. The server
             # returns that many per-iteration row counts in the response RPA

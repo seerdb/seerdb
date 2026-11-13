@@ -9395,28 +9395,86 @@ exception instead of an unexpected-keyword `TypeError`. A downstream thin
 implementation should do the same rather than search for a wire encoding that the
 thin protocol does not have.
 
-## 38. Continuous Query Notification is not on the thin wire (#129)
+## 38. Subscriptions: CQN and AQ notifications, client-initiated (#129, #2460)
 
-> **Superseded.** python-oracledb 4.0.0 (May 2026) added CQN and AQ
-> notifications to its thin mode, so the finding below no longer holds for
-> current servers and clients. It is kept as the 2026-08 record until the
-> thin form is measured and documented here (#2460). Until then seerdb still
-> raises `NotSupportedError` from `subscribe()`.
+python-oracledb 4.0 thin makes **client-initiated** subscriptions: the client
+opens the channel the notifications arrive on, so nothing on the client listens.
+Measured from python-oracledb 26.1 against 23ai FREEPDB1 through a relay that
+tags each connection. seerdb's calls are the same bytes (`tests/test_subscr.py`).
+A server-initiated subscription, where the server connects back to a listener
+the client runs, stays an OCI-client capability, and thin refuses it (DPY-3001).
+So does seerdb.
 
-Continuous Query Notification (CQN) registers a **server-initiated
-subscription**: the client asks the database to watch a query / set of objects
-and, when they change, the *server opens a callback connection back to the
-client* to push a notification. That callback channel — a listener the client
-runs, plus the registration that points the server at it — is an OCI-client
-capability that sits outside the thin TTC/TNS request-response protocol. A
-pure-protocol thin client has no way to host the callback, so it cannot offer
-CQN; the reference thin driver rejects `subscribe()` for the same reason.
+**1. Register: `TTI_KPN` (function 125) on the session.** The call carries, in
+thin's variable-width integers:
+- op 1 (register) or 2 (unregister), and mode 4 (client-initiated);
+- the user;
+- on unregister, the client id;
+- one registration: presentation 1 (raw), notification version 6, and the
+  out-parameter pointers. From 12.1 these include the client-id slot, length 29.
 
-As with sharding keys (§37), there is nothing to reverse-engineer or emit on the
-thin wire. seerdb exposes `subscribe` / `unsubscribe` for API parity but raises
-`NotSupportedError` (`_reject_cqn`), so code ported from a thin driver gets the
-recognizable exception rather than an `AttributeError`. A downstream thin
-implementation should do the same.
+Then the namespace (1 AQ, with the queue's name; 2 database change), the QOS, the
+timeout, the flags, the grouping class, value and type, and the registration id
+(0 to register).
+- The QOS always has SECURE (`0x08`), with RELIABLE (`0x01`) and PURGE_ON_NTFN
+  (`0x10`) as asked.
+- The flags are the operations, with QUERY (`0x20`) and INCLUDE_ROWIDS (`0x10`)
+  from the QOS the caller gave. An AQ subscription's QOS is SECURE's `0x08`,
+  which is also `SUBSCR_QOS_QUERY`'s bit, so python-oracledb sends AQ with the
+  QUERY flag. seerdb sends the same.
+
+The reply's return parameters give:
+- short ids;
+- the registration id (a ub8) and the subscriber's name;
+- the instances and listener addresses;
+- the **client id**, `OCI:EP:301` in the capture.
+
+**2. Listen: a second connection with `(SERVER=emon)`.** It is made to the same
+address, with the session's parameters and `(SERVER=emon)` in CONNECT_DATA, and
+logs in as usual.
+- It then sends **NOTIFY (function 187, `0xbb`)**: the client id (a ub4 length,
+  then the bytes with their own length), the request byte 1, and a ub4 0.
+- That call is never answered as one. The server sends an OAC token (`0x0d`),
+  then **one record per notification**, as each happens, and a STOP record
+  (type 4) at the end.
+- The client reads the stream as TNS DATA packets. They carry no end of response,
+  so they are read as they arrive, not as a reply.
+- Unsubscribing closes this connection.
+
+**A record:**
+- its type, an error, the registration id, the queue and consumer names;
+- the message id, and the message properties when there are any (as a dequeue
+  sends them);
+- the JMS properties;
+- for a database change, the payload type, flags and chunk number, then the
+  **payload** and an object payload.
+
+The payload is big-endian:
+- a version, the registration id and the event type (6 object change, 7 query
+  change);
+- the database name;
+- the transaction id and SCN, 14 bytes;
+- then the tables, or the queries (an id, low word first, an operation, and
+  their tables);
+- each table: an operation, its name and its object number, then, unless the
+  operation has ALLROWS (`0x01`), its rows, each an operation and a ROWID.
+
+An empty payload means the registration is gone (EVENT_DEREG).
+
+**3. Register a query:** an ordinary OALL8 execute with the registration id in
+the 12.1 block's first and last words, low word first. The reply's registration
+bytes end with the query's id, low word first. A statement other than a query
+with a registration draws ORA-03137, so a client refuses it before sending.
+
+**Beds:**
+- A database-change subscription needs CHANGE NOTIFICATION (ORA-29972 without
+  it).
+- A client-initiated AQ subscription needs a **sharded queue** (TxEventQ). A
+  classic queue table answers ORA-24900, as python-oracledb's own tests show.
+
+python-oracledb has no subscriptions on an asyncio connection, and seerdb's
+`AsyncOracleConnect.subscribe` raises `NotSupportedError`. The Mirror serves
+none of this (MIRROR.md, *Not served*).
 
 ## 39. The Mirror's fixed 11.2-identity constants (#566)
 

@@ -1176,21 +1176,6 @@ class _ConnectionLogic:
 
         return Xid(format_id, global_transaction_id, branch_qualifier)
 
-    def subscribe(self, *args: object, **kwargs: object) -> None:
-        """Register a Continuous Query Notification subscription — not supported
-        (#129). Accepts any arguments for API compatibility and raises
-        NotSupportedError; see ``_reject_cqn``."""
-        from seerdb.client.connection import _reject_cqn
-
-        _reject_cqn()
-
-    def unsubscribe(self, *args: object, **kwargs: object) -> None:
-        """Remove a CQN subscription — not supported (#129); the counterpart to
-        ``subscribe``, raising NotSupportedError for the same reason."""
-        from seerdb.client.connection import _reject_cqn
-
-        _reject_cqn()
-
     def _rows(self, result: object) -> list:
         # The row block of an execute() result (execute is typed `object`); [] if
         # the result carries no rows.
