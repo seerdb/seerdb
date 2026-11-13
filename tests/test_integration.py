@@ -6066,6 +6066,54 @@ class BindIntegration(_IntegrationBase):
                 self.cur.execute(f'SELECT {expr} FROM dual')
                 self.assertEqual(self.cur.fetchone(), (value,))
 
+    @_requires(_INTERVAL)
+    def test_an_intervals_months_on_a_missing_day_are_refused(self):
+        # A DATE or TIMESTAMP plus an interval's months on a day the month
+        # lacks is ORA-01839, as is a WITH TIME ZONE value's, whose months move
+        # it in UTC, and a WITH LOCAL TIME ZONE value's, in the session's zone.
+        # Over PostgreSQL the month ended short (#2611). ADD_MONTHS ends it
+        # short on Oracle too.
+        for expr in (
+            "DATE '2020-01-31' + INTERVAL '1' MONTH",
+            "TIMESTAMP '2020-02-29 10:00:00' + INTERVAL '1' YEAR",
+            "TIMESTAMP '2020-05-31 00:00:00' - INTERVAL '1' MONTH",
+            "INTERVAL '1-1' YEAR TO MONTH + DATE '2020-01-30'",
+            "TIMESTAMP '2020-02-01 02:00:00 +05:00' + INTERVAL '1' MONTH",
+            "TIMESTAMP '1500-01-30 00:00:00' + INTERVAL '1' MONTH",
+            # The 31st in any session zone within 12 hours of UTC.
+            "CAST(TIMESTAMP '2020-01-31 12:00:00 +00:00' AS TIMESTAMP WITH LOCAL TIME ZONE) "
+            "+ INTERVAL '1' MONTH",
+        ):
+            with self.subTest(expr=expr):
+                with self.assertRaises(seerdb.DatabaseError) as ctx:
+                    self.cur.execute(f'SELECT {expr} FROM dual')
+                    self.cur.fetchall()
+                self.assertEqual(ctx.exception.code, 1839)
+        f = "'YYYY-MM-DD HH24:MI'"
+        for expr, value in (
+            (
+                f"TO_CHAR(DATE '2020-01-31' + INTERVAL '2' MONTH, {f})",
+                '2020-03-31 00:00',
+            ),
+            (
+                f"TO_CHAR(DATE '2020-02-29' - INTERVAL '4' YEAR, {f})",
+                '2016-02-29 00:00',
+            ),
+            (
+                f"TO_CHAR(DATE '2020-01-31' + INTERVAL '30' DAY, {f})",
+                '2020-03-01 00:00',
+            ),
+            (f"TO_CHAR(ADD_MONTHS(DATE '2020-01-31', 1), {f})", '2020-02-29 00:00'),
+            (
+                "TO_CHAR(SYS_EXTRACT_UTC(TIMESTAMP '2020-01-30 00:00:00 +03:00' "
+                f"+ INTERVAL '1' MONTH), {f})",
+                '2020-02-29 21:00',
+            ),
+        ):
+            with self.subTest(expr=expr):
+                self.cur.execute(f'SELECT {expr} FROM dual')
+                self.assertEqual(self.cur.fetchone(), (value,))
+
     def test_a_date_bind_is_a_date(self):
         # seerdb binds a datetime without a fraction as a DATE, as Oracle's
         # clients do, and Oracle types the bind and every expression over it

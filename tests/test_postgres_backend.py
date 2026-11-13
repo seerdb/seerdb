@@ -2329,6 +2329,87 @@ def test_timestamp_arithmetic_before_1582_is_julian() -> None:
         backend.close()
 
 
+def test_an_intervals_months_on_a_missing_day_are_refused() -> None:
+    # Oracle refuses a DATE, TIMESTAMP or WITH TIME ZONE value plus an
+    # interval's months on a day the month lacks, ORA-01839, where
+    # PostgreSQL ends the month short (#2611), against 23ai's answers. A WITH
+    # TIME ZONE value moves in UTC, whatever the session's zone, and a WITH
+    # LOCAL TIME ZONE one in the session's zone.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for expr in (
+            "TIMESTAMP '2020-01-31 10:00:00' + INTERVAL '1' MONTH",
+            "DATE '2020-03-31' - INTERVAL '1' MONTH",
+            "INTERVAL '1' MONTH + DATE '2020-01-31'",
+            "TIMESTAMP '2020-02-29 00:00:00' + INTERVAL '1' YEAR",
+            "TIMESTAMP '2020-02-01 02:00:00 +05:00' + INTERVAL '1' MONTH",
+            "TIMESTAMP '2020-03-31 10:00:00 +03:00' - INTERVAL '1' MONTH",
+            "INTERVAL '1' MONTH + TIMESTAMP '2020-01-31 10:00:00 +03:00'",
+            "TIMESTAMP '1500-01-31 00:00:00' + INTERVAL '1' MONTH",
+        ):
+            with pytest.raises(
+                BackendError, match='date not valid for month specified'
+            ) as raised:
+                backend.execute(f'SELECT {expr} FROM dual')
+            assert raised.value.ora_code == 1839, expr
+            backend.rollback()
+        # The session's zone is not UTC's, which a WITH TIME ZONE value's
+        # months once moved in.
+        backend.execute("ALTER SESSION SET TIME_ZONE = '+05:00'")
+        ltz = "CAST(TIMESTAMP '{} +00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)"
+        # 01-29 20:00 UTC is 01-30 01:00 here, and February has no 30th.
+        with pytest.raises(BackendError, match='date not valid for month specified'):
+            backend.execute(
+                f"SELECT {ltz.format('2020-01-29 20:00:00')} + INTERVAL '1' MONTH FROM dual"
+            )
+        backend.rollback()
+        backend.execute("ALTER SESSION SET TIME_ZONE = '+05:00'")
+        for expr, label in (
+            (
+                "TIMESTAMP '2020-01-28 10:00:00' + INTERVAL '1' MONTH",
+                '2020-02-28 10:00:00',
+            ),
+            (
+                "TIMESTAMP '2020-01-31 10:00:00' + INTERVAL '2' MONTH",
+                '2020-03-31 10:00:00',
+            ),
+            (
+                "TIMESTAMP '2020-02-29 00:00:00' - INTERVAL '4' YEAR",
+                '2016-02-29 00:00:00',
+            ),
+            ("DATE '2020-01-31' + INTERVAL '1' DAY", '2020-02-01 00:00:00'),
+            ("ADD_MONTHS(DATE '2020-01-31', 1)", '2020-02-29 00:00:00'),
+            (
+                "SYS_EXTRACT_UTC(TIMESTAMP '2020-01-31 23:00:00 -05:00' + INTERVAL '1' MONTH)",
+                '2020-03-01 04:00:00',
+            ),
+            (
+                "SYS_EXTRACT_UTC(TIMESTAMP '2020-01-30 00:00:00 +03:00' + INTERVAL '1' MONTH)",
+                '2020-02-29 21:00:00',
+            ),
+            (
+                "SYS_EXTRACT_UTC(TIMESTAMP '2020-03-01 02:00:00 +05:00' - INTERVAL '1' MONTH)",
+                '2020-01-29 21:00:00',
+            ),
+            # A WITH LOCAL TIME ZONE value moves in the session's zone: its
+            # 01-31 22:00 UTC is 02-01 03:00 here.
+            (
+                f'SYS_EXTRACT_UTC(CAST({ltz.format("2020-01-31 22:00:00")} '
+                "+ INTERVAL '1' MONTH AS TIMESTAMP WITH TIME ZONE))",
+                '2020-02-29 22:00:00',
+            ),
+        ):
+            (row,) = backend.execute(
+                f"SELECT TO_CHAR({expr}, 'YYYY-MM-DD HH24:MI:SS') FROM dual"
+            ).rows
+            assert row[0] == label, expr
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_day_counting_formats_before_1582_are_oracles() -> None:
     # Before 1582-10-15 TO_CHAR's day-counting elements, TO_DATE's J, TRUNC
     # and ROUND to a week and NEXT_DAY count Oracle's Julian days (#2600),
