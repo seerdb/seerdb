@@ -61,6 +61,8 @@ ONE_WAY = {
     '_IMPLICIT_RESULTS',
     # 9i's SQL length counts characters, not the bytes its text takes (#2275).
     '_O7_ALL7',
+    # A direct path LOAD STREAM's rows, packed into pieces before (#2462).
+    '_DIRECT_PATH_LOAD_STREAM',
 }
 SAMPLES = 12
 

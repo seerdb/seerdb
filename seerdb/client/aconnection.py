@@ -2948,6 +2948,85 @@ class AsyncOracleConnect(_ConnectionLogic):
         finally:
             await Cursor.close()
 
+    # --- Direct path load (#2462), async port ---
+
+    async def _direct_path_call(self, Data: bytes) -> bytes:
+        await self.send(TNS_DATA, Data)
+        Received = await self._next_data_packet(b'', b'')
+        if Received is False:
+            raise OperationalError('connection closed during a direct path load')
+        return Received[1]
+
+    async def direct_path_load(
+        self,
+        schema_name: str,
+        table_name: str,
+        column_names: list[str],
+        data,
+        *,
+        batch_size: int = 2**32 - 1,
+    ) -> None:
+        """Async port of `OracleConnect.direct_path_load` (#2462)."""
+        from seerdb.common.tns import (
+            DIRECT_PATH_OP_ABORT,
+            DIRECT_PATH_OP_FINISH,
+            encode_direct_path_load_stream,
+            encode_direct_path_op,
+            encode_direct_path_pieces,
+            encode_direct_path_prepare,
+            encode_direct_path_rows,
+        )
+
+        self._direct_path_check()
+        Batches = self._direct_path_batches(data, batch_size)
+        (Columns, Cursor) = self._direct_path_reply(
+            await self._direct_path_call(
+                encode_direct_path_prepare(
+                    self._next_seq(),
+                    self.field_version,
+                    schema_name,
+                    table_name,
+                    list(column_names),
+                )
+            ),
+            Prepare=True,
+        )
+        try:
+            for Rows in Batches:
+                (Cells, Fast) = encode_direct_path_rows(
+                    Rows, Columns, self._server_charset
+                )
+                (Pieces, Length) = encode_direct_path_pieces(Cells, Fast)
+                self._direct_path_reply(
+                    await self._direct_path_call(
+                        encode_direct_path_load_stream(
+                            self._next_seq(), self.field_version, Cursor, Pieces, Length
+                        )
+                    )
+                )
+        except BaseException:
+            try:
+                self._direct_path_reply(
+                    await self._direct_path_call(
+                        encode_direct_path_op(
+                            self._next_seq(),
+                            self.field_version,
+                            Cursor,
+                            DIRECT_PATH_OP_ABORT,
+                        )
+                    )
+                )
+            except (DatabaseError, OSError):
+                pass  # the load's own failure is the one to report
+            raise
+        self._direct_path_reply(
+            await self._direct_path_call(
+                encode_direct_path_op(
+                    self._next_seq(), self.field_version, Cursor, DIRECT_PATH_OP_FINISH
+                )
+            )
+        )
+
     # --- Sessionless transactions (#133, 23ai), async port ---
 
     async def _sessionless_switch(

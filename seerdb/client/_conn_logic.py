@@ -576,6 +576,58 @@ class _ConnectionLogic:
             'thick mode, and the thin protocol form is not known'
         )
 
+    # --- Direct path load (#2462) -------------------------------------------
+
+    def _direct_path_check(self) -> None:
+        # The load's three calls are python-oracledb thin's, which it sends to
+        # a 12.1 server and later; a dialect session speaks no thin calls.
+        if self._dialect is not None or self.field_version < FIELD_VERSION_12_1:
+            raise NotSupportedError('direct_path_load requires an Oracle 12.1+ server')
+
+    @staticmethod
+    def _direct_path_batches(data, batch_size: int) -> list[list]:
+        # The rows to load, in batches of at most batch_size, each one LOAD
+        # STREAM call: a sequence of rows, or a DataFrame -- any object with the
+        # Arrow PyCapsule stream interface -- as executemany takes it (#2461).
+        if batch_size < 1:
+            raise ProgrammingError('batch_size must be at least 1')
+        if hasattr(data, '__arrow_c_stream__'):
+            from seerdb.client.dataframe import arrow_batches
+
+            Rows = [Row for _, Batch in arrow_batches(data) for Row in Batch]
+        else:
+            Rows = list(data)
+        return [Rows[At : At + batch_size] for At in range(0, len(Rows), batch_size)]
+
+    @staticmethod
+    def _direct_path_reply(Packet: bytes, Prepare: bool = False) -> tuple[list, int]:
+        # A direct path call's reply: its return parameters, then the status.
+        # A failure the server reports comes as the status alone, its ORA code
+        # raised here. A PREPARE's reply gives the columns and the load's cursor.
+        from seerdb.common.exceptions import DatabaseError, from_ora_code
+        from seerdb.common.tns import (
+            decode_direct_path_prepare_reply,
+            decode_direct_path_reply,
+            decode_error_reply,
+        )
+        from seerdb.common.tns_consts import TTI_RPA
+
+        Columns: list = []
+        (Cursor, Rest) = (0, Packet)
+        Returned = bool(Packet) and Packet[0] == TTI_RPA
+        if Returned and Prepare:
+            (Columns, Cursor, Rest) = decode_direct_path_prepare_reply(Packet[1:])
+        elif Returned:
+            Rest = decode_direct_path_reply(Packet[1:])
+        (Code, Message) = decode_error_reply(Rest)
+        if Code:
+            raise from_ora_code(Code)(Message or f'ORA-{Code:05d}', code=Code)
+        if Prepare and not Returned:
+            raise DatabaseError(
+                f'unexpected direct path PREPARE reply 0x{Packet[:1].hex()}'
+            )
+        return (Columns, Cursor)
+
     def _absorb_identity(self, Identity: dict) -> None:
         # What the login reply says about the server (#2456): the longest
         # identifier it takes (None where it doesn't say, as before 12.2) and

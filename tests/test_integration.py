@@ -17588,5 +17588,318 @@ class PreTwelveObjectOutBindIntegration(unittest.TestCase):
             conn.close()
 
 
+# Direct path load (#2462): python-oracledb thin's calls, which a 12.1+ server
+# takes. The Mirror serves none of them.
+_DIRECT_PATH = _Need(
+    'a direct path load needs a 12.1+ server, and the Mirror does not serve it',
+    min_fv=FIELD_VERSION_12_1,
+    not_mirror=('*',),
+)
+# The schema the tests load into: the test user's own.
+_DIRECT_PATH_OWNER = (_USER or '').upper()
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_DIRECT_PATH)
+class DirectPathLoadIntegration(_IntegrationBase):
+    """Connection.direct_path_load, end to end (#2462)."""
+
+    TABLE = 'PYO_DIRECT_PATH'
+
+    def setUp(self):
+        super().setUp()
+        self.cur.execute(
+            f'CREATE TABLE {self.TABLE} (n NUMBER, v VARCHAR2(20), d DATE, '
+            't TIMESTAMP, r RAW(10), c CLOB, b BLOB, nv NVARCHAR2(10), '
+            'bd BINARY_DOUBLE, k NUMBER NOT NULL)'
+        )
+
+    def _rows(self, conn=None) -> list:
+        cur = (conn or self.conn).cursor()
+        cur.execute(
+            'SELECT k, n, v, d, t, r, dbms_lob.getlength(c), dbms_lob.substr(c, 5), '
+            f'dbms_lob.getlength(b), nv, bd FROM {self.TABLE} ORDER BY k'
+        )
+        return cur.fetchall()
+
+    _COLUMNS = ['K', 'N', 'V', 'D', 'T', 'R', 'C', 'B', 'NV', 'BD']
+
+    def test_rows_of_each_type_load_in_batches(self):
+        # Three batches of one row; a LOB past one piece (0xfff0 bytes) goes
+        # split over several, and a NULL in each nullable column.
+        import datetime
+        from decimal import Decimal
+
+        rows = [
+            (
+                1,
+                7,
+                'one',
+                datetime.datetime(2020, 1, 15, 10),
+                datetime.datetime(2020, 1, 15, 10, 0, 0, 500000),
+                b'\x01\x02',
+                'clob one',
+                b'blob',
+                'Grüße',
+                1.5,
+            ),
+            (
+                2,
+                Decimal('2.5'),
+                'two',
+                None,
+                None,
+                None,
+                'x' * 70000,
+                b'\xff' * 70000,
+                None,
+                None,
+            ),
+            (3, None, None, None, None, None, None, None, None, None),
+        ]
+        self.conn.direct_path_load(
+            _DIRECT_PATH_OWNER, self.TABLE, self._COLUMNS, rows, batch_size=1
+        )
+        self.assertEqual(
+            self._rows(),
+            [
+                (
+                    1,
+                    7,
+                    'one',
+                    datetime.datetime(2020, 1, 15, 10),
+                    datetime.datetime(2020, 1, 15, 10, 0, 0, 500000),
+                    b'\x01\x02',
+                    8,
+                    'clob ',
+                    4,
+                    'Grüße',
+                    1.5,
+                ),
+                (
+                    2,
+                    Decimal('2.5'),
+                    'two',
+                    None,
+                    None,
+                    None,
+                    70000,
+                    'xxxxx',
+                    70000,
+                    None,
+                    None,
+                ),
+                (3, None, None, None, None, None, None, None, None, None, None),
+            ],
+        )
+
+    def test_a_finished_load_is_committed(self):
+        # Another session sees the rows, and a rollback keeps them.
+        self.conn.direct_path_load(_DIRECT_PATH_OWNER, self.TABLE, ['K'], [(1,), (2,)])
+        self.conn.rollback()
+        with _connect() as other:
+            self.assertEqual([r[0] for r in self._rows(other)], [1, 2])
+
+    def test_a_refused_row_aborts_the_whole_load(self):
+        # A NULL for the NOT NULL column is refused before the batch is sent;
+        # the batch before it was streamed and is discarded with the load.
+        from seerdb.common.exceptions import IntegrityError
+
+        with self.assertRaises(IntegrityError):
+            self.conn.direct_path_load(
+                _DIRECT_PATH_OWNER,
+                self.TABLE,
+                ['K', 'V'],
+                [(1, 'a'), (None, 'b')],
+                batch_size=1,
+            )
+        self.assertEqual(self._rows(), [])
+        # The session goes on, and so does a load after it.
+        self.conn.direct_path_load(_DIRECT_PATH_OWNER, self.TABLE, ['K'], [(5,)])
+        self.assertEqual([r[0] for r in self._rows()], [5])
+
+    def test_a_value_past_the_column_is_refused(self):
+        from seerdb.common.exceptions import DataError
+
+        with self.assertRaises(DataError):
+            self.conn.direct_path_load(
+                _DIRECT_PATH_OWNER, self.TABLE, ['K', 'V'], [(1, 'y' * 21)]
+            )
+        self.assertEqual(self._rows(), [])
+
+    def test_the_servers_error_is_raised(self):
+        # No such table: the server's ORA code, and the session goes on.
+        from seerdb.common.exceptions import DatabaseError
+
+        with self.assertRaises(DatabaseError) as caught:
+            self.conn.direct_path_load(
+                _DIRECT_PATH_OWNER, 'PYO_NO_SUCH_TABLE', ['K'], [(1,)]
+            )
+        self.assertEqual(caught.exception.code, 39826)
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
+    def _load_column(self, declaration: str, value, read: str = 'x'):
+        # One value and a NULL into a table of one column, read back as `read`.
+        from seerdb.common.exceptions import DatabaseError
+
+        table = self.TABLE + '_T'
+        cur = self.conn.cursor()
+        try:
+            cur.execute(f'DROP TABLE {table}')
+        except DatabaseError:
+            pass  # not left over from an earlier run
+        cur.execute(f'CREATE TABLE {table} (x {declaration})')
+        try:
+            self.conn.direct_path_load(
+                _DIRECT_PATH_OWNER, table, ['X'], [(value,), (None,)]
+            )
+            cur.execute(f'SELECT {read} FROM {table}')
+            return [x.read() if hasattr(x, 'read') else x for (x,) in cur.fetchall()]
+        finally:
+            cur.execute(f'DROP TABLE {table}')
+
+    def test_more_types_load(self):
+        import datetime
+
+        zone = datetime.timezone(datetime.timedelta(hours=2))
+        moment = datetime.datetime(2024, 5, 6, 7, 8, 9, 123000, tzinfo=zone)
+        span = datetime.timedelta(days=3, seconds=7, microseconds=5)
+        for declaration, value in (
+            ('TIMESTAMP WITH TIME ZONE', moment),
+            ('INTERVAL DAY TO SECOND', span),
+            ('NCLOB', 'Grüße ' * 3),
+            ('BINARY_FLOAT', 2.5),
+            ('NCHAR(5)', 'äb'),
+            ('LONG', 'long text'),
+        ):
+            with self.subTest(declaration):
+                self.assertEqual(self._load_column(declaration, value), [value, None])
+
+    def test_char_is_stored_as_sent(self):
+        # Past SQL, nothing blank-pads a CHAR value, as with python-oracledb.
+        self.assertEqual(self._load_column('CHAR(5)', 'ab'), ['ab', None])
+
+    @_requires(_Need('BOOLEAN, JSON and VECTOR columns are 23ai', min_server=23))
+    def test_23ai_types_load(self):
+        import array
+
+        vector = array.array('f', [1.5, 2.5, 3.5])
+        for declaration, value in (
+            ('BOOLEAN', True),
+            ('VECTOR(3, FLOAT32)', vector),
+        ):
+            with self.subTest(declaration):
+                self.assertEqual(self._load_column(declaration, value), [value, None])
+        # A session below 23ai's field version fetches a JSON column as its
+        # bytes, so the value is read back as its text, the same at any.
+        self.assertEqual(
+            self._load_column(
+                'JSON', {'a': [1, 2, {'b': 'c'}]}, read='json_serialize(x)'
+            ),
+            ['{"a":[1,2,{"b":"c"}]}', None],
+        )
+
+    def test_no_rows_load_nothing(self):
+        self.conn.direct_path_load(_DIRECT_PATH_OWNER, self.TABLE, ['K'], [])
+        self.assertEqual(self._rows(), [])
+
+    def test_a_dataframe_loads(self):
+        try:
+            import pyarrow as pa
+        except ImportError:
+            self.skipTest('pyarrow is not installed')
+        table = pa.table({'K': [1, 2, 3], 'V': ['a', None, 'c']})
+        self.conn.direct_path_load(_DIRECT_PATH_OWNER, self.TABLE, ['K', 'V'], table)
+        self.assertEqual(
+            [(r[0], r[2]) for r in self._rows()], [(1, 'a'), (2, None), (3, 'c')]
+        )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(
+    _Need(
+        'a session below 12.1 refuses a direct path load', below_fv=FIELD_VERSION_12_1
+    )
+)
+class DirectPathLoadRefusedIntegration(_IntegrationBase):
+    """Below 12.1, direct_path_load is refused before anything is sent (#2462)."""
+
+    def test_below_12_1_it_is_refused(self):
+        from seerdb.common.exceptions import NotSupportedError
+
+        with self.assertRaises(NotSupportedError):
+            self.conn.direct_path_load(_DIRECT_PATH_OWNER, self.TABLE, ['K'], [(1,)])
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class AsyncDirectPathLoadIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
+    """The async twin of DirectPathLoadIntegration's main paths (#2462)."""
+
+    TABLE = 'PYO_DIRECT_PATH_ASYNC'
+
+    async def _connect(self):
+        return await seerdb.connect_async(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            autocommit=True,
+            **_FV_KW,
+        )
+
+    async def asyncSetUp(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        self.conn = await self._connect()
+        # Skipped before the table is made; a skip from here runs no teardown.
+        if _DIRECT_PATH.missing(_target_of(self.conn)):
+            await self.conn.close()
+            self.skipTest(_DIRECT_PATH.reason)
+        self.cur = self.conn.cursor()
+        try:
+            await self.cur.execute(f'DROP TABLE {self.TABLE} PURGE')
+        except DatabaseError:
+            pass  # not left over from an earlier run
+        await self.cur.execute(f'CREATE TABLE {self.TABLE} (k NUMBER NOT NULL, c CLOB)')
+
+    async def asyncTearDown(self):
+        from seerdb.common.exceptions import DatabaseError
+
+        try:
+            await self.cur.execute(f'DROP TABLE {self.TABLE} PURGE')
+        except DatabaseError:
+            pass  # nothing was made
+        await self.conn.close()
+
+    async def _rows(self) -> list:
+        await self.cur.execute(
+            f'SELECT k, dbms_lob.getlength(c) FROM {self.TABLE} ORDER BY k'
+        )
+        return await self.cur.fetchall()
+
+    async def test_rows_load(self):
+        await self.conn.direct_path_load(
+            _DIRECT_PATH_OWNER,
+            self.TABLE,
+            ['K', 'C'],
+            [(1, 'a'), (2, 'z' * 70000), (3, None)],
+            batch_size=2,
+        )
+        self.assertEqual(await self._rows(), [(1, 1), (2, 70000), (3, None)])
+
+    async def test_a_refused_row_aborts_the_whole_load(self):
+        from seerdb.common.exceptions import IntegrityError
+
+        with self.assertRaises(IntegrityError):
+            await self.conn.direct_path_load(
+                _DIRECT_PATH_OWNER, self.TABLE, ['K'], [(1,), (None,)], batch_size=1
+            )
+        self.assertEqual(await self._rows(), [])
+
+
 if __name__ == '__main__':
     unittest.main()
