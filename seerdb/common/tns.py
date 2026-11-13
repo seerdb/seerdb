@@ -242,6 +242,9 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_AQ_DEQ,
     TNS_FUNC_AQ_ENQ,
     TNS_FUNC_ARRAY_AQ,
+    TNS_FUNC_DIRECT_PATH_LOAD_STREAM,
+    TNS_FUNC_DIRECT_PATH_OP,
+    TNS_FUNC_DIRECT_PATH_PREPARE,
     TNS_FUNC_END_USER_SECURITY_CTX,
     TNS_FUNC_PIPELINE_BEGIN,
     TNS_FUNC_PIPELINE_END,
@@ -8947,6 +8950,448 @@ def _cid_value(Value: str) -> bytes:
     # end or nest it, or fall outside the network character set, becomes '?'
     # (python-oracledb's rule).
     return ''.join(c if c in _CID_CHARS else '?' for c in Value).encode('ascii')
+
+
+# Direct path load (#2462): three function calls, measured from python-oracledb
+# 26.1 thin against 23ai and cross-referenced with its direct_path_prepare,
+# direct_path_load_stream and direct_path_op messages.
+#
+# 128 PREPARE names the table and its columns, as keyword parameters, and sets an
+# input array; the reply describes the columns -- a LOB as a LONG / LONG RAW --
+# and returns the load's cursor in its output array. 129 LOAD STREAM carries the
+# rows, packed into pieces; it is sent once per batch. 130 OP ends the load:
+# FINISH commits what was streamed, ABORT discards it.
+DIRECT_PATH_OP_ABORT = 1
+DIRECT_PATH_OP_FINISH = 2
+_DIRECT_PATH_LOAD = 1  # PREPARE's operation: a load
+_DIRECT_PATH_VERSION = 400  # the interface and stream versions, both
+# PREPARE's keyword indexes, and the input array's slots.
+_DPP_KEYWORD_TABLE = 1
+_DPP_KEYWORD_SCHEMA = 3
+_DPP_KEYWORD_COLUMN = 4
+_DPP_INPUT_INTERFACE_VERSION = 0
+_DPP_INPUT_STREAM_VERSION = 1
+_DPP_INPUT_NFOBJ_OID_POS = 11
+_DPP_INPUT_LOCK_WAIT = 14
+_DPP_OUTPUT_CURSOR = 3
+# A piece's row header (#2462): first or last of its row, split from the
+# previous or into the next piece, and for a row whose every value is of a
+# fixed-form type in one piece, the fast form with its length.
+_DPLS_SPLIT_WITH_NEXT = 0x01
+_DPLS_SPLIT_WITH_PREV = 0x02
+_DPLS_LAST = 0x04
+_DPLS_FIRST = 0x08
+_DPLS_FAST_PIECE = 0x10
+_DPLS_FAST_ROW = 0x20
+_DPLS_MAX_PIECE = 0xFFF0  # a piece's data, at most
+_DPLS_MAX_SHORT = 0xFA  # a value this long or shorter has a one-byte length
+_DPLS_MAX_SEGMENTS = 255
+_DPLS_MAX_MESSAGE = 1_073_728_895
+
+_DIRECT_PATH_KEYWORD: wire_schema.Schema = (
+    ('n2', 'text_length'),
+    ('n2', 'name_length'),
+    ('chr', 'name'),
+    ('n2', 'index'),
+)
+_DIRECT_PATH_PREPARE: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TNS_FUNC_DIRECT_PATH_PREPARE])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('n4', 'operation'),
+    ('ptr', 'keywords_present'),
+    ('n4', 'keyword_count'),
+    ('ptr', 'inputs_present'),
+    ('n2', 'input_count'),
+    ('ptr', 'metadata_present'),
+    ('ptr', 'metadata_length_present'),
+    ('ptr', 'parameters_present'),
+    ('ptr', 'parameters_length_present'),
+    ('ptr', 'outputs_present'),
+    ('ptr', 'outputs_length_present'),
+    ('each', 'keywords', 'keyword_count', _DIRECT_PATH_KEYWORD),
+    ('each', 'inputs', 'input_count', (('n4', 'value'),)),
+)
+_DIRECT_PATH_LOAD_STREAM: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TNS_FUNC_DIRECT_PATH_LOAD_STREAM])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('n2', 'cursor'),
+    ('ptr', 'buffer_present'),
+    ('n4', 'buffer_length'),
+    ('n4', 'stream_version'),
+    ('ptr', 'inputs_present'),
+    ('n4', 'input_count'),
+    ('ptr', 'outputs_present'),
+    ('ptr', 'outputs_length_present'),
+    ('raw', 'pieces'),
+)
+_DIRECT_PATH_OP: wire_schema.Schema = (
+    ('const', bytes([TTI_FUN, TNS_FUNC_DIRECT_PATH_OP])),
+    ('u8', 'seq'),
+    ('token', 'token_number'),
+    ('n4', 'operation'),
+    ('n2', 'cursor'),
+    ('ptr', 'inputs_present'),
+    ('n4', 'input_count'),
+    ('ptr', 'outputs_present'),
+    ('ptr', 'outputs_length_present'),
+)
+_DIRECT_PATH_PREPARE_THIN = wire_schema.compile_encoder(_DIRECT_PATH_PREPARE, _THIN)
+_DIRECT_PATH_LOAD_STREAM_THIN = wire_schema.compile_encoder(
+    _DIRECT_PATH_LOAD_STREAM, _THIN
+)
+_DIRECT_PATH_OP_THIN = wire_schema.compile_encoder(_DIRECT_PATH_OP, _THIN)
+
+
+def _direct_path_token(FieldVersion: int) -> int | None:
+    # A function call's token number, which 23ai's sessions carry (_fun_header).
+    return 0 if FieldVersion >= FIELD_VERSION_23_1_EXT_1 else None
+
+
+def _direct_path_encode(Encoder: Callable, FieldVersion: int, Values: dict) -> bytes:
+    # A direct path call encoded at the session's field version, which the
+    # token primitive reads from the context, as _piggyback_head sets it.
+    Token = _ENCODE_FIELD_VERSION.set(FieldVersion)
+    try:
+        return Encoder(Values)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
+
+
+def encode_direct_path_prepare(
+    Seq: int, FieldVersion: int, Schema: str, Table: str, Columns: list[str]
+) -> bytes:
+    """The PREPARE call (128) of a direct path load into ``Schema.Table``'s
+    ``Columns`` (#2462): the names as keyword parameters, then the input array
+    -- the interface and stream versions, the object-id slot unset and a lock
+    wait."""
+    Keywords = [(_DPP_KEYWORD_SCHEMA, Schema), (_DPP_KEYWORD_TABLE, Table)]
+    Keywords += [(_DPP_KEYWORD_COLUMN, Name) for Name in Columns]
+    Inputs = [0] * (_DPP_INPUT_LOCK_WAIT + 1)
+    Inputs[_DPP_INPUT_INTERFACE_VERSION] = _DIRECT_PATH_VERSION
+    Inputs[_DPP_INPUT_STREAM_VERSION] = _DIRECT_PATH_VERSION
+    Inputs[_DPP_INPUT_NFOBJ_OID_POS] = 0xFFFF
+    Inputs[_DPP_INPUT_LOCK_WAIT] = 1
+    return _direct_path_encode(
+        _DIRECT_PATH_PREPARE_THIN,
+        FieldVersion,
+        {
+            'seq': Seq,
+            'token_number': _direct_path_token(FieldVersion),
+            'operation': _DIRECT_PATH_LOAD,
+            'keywords_present': True,
+            'keyword_count': len(Keywords),
+            'inputs_present': True,
+            'input_count': len(Inputs),
+            'metadata_present': True,
+            'metadata_length_present': True,
+            'parameters_present': True,
+            'parameters_length_present': True,
+            'outputs_present': True,
+            'outputs_length_present': True,
+            'keywords': [
+                {
+                    'text_length': 0,
+                    'name_length': len(Name.encode('utf-8')),
+                    'name': Name.encode('utf-8'),
+                    'index': Index,
+                }
+                for Index, Name in Keywords
+            ],
+            'inputs': [{'value': Value} for Value in Inputs],
+        },
+    )
+
+
+def decode_direct_path_prepare_reply(Data: bytes) -> tuple[list, int, bytes]:
+    """The PREPARE reply's return parameters (#2462), ``Data`` from past the
+    TTI_RPA token: the columns as a describe gives them -- a dict each, as
+    _decode_dcb_column reads it -- and the load's cursor, from the output
+    array, and what follows: the call's status. A CLOB column is described as a
+    LONG and a BLOB as a LONG RAW."""
+    (Count, Rest) = decode_ub4(Data)
+    Columns = []
+    for _ in range(Count):
+        (Column, Rest) = _decode_dcb_column(Rest)
+        Columns.append(Column)
+    (Parameters, Rest) = decode_ub4(Rest)  # a ub2, the same variable width
+    if Parameters:
+        raise ValueError(f'a direct path PREPARE returned {Parameters} parameters')
+    (Outputs, Rest) = decode_ub4(Rest)
+    Values = []
+    for _ in range(Outputs):
+        (Value, Rest) = decode_ub4(Rest)
+        Values.append(Value)
+    if len(Values) <= _DPP_OUTPUT_CURSOR:
+        raise ValueError('a direct path PREPARE returned no cursor')
+    return (Columns, Values[_DPP_OUTPUT_CURSOR], Rest)
+
+
+def decode_direct_path_reply(Data: bytes) -> bytes:
+    """A LOAD STREAM or OP reply's return parameters (#2462), ``Data`` from past
+    the TTI_RPA token: an output array no caller needs, a ub2 count of ub4s.
+    What follows, the call's status, is returned."""
+    (Count, Rest) = decode_ub4(Data)  # a ub2, the same variable width
+    for _ in range(Count):
+        (_, Rest) = decode_ub4(Rest)
+    return Rest
+
+
+class _DirectPathPiece:
+    # One piece of a LOAD STREAM (#2462): its row-header flags, the number of
+    # segments (values) it holds and their bytes.
+    __slots__ = ('flags', 'segments', 'data')
+
+    def __init__(self, flags: int = 0) -> None:
+        self.flags = flags
+        self.segments = 0
+        self.data = bytearray()
+
+    def room(self) -> int:
+        return _DPLS_MAX_PIECE - len(self.data)
+
+
+def encode_direct_path_pieces(Rows: list, Fast: list[bool]) -> tuple[bytes, int]:
+    """A LOAD STREAM's rows, packed into pieces (#2462), and their total
+    length.
+
+    ``Rows`` holds each row's cells, each the value's encoded bytes or None for
+    NULL; ``Fast`` says, per column, whether its type takes the fast row form
+    (every type but LONG, LOB, JSON and VECTOR). A piece is a row header -- its
+    flags, the length when it is a fast row, then the number of segments --
+    and at most 0xfff0 bytes of segments, each a value with its length: one
+    byte up to 0xfa, else 0xfe and a big-endian ub2, and 0xff for NULL. A value
+    that does not fit goes on in the next piece, the two flagged as split."""
+    Out = bytearray()
+    for Cells in Rows:
+        Pieces: list[_DirectPathPiece] = []
+        Current = _DirectPathPiece(_DPLS_FIRST)
+        for Cell in Cells:
+            if Current.segments == _DPLS_MAX_SEGMENTS:
+                Pieces.append(Current)
+                Current = _DirectPathPiece()
+            if Cell is None:
+                if Current.room() < 1:
+                    Pieces.append(Current)
+                    Current = _DirectPathPiece()
+                Current.data.append(TNS_NULL_LENGTH_INDICATOR)
+                Current.segments += 1
+            elif len(Cell) <= _DPLS_MAX_SHORT:
+                if len(Cell) + 1 > Current.room():
+                    Pieces.append(Current)
+                    Current = _DirectPathPiece()
+                Current.data += bytes([len(Cell)]) + Cell
+                Current.segments += 1
+            else:
+                Left = memoryview(Cell)
+                while len(Left) + 3 > Current.room():
+                    Take = Current.room() - 3
+                    Current.data += bytes([TNS_LONG_LENGTH_INDICATOR])
+                    Current.data += Take.to_bytes(2, 'big') + Left[:Take]
+                    Left = Left[Take:]
+                    Current.flags |= _DPLS_SPLIT_WITH_NEXT
+                    Current.segments += 1
+                    Pieces.append(Current)
+                    Current = _DirectPathPiece(
+                        _DPLS_SPLIT_WITH_PREV if len(Left) else 0
+                    )
+                if len(Left):
+                    Current.data += bytes([TNS_LONG_LENGTH_INDICATOR])
+                    Current.data += len(Left).to_bytes(2, 'big') + Left
+                    Current.segments += 1
+        Current.flags |= _DPLS_LAST
+        Pieces.append(Current)
+        FastRow = len(Pieces) == 1 and all(Fast[: len(Cells)])
+        for Piece in Pieces:
+            if FastRow:
+                Out += bytes([Piece.flags | _DPLS_FAST_ROW | _DPLS_FAST_PIECE])
+                Out += (len(Piece.data) + 4).to_bytes(2, 'big')
+            else:
+                Out += bytes([Piece.flags])
+            Out += bytes([Piece.segments]) + Piece.data
+        if len(Out) > _DPLS_MAX_MESSAGE:
+            raise ValueError('too much data for one direct path load call')
+    return (bytes(Out), len(Out))
+
+
+def encode_direct_path_load_stream(
+    Seq: int, FieldVersion: int, Cursor: int, Pieces: bytes, Length: int
+) -> bytes:
+    """A LOAD STREAM call (129): the load's cursor, the pieces' length and the
+    stream version, then the pieces as encode_direct_path_pieces packed them
+    (#2462)."""
+    return _direct_path_encode(
+        _DIRECT_PATH_LOAD_STREAM_THIN,
+        FieldVersion,
+        {
+            'seq': Seq,
+            'token_number': _direct_path_token(FieldVersion),
+            'cursor': Cursor,
+            'buffer_present': True,
+            'buffer_length': Length,
+            'stream_version': _DIRECT_PATH_VERSION,
+            'inputs_present': False,
+            'input_count': 0,
+            'outputs_present': True,
+            'outputs_length_present': True,
+            'pieces': Pieces,
+        },
+    )
+
+
+def encode_direct_path_op(
+    Seq: int, FieldVersion: int, Cursor: int, Operation: int
+) -> bytes:
+    """The OP call (130) that ends a direct path load (#2462):
+    DIRECT_PATH_OP_FINISH keeps what was streamed, DIRECT_PATH_OP_ABORT
+    discards it."""
+    return _direct_path_encode(
+        _DIRECT_PATH_OP_THIN,
+        FieldVersion,
+        {
+            'seq': Seq,
+            'token_number': _direct_path_token(FieldVersion),
+            'operation': Operation,
+            'cursor': Cursor,
+            'inputs_present': False,
+            'input_count': 0,
+            'outputs_present': True,
+            'outputs_length_present': True,
+        },
+    )
+
+
+# The types a direct path load writes, by the type its PREPARE reply describes
+# (#2462): those of fixed form take the fast row header; a LONG, LONG RAW, LOB,
+# JSON or VECTOR value does not.
+_DIRECT_PATH_TEXT = (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_LONG, TNS_TYPE_CLOB)
+_DIRECT_PATH_BINARY = (TNS_TYPE_RAW, TNS_TYPE_LONGRAW, TNS_TYPE_BLOB)
+_DIRECT_PATH_SLOW = (
+    TNS_TYPE_LONG,
+    TNS_TYPE_LONGRAW,
+    TNS_TYPE_CLOB,
+    TNS_TYPE_BLOB,
+    TNS_TYPE_JSON,
+    TNS_TYPE_VECTOR,
+)
+_DIRECT_PATH_DATETIMES = (
+    TNS_TYPE_DATE,
+    TNS_TYPE_TIMESTAMP,
+    TNS_TYPE_TIMESTAMPTZ,
+    TNS_TYPE_TIMESTAMPLTZ,
+)
+
+
+def _direct_path_cell(
+    Value: object, Column: dict, ServerCharset: int | None
+) -> bytes | None:
+    # One value as a direct path load writes it into Column (#2462), None for
+    # NULL. A LOB column is loaded as a LONG / LONG RAW; a CLOB's text goes as
+    # NCHAR (UTF-16) in a database of a multi-byte character set (an id of 800
+    # or more), as python-oracledb sends it, since the server converts nothing.
+    from seerdb.common.exceptions import DataError, IntegrityError
+
+    Name = (Column.get('column_name') or b'').decode('utf-8', 'replace')
+    if Value is None:
+        if not Column.get('null_ok', 1):
+            raise IntegrityError(f'column {Name} does not allow NULL values')
+        return None
+    Type = Column['data_type']
+    if Type in _DIRECT_PATH_TEXT:
+        National = Column.get('csfrm') == 2 or (
+            Type == TNS_TYPE_CLOB and (ServerCharset or 0) >= 800
+        )
+        Data = (
+            Value.encode('utf-16-be' if National else 'utf-8')
+            if isinstance(Value, str)
+            else bytes(Value)  # type: ignore[call-overload]
+        )
+    elif Type in _DIRECT_PATH_BINARY:
+        if isinstance(Value, str):
+            raise DataError(f'column {Name} takes bytes, not str')
+        Data = bytes(Value)  # type: ignore[call-overload]
+    elif Type == TNS_TYPE_NUMBER:
+        if isinstance(Value, Decimal):
+            return encode_token_decimal(Value)
+        if isinstance(Value, str):
+            return encode_token_decimal(Decimal(Value))
+        return encode_token_num(int(Value) if isinstance(Value, bool) else Value)  # type: ignore[arg-type]
+    elif Type == TNS_TYPE_BFLOAT:
+        return encode_token_binary_float(float(Value))  # type: ignore[arg-type]
+    elif Type == TNS_TYPE_BDOUBLE:
+        return encode_token_binary_double(float(Value))  # type: ignore[arg-type]
+    elif Type in _DIRECT_PATH_DATETIMES:
+        if isinstance(Value, datetime.datetime):
+            Moment = Value
+        elif isinstance(Value, datetime.date):
+            Moment = datetime.datetime(Value.year, Value.month, Value.day)
+        else:
+            raise DataError(
+                f'column {Name} takes a datetime, not {type(Value).__name__}'
+            )
+        if Type == TNS_TYPE_DATE:
+            return encode_token_datetime(Moment.replace(microsecond=0, tzinfo=None))
+        if Type == TNS_TYPE_TIMESTAMPTZ:
+            if Moment.tzinfo is None:
+                Moment = Moment.replace(tzinfo=datetime.timezone.utc)
+            return encode_token_datetime(Moment)
+        return encode_token_datetime(Moment.replace(tzinfo=None))
+    elif Type == TNS_TYPE_INTERVALDS:
+        return encode_token_interval_ds(Value)  # type: ignore[arg-type]
+    elif Type == TNS_TYPE_INTERVALYM:
+        return encode_token_interval_ym(Value)  # type: ignore[arg-type]
+    elif Type == TNS_TYPE_BOOLEAN:
+        return bytes([1 if Value else 0])
+    elif Type == TNS_TYPE_JSON:
+        from seerdb.common.oson import encode_oson
+
+        return encode_oson(Value)
+    elif Type == TNS_TYPE_VECTOR:
+        from seerdb.common.vector import encode_vector
+
+        return encode_vector(Value)
+    else:
+        from seerdb.common.exceptions import NotSupportedError
+
+        raise NotSupportedError(
+            f'a direct path load cannot write column {Name} (type {Type})'
+        )
+    Limit = Column.get('max_size') or 0
+    if (
+        Limit
+        and Type in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR, TNS_TYPE_RAW)
+        and len(Data) > Limit
+    ):
+        raise DataError(
+            f'value for column {Name} is {len(Data)} bytes, past its {Limit}'
+        )
+    return Data
+
+
+def encode_direct_path_rows(
+    Rows: list, Columns: list[dict], ServerCharset: int | None
+) -> tuple[list, list[bool]]:
+    """Each row's cells as a direct path load writes them, and per column
+    whether its type takes the fast row form (#2462). ``Columns`` are the
+    PREPARE reply's, in the load's column order."""
+    from seerdb.common.exceptions import ProgrammingError
+
+    Fast = [Column['data_type'] not in _DIRECT_PATH_SLOW for Column in Columns]
+    Out = []
+    for Row in Rows:
+        Values = list(Row)
+        if len(Values) != len(Columns):
+            raise ProgrammingError(
+                f'a row has {len(Values)} values for {len(Columns)} columns'
+            )
+        Out.append(
+            [
+                _direct_path_cell(Value, Column, ServerCharset)
+                for Value, Column in zip(Values, Columns)
+            ]
+        )
+    return (Out, Fast)
 
 
 def encode_dictionary_description(Dictionary: dict) -> bytes:

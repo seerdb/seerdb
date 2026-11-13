@@ -9903,3 +9903,86 @@ NCHAR values chunked with `ub4` lengths; the Mirror does not advertise it
 
 Read by a pattern search for each descriptor's lead, the Mirror took descriptor
 bytes for the first value, and PostgreSQL refused the NUL in them.
+
+## 44. Direct path load — functions 128, 129 and 130 (#2462)
+
+A direct path load writes rows straight into a table's blocks, past SQL: no
+triggers fire. python-oracledb 4.0 sends it from its thin mode, and seerdb sends
+the same three calls (`Connection.direct_path_load`). Measured from python-oracledb
+26.1 thin against 23ai and cross-checked against its message classes. seerdb's
+encoders give the captured calls byte for byte (`tests/test_direct_path.py`).
+seerdb's calls load on 18c (field version 11), 21c (16) and 23ai (24). The
+calls have no form below 12.1, and seerdb refuses a load there before sending
+anything.
+
+Each call is a function call (`03 <func> <seq>`, then from field version 23.1
+EXT 1 the ub8 token number, `00`), in thin's variable-width integers:
+
+| call | function | carries | reply's return parameters |
+|---|---|---|---|
+| PREPARE | 128 (`0x80`) | operation 1 (load); keyword parameters naming the table and columns; a 15-slot input array | the columns, then the output array with the load's cursor |
+| LOAD STREAM | 129 (`0x81`) | the cursor; the rows, packed into pieces | an output array no caller needs |
+| OP | 130 (`0x82`) | the operation, 2 FINISH or 1 ABORT; the cursor | the same |
+
+**PREPARE.**
+- After the operation come pointer-and-count pairs for the keywords and the
+  inputs, then six present-pointers (metadata, parameters, outputs, each with
+  its length), then the keywords.
+- Each keyword is a ub2 text length (0), a ub2 name length, the name and a ub2
+  index: 3 the schema, 1 the table, 4 for each column in load order.
+- Then the inputs, each a ub4:
+  - slot 0, the interface version, and slot 1, the stream version: both 400;
+  - slot 11, the object-id position: `0xffff`;
+  - slot 14, wait for the table lock: 1;
+  - every other slot 0.
+- The reply (`08`, the RPA) holds:
+  - a ub4 column count, then each column as a describe sends it (§5.3);
+  - a ub2 parameter count (0);
+  - a ub2 output count and the outputs, each a ub4. Output 3 is the cursor the
+    other two calls name.
+- **A LOB column is described as a LONG (CLOB) or LONG RAW (BLOB)**, and is
+  loaded as one.
+
+**LOAD STREAM.** The cursor (ub2), a present-pointer, the pieces' total length
+(ub4), the stream version (400), an absent input array, two output pointers,
+then the pieces.
+- Each row is one or more **pieces**: a flags byte, then a segment count (ub1),
+  then the segments. A segment is one value:
+  - a length byte up to `0xfa`, then the value;
+  - `fe` and a big-endian ub2 for a longer one;
+  - `ff` for NULL.
+- A piece holds at most `0xfff0` bytes of segments and 255 segments. A value
+  that doesn't fit goes on in the next piece.
+- The flags:
+
+| flag | meaning |
+|---|---|
+| `0x08` | the row's first piece |
+| `0x04` | the row's last piece |
+| `0x02` | goes on from the previous piece's last value |
+| `0x01` | its last value goes on in the next piece |
+| `0x20` and `0x10` | a fast row: a row in one piece whose every value is of a fixed form (not LONG, LONG RAW, LOB, JSON or VECTOR). After the flags comes the piece's length, a big-endian ub2 counting the segments plus 4 |
+
+- Values are in their row-data forms: NUMBER, DATE and TIMESTAMP as a fetch
+  returns them, text in the column's character set.
+- **A CLOB's text goes as UTF-16 in a database whose character set id is 800
+  or more**, as python-oracledb sends it. The server converts nothing.
+- **Nothing blank-pads a CHAR value**: `'ab'` loaded into a CHAR(5) reads back
+  as `'ab'`. python-oracledb sends it as given too.
+- A load may send any number of LOAD STREAM calls, one per batch. One call's
+  pieces stay under 1,073,728,895 bytes.
+
+**OP.** The operation (ub4), the cursor (ub2), an absent input array and two
+output pointers.
+- **FINISH commits** the streamed rows: another session sees them, and a
+  rollback after the load keeps them.
+- **ABORT discards** them. A client sends it whenever the load fails after the
+  PREPARE: a row it refuses to encode (a NULL for a NOT NULL column, a value
+  past its column), or a server error. Nothing streamed before is kept.
+
+**Errors** come as the status alone, without the return parameters. A table
+that doesn't exist draws ORA-39826 to the PREPARE ("Direct path load of view or
+synonym ... could not be resolved"), and the session goes on.
+
+The Mirror serves none of the three: it answers ORA-03115 ("TTC function 128")
+and the session stays usable (MIRROR.md, *Not served*).
