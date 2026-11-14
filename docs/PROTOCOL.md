@@ -5933,6 +5933,27 @@ raises `VectorError` rather than spinning to build an unbounded list (#228).
 
 ## 19. Oracle 9i (pre-10g) query/fetch — the fv2 dialect (#97)
 
+**At a glance.** For 9i, Oracle shipped two clients: OCI (sqlplus and the like,
+the thick wire) and the JDBC thin driver (ojdbc14), a pure-Java TTC client.
+python-oracledb's thin mode never supported 9i, so ojdbc14 is the only thin
+reference there is. seerdb's 9i session is a mix of the two. Each part is
+seerdb's own code, and every value that names the client is the caller's or
+seerdb's, none copied from a capture:
+
+| Part | What seerdb sends | Its model |
+|---|---|---|
+| CONNECT descriptor | `(CID=(PROGRAM=<program>)(HOST=<machine>)(USER=<OS user>))` (§19.8.1) | python-oracledb's form |
+| Protocol banner (TTI_PRO) | `seerdb <machine>/<os>`; with `oall8=True`, `<machine>/<os> 2.4.xx`, which that path's TTI_DTY needs (§19.18) | seerdb's own; OCI's form for `oall8` |
+| Type negotiation (TTI_DTY) | the thin-style table 10g and later get, with field-version-2 capabilities; with `oall8=True`, OCI's compact form | seerdb's 10g+ table; OCI's for `oall8` |
+| Login | O3LOGON in the key-value OSESSKEY / OAUTH envelope (§4), with `AUTH_PROGRAM_NM`, `AUTH_MACHINE`, `AUTH_PID` and `AUTH_SID` from the caller's settings (#2342) | OCI's envelope, also 8i's and 10g+'s |
+| Queries, DML, PL/SQL (the default, `Fv2Dialect`) | OOPEN, then `TTI_ALL7` (0x47), the describe (0x62) and the close, below | ojdbc14's dialect: the thin one |
+| The same with `oall8=True` (`Fv2Oall8Dialect`) | the native 64-bit OALL8 (§19.18) | OCI's wire, opt-in |
+
+ojdbc14's login is the positional `TTI_3LOGA` / `TTI_3LOGON` instead (§4,
+§19.8.1). seerdb's first 9i login (#90) copied it, with its fixed session strings
+(`unknown`, `JDBC Thin Client`), and #2342 replaced it with the envelope; 9i
+takes both.
+
 Oracle 9i negotiates **TTC field version 2** (`FIELD_VERSION_9_2`). Its login is
 O3LOGON (§4, gated `field_version < FIELD_VERSION_10_2`); its **query/fetch path
 is a different RPC** from the `TTI_ALL8` (§5.1) seerdb sends to 10g+. A 9i

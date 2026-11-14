@@ -18246,10 +18246,11 @@ def _encode_dictionary_sess(Dictionary: dict) -> bytes:
 
 
 # --- Oracle 8i (8.1.7) O3LOGON via the OSESSKEY/OAUTH envelope ---------------
-# 8i uses the same DES O3LOGON *crypto* as 9i, but wraps it in the OSESSKEY
-# (0x76) / OAUTH (0x73) function envelope with key-value AUTH_ pairs -- NOT 9i's
-# positional TTI_3LOGA/TTI_3LOGON. Sending 3LOGA to 8i draws a TTI_OER. The
-# envelope is the 10g login's head and pairs (`_AUTH_HEAD`, `_AUTH_PAIR`) at the
+# 8i uses the same DES O3LOGON *crypto* as 9i, and seerdb wraps it in the
+# OSESSKEY (0x76) / OAUTH (0x73) function envelope with key-value AUTH_ pairs,
+# as it does for 9i (#2342). 8i takes ojdbc14's positional TTI_3LOGA/TTI_3LOGON
+# too; the TTI_OER seerdb once drew came from its own attempt at them (PROTOCOL.md
+# §19.8, §19.8.1). The envelope is the 10g login's head and pairs (`_AUTH_HEAD`, `_AUTH_PAIR`) at the
 # 8i codec's fixed little-endian widths (#2284): what read before as a ub1
 # length and a big-endian ub4 repeat of it is a ub4 length and a value, a ub1
 # length and the bytes. Reproduced byte for byte from a live 9.2-client -> 8.1.7
