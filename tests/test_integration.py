@@ -652,6 +652,9 @@ del _FV
 # By the server.
 _SODA = _Need('SODA needs an Oracle 18c+ server (DBMS_SODA)', min_server=18)
 _RETURNING_OLD_NEW = _Need('RETURNING OLD / NEW needs Oracle 23ai', min_server=23)
+_JSON_VALUE = _Need(
+    'JSON_VALUE with these clauses needs Oracle 18c or later', min_server=18
+)
 _TIMESTAMP_AT_SESSION_ZONE = _Need(
     'a TIMESTAMP AT TIME ZONE is read in the session zone from 18c', min_server=18
 )
@@ -18386,6 +18389,41 @@ class ReturningOldNewIntegration(_IntegrationBase):
             [a],
         )
         self.assertEqual(a.getvalue(), 10)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_JSON_VALUE)
+class JsonValueIntegration(_IntegrationBase):
+    """JSON_VALUE, as Oracle answers it (#2679). Through a Mirror-over-PG it
+    needs PostgreSQL 17; before, it is refused (docs/MIRROR.md, *By
+    PostgreSQL version*)."""
+
+    def _value(self, expression: str):
+        self.cur.execute(f'SELECT {expression} FROM dual')
+        return self.cur.fetchone()[0]
+
+    def test_the_value_its_type_and_the_defaults(self):
+        doc = """{"a":12.5,"b":true,"c":[1,2]}"""
+        self.assertEqual(self._value(f"JSON_VALUE('{doc}', '$.a')"), '12.5')
+        self.assertEqual(
+            self._value(f"JSON_VALUE('{doc}', '$.a' RETURNING NUMBER)"), Decimal('12.5')
+        )
+        self.assertEqual(self._value(f"JSON_VALUE('{doc}', '$.b')"), 'true')
+        self.assertIsNone(self._value(f"JSON_VALUE('{doc}', '$.c')"))
+        self.assertEqual(
+            self._value(f"JSON_VALUE('{doc}', '$.z' DEFAULT 'none' ON EMPTY)"), 'none'
+        )
+        self.assertIsNone(self._value("JSON_VALUE('not json', '$.a')"))
+
+    def test_error_on_error_and_on_empty(self):
+        for expression, code in (
+            ("""JSON_VALUE('{"c":[1,2]}', '$.c' ERROR ON ERROR)""", 40456),
+            ("""JSON_VALUE('{"a":1}', '$.z' ERROR ON EMPTY)""", 40462),
+        ):
+            with self.subTest(expression=expression):
+                with self.assertRaises(seerdb.DatabaseError) as raised:
+                    self._value(expression)
+                self.assertEqual(raised.exception.code, code)
 
 
 if __name__ == '__main__':

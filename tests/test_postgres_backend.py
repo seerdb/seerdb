@@ -145,7 +145,8 @@ def test_an_outer_join_operator_is_lowered_and_noted() -> None:
     # through the idiom pipeline, and notes the rule for the translation report
     # (#1557) exactly as the regex rules do.
     translated, rules = _idioms_and_rules(
-        'SELECT e.ename, d.dname FROM emp e, dept d WHERE e.deptno = d.deptno(+)'
+        'SELECT e.ename, d.dname FROM emp e, dept d WHERE e.deptno = d.deptno(+)',
+        180000,
     )
     assert translated == (
         'SELECT e.ename, d.dname FROM emp e LEFT JOIN dept d ON e.deptno = d.deptno'
@@ -153,7 +154,9 @@ def test_an_outer_join_operator_is_lowered_and_noted() -> None:
     assert 'outer-join' in rules
     # A statement with no (+) is untouched and notes nothing.
     assert (
-        _idioms_and_rules('SELECT * FROM emp e, dept d WHERE e.deptno = d.deptno')[1]
+        _idioms_and_rules(
+            'SELECT * FROM emp e, dept d WHERE e.deptno = d.deptno', 180000
+        )[1]
         == ()
     )
 
@@ -6168,8 +6171,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # and three overloads each of sys.ora_at_time_zone and sys.ora_at_local
     # (#2617), and an interval's text: sys.ora_interval_text and
     # sys.ora_intervalym_text (#2621), and the two state functions of MAX and
-    # MIN of a WITH TIME ZONE value: sys.ora_tstz_larger and smaller (#2660).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 385
+    # MIN of a WITH TIME ZONE value: sys.ora_tstz_larger and smaller (#2660),
+    # and JSON_VALUE's lenient context item, three sys.ora_json_or_null (#2679).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 388
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -18325,5 +18329,70 @@ def test_a_not_null_s_name_and_whose_it_is_from_postgresql_18() -> None:
         finally:
             backend.rollback()
             backend.execute('DROP TABLE t2677')
+    finally:
+        backend.close()
+
+
+# JSON_VALUE cases and 23ai's answers (#2679), measured on 23ai Free.
+_JSON_VALUE_CASES = (
+    ("JSON_VALUE('{\"a\":12.5}', '$.a')", '12.5'),
+    ("JSON_VALUE('{\"a\":12.5}', '$.a' RETURNING NUMBER)", Decimal('12.5')),
+    ('JSON_VALUE(\'{"a":"x"}\', \'$.a\' RETURNING VARCHAR2(10))', 'x'),
+    ("JSON_VALUE('{\"a\":[1,2]}', '$.a')", None),
+    ("JSON_VALUE('{\"a\":1}', '$.b')", None),
+    ("JSON_VALUE('{\"a\":1}', '$.b' DEFAULT 'x' ON EMPTY)", 'x'),
+    ('JSON_VALUE(\'{"a":"abc"}\', \'$.a\' RETURNING NUMBER)', None),
+    ('JSON_VALUE(\'{"a":"abc"}\', \'$.a\' RETURNING NUMBER DEFAULT -1 ON ERROR)', -1),
+    ("JSON_VALUE('{\"a\":true}', '$.a')", 'true'),
+    ("JSON_VALUE('{\"a\":null}', '$.a')", None),
+    ('JSON_VALUE(\'{"a":{"b":[10,20]}}\', \'$.a.b[1]\')', '20'),
+    ("JSON_VALUE('not json', '$.a')", None),
+    ("JSON_VALUE('{\"a\":12.5}', '$.a.number()')", Decimal('12.5')),
+    ("JSON_VALUE('{\"a\":true}', '$.a.boolean()')", True),
+    ("JSON_VALUE('{\"a\":[1,2]}', '$.a.size()')", 2),
+    ("JSON_VALUE(JSON('{\"a\":7}'), '$.a')", '7'),
+)
+
+
+def test_json_value_is_23ai_s_from_postgresql_17() -> None:
+    # The Mirror had no JSON_VALUE (#2679): on 17 and later it is the native
+    # one, with 23ai's types and answers: VARCHAR2(4000) by default, a boolean
+    # 'true', invalid JSON NULL, an item method's type, and ORA-40456 /
+    # ORA-40462 for ERROR ON ERROR / ON EMPTY.
+    from seerdb.server.backend import BackendError
+
+    if _server_version_num() < 170000:
+        pytest.skip('JSON_VALUE needs PostgreSQL 17')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        for expression, expected in _JSON_VALUE_CASES:
+            (got,) = backend.execute(f'SELECT {expression} FROM dual').rows[0]
+            assert got == expected, expression
+        for expression, code in (
+            ("JSON_VALUE('{\"a\":[1,2]}', '$.a' ERROR ON ERROR)", 40456),
+            ("JSON_VALUE('{\"a\":1}', '$.b' ERROR ON EMPTY)", 40462),
+        ):
+            with pytest.raises(BackendError) as raised:
+                backend.execute(f'SELECT {expression} FROM dual')
+            backend.rollback()
+            assert raised.value.ora_code == code, expression
+    finally:
+        backend.close()
+
+
+def test_json_value_before_postgresql_17_is_refused() -> None:
+    # PostgreSQL 16 has no JSON_VALUE (docs/MIRROR.md, *By PostgreSQL version*).
+    from seerdb.server.backend import UnsupportedFeature
+
+    if _server_version_num() >= 170000:
+        pytest.skip('PostgreSQL 17 has JSON_VALUE')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        with pytest.raises(UnsupportedFeature):
+            backend.execute("SELECT JSON_VALUE('{\"a\":1}', '$.a') FROM dual")
     finally:
         backend.close()
