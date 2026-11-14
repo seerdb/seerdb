@@ -4027,7 +4027,12 @@ _ORACLE_DICTIONARY_DDL = (
     'END::text AS search_condition, '
     'upper(rc.unique_constraint_schema) AS r_owner, '
     'ora_name(rc.unique_constraint_name) AS r_constraint_name, '
-    "'NO ACTION' AS delete_rule, 'ENABLED' AS status, 'VALIDATED' AS validated, "
+    "'NO ACTION' AS delete_rule, "
+    # A constraint DISABLE switched off (#2663): PostgreSQL 18 keeps it NOT
+    # ENFORCED, and `enforced` says so. Before 18 the column is always YES.
+    "CASE WHEN tc.enforced = 'NO' THEN 'DISABLED' ELSE 'ENABLED' END AS status, "
+    "CASE WHEN tc.enforced = 'NO' THEN 'NOT VALIDATED' ELSE 'VALIDATED' END "
+    'AS validated, '
     # An unnamed constraint is named SYS_Cnnnnnnn (#2141), and a NOT NULL
     # keeps information_schema's made-up name: Oracle's GENERATED NAME both.
     "CASE WHEN nn.attnum IS NOT NULL OR tc.constraint_name ~* '^sys_c[0-9]{7}$' "
@@ -15843,6 +15848,44 @@ class _PrivilegeDenied(BackendError):
         self.relation = relation
 
 
+# Oracle's DISABLE and ENABLE of a constraint (#2663), in either spelling:
+# ALTER TABLE t DISABLE CONSTRAINT c, and ALTER TABLE t MODIFY CONSTRAINT c
+# DISABLE. What follows the constraint's name, CASCADE or KEEP INDEX, is
+# refused with the rest.
+_CONSTRAINT_STATE = re.compile(
+    rf'\s*ALTER\s+TABLE\s+{_TABLE_NAME}\s+(?:'
+    r'(?P<verb>DISABLE|ENABLE)(?:\s+(?P<check>VALIDATE|NOVALIDATE))?\s+CONSTRAINT\s+'
+    r'(?P<name>"[^"]+"|[A-Za-z_][\w$#]*)'
+    r'|MODIFY\s+CONSTRAINT\s+(?P<mname>"[^"]+"|[A-Za-z_][\w$#]*)\s+'
+    r'(?P<mverb>DISABLE|ENABLE)(?:\s+(?P<mcheck>VALIDATE|NOVALIDATE))?'
+    r')(?P<rest>[^;]*?)\s*;?\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+# The same of a key named by its kind: DISABLE PRIMARY KEY, ENABLE UNIQUE (a).
+_KEY_STATE = re.compile(
+    rf'\s*ALTER\s+TABLE\s+{_TABLE_NAME}\s+(?:DISABLE|ENABLE)'
+    r'(?:\s+(?:VALIDATE|NOVALIDATE))?\s+(?:PRIMARY\s+KEY|UNIQUE)\b',
+    re.IGNORECASE,
+)
+# What _constraint_state turns ENABLE into, which a check of the rows can fail.
+_ENFORCE_AGAIN = re.compile(
+    r'\s*ALTER\s+TABLE\s+.+\s+ALTER\s+CONSTRAINT\s+\S+\s+ENFORCED\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+_ORA_CANNOT_VALIDATE_PARENT_KEYS = 2298
+_ORA_CANNOT_ENABLE_NO_SUCH = 2430
+_ORA_CANNOT_DISABLE_NO_SUCH = 2431
+# A constraint's kind, as a DISABLE's refusal names it.
+_DISABLE_REFUSED_KINDS = {
+    'c': 'CHECK',
+    'n': 'NOT NULL',
+    'p': 'PRIMARY KEY',
+    'u': 'UNIQUE',
+    'x': 'exclusion',
+    't': 'trigger',
+}
+
+
 def _backend_error(
     exc,
     *,
@@ -15857,6 +15900,19 @@ def _backend_error(
         if compile_error is not None:
             return compile_error
     code = _ora_code_for(exc)
+    if (
+        code == ORA_PARENT_KEY_NOT_FOUND
+        and translated is not None
+        and _ENFORCE_AGAIN.match(translated)
+    ):
+        # ENABLE of a foreign key whose rows include an orphan (#2663).
+        diag = getattr(exc, 'diag', None)
+        schema = (getattr(diag, 'schema_name', None) or '').upper()
+        name = (getattr(diag, 'constraint_name', None) or '').upper()
+        return BackendError(
+            f'cannot validate ({schema}.{name}) - parent keys not found',
+            ora_code=_ORA_CANNOT_VALIDATE_PARENT_KEYS,
+        )
     if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and _names_a_sequence(exc, original):
         code = _ORA_SEQUENCE_DOES_NOT_EXIST
     if (
@@ -19524,6 +19580,7 @@ class PostgresBackend:
             sql,
         )
         sql = _ruled('admin', _translate_admin(sql), sql)
+        sql = _ruled('constraint-state', self._constraint_state(sql), sql)
         sql = _ruled('instant-index', self._instant_index_keys(sql), sql)
         sql = _ruled('index-expressions', _parenthesized_index_keys(sql), sql)
         sql = _ruled('constraint-names', self._named_constraints(sql), sql)
@@ -21714,6 +21771,80 @@ class PostgresBackend:
                 + sql[star.start(4) :]
             )
         return sql
+
+    def _constraint_state(self, sql: str) -> str:
+        # Oracle's DISABLE / ENABLE of a constraint (#2663). PostgreSQL 18
+        # switches a foreign key off and on, ALTER CONSTRAINT ... NOT ENFORCED |
+        # ENFORCED, and checks its rows as it goes back on, as ENABLE VALIDATE
+        # does. It has no way for any other kind, nor before 18, nor for ENABLE
+        # NOVALIDATE: those are refused (docs/MIRROR.md, *By PostgreSQL
+        # version* and *Known limits*).
+        if _KEY_STATE.match(sql):
+            raise UnsupportedFeature(
+                'DISABLE or ENABLE of a PRIMARY KEY or UNIQUE constraint: '
+                'PostgreSQL switches only a foreign key off and on'
+            )
+        found = _CONSTRAINT_STATE.match(sql)
+        if found is None:
+            return sql
+        table = found.group(1)
+        name = found.group('name') or found.group('mname')
+        disable = (found.group('verb') or found.group('mverb')).upper() == 'DISABLE'
+        check = (found.group('check') or found.group('mcheck') or '').upper()
+        if found.group('rest').strip():
+            raise UnsupportedFeature(
+                f'{found.group("rest").strip().upper()} on DISABLE or ENABLE of a '
+                'constraint'
+            )
+        if check == 'NOVALIDATE':
+            raise UnsupportedFeature(
+                "ENABLE NOVALIDATE: PostgreSQL checks a constraint's rows as it "
+                'turns it back on'
+            )
+        # The table as to_regclass reads it: each part as PostgreSQL resolves
+        # it, quoted.
+        regclass = '.'.join(
+            '"' + _folded_name(part, ()).replace('"', '""') + '"'
+            for part in re.findall(r'"[^"]+"|[^.]+', table)
+        )
+        row = self._conn.execute(
+            'SELECT c.contype FROM pg_constraint c WHERE c.conrelid = '
+            'to_regclass(%s) AND c.conname = %s',
+            (regclass, _folded_name(name, ())),
+        ).fetchone()
+        target = f'ALTER TABLE {table} ALTER CONSTRAINT {name}'
+        if row is None:
+            exists = self._conn.execute(
+                'SELECT to_regclass(%s) IS NOT NULL', (regclass,)
+            ).fetchone()
+            if exists is None or not exists[0]:
+                raise _ObjectMissing(
+                    '.'.join(
+                        _folded_name(part, ())
+                        for part in re.findall(r'"[^"]+"|[^.]+', table)
+                    ),
+                    None,
+                )
+            shown = name[1:-1] if name.startswith('"') else name.upper()
+            verb = 'disable' if disable else 'enable'
+            raise BackendError(
+                f'cannot {verb} constraint ({shown}) - no such constraint',
+                ora_code=(
+                    _ORA_CANNOT_DISABLE_NO_SUCH
+                    if disable
+                    else _ORA_CANNOT_ENABLE_NO_SUCH
+                ),
+            )
+        if row[0] != 'f':
+            raise UnsupportedFeature(
+                f'DISABLE or ENABLE of a {_DISABLE_REFUSED_KINDS.get(row[0], row[0])} '
+                'constraint: PostgreSQL switches only a foreign key off and on'
+            )
+        if self._conn.info.server_version < 180000:
+            raise UnsupportedFeature(
+                'DISABLE or ENABLE of a foreign key needs PostgreSQL 18 or later'
+            )
+        return f'{target} {"NOT ENFORCED" if disable else "ENFORCED"}'
 
     def _named_constraints(self, sql: str) -> str:
         # `sql` with each constraint it declares without a name named as

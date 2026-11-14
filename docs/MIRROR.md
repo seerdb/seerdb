@@ -670,6 +670,7 @@ pgvector 0.8.0 and plpgsql_check 2.10.11.
 |---|---|---|
 | A NOT NULL constraint keeps its name: `CONSTRAINT nn NOT NULL` shows as `NN` in `USER_CONSTRAINTS`, and `ALTER TABLE … DROP CONSTRAINT nn` drops it | PostgreSQL 18 | listed under a made-up name (`<oid>_<oid>_<n>_not_null`); `DROP CONSTRAINT` is refused with ORA-00942 |
 | `MERGE INTO` a view | PostgreSQL 17 | refused: "cannot execute MERGE on relation" |
+| `ALTER TABLE … DISABLE CONSTRAINT` / `ENABLE CONSTRAINT` of a foreign key, and `MODIFY CONSTRAINT … DISABLE \| ENABLE`: the constraint shows as `DISABLED` / `NOT VALIDATED`, and `ENABLE` checks the rows (an orphan is ORA-02298) | PostgreSQL 18 | refused with ORA-03001 |
 
 ### Which role to connect as
 
@@ -1276,6 +1277,11 @@ Read them as follows:
 The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 
 - **Invalid UTF-8** cannot be stored in a string column (#1659).
+- **Only a foreign key can be disabled**, and only from PostgreSQL 18
+  (*By PostgreSQL version*). `DISABLE` / `ENABLE` of a CHECK, NOT NULL,
+  PRIMARY KEY or UNIQUE constraint, `ENABLE NOVALIDATE`, and `CASCADE` or
+  `KEEP INDEX` on either are refused with ORA-03001: PostgreSQL can't switch
+  those off and on ([#2663](https://github.com/seerdb/seerdb/issues/2663)).
 - **Fractional seconds** stop at six digits; a `TIMESTAMP(9)` is a
   `TIMESTAMP(6)`.
 - **A WITH TIME ZONE value keeps no region.** It keeps its instant and its
