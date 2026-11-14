@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Callable, Protocol
 
 from seerdb.common.datatypes import dbtype_for_oracle_type
+from seerdb.common.exceptions import InternalError, connection_closed
 from seerdb.common.sqltext import is_reusable_dml
 from seerdb.common.tns import (
     FV2_BIND_IN,
@@ -388,7 +389,7 @@ class Fv2Dialect:
         yield Send(encode_o7_describe(0, cursor))
         resp = yield RECV
         if resp is False:
-            raise Exception('Connection closed during 9i describe')
+            raise connection_closed('9i describe')
         columns = decode_fv2_describe(resp[1])
         # Execute, then fetch in batches: each batch re-sends the same exec+fetch
         # TTI_ALL7; the server continues the cursor and ends with ORA-01403 (#99).
@@ -401,7 +402,7 @@ class Fv2Dialect:
             yield Send(encode_o7_exec(0, columns, cursor))
             resp = yield RECV
             if resp is False:
-                raise Exception('Connection closed during 9i fetch')
+                raise connection_closed('9i fetch')
             (rows, err_code, message) = decode_fv2_exec_status(resp[1], columns)
             all_rows.extend(rows)
             if err_code or not rows:
@@ -472,7 +473,7 @@ class Fv2Dialect:
         )
         resp = yield RECV
         if resp is False:
-            raise Exception('Connection closed during 9i DML')
+            raise connection_closed('9i DML')
         # An error (ORA-00942, a constraint) comes back in the result, as on
         # 10g+, so the cursor can report the rows applied before it: a batch
         # that fails part-way applied the rows before the failing one, and the
@@ -544,7 +545,7 @@ class Fv2Dialect:
         yield Send(encode_o7_block(0, sql, bind, Cursor=cursor))
         resp = yield RECV
         if resp is False:
-            raise Exception('Connection closed during 9i PL/SQL block')
+            raise connection_closed('9i PL/SQL block')
         packet = resp[1]
         # The server returns values only for the binds the block writes, and
         # takes inputs only for those it reads. A Var used only as input counted
@@ -566,7 +567,7 @@ class Fv2Dialect:
             yield Send(encode_tokens_rxd(input_values, b''))
             resp = yield RECV
             if resp is False:
-                raise Exception('Connection closed during 9i PL/SQL bind send')
+                raise connection_closed('9i PL/SQL bind send')
             packet = resp[1]
         # A block's ORA-01403 is a real error, not an end of fetch (#1039).
         fv2_raise_for_error(  # ORA-06512, 01403 …
@@ -633,7 +634,7 @@ class Fv2Dialect:
             yield Send(encode_o7_lob_getlen(0, locator))
             resp = yield RECV
             if resp is False:
-                raise Exception('Connection closed during 9i LOB GETLEN')
+                raise connection_closed('9i LOB GETLEN')
             amount = decode_fv2_lob_getlen(resp[1]) - offset + 1
         if amount <= 0:
             return b''
@@ -658,7 +659,7 @@ class Fv2Dialect:
         )
         resp = yield RECV
         if resp is False:
-            raise Exception('Connection closed during 9i LOB call')
+            raise connection_closed('9i LOB call')
         fv2_raise_for_error(resp[1])
         return decode_fv2_lob_value(resp[1], operation)
 
@@ -670,16 +671,18 @@ class Fv2Dialect:
         yield Send(encode_o7_bfile_open(0, locator))
         resp = yield RECV
         if resp is False:
-            raise Exception('Connection closed during 9i BFILE FILE_OPEN')
+            raise connection_closed('9i BFILE FILE_OPEN')
         fv2_raise_for_error(resp[1])  # e.g. ORA-22285
         opened = decode_fv2_opened_locator(resp[1])
         if opened is None:
-            raise Exception('Unexpected 9i BFILE FILE_OPEN reply', resp[1][:8].hex())
+            raise InternalError(
+                f'unexpected 9i BFILE FILE_OPEN reply: {resp[1][:8].hex()!r}'
+            )
         try:
             yield Send(encode_o7_lob_getlen(0, opened))
             resp = yield RECV
             if resp is False:
-                raise Exception('Connection closed during 9i BFILE GETLEN')
+                raise connection_closed('9i BFILE GETLEN')
             amount = decode_fv2_lob_getlen(resp[1])
             if amount <= 0:
                 return b''
@@ -698,7 +701,7 @@ class Fv2Dialect:
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during 9i LOB READ')
+                raise connection_closed('9i LOB READ')
             data += received[1]
             (content, complete) = decode_fv2_lob_chunks(data)
             if complete:
@@ -888,7 +891,7 @@ class Oall8Dialect:
         yield Send(self._closing() + self._encode_query(self._sql_text(sql), bind))
         resp = yield RECV
         if resp is False:
-            raise Exception(f'Connection closed during {self._wire} query response')
+            raise connection_closed(f'{self._wire} query response')
         packet = resp[1]
         # A rejected SELECT comes back as a TTI_OER (0x04) error, not the TTI_DCB
         # (0x10) describe -- surface the mapped ORA error rather than overrunning
@@ -1010,9 +1013,7 @@ class Oall8Dialect:
             except (Truncated, IndexError):
                 received = yield RECV
                 if received is False:
-                    raise Exception(
-                        f'Connection closed during {self._wire} describe'
-                    ) from None
+                    raise connection_closed(f'{self._wire} describe') from None
                 more = received[1]
                 if more[:1] == bytes([TTI_OER]):
                     (err_code, message) = self._terminal_error(more)
@@ -1062,7 +1063,7 @@ class Oall8Dialect:
         while True:
             received = yield RECV
             if received is False:
-                raise Exception(f'Connection closed during {self._wire} {what}')
+                raise connection_closed(f'{self._wire} {what}')
             buf += received[1]
             if self._terminal_complete(buf):
                 return buf
@@ -1119,7 +1120,7 @@ class Oall8Dialect:
         )
         received = yield RECV
         if received is False:
-            raise Exception('Connection closed during 8i DML')
+            raise connection_closed('8i DML')
         self._finished(decode_8i_cursor_id(received[1]))
         (row_count, err_code, message) = decode_8i_dml_response(received[1])
         _raise_ora(err_code, message)
@@ -1142,7 +1143,7 @@ class Oall8Dialect:
         )
         received = yield RECV
         if received is False:
-            raise Exception('Connection closed during 8i PL/SQL block')
+            raise connection_closed('8i PL/SQL block')
         packet = received[1]
         # 8i marks no packet as a reply's last: read on until the reply is whole.
         # Read alone, the first packet of a long OUT value's reply ran off its
@@ -1150,7 +1151,7 @@ class Oall8Dialect:
         while not o8i_block_complete(packet):
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during 8i PL/SQL block')
+                raise connection_closed('8i PL/SQL block')
             packet += received[1]
         # The reply may open with a 0x0b bind prompt; decode_8i_dml_response
         # surfaces any ORA- error regardless (its rowcount is not meaningful here).
@@ -1205,7 +1206,7 @@ class Oall8Dialect:
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during 8i LOB read')
+                raise connection_closed('8i LOB read')
             data += received[1]
             # An empty LOB (EMPTY_CLOB / EMPTY_BLOB) has no TTI_LOB (0x0e) content
             # block — the server replies with a bare 0x08 piggyback — so there is
@@ -1224,7 +1225,7 @@ class Oall8Dialect:
         yield Send(encode_o8i_bfile_open(self._next_seq(), locator))
         resp = yield RECV
         if resp is False:
-            raise Exception('Connection closed during 8i BFILE FILE_OPEN')
+            raise connection_closed('8i BFILE FILE_OPEN')
         # A file that does not open is answered with an 8i status alone; one
         # that does, with the LOBOPS RPA. The 9i reader missed the error,
         # unseen while a fetch read the BFILE (#1103).
@@ -1233,12 +1234,14 @@ class Oall8Dialect:
             _raise_ora(*decode_8i_terminal_error(resp[1]))
         opened = decode_fv2_opened_locator(resp[1])
         if opened is None:
-            raise Exception('Unexpected 8i BFILE FILE_OPEN reply', resp[1][:8].hex())
+            raise InternalError(
+                f'unexpected 8i BFILE FILE_OPEN reply: {resp[1][:8].hex()!r}'
+            )
         try:
             yield Send(encode_o8i_bfile_getlen(self._next_seq(), opened))
             resp = yield RECV
             if resp is False:
-                raise Exception('Connection closed during 8i BFILE GETLEN')
+                raise connection_closed('8i BFILE GETLEN')
             amount = decode_o8i_bfile_getlen(resp[1])
             if amount <= 0:
                 return b''
@@ -1256,7 +1259,7 @@ class Oall8Dialect:
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during 8i LOB READ')
+                raise connection_closed('8i LOB READ')
             data += received[1]
             (content, complete) = decode_fv2_lob_chunks(data)
             if complete:
@@ -1406,7 +1409,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during a 9i CREATE_TEMP')
+                raise connection_closed('9i CREATE_TEMP')
             buf += received[1]
             try:
                 (locator, rest) = decode_9i_oall8_create_temp(buf)
@@ -1416,7 +1419,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 continue
             _raise_ora(*self._terminal_error(rest))
             if locator is None:
-                raise Exception('A 9i CREATE_TEMP answered without a locator')
+                raise InternalError('a 9i CREATE_TEMP answered without a locator')
             return locator
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
@@ -1450,7 +1453,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during 9i OALL8 LOB read')
+                raise connection_closed('9i OALL8 LOB read')
             data += received[1]
             if data[0] != TTI_LOB:
                 return b''
@@ -1487,7 +1490,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
         )
         resp = yield RECV
         if resp is False:
-            raise Exception('Connection closed during 9i OALL8 LOB call')
+            raise connection_closed('9i OALL8 LOB call')
         (value, updated) = decode_9i_oall8_lob_value(resp[1], operation)
         if not updated:
             (err_code, message) = decode_9i_oall8_terminal_error(resp[1])
@@ -1514,14 +1517,14 @@ class Fv2Oall8Dialect(Oall8Dialect):
         )
         resp = yield RECV
         if resp is False:
-            raise Exception('Connection closed during 9i OALL8 BFILE FILE_OPEN')
+            raise connection_closed('9i OALL8 BFILE FILE_OPEN')
         if resp[1][:1] == bytes([TTI_OER]):
             # e.g. ORA-22285 (no such directory)
             _raise_ora(*decode_9i_oall8_terminal_error(resp[1]))
         opened = decode_fv2_opened_locator(resp[1])
         if opened is None:
-            raise Exception(
-                'Unexpected 9i OALL8 BFILE FILE_OPEN reply', resp[1][:8].hex()
+            raise InternalError(
+                f'unexpected 9i OALL8 BFILE FILE_OPEN reply: {resp[1][:8].hex()!r}'
             )
         try:
             yield Send(
@@ -1529,7 +1532,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
             )
             resp = yield RECV
             if resp is False:
-                raise Exception('Connection closed during 9i OALL8 BFILE GETLEN')
+                raise connection_closed('9i OALL8 BFILE GETLEN')
             amount = decode_o8i_bfile_getlen(resp[1])
             if amount <= 0:
                 return b''
@@ -2227,7 +2230,7 @@ class Oci11Dialect(Oall8Dialect):
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during an 11g LOB read')
+                raise connection_closed('11g LOB read')
             buf += received[1]
             try:
                 (content, rest) = decode_oci11_lob_read(buf, len(locator))
@@ -2269,7 +2272,7 @@ class Oci11Dialect(Oall8Dialect):
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during an 11g LOB call')
+                raise connection_closed('11g LOB call')
             buf += received[1]
             try:
                 (value, updated, rest) = decode_oci11_lobop(buf, operation)
@@ -2302,13 +2305,13 @@ class Oci11Dialect(Oall8Dialect):
         )
         received = yield RECV
         if received is False:
-            raise Exception('Connection closed during an 11g scrollable open')
+            raise connection_closed('11g scrollable open')
         packet = self._session_return(received[1])
         if packet[:1] != bytes([TTI_DCB]):
             status = self._status(packet)
             self._finished(status.get('cursor', 0))
             _raise_ora(status.get('error_code', 0), status.get('message'))
-            raise Exception('An 11g scrollable open answered without a describe')
+            raise InternalError('an 11g scrollable open answered without a describe')
         (columns, rest) = yield from self._recv_describe(packet)
         (rows, terminal, _) = yield from self.recv_rows(rest, columns, None)
         status = self._status(terminal)
@@ -2411,7 +2414,7 @@ class Oci11Dialect(Oall8Dialect):
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during an 11g DML RETURNING')
+                raise connection_closed('11g DML RETURNING')
             buf += received[1]
             if self._session_return(buf)[:1] == bytes([TTI_FOB]):
                 # A statement that failed asks to flush out its binds, a bare
@@ -2464,7 +2467,7 @@ class Oci11Dialect(Oall8Dialect):
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during an 11g password change')
+                raise connection_closed('11g password change')
             buf += received[1]
             try:
                 status = self._status(
@@ -2479,7 +2482,7 @@ class Oci11Dialect(Oall8Dialect):
         yield Send(self._closing() + message)
         received = yield RECV
         if received is False:
-            raise Exception('Connection closed during a two-phase commit call')
+            raise connection_closed('two-phase commit call')
         return self._session_return(received[1])
 
     def _tpc_status(self, rest: bytes) -> tuple[int, str | None]:
@@ -2521,7 +2524,7 @@ class Oci11Dialect(Oall8Dialect):
         yield Send(self._closing() + encode_oci11_ping(self._next_seq()))
         received = yield RECV
         if received is False:
-            raise Exception('Connection closed during an 11g ping')
+            raise connection_closed('11g ping')
         # A first call's reply has the session return ahead of it.
         reply = self._session_return(received[1])
         if decode_oci11_ping(reply) is None:
@@ -2548,7 +2551,7 @@ class Oci11Dialect(Oall8Dialect):
         )
         received = yield RECV
         if received is False:
-            raise Exception('Connection closed during an 11g parse')
+            raise connection_closed('11g parse')
         packet = self._session_return(received[1])
         columns = None
         if query and packet[:1] == bytes([TTI_DCB]):
@@ -2587,7 +2590,7 @@ class Oci11Dialect(Oall8Dialect):
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during an 11g CREATE_TEMP')
+                raise connection_closed('11g CREATE_TEMP')
             buf += received[1]
             try:
                 (locator, rest) = decode_oci11_create_temp(buf)
@@ -2596,7 +2599,7 @@ class Oci11Dialect(Oall8Dialect):
                 continue
             _raise_ora(status.get('error_code', 0), status.get('message'))
             if locator is None:
-                raise Exception('An 11g CREATE_TEMP answered without a locator')
+                raise InternalError('an 11g CREATE_TEMP answered without a locator')
             return locator
 
     def execute_block(self, sql: str, bind: list | None = None):
@@ -2666,7 +2669,7 @@ class Oci11Dialect(Oall8Dialect):
         while True:
             received = yield RECV
             if received is False:
-                raise Exception('Connection closed during an 11g PL/SQL block')
+                raise connection_closed('11g PL/SQL block')
             buf += received[1]
             try:
                 (_, _, rest, _) = decode_oci11_block(

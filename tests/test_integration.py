@@ -18240,7 +18240,11 @@ class TransactionGuardIntegration(_IntegrationBase):
                 self.skipTest('needs EXECUTE on DBMS_TG_DBG')
             raise
         ltxid = conn.ltxid
-        with self.assertRaises(Exception):
+        # A DB-API error either way: before the commit the session just ends,
+        # which raised a bare Exception (#2656); after it, ORA-00603.
+        with self.assertRaises(
+            seerdb.OperationalError if point == 'pre_commit' else seerdb.DatabaseError
+        ):
             conn.commit()
         try:
             conn.close()

@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 
 from seerdb.client.dialect import RECV, O8iDialect
-from seerdb.common.exceptions import DatabaseError, Truncated
+from seerdb.common.exceptions import DatabaseError, OperationalError, Truncated
 from seerdb.common.tns import decode_8i_dcb_describe
 
 _FIXTURES = Path(__file__).parent / 'fixtures'
@@ -69,7 +69,9 @@ class TestADescribeCutShortByAnError(unittest.TestCase):
         dialect = O8iDialect(next_seq=lambda: 1)
         gen = dialect._recv_describe(_packet('cut_1'))
         next(gen)
-        with self.assertRaisesRegex(Exception, 'Connection closed during 8i describe'):
+        with self.assertRaisesRegex(
+            OperationalError, 'closed the connection during 8i describe'
+        ):
             gen.send(False)
 
 

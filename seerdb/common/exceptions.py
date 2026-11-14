@@ -175,3 +175,11 @@ def from_ora_code(code: int) -> type[DatabaseError]:
     Codes without a mapping fall back to the base `DatabaseError`.
     """
     return _ORA_CODE_TO_CLASS.get(code, DatabaseError)
+
+
+def connection_closed(during: str) -> OperationalError:
+    """The error a call raises when a receive finds the connection closed mid-call
+    (#2656), worded as python-oracledb's DPY-4011. ``during`` names the call."""
+    return OperationalError(
+        f'the database or network closed the connection during {during}'
+    )
