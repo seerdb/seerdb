@@ -33,8 +33,9 @@ from seerdb.client.dialect import (
 )
 from seerdb.client.enums import TransactionPriority
 from seerdb.common.end_user_sec import EndUserSecurityContext
-from seerdb.common.exceptions import NotSupportedError, ProgrammingError
+from seerdb.common.exceptions import InterfaceError, NotSupportedError, ProgrammingError
 from seerdb.common.tns import (
+    SESSION_KEYWORD_LTXID,
     SESSION_KEYWORD_POOLED_SERVER,
     encode_alter_session_piggyback,
     encode_ano_fragment,
@@ -178,8 +179,9 @@ class _ConnectionLogic:
     _txn_priority_requested: str
     _txn_priority: str | None
     _txn_priority_pending: str | None
-    _session_keywords: dict[int, str | None]
+    _session_keywords: dict[int, str | bytes | None]
     _pooled_server: bool
+    _ltxid: bytes
     _session_state_desired: int
     _in_request: bool
     _supports_eor: bool
@@ -708,11 +710,30 @@ class _ConnectionLogic:
         # Take the session state the last reply reported (#1776).
         Keywords = self._session_keywords
         if TNS_KEYWORD_NUM_TXN_PRIORITY in Keywords:
-            self._txn_priority = Keywords[TNS_KEYWORD_NUM_TXN_PRIORITY]
+            Priority = Keywords[TNS_KEYWORD_NUM_TXN_PRIORITY]
+            self._txn_priority = None if isinstance(Priority, bytes) else Priority
         if SESSION_KEYWORD_POOLED_SERVER in Keywords:
             # A DRCP pooled server answered (#2544): a session return came.
             self._pooled_server = True
+        Ltxid = Keywords.get(SESSION_KEYWORD_LTXID)
+        if isinstance(Ltxid, bytes):
+            # A service with COMMIT_OUTCOME on reported the logical
+            # transaction id (#2650).
+            self._ltxid = Ltxid
         Keywords.clear()
+
+    @property
+    def ltxid(self) -> bytes:
+        """The session's logical transaction id, for Transaction Guard (#2650):
+        the latest one the server reported, at login and after each call that
+        starts or ends a transaction. Pass it to
+        ``DBMS_APP_CONT.GET_LTXID_OUTCOME`` from another session to learn
+        whether the transaction committed. ``b''`` when the service doesn't
+        have COMMIT_OUTCOME on, and before Oracle 12.1. InterfaceError on a
+        connection that isn't open."""
+        if self.conn_state != CONN_STATE_AUTHENTICATED:
+            raise InterfaceError('ltxid needs an open connection')
+        return self._ltxid
 
     def _require_txn_priority(self) -> None:
         if not self._supports_txn_priority():

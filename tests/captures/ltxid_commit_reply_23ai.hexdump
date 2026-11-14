@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# A live 23ai Free reply to a COMMIT on the same service (#2654): the LTXID
+# piggyback (17 07 01 38 38 + 56 bytes), its commit number one past the
+# login's, then the call status. Reading the ub4 length as the value made the
+# client take the value's own length byte (0x38) for a response token.
+00000000  00 00 00 50 06 00 00 00  20 00 17 07 01 38 38 00  |...P.... ....88.|
+00000010  02 00 02 f1 82 ab 1a 01  00 00 00 01 00 00 00 01  |................|
+00000020  00 00 00 00 00 00 00 9c  30 a3 59 5d ef 6b 49 18  |........0.Y].kI.|
+00000030  7b 1f 00 00 00 00 00 60  3d 23 9f e3 ac 02 84 e0  |{......`=#......|
+00000040  63 96 00 a8 c0 c3 c3 09  03 01 00 05 02 84 83 1d  |c...............|

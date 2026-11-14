@@ -275,10 +275,13 @@ from seerdb.common.tns_consts import (
     TNS_REDIRECT,
     TNS_SECURITY_CONTEXT_ATTACH_FLAG,
     TNS_SERVER_CONVERTS_CHARS,
+    TNS_SERVER_PIGGYBACK_AC_REPLAY_CONTEXT,
+    TNS_SERVER_PIGGYBACK_EXT_SYNC,
     TNS_SERVER_PIGGYBACK_LTXID,
     TNS_SERVER_PIGGYBACK_OS_PID_MTS,
     TNS_SERVER_PIGGYBACK_QUERY_CACHE_INVALIDATION,
     TNS_SERVER_PIGGYBACK_SESS_RET,
+    TNS_SERVER_PIGGYBACK_SESS_SIGNATURE,
     TNS_SERVER_PIGGYBACK_SYNC,
     TNS_SERVER_PIGGYBACK_TRACE_EVENT,
     TNS_SESSION_STATE_EXPLICIT_BOUNDARY,
@@ -704,14 +707,17 @@ _DECODE_QUERY_IDS: contextvars.ContextVar[list[int] | None] = contextvars.Contex
 # connection decodes a reply it points this at a dict of its own, and the decoder
 # records each pair there; otherwise it is None and the pairs are only walked, so
 # one connection never sees another's.
-_DECODE_SESSION_KEYWORDS: contextvars.ContextVar[dict[int, str | None] | None] = (
-    contextvars.ContextVar('decode_session_keywords', default=None)
-)
+_DECODE_SESSION_KEYWORDS: contextvars.ContextVar[
+    dict[int, str | bytes | None] | None
+] = contextvars.ContextVar('decode_session_keywords', default=None)
 # Recorded in the same sink, under a key no SYNC keyword has, when a reply
 # carried a session return (SESS_RET): a DRCP pooled server served the call
 # (#2544). A dedicated server, 10g's for a pooled request among them, and a
 # Mirror send none, and a session release would end their sessions.
 SESSION_KEYWORD_POOLED_SERVER = -1
+# Recorded there too, as bytes, under a key of its own: the logical transaction
+# id an LTXID piggyback reported (#2650), the latest one a reply carried.
+SESSION_KEYWORD_LTXID = -2
 
 
 # The call status and error code of the last OER or status a connection decoded
@@ -726,7 +732,7 @@ _DECODE_CALL_STATUS: contextvars.ContextVar[list[int] | None] = contextvars.Cont
 
 @contextlib.contextmanager
 def recording_session_keywords(
-    Sink: dict[int, str | None], CallStatus: list[int] | None = None
+    Sink: dict[int, str | bytes | None], CallStatus: list[int] | None = None
 ) -> Iterator[None]:
     """Record the keyword-value pairs the replies decoded inside the block report
     into ``Sink``, keyword -> text value (#1776), and the last reply's call
@@ -762,6 +768,26 @@ def _decode_sync_pairs(Rest: bytes) -> bytes:
                 None if Text is None else bytes(Text).decode('utf-8', 'replace')
             )
     return Rest
+
+
+def _decode_ltxid(Rest: bytes) -> bytes:
+    # An LTXID piggyback's body after its opcode, read by the `_LTXID` schema
+    # (#2654), the value recorded for the connection (#2650). The schema wants
+    # the `17 07` opcode the caller stripped, so it is put back.
+    (Fields, Rest) = _LTXID_FROM_THIN(
+        bytes((TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_LTXID)) + Rest
+    )
+    Sink = _DECODE_SESSION_KEYWORDS.get()
+    if Sink is not None:
+        Sink[SESSION_KEYWORD_LTXID] = bytes(Fields.get('ltxid') or b'')
+    return Rest
+
+
+def encode_ltxid_piggyback(ltxid: bytes) -> bytes:
+    """An LTXID server piggyback carrying ``ltxid`` (#2654), laid out as 23ai
+    sends it on a service with COMMIT_OUTCOME on: ``17 07``, a ub4 length, then
+    the value with its own length."""
+    return _LTXID_THIN({'length': len(ltxid), 'ltxid': ltxid})
 
 
 # DML RETURNING ... INTO (#120): the sorted return-bind positions for the next
@@ -1258,8 +1284,27 @@ class _ThinCodec:
 
     wn4 = n4
     read_wn4 = read_n4
-    n8 = n4
-    read_n8 = read_n4
+
+    @staticmethod
+    def n8(value: int) -> bytes:
+        # A ub8 is a ub4's form with up to 8 magnitude bytes (#2654): a LOB
+        # amount or a row count past 4 GiB, a session signature.
+        if 0 <= value <= 0xFFFFFFFF:
+            return _encode_signed_sb4(value)
+        magnitude = value.to_bytes(8, 'big').lstrip(b'\x00')
+        return bytes([len(magnitude)]) + magnitude
+
+    @staticmethod
+    def read_n8(data: bytes) -> tuple[int, bytes]:
+        # Widths 5 to 8 are a ub8's own. decode_ub4 reads those leniently, as
+        # two bytes, for the OER counters it is also used for.
+        width = data[0] & 0x7F if data else 0
+        if 4 < width <= 8 and not data[0] & 0x80:
+            if len(data) < width + 1:
+                raise Truncated(f'ub8: {width} magnitude bytes, {len(data) - 1} left')
+            return int.from_bytes(data[1 : width + 1], 'big'), data[width + 1 :]
+        return decode_ub4(data)
+
     n1 = n4
     read_n1 = read_n4
 
@@ -1566,6 +1611,40 @@ _SYNC: wire_schema.Schema = (
     ('u8', 'pairs_length'),
     ('each', 'pairs', 'pair_count', _SYNC_PAIR),
     ('n4', 'flags'),
+)
+# The LTXID server piggyback (#2654): the logical transaction id a service with
+# COMMIT_OUTCOME on reports in the login reply and after each call that starts
+# or ends a transaction, as a ub4 length, then the value with its own length.
+_LTXID: wire_schema.Schema = (
+    ('const', bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_LTXID])),
+    ('n4', 'length'),
+    ('when', 'length', (('value', 'ltxid'),)),
+)
+# The piggybacks an Application Continuity service adds (#2654), read as
+# python-oracledb reads them and not kept: the replay context
+# (AC_REPLAY_CONTEXT), EXT_SYNC, and the session signature (SESS_SIGNATURE).
+_AC_REPLAY_CONTEXT: wire_schema.Schema = (
+    ('const', bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_AC_REPLAY_CONTEXT])),
+    ('n2', 'dty_count'),
+    ('u8', 'dty_length'),
+    ('n4', 'flags'),
+    ('n4', 'error_code'),
+    ('u8', 'queue'),
+    ('n4', 'length'),
+    ('when', 'length', (('value', 'context'),)),
+)
+_EXT_SYNC: wire_schema.Schema = (
+    ('const', bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_EXT_SYNC])),
+    ('n2', 'dty_count'),
+    ('u8', 'dty_length'),
+)
+_SESS_SIGNATURE: wire_schema.Schema = (
+    ('const', bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SESS_SIGNATURE])),
+    ('n2', 'dty_count'),
+    ('u8', 'dty_length'),
+    ('n8', 'flags'),
+    ('n8', 'client_signature'),
+    ('n8', 'server_signature'),
 )
 # The per-iteration affected-row counts an array DML answers when the client
 # asked for arraydmlrowcounts (#18/#859): the execute's return-parameters block
@@ -2789,6 +2868,14 @@ _LOB_DATA_THIN = wire_schema.compile_encoder(_LOB_DATA, _THIN)
 _LOB_DATA_OCI = wire_schema.compile_encoder(_LOB_DATA, _OCI)
 _SYNC_THIN = wire_schema.compile_encoder(_SYNC, _THIN)
 _SYNC_FROM_THIN = wire_schema.compile_decoder(_SYNC, _THIN)
+_LTXID_THIN = wire_schema.compile_encoder(_LTXID, _THIN)
+_LTXID_FROM_THIN = wire_schema.compile_decoder(_LTXID, _THIN)
+_AC_REPLAY_CONTEXT_THIN = wire_schema.compile_encoder(_AC_REPLAY_CONTEXT, _THIN)
+_AC_REPLAY_CONTEXT_FROM_THIN = wire_schema.compile_decoder(_AC_REPLAY_CONTEXT, _THIN)
+_EXT_SYNC_THIN = wire_schema.compile_encoder(_EXT_SYNC, _THIN)
+_EXT_SYNC_FROM_THIN = wire_schema.compile_decoder(_EXT_SYNC, _THIN)
+_SESS_SIGNATURE_THIN = wire_schema.compile_encoder(_SESS_SIGNATURE, _THIN)
+_SESS_SIGNATURE_FROM_THIN = wire_schema.compile_decoder(_SESS_SIGNATURE, _THIN)
 _SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
 _ROWCOUNTS_BLOCK_THIN = wire_schema.compile_encoder(_ROWCOUNTS_BLOCK, _THIN)
 _CREATE_TEMP_RESPONSE_THIN = wire_schema.compile_encoder(_CREATE_TEMP_RESPONSE, _THIN)
@@ -7272,6 +7359,15 @@ def _login_reply(KVs: list, Flags: dict, Rest1: bytes) -> tuple:
     # A login reply's pairs, read: the challenge, as (TTI_SESS, ...), or the
     # result, as (TTI_AUTH, ...). Shared by the thin reply and the native one
     # (decode_token_rpa_oci), whose pairs are the same at other widths.
+    #
+    # Piggybacks may follow either reply's pairs. 23ai and later report session
+    # state in the result as a SYNC piggyback: the transaction priority the
+    # session starts at (#1776). A service with COMMIT_OUTCOME on reports the
+    # logical transaction id as an LTXID piggyback, in the challenge, and sends
+    # no SYNC (#2654). Each is read as a reply's piggyback is.
+    # The challenge on such a service also carries the replay context first.
+    while Rest1[:1] == bytes([TTI_SVR_PIGGYBACK]):
+        Rest1 = _decode_server_piggyback(Rest1)
     SessKey = dict(KVs).get(b'AUTH_SESSKEY')
     Salt = dict(KVs).get(b'AUTH_VFR_DATA')
     DerivedSalt = dict(KVs).get(b'AUTH_PBKDF2_CSK_SALT')
@@ -7297,10 +7393,6 @@ def _login_reply(KVs: list, Flags: dict, Rest1: bytes) -> tuple:
             b'AUTH_SC_DBUNIQUE_NAME'
         )
         DbUniqueName = bytes(Unique).decode('utf-8') if Unique else None
-        # 23ai and later report session state after the pairs, as a SYNC
-        # piggyback: the transaction priority the session starts at (#1776).
-        if Rest1[:2] == bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SYNC]):
-            _decode_sync_pairs(Rest1[2:])
         # The longest identifier the server takes (128 from 12.2, unsent
         # before) and the instance's name, for the connection's attributes
         # (#2456).
@@ -7385,6 +7477,11 @@ _KNOWN_TTI_TOKENS = frozenset(
 
 
 def decode_token_server_piggyback(Data: bytes, Acc: tuple) -> tuple:
+    # One server-side piggyback, then the rest of the response.
+    return decode_packet(_decode_server_piggyback(Data), Acc)
+
+
+def _decode_server_piggyback(Data: bytes) -> bytes:
     # Server-side piggyback (#130): a session-state block the server prepends to
     # a response. DRCP-pooled sessions carry SESS_RET (the assigned session id /
     # serial + any session-state key/value pairs) and OS_PID_MTS; consume it
@@ -7425,7 +7522,13 @@ def decode_token_server_piggyback(Data: bytes, Acc: tuple) -> tuple:
         # the connection takes from the recorded pairs.
         Rest = _decode_sync_pairs(Rest)
     elif Opcode == TNS_SERVER_PIGGYBACK_LTXID:
-        (_, Rest) = decode_dalc(Rest)  # logical transaction id
+        Rest = _decode_ltxid(Rest)  # the logical transaction id (#2654)
+    elif Opcode == TNS_SERVER_PIGGYBACK_AC_REPLAY_CONTEXT:
+        (_, Rest) = _AC_REPLAY_CONTEXT_FROM_THIN(Data[:2] + Rest)
+    elif Opcode == TNS_SERVER_PIGGYBACK_EXT_SYNC:
+        (_, Rest) = _EXT_SYNC_FROM_THIN(Data[:2] + Rest)
+    elif Opcode == TNS_SERVER_PIGGYBACK_SESS_SIGNATURE:
+        (_, Rest) = _SESS_SIGNATURE_FROM_THIN(Data[:2] + Rest)
     elif Opcode in (
         TNS_SERVER_PIGGYBACK_QUERY_CACHE_INVALIDATION,
         TNS_SERVER_PIGGYBACK_TRACE_EVENT,
@@ -7433,7 +7536,7 @@ def decode_token_server_piggyback(Data: bytes, Acc: tuple) -> tuple:
         pass  # no body
     else:
         raise Exception('Unhandled server-side piggyback opcode', Opcode, Data)
-    return decode_packet(Rest, Acc)
+    return Rest
 
 
 def decode_token_rpa_piggyback(Data: bytes, Acc: tuple) -> tuple:
