@@ -58,10 +58,12 @@ from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
     InterfaceError,
+    InternalError,
     NotSupportedError,
     OperationalError,
     ProgrammingError,
     Truncated,
+    connection_closed,
 )
 from seerdb.common.sqltext import is_plsql, is_reusable_dml, statement_head
 from seerdb.common.tns import (
@@ -3315,11 +3317,11 @@ class OracleConnect(_ConnectionLogic):
         self.send(TNS_DATA, Data)
         Received = self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during CREATE_TEMP')
+            raise connection_closed('CREATE_TEMP')
         (_, Packet) = Received
         if not Packet or Packet[0] != TTI_RPA:
-            raise Exception(
-                'Unexpected CREATE_TEMP response', Packet[:8].hex() if Packet else None
+            raise InternalError(
+                f'unexpected CREATE_TEMP response: {Packet[:8].hex() if Packet else None!r}'
             )
         LocLen = (Packet[1] << 8) | Packet[2]
         return Packet[3 : 3 + LocLen]
@@ -3371,7 +3373,7 @@ class OracleConnect(_ConnectionLogic):
         self.send(TNS_DATA, encode_dictionary(Dict))
         Received = self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during LOBOPS')
+            raise connection_closed('LOBOPS')
         self._raise_lobops_error(Received[1])
         return decode_lobops_locator(Received[1])
 
@@ -3407,7 +3409,7 @@ class OracleConnect(_ConnectionLogic):
         # non-zero ORA error.
         Received = self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during LOBOPS')
+            raise connection_closed('LOBOPS')
         self._raise_lobops_error(Received[1])
 
     def lob_operation(
@@ -3446,7 +3448,7 @@ class OracleConnect(_ConnectionLogic):
         self.send(TNS_DATA, Data)
         Received = self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during LOBOPS')
+            raise connection_closed('LOBOPS')
         self._raise_lobops_error(Received[1])
         return (
             decode_lobops_value(Received[1]),
@@ -3487,12 +3489,12 @@ class OracleConnect(_ConnectionLogic):
         )
         Received = self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during BFILE FILE_OPEN')
+            raise connection_closed('BFILE FILE_OPEN')
         (_, Packet) = Received
         self._raise_lobops_error(Packet)
         if not Packet or Packet[0] != TTI_RPA:
-            raise Exception(
-                'Unexpected FILE_OPEN response', Packet[:8].hex() if Packet else None
+            raise InternalError(
+                f'unexpected FILE_OPEN response: {Packet[:8].hex() if Packet else None!r}'
             )
         OpenLen = (Packet[1] << 8) | Packet[2]
         Opened = Packet[3 : 3 + OpenLen]
@@ -3545,10 +3547,10 @@ class OracleConnect(_ConnectionLogic):
         while True:
             Received = self._next_data_packet(b'', b'')
             if Received is False:
-                raise Exception('Connection closed during LOBOPS response')
+                raise connection_closed('LOBOPS response')
             (Type, Packet) = Received
             if Type != TNS_DATA:
-                raise Exception('Unexpected LOBOPS response type', Type)
+                raise InternalError(f'unexpected LOBOPS response type: {Type!r}')
             Data = Data[Pos:] + Packet
             (Pos, Chunked, Done) = _lob_reply_step(
                 Data,
@@ -3781,10 +3783,10 @@ class OracleConnect(_ConnectionLogic):
             # no longer storms the line or discards the trailing error/result.
             Received = self._next_data_packet(b'', b'')
             if Received is False:
-                raise Exception('Connection closed while awaiting response')
+                raise connection_closed('the call')
             (Type, Packet) = Received
             if Type != TNS_DATA:
-                raise Exception('Unexpected response type', Type)
+                raise InternalError(f'unexpected response type: {Type!r}')
             # Rows decode into the caller's list in place; a decode retried on
             # more bytes starts from the rows it began with.
             Rows = Acc[2] if len(Acc) > 2 and isinstance(Acc[2], list) else None

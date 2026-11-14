@@ -91,10 +91,12 @@ from seerdb.common.crypto import validate
 from seerdb.common.exceptions import (
     DatabaseError,
     InterfaceError,
+    InternalError,
     NotSupportedError,
     OperationalError,
     ProgrammingError,
     Truncated,
+    connection_closed,
 )
 from seerdb.common.sqltext import is_plsql, is_reusable_dml, statement_head
 from seerdb.common.tns import (
@@ -1490,10 +1492,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         for _ in range(MAX_FLUSH_OUT_BINDS + 1):
             Received = await self._next_data_packet(b'', b'')
             if Received is False:
-                raise InterfaceError('connection closed while awaiting response')
+                raise connection_closed('the call')
             (Type, Packet) = Received
             if Type != TNS_DATA:
-                raise Exception('Unexpected response type', Type)
+                raise InternalError(f'unexpected response type: {Type!r}')
             # As OracleConnect._handle_response: a decode that runs past the
             # bytes read so far is retried on the reply's next packet (#1845).
             Rows = Acc[2] if len(Acc) > 2 and isinstance(Acc[2], list) else None
@@ -2497,11 +2499,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         await self.send(TNS_DATA, Data)
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during CREATE_TEMP')
+            raise connection_closed('CREATE_TEMP')
         (_, Packet) = Received
         if not Packet or Packet[0] != TTI_RPA:
-            raise Exception(
-                'Unexpected CREATE_TEMP response', Packet[:8].hex() if Packet else None
+            raise InternalError(
+                f'unexpected CREATE_TEMP response: {Packet[:8].hex() if Packet else None!r}'
             )
         LocLen = (Packet[1] << 8) | Packet[2]
         return Packet[3 : 3 + LocLen]
@@ -2533,7 +2535,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         non-zero OER."""
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during LOBOPS')
+            raise connection_closed('LOBOPS')
         self._raise_lobops_error(Received[1])
 
     async def lob_write(
@@ -2581,7 +2583,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         await self.send(TNS_DATA, encode_dictionary(Dict))
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during LOBOPS')
+            raise connection_closed('LOBOPS')
         self._raise_lobops_error(Received[1])
         return decode_lobops_locator(Received[1])
 
@@ -2617,7 +2619,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         await self.send(TNS_DATA, Data)
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during LOBOPS')
+            raise connection_closed('LOBOPS')
         self._raise_lobops_error(Received[1])
         return (
             decode_lobops_value(Received[1]),
@@ -2654,12 +2656,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         )
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
-            raise Exception('Connection closed during BFILE FILE_OPEN')
+            raise connection_closed('BFILE FILE_OPEN')
         (_, Packet) = Received
         self._raise_lobops_error(Packet)
         if not Packet or Packet[0] != TTI_RPA:
-            raise Exception(
-                'Unexpected FILE_OPEN response', Packet[:8].hex() if Packet else None
+            raise InternalError(
+                f'unexpected FILE_OPEN response: {Packet[:8].hex() if Packet else None!r}'
             )
         OpenLen = (Packet[1] << 8) | Packet[2]
         Opened = Packet[3 : 3 + OpenLen]
@@ -2710,10 +2712,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         while True:
             Received = await self._next_data_packet(b'', b'')
             if Received is False:
-                raise Exception('Connection closed during LOBOPS response')
+                raise connection_closed('LOBOPS response')
             (Type, Packet) = Received
             if Type != TNS_DATA:
-                raise Exception('Unexpected LOBOPS response type', Type)
+                raise InternalError(f'unexpected LOBOPS response type: {Type!r}')
             Data = Data[Pos:] + Packet
             (Pos, Chunked, Done) = _lob_reply_step(
                 Data,
