@@ -18255,6 +18255,34 @@ class TransactionGuardIntegration(_IntegrationBase):
             self._commit_outcome(self._fail_commit('pre_commit')), (False, False)
         )
 
+    def test_a_session_the_server_ended_is_not_healthy(self):
+        # The post-commit failpoint ends the session with ORA-00603, which
+        # is_healthy didn't count as ending one (#2657).
+        conn = self._tg_connect()
+        cur = conn.cursor()
+        cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+        try:
+            cur.execute(
+                'BEGIN dbms_tg_dbg.set_failpoint('
+                'dbms_tg_dbg.tg_failpoint_post_commit); END;'
+            )
+        except seerdb.DatabaseError as exc:
+            conn.close()
+            if exc.code in (904, 6550):
+                self.skipTest('needs EXECUTE on DBMS_TG_DBG')
+            raise
+        self.assertTrue(conn.is_healthy())
+        with self.assertRaises(seerdb.DatabaseError) as raised:
+            conn.commit()
+        self.assertEqual(raised.exception.code, 603)
+        self.assertFalse(conn.is_healthy())
+        try:
+            conn.close()
+        except Exception:
+            # What is left of the session may not close cleanly; it doesn't
+            # matter here.
+            pass
+
     def test_a_commit_lost_after_it_happened(self):
         self.assertEqual(
             self._commit_outcome(self._fail_commit('post_commit')), (True, True)

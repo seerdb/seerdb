@@ -11,11 +11,23 @@ ORA-00028, as a dedicated server sends. The bytes are the pool's, captured
 
 import unittest
 
+from replay import load_capture
+
 from seerdb.client.connection import OracleConnect
 from seerdb.client.dialect import Oci11Dialect
 from seerdb.common.exceptions import DatabaseError, OperationalError
-from seerdb.common.tns import ends_response, ends_session
-from seerdb.common.tns_consts import CONN_STATE_AUTHENTICATED, TNS_DATA
+from seerdb.common.tns import (
+    assemble_packet,
+    decode_packet,
+    ends_response,
+    ends_session,
+    recording_session_keywords,
+)
+from seerdb.common.tns_consts import (
+    CONN_STATE_AUTHENTICATED,
+    FIELD_VERSION_MAX,
+    TNS_DATA,
+)
 
 # The pool's answer to a query on the killed session: a 10-byte DATA packet,
 # data flags 0x0040 (EOF), no payload.
@@ -81,3 +93,30 @@ class SessionShutdownTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SessionEndedByAnErrorTest(unittest.TestCase):
+    # A reply whose error means the server ended the session leaves the
+    # connection unhealthy (#2657). ORA-00603 wasn't among the codes is_healthy
+    # knew, so after one it still said True. Live 23ai bytes: a DDL's implicit
+    # commit hit Transaction Guard's post-commit failpoint.
+    _CAPTURE = load_capture('ora_00603_session_ended_23ai.hexdump')
+
+    def test_the_reply_records_its_code(self):
+        (_flag, packet_type, body, rest) = assemble_packet(self._CAPTURE, 8192, True)
+        self.assertEqual((packet_type, rest), (TNS_DATA, b''))
+        assert body is not None
+        status: list[int] = []
+        with recording_session_keywords({}, status):
+            decode_packet(body, (None, None, []), FIELD_VERSION_MAX)
+        self.assertEqual(status[1], 603)
+        Conn = _bare(b'')
+        Conn._socket_open = lambda: True
+        Conn._call_status = status
+        self.assertFalse(Conn.is_healthy())
+
+    def test_an_ordinary_error_leaves_it_healthy(self):
+        Conn = _bare(b'')
+        Conn._socket_open = lambda: True
+        Conn._call_status = [0, 942]
+        self.assertTrue(Conn.is_healthy())

@@ -75,11 +75,41 @@ from seerdb.common.tns_consts import (
     DictionaryType,
 )
 
-# Errors after which the server has ended the session (#2456): it was killed
-# (ORA-00028), is not logged on (ORA-01012), the instance is going down
-# (ORA-01089, ORA-01092), the idle limit passed (ORA-02396), or the connection
-# is lost (ORA-03113, ORA-03114, ORA-03135).
-_SESSION_ENDED = frozenset({28, 1012, 1089, 1092, 2396, 3113, 3114, 3135})
+# Errors after which the server has ended the session (#2456, #2657): the ones
+# python-oracledb 26.1 maps to DPY-4011, a closed connection
+# (ERR_ORACLE_ERROR_XREF in src/oracledb/errors.py). The messages are Oracle
+# 23ai's.
+_SESSION_ENDED = frozenset(
+    {
+        22,  # invalid session ID; access denied
+        28,  # session has been terminated
+        31,  # session marked for kill
+        45,  # Your session has been terminated with no replay.
+        378,  # buffer pools cannot be created as specified
+        600,  # internal error code
+        602,  # internal programming exception
+        603,  # ORACLE server session terminated by irrecoverable error
+        609,  # An Oracle process was unable to attach to incoming connection.
+        1012,  # not logged on
+        1041,  # internal error. hostdef extension doesn't exist
+        1043,  # user side memory corruption
+        1089,  # immediate shutdown or close in progress
+        1092,  # ORACLE instance terminated. Disconnection forced
+        2396,  # exceeded maximum idle time, please connect again
+        3113,  # end-of-file on communication channel
+        3114,  # not connected to ORACLE
+        3122,  # attempt to close ORACLE-side window on user side
+        3135,  # connection lost contact
+        12153,  # TNS:not connected
+        12537,  # TNS:connection closed
+        12547,  # TNS:lost contact
+        12570,  # TNS:packet reader failure
+        12583,  # TNS:no reader
+        27146,  # post/wait initialization failed
+        28511,  # lost RPC connection to heterogeneous remote agent
+        56600,  # DRCP: Illegal call
+    }
+)
 # The error a call ends with when the server ended the session with an EOF
 # DATA packet instead of a reply, as python-oracledb words its DPY-4011.
 SESSION_SHUTDOWN_MESSAGE = (
