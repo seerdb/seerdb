@@ -18098,3 +18098,64 @@ def test_an_index_on_an_expression_is_created_and_enforced() -> None:
             backend.execute('DROP TABLE t2662')
     finally:
         backend.close()
+
+
+def test_a_set_target_named_through_its_table_is_bare() -> None:
+    # Oracle takes an UPDATE's or a MERGE's SET target, and a MERGE's INSERT
+    # column, through the target's alias or name; PostgreSQL a bare column
+    # only, so `SET t.v = 1` was ORA-00904 (#2661). The rows are 23ai's for
+    # the same statements.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE m2661 (k NUMBER, v NUMBER, w NUMBER)')
+        try:
+            backend.execute('INSERT INTO m2661 VALUES (1, 10, 0)')
+            for sql in (
+                'UPDATE m2661 t SET t.v = 11 WHERE t.k = 1',
+                'UPDATE m2661 t SET t.v = 12, t.w = t.v WHERE t.k = 1',
+                'UPDATE m2661 SET m2661.v = 13',
+                'UPDATE m2661 t SET (t.v, t.w) = (SELECT 14, 4 FROM dual) WHERE t.k = 1',
+                'MERGE INTO m2661 t USING (SELECT 1 k, 20 v FROM dual) s '
+                'ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET t.v = s.v',
+                'MERGE INTO m2661 t USING (SELECT 1 k, 21 v FROM dual) s '
+                'ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET v = s.v, t.w = t.v + 1',
+                'MERGE INTO m2661 t USING (SELECT 2 k, 5 v FROM dual) s '
+                'ON (t.k = s.k) WHEN MATCHED THEN UPDATE SET t.v = s.v '
+                'WHEN NOT MATCHED THEN INSERT (t.k, t.v) VALUES (s.k, s.v)',
+            ):
+                backend.execute(sql)
+            assert [
+                tuple(None if c is None else int(c) for c in row)
+                for row in backend.execute('SELECT k, v, w FROM m2661 ORDER BY k').rows
+            ] == [(1, 21, 21), (2, 5, None)]
+            backend.execute('BEGIN UPDATE m2661 t SET t.w = 0 WHERE t.k = 2; END;')
+            assert backend.execute('SELECT w FROM m2661 WHERE k = 2').rows == [(0,)]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE m2661')
+    finally:
+        backend.close()
+
+
+def test_set_targets_keep_what_does_not_name_the_target() -> None:
+    # The rule (#2661) drops only a qualifier naming the table written: the
+    # values, the WHERE clause, a literal, another table's name stay.
+    from seerdb.server.backends.postgres import _unqualified_set_targets
+
+    assert (
+        _unqualified_set_targets(
+            "UPDATE m t SET t.v = 't.v = 1', t.w = t.v WHERE t.k = 1"
+        )
+        == "UPDATE m t SET v = 't.v = 1', w = t.v WHERE t.k = 1"
+    )
+    assert (
+        _unqualified_set_targets('UPDATE pyo.m SET m.v = 1') == 'UPDATE pyo.m SET v = 1'
+    )
+    for as_is in (
+        'UPDATE m t SET o.v = 1',
+        'SELECT t.v FROM m t',
+        'UPDATE m SET v = 1',
+    ):
+        assert _unqualified_set_targets(as_is) == as_is
