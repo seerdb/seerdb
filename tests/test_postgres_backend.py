@@ -18298,3 +18298,32 @@ def test_returning_old_and_new_are_postgresql_18_s() -> None:
         'SELECT 1 FROM dual',
     ):
         assert _returning_old_new(as_is, False) == as_is
+
+
+def test_a_not_null_s_name_and_whose_it_is_from_postgresql_18() -> None:
+    # On 18, a NOT NULL named by CONSTRAINT showed as GENERATED NAME, and an
+    # unnamed one took PostgreSQL's <table>_<column>_not_null (#2677). As on
+    # Oracle: the user's name is USER NAME, an unnamed one is SYS_Cnnnnnnn.
+    if _server_version_num() < 180000:
+        pytest.skip('a NOT NULL constraint has a name from PostgreSQL 18')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute(
+            'CREATE TABLE t2677 (a NUMBER CONSTRAINT t2677_a NOT NULL, b NUMBER NOT NULL)'
+        )
+        try:
+            backend.execute('ALTER TABLE t2677 ADD (c NUMBER NOT NULL)')
+            rows = backend.execute(
+                'SELECT constraint_name, generated FROM user_constraints '
+                "WHERE table_name = 'T2677' ORDER BY constraint_name"
+            ).rows
+            assert rows[-1] == ('T2677_A', 'USER NAME')
+            assert [g for (_n, g) in rows[:-1]] == ['GENERATED NAME'] * 2
+            assert all(re.fullmatch(r'SYS_C\d{7}', n) for (n, _g) in rows[:-1]), rows
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2677')
+    finally:
+        backend.close()
