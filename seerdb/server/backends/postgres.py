@@ -4047,7 +4047,15 @@ _ORACLE_DICTIONARY_DDL = (
     'WHERE m.made_up AND a.attrelid = CASE WHEN m.made_up THEN '
     "split_part(tc.constraint_name, '_', 2)::oid END "
     'AND a.attnum = CASE WHEN m.made_up THEN '
-    "split_part(tc.constraint_name, '_', 3)::smallint END) nn ON true "
+    "split_part(tc.constraint_name, '_', 3)::smallint END "
+    # PostgreSQL 18 keeps a NOT NULL as a constraint of its own, contype `n`,
+    # which information_schema lists as a CHECK under its real name (#2652).
+    # On 16 no constraint has that type, and this finds none.
+    'UNION ALL SELECT a.attrelid, a.attnum, a.attname FROM pg_constraint c '
+    'JOIN pg_namespace cn ON cn.oid = c.connamespace '
+    'JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1] '
+    "WHERE tc.constraint_type = 'CHECK' AND c.contype = 'n' "
+    'AND cn.nspname = tc.constraint_schema AND c.conname = tc.constraint_name) nn ON true '
     "WHERE tc.constraint_schema NOT IN ('pg_catalog','information_schema','oracle','sys') "
     'AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE nn.attnum IS NOT NULL '
     'AND i.indrelid = nn.attrelid AND i.indisprimary AND nn.attnum = ANY(i.indkey));'

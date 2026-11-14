@@ -19,7 +19,7 @@
 # and `plpgsql_check` where they are installed) and puts the `oracle` schema on the search_path itself,
 # so no further setup is needed.
 
-FROM postgres:16-alpine
+FROM postgres:18.7-alpine3.24
 
 ARG ORAFCE_VERSION=VERSION_4_17_1
 ARG PGVECTOR_VERSION=v0.8.7

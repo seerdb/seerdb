@@ -632,7 +632,8 @@ Both modes translate the same SQL and PL/SQL; only who may do what differs.
 
 ### What the database needs
 
-- **PostgreSQL**, tested on 16.
+- **PostgreSQL 16 or later**, tested on the newest (18). What an older one
+  lacks is listed under *By PostgreSQL version* below.
 - **[orafce](https://github.com/orafce/orafce)** 4.17 or later, which supplies
   Oracle's built-in functions (`NVL`, `DECODE`, `TO_CHAR`, `ADD_MONTHS`, ...)
   and `UTL_RAW`. It is a requirement: without it, much ordinary Oracle SQL
@@ -654,7 +655,21 @@ Both modes translate the same SQL and PL/SQL; only who may do what differs.
   fetches from a cursor parameter, and a crash in it restarts every session.
 
 The repository's [`examples/mirror-pg.Dockerfile`](../examples/mirror-pg.Dockerfile)
-builds PostgreSQL 16 with all three, as CI uses it.
+builds PostgreSQL 18 with all three, as CI uses it.
+
+### By PostgreSQL version
+
+The Mirror runs on PostgreSQL 16 and later. It uses what the newest PostgreSQL
+and extensions offer, rather than keeping to what every supported version has.
+CI tests the newest version (#2652). What an older one lacks is listed here and
+not worked around. A non-blocking CI leg on the oldest supported setup reports
+what it lacks (#2668). That setup is PostgreSQL 16.14 with orafce 4.17.1,
+pgvector 0.8.0 and plpgsql_check 2.10.11.
+
+| feature | needs | before that |
+|---|---|---|
+| A NOT NULL constraint keeps its name: `CONSTRAINT nn NOT NULL` shows as `NN` in `USER_CONSTRAINTS`, and `ALTER TABLE … DROP CONSTRAINT nn` drops it | PostgreSQL 18 | listed under a made-up name (`<oid>_<oid>_<n>_not_null`); `DROP CONSTRAINT` is refused with ORA-00942 |
+| `MERGE INTO` a view | PostgreSQL 17 | refused: "cannot execute MERGE on relation" |
 
 ### Which role to connect as
 
@@ -1097,7 +1112,7 @@ WantedBy=multi-user.target
 a Python image, run `seerdb-mirror` as its command, and give it `--host 0.0.0.0`
 so the container's port is reachable. The database side has its own recipe:
 [`examples/mirror-pg.Dockerfile`](../examples/mirror-pg.Dockerfile) builds
-PostgreSQL 16 with the extensions the Mirror uses.
+PostgreSQL 18 with the extensions the Mirror uses; 16 and later serve.
 
 **The log** (`--log-level`):
 - **WARNING:** what an operator must see, such as the start-up notice and a
