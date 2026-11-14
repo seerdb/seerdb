@@ -6158,8 +6158,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_extract overloads (#2627), and AT TIME ZONE's: sys.ora_zone_offset
     # and three overloads each of sys.ora_at_time_zone and sys.ora_at_local
     # (#2617), and an interval's text: sys.ora_interval_text and
-    # sys.ora_intervalym_text (#2621).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 383
+    # sys.ora_intervalym_text (#2621), and the two state functions of MAX and
+    # MIN of a WITH TIME ZONE value: sys.ora_tstz_larger and smaller (#2660).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 385
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -17856,3 +17857,52 @@ def test_an_interval_literal_says_its_text_call_and_precisions() -> None:
         ("INTERVAL '14' MONTH", 'sys.ora_intervalym_text', 200),
     ):
         assert found(f"SELECT {literal} || 'x' FROM dual") == [(call, code)], literal
+
+
+def test_max_and_min_of_a_with_time_zone_value_keep_its_offset() -> None:
+    # MAX and MIN of a TIMESTAMP WITH TIME ZONE came back on PostgreSQL 16 as
+    # the UTC instant with no offset (max(timestamptz), reached through the
+    # implicit cast), and failed on 18, whose max(record) and max(anyarray)
+    # made the call ambiguous (#2660). Oracle orders by the instant and
+    # returns the value with its own offset.
+    import datetime
+
+    def at(hours: int) -> datetime.timezone:
+        return datetime.timezone(datetime.timedelta(hours=hours))
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2660 (g NUMBER, t TIMESTAMP WITH TIME ZONE)')
+        try:
+            # The latest instant has the earliest wall clock, and the reverse.
+            for g, value in (
+                (1, "TIMESTAMP '2026-01-02 03:04:05 +02:00'"),  # 01:04:05 UTC
+                (1, "TIMESTAMP '2026-01-01 22:00:00 -05:00'"),  # 03:00:00 UTC
+                (2, "TIMESTAMP '2026-01-02 00:30:00 +00:00'"),  # 00:30:00 UTC
+                (2, 'NULL'),
+            ):
+                backend.execute(f'INSERT INTO t2660 VALUES ({g}, {value})')
+            latest = datetime.datetime(2026, 1, 1, 22, 0, 0, tzinfo=at(-5))
+            earliest = datetime.datetime(2026, 1, 2, 0, 30, 0, tzinfo=at(0))
+            first = datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=at(2))
+            assert backend.execute('SELECT MAX(t), MIN(t) FROM t2660').rows == [
+                (latest, earliest)
+            ]
+            for got, want in zip(
+                backend.execute('SELECT MAX(t), MIN(t) FROM t2660').rows[0],
+                (latest, earliest),
+            ):
+                assert got.utcoffset() == want.utcoffset()
+            assert backend.execute(
+                'SELECT g, MAX(t), MIN(t) FROM t2660 GROUP BY g ORDER BY g'
+            ).rows == [(1, latest, first), (2, earliest, earliest)]
+            assert backend.execute(
+                'SELECT DISTINCT MAX(t) OVER () FROM t2660'
+            ).rows == [(latest,)]
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2660')
+    finally:
+        backend.close()

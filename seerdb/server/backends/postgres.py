@@ -1662,6 +1662,21 @@ _HELPER_FUNCTIONS_DDL = (
     # An operator class needs a superuser; without one the operators still
     # compare by instant, and ORDER BY / DISTINCT keep the record's meaning.
     'EXCEPTION WHEN duplicate_object OR insufficient_privilege THEN NULL; END $$;'
+    # MAX and MIN of a WITH TIME ZONE value, by the instant, keeping the
+    # value's own offset (#2660). Without them PostgreSQL 16 reached
+    # max(timestamptz) through the implicit cast and dropped the offset, and
+    # 18's max(record) and max(anyarray) made the call ambiguous. Of two values
+    # at one instant, the first is kept.
+    f'CREATE OR REPLACE FUNCTION sys.ora_tstz_larger({_TSTZ_TYPE}, {_TSTZ_TYPE}) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS '
+    '$$ SELECT CASE WHEN ($2).utc > ($1).utc THEN $2 ELSE $1 END $$;'
+    f'CREATE OR REPLACE FUNCTION sys.ora_tstz_smaller({_TSTZ_TYPE}, {_TSTZ_TYPE}) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS '
+    '$$ SELECT CASE WHEN ($2).utc < ($1).utc THEN $2 ELSE $1 END $$;'
+    f'CREATE OR REPLACE AGGREGATE sys.max({_TSTZ_TYPE}) (SFUNC = sys.ora_tstz_larger, '
+    f'STYPE = {_TSTZ_TYPE}, COMBINEFUNC = sys.ora_tstz_larger, PARALLEL = SAFE);'
+    f'CREATE OR REPLACE AGGREGATE sys.min({_TSTZ_TYPE}) (SFUNC = sys.ora_tstz_smaller, '
+    f'STYPE = {_TSTZ_TYPE}, COMBINEFUNC = sys.ora_tstz_smaller, PARALLEL = SAFE);'
     # A number of days added to a WITH [LOCAL] TIME ZONE value (#1240). Oracle
     # makes it a DATE first, on the session's clock for LTZ and on the value's
     # own offset for TSTZ, dropping the fractional seconds; the result is that
