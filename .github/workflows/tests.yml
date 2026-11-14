@@ -310,15 +310,29 @@ jobs:
   # 23ai, its default, and once more 12.1, so the older release's dialect stays
   # covered (#1747).
   mirror-postgres:
-    name: Integration tests (Mirror over PostgreSQL, ${{ matrix.presents }})
+    name: Integration tests (Mirror over PostgreSQL, ${{ matrix.presents }}${{ matrix.setup == 'oldest' && ', oldest supported PostgreSQL' || '' }})
     needs: changes
     if: needs.changes.outputs.mirror == 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Even a failure to build the oldest setup's image doesn't fail the run.
+    continue-on-error: ${{ matrix.setup == 'oldest' }}
     strategy:
       fail-fast: false
       matrix:
         presents: ["23ai", "12.1"]
+        setup: [newest]
+        include:
+          # The oldest setup the Mirror supports (#2668): what it lacks is
+          # documented (docs/MIRROR.md, *By PostgreSQL version*), not worked
+          # around, so this entry never fails. Its failures are listed in the
+          # job's summary instead.
+          - presents: "23ai"
+            setup: oldest
+            build_args: >-
+              --build-arg PG_IMAGE=postgres:16.14-alpine3.24
+              --build-arg PGVECTOR_VERSION=v0.8.0
+              --build-arg PLPGSQL_CHECK_VERSION=v2.10.11
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -327,7 +341,7 @@ jobs:
       - run: pip install ".[mirror]" pytest
       - name: Build and start PostgreSQL with orafce
         run: |
-          docker build -f examples/mirror-pg.Dockerfile -t mirror-pg .
+          docker build -f examples/mirror-pg.Dockerfile ${{ matrix.build_args }} -t mirror-pg .
           docker run -d --name mirror-pg -p 5433:5432 \
             -e POSTGRES_USER=pyo -e POSTGRES_PASSWORD=pyo123 -e POSTGRES_DB=mirror \
             mirror-pg
@@ -359,11 +373,32 @@ jobs:
           # this, instead of failing as though the client were at fault (#964).
           SEERDB_TEST_MIRROR: "1"
           MIRROR_PRESENTS: ${{ matrix.presents }}
+          SETUP: ${{ matrix.setup }}
         run: |
+          # A failing pytest must not hide behind `tee`'s status.
+          set -o pipefail
+          # The oldest setup's failures are reported, not raised (#2668): each
+          # run keeps going, and the summary lists what failed.
+          oldest_failed=0
+          report() {
+            if [ "$SETUP" = "oldest" ] && [ "$1" -ne 0 ]; then
+              oldest_failed=1
+              {
+                echo "### $2: fails on the oldest supported PostgreSQL"
+                echo '```'
+                grep -E '^(FAILED|ERROR) ' "$3" || tail -n 20 "$3"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              return 0
+            fi
+            return "$1"
+          }
           # The backend's unit module presents what each test asks for, so one
           # entry of the matrix runs it.
           if [ "$MIRROR_PRESENTS" = "23ai" ]; then
-            python -m pytest -q tests/test_postgres_backend.py
+            backend=0
+            python -m pytest -q -rfE tests/test_postgres_backend.py 2>&1 | tee backend.out || backend=$?
+            report "$backend" "tests/test_postgres_backend.py" backend.out
           fi
           # The packaged launcher, as a user runs it: `pip install ".[mirror]"`
           # installed this checkout. PYO is the suite's account (#1835).
@@ -382,7 +417,12 @@ jobs:
           # pytest rather than unittest, matching the step above and
           # tools/run_mirror_suite.py, which is how this same run is done
           # locally. The whole suite runs: nothing is skipped here any more.
-          python -m pytest -q --tb=short tests/test_integration.py || status=$?
+          python -m pytest -q -rfE --tb=short tests/test_integration.py 2>&1 | tee integration.out || status=$?
           kill "$MIRROR_PID" 2>/dev/null || true
           if [ "$status" -ne 0 ]; then echo "--- mirror log ---"; tail -n 200 mirror.log; fi
-          exit "$status"
+          report "$status" "tests/test_integration.py" integration.out || exit $?
+          if [ "$oldest_failed" -ne 0 ]; then
+            echo "::warning title=Oldest supported PostgreSQL::tests fail on PostgreSQL 16.14; see the job summary, and docs/MIRROR.md *By PostgreSQL version*"
+          elif [ "$SETUP" = "oldest" ]; then
+            echo "Everything passes on the oldest supported PostgreSQL." >> "$GITHUB_STEP_SUMMARY"
+          fi

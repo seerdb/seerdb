@@ -19,7 +19,12 @@
 # and `plpgsql_check` where they are installed) and puts the `oracle` schema on the search_path itself,
 # so no further setup is needed.
 
-FROM postgres:18.7-alpine3.24
+# The newest releases by default, which CI's gating legs test. The oldest
+# setup the Mirror supports is built from the same file (#2668):
+#   --build-arg PG_IMAGE=postgres:16.14-alpine3.24
+#   --build-arg PGVECTOR_VERSION=v0.8.0 --build-arg PLPGSQL_CHECK_VERSION=v2.10.11
+ARG PG_IMAGE=postgres:18.7-alpine3.24
+FROM ${PG_IMAGE}
 
 ARG ORAFCE_VERSION=VERSION_4_17_1
 ARG PGVECTOR_VERSION=v0.8.7
