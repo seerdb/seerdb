@@ -2455,6 +2455,15 @@ _HELPER_FUNCTIONS_DDL = (
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_json($1::text) $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json(jsonb) RETURNS jsonb '
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+        # JSON_VALUE's context item when no ERROR ON ERROR is given (#2679):
+        # invalid JSON is NULL, as 23ai's default NULL ON ERROR makes it.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(text) RETURNS jsonb '
+        "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE WHEN pg_input_is_valid($1, 'jsonb') "
+        'THEN jsonb_in($1::cstring) END $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(character) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_json_or_null($1::text) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(jsonb) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
         # A text value stored into a JSON column (#2441): 23ai converts a
         # VARCHAR2, a CLOB or any text expression, where PostgreSQL converts only
         # an untyped literal, through jsonb's input, and refused the rest. These
@@ -9373,8 +9382,88 @@ def _rr_format(fmt: str, parsing: bool) -> str:
 # Oracle's SQL/JSON functions and the PostgreSQL calls that do their work
 # over jsonb (#1707).
 _JSON_FUNCTION_NAMES = frozenset(
-    {'JSON', 'JSON_SCALAR', 'JSON_QUERY', 'JSON_EXISTS', 'JSON_SERIALIZE'}
+    {'JSON', 'JSON_SCALAR', 'JSON_QUERY', 'JSON_EXISTS', 'JSON_SERIALIZE', 'JSON_VALUE'}
 )
+# JSON_VALUE's clauses past the path (#2679): RETURNING a type, and the
+# answer for an error and for no value. Anything else is refused.
+_JSON_VALUE_RETURNING = re.compile(
+    r'\s*RETURNING\s+(.+?)(?=\s+(?:ERROR|NULL|DEFAULT)\b|\s*$)',
+    re.IGNORECASE | re.DOTALL,
+)
+_JSON_VALUE_ON = re.compile(
+    r'\s*(ERROR|NULL|DEFAULT\s+(.+?))\s+ON\s+(ERROR|EMPTY)\b', re.IGNORECASE | re.DOTALL
+)
+_JSON_FORMAT = re.compile(r'\s+FORMAT\s+JSON\s*$', re.IGNORECASE)
+# The type a path's last item method gives a JSON_VALUE with no RETURNING,
+# as 23ai types it, for the methods PostgreSQL's jsonpath has (#2679).
+_JSON_METHOD_TYPES = {
+    'number': 'numeric',
+    'size': 'numeric',
+    'double': 'double precision',
+    'date': 'ora_date',
+    'timestamp': 'timestamp',
+    'boolean': 'boolean',
+}
+_JSON_LAST_METHOD = re.compile(r'\.(\w+)\(\)\s*$')
+
+
+def _native_json_value(context: str, path_and_clauses: str) -> str:
+    # Oracle's JSON_VALUE(x, path [RETURNING type] [ERROR | NULL | DEFAULT e
+    # ON ERROR] [... ON EMPTY]) as PostgreSQL 17's native JSON_VALUE (#2679),
+    # with what 23ai does differently made the same:
+    #   - invalid JSON text is NULL unless ERROR ON ERROR: sys.ora_json_or_null;
+    #   - a RETURNING type is the Mirror's for Oracle's; with none, a path's
+    #     last item method types the value as 23ai does (.number() a NUMBER);
+    #   - otherwise the value is VARCHAR2(4000), and a boolean 'true' where
+    #     PostgreSQL's text is 't': read as jsonb and taken as its text.
+    (masked, contents) = _mask_quoted(path_and_clauses.strip())
+    path = re.match(r"\s*('[^']*'|\S+)", masked)
+    if path is None:
+        raise UnsupportedFeature('JSON_VALUE without a path')
+    path_text = _unmask_quoted(path.group(1), contents)
+    rest = masked[path.end() :]
+    returning = _JSON_VALUE_RETURNING.match(rest)
+    pg_type = None
+    if returning is not None:
+        pg_type = _translate_column_types(
+            _unmask_quoted(returning.group(1).strip(), contents)
+        )
+        rest = rest[returning.end() :]
+    else:
+        method = _JSON_LAST_METHOD.search(path_text[1:-1])
+        if method is not None:
+            pg_type = _JSON_METHOD_TYPES.get(method.group(1))
+    clauses: list[str] = []
+    error_on_error = False
+    while rest.strip():
+        found = _JSON_VALUE_ON.match(rest)
+        if found is None:
+            raise UnsupportedFeature(
+                f'JSON_VALUE clause {_unmask_quoted(rest.strip(), contents)}'
+            )
+        (answer, default, event) = found.groups()
+        event = event.upper()
+        if default is None:
+            answer = answer.upper()
+            error_on_error = error_on_error or (answer == 'ERROR' and event == 'ERROR')
+        else:
+            # As text read back as jsonb's text, where the value is.
+            value = _unmask_quoted(default.strip(), contents)
+            answer = (
+                f'DEFAULT {value}' if pg_type else f'DEFAULT to_jsonb(({value})::text)'
+            )
+        clauses.append(f'{answer} ON {event}')
+        rest = rest[found.end() :]
+    item = _JSON_FORMAT.sub('', context).strip()
+    item = (
+        f'sys.ora_json({item})' if error_on_error else f'sys.ora_json_or_null({item})'
+    )
+    tail = ''.join(f' {c}' for c in clauses)
+    if pg_type is not None:
+        return f'JSON_VALUE({item}, {path_text} RETURNING {pg_type}{tail})'
+    return f"(JSON_VALUE({item}, {path_text} RETURNING jsonb{tail}) #>> '{{}}')::varchar(4000)"
+
+
 _JSON_EXTENDED = re.compile(r'\s+EXTENDED\s*$', re.IGNORECASE)
 _JSON_RETURNING = re.compile(r'\s+RETURNING\b.*$', re.IGNORECASE | re.DOTALL)
 
@@ -9397,6 +9486,11 @@ def _translate_json_functions(sql: str) -> str:
         if upper == 'JSON_SERIALIZE' and len(inner) == 1:
             value = _JSON_RETURNING.sub('', inner[0]).strip()
             return f'sys.ora_json_serialize(sys.ora_json({value}))'
+        if upper == 'JSON_VALUE' and len(inner) == 2:
+            if _SERVER_VERSION.get() < 170000:
+                # floor: PG17 -- refused below 17 (#2679, #2682).
+                raise UnsupportedFeature('JSON_VALUE needs PostgreSQL 17 or later')
+            return _native_json_value(inner[0], inner[1])
         if upper in ('JSON_QUERY', 'JSON_EXISTS') and len(inner) >= 2:
             path = _JSON_RETURNING.sub('', inner[1]).strip().split()[0]
             function = (
@@ -12114,6 +12208,11 @@ def _cast_literal_items(sql: str) -> str:
 
 # The translation report (#1557): the names of the translation rules that have
 # changed the statement in flight, or None while no report is being taken.
+# The PostgreSQL server the running backend call talks to, as
+# server_version_num (#2679): a translation that uses what only a newer
+# server has reads it. _while_connected sets it for each call; outside one,
+# a pure translation sees the oldest supported server, 16.
+_SERVER_VERSION: ContextVar[int] = ContextVar('pg_server_version', default=160000)
 _TRANSLATION_RULES: ContextVar[list[str] | None] = ContextVar(
     '_TRANSLATION_RULES', default=None
 )
@@ -12302,7 +12401,7 @@ def _translate_idioms(sql: str) -> str:
     would hold the cache's memory for nothing."""
     if len(sql) > _KEPT_IDIOMS_TEXT:
         return _rewritten_idioms(sql)
-    (translated, rules) = _idioms_and_rules(sql)
+    (translated, rules) = _idioms_and_rules(sql, _SERVER_VERSION.get())
     for rule in rules:
         _note_rule(rule)
     return translated
@@ -12312,8 +12411,9 @@ _KEPT_IDIOMS_TEXT = 8192
 
 
 @functools.lru_cache(maxsize=512)
-def _idioms_and_rules(sql: str) -> tuple[str, tuple[str, ...]]:
-    # _translate_idioms' rewrite of `sql`, and the rules it noted, in order.
+def _idioms_and_rules(sql: str, version: int) -> tuple[str, tuple[str, ...]]:
+    # _translate_idioms' rewrite of `sql`, and the rules it noted, in order;
+    # kept per server `version` too, which a rule may read (_SERVER_VERSION).
     rules: list[str] = []
     token = _TRANSLATION_RULES.set(rules)
     try:
@@ -15495,6 +15595,8 @@ _INTERVAL_OIDS = frozenset({_INTERVAL_OID})
 # `undefined_table` → ORA-00942: the suite's setUp/tearDown drops tables
 # best-effort and only swallows ORA-00942 — reporting ORA-00900 instead re-raised
 # and failed every test in setUp. Anything unmapped falls back to ORA-00900.
+_ORA_JSON_NON_SCALAR = 40456
+_ORA_JSON_NO_VALUE = 40462
 _SQLSTATE_TO_ORA = {
     '42P01': ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,  # undefined_table
     '42704': ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,  # undefined_object (type), for DROP TYPE cleanup
@@ -15507,6 +15609,10 @@ _SQLSTATE_TO_ORA = {
     # direction; the delete or update of a parent row is ORA-02292, which only the
     # message tells (_ora_code_for, sys.ora_sqlcode; #2664)
     '23514': ORA_CHECK_CONSTRAINT_VIOLATED,  # check_violation
+    # JSON_VALUE ... ERROR ON ERROR | EMPTY (#2679): a value that isn't a
+    # scalar, and no value at all.
+    '2203F': _ORA_JSON_NON_SCALAR,  # sql_json_scalar_required
+    '22035': _ORA_JSON_NO_VALUE,  # no_sql_json_item
     '22P02': ORA_INVALID_NUMBER,  # invalid_text_representation (TO_NUMBER)
     '3B001': ORA_SAVEPOINT_NEVER_ESTABLISHED,  # invalid_savepoint_specification
     '55P03': ORA_RESOURCE_BUSY,  # lock_not_available (a DDL's lock wait, #1191)
@@ -16929,6 +17035,9 @@ def _while_connected(method):
         # than commit() or rollback() ended -- a COMMIT a routine ran -- turns
         # autocommit off here, before the call.
         self._conn.end_own_transaction()
+        # A stand-in connection a test makes may have no server to report.
+        info = getattr(self._conn, 'info', None)
+        version = _SERVER_VERSION.set(getattr(info, 'server_version', 160000))
         try:
             return method(self, *args, **kwargs)
         except (_ObjectMissing, _UniqueViolation, _InvalidNumber) as error:
@@ -16952,6 +17061,8 @@ def _while_connected(method):
             if self._conn.closed:
                 raise _session_terminated() from None
             raise
+        finally:
+            _SERVER_VERSION.reset(version)
 
     return call
 
