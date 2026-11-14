@@ -15351,7 +15351,8 @@ _SQLSTATE_TO_ORA = {
     '23505': ORA_UNIQUE_CONSTRAINT_VIOLATED,  # unique_violation
     '23502': ORA_CANNOT_INSERT_NULL,  # not_null_violation
     '23503': ORA_PARENT_KEY_NOT_FOUND,  # foreign_key_violation: the insert/update
-    # direction; the delete direction is ORA-02292, which SQLSTATE cannot tell apart
+    # direction; the delete or update of a parent row is ORA-02292, which only the
+    # message tells (_ora_code_for, sys.ora_sqlcode; #2664)
     '23514': ORA_CHECK_CONSTRAINT_VIOLATED,  # check_violation
     '22P02': ORA_INVALID_NUMBER,  # invalid_text_representation (TO_NUMBER)
     '3B001': ORA_SAVEPOINT_NEVER_ESTABLISHED,  # invalid_savepoint_specification
@@ -15423,6 +15424,13 @@ def _application_error(exc) -> tuple[int, str] | None:
     return (int(m.group(1)), m.group(2)) if m else None
 
 
+# How PostgreSQL's foreign_key_violation begins when a parent row was deleted or
+# updated under its children (#2664), as against `insert or update on table`:
+# Oracle's ORA-02292, "integrity constraint violated - child record found".
+_PARENT_ROW_CHANGE = 'update or delete on table'
+_ORA_CHILD_RECORD_FOUND = 2292
+
+
 def _ora_code_for(exc) -> int:
     sqlstate = getattr(exc, 'sqlstate', None)
     if not isinstance(sqlstate, str):
@@ -15439,6 +15447,12 @@ def _ora_code_for(exc) -> int:
         if _primary_message(exc).startswith('permission denied for schema'):
             return ORA_TABLE_OR_VIEW_DOES_NOT_EXIST
         return ORA_INSUFFICIENT_PRIVILEGES
+    if sqlstate == '23503' and _primary_message(exc).startswith(_PARENT_ROW_CHANGE):
+        # A delete or an update of a row others still reference: ORA-02292,
+        # "child record found". The insert or update of a referencing row is
+        # ORA-02291, "parent key not found". PostgreSQL gives both one SQLSTATE
+        # and tells them apart in its message only (#2664).
+        return _ORA_CHILD_RECORD_FOUND
     if sqlstate == '42601':
         primary = _primary_message(exc)
         for text, code in _INSERT_ARITY:
@@ -15675,6 +15689,8 @@ _PLSQL_ERROR_DDL = (
     + "WHEN $1 = '22003' AND strpos($2, 'numeric field overflow') > 0 "
     f'THEN -{ORA_VALUE_LARGER_THAN_PRECISION} '
     f"WHEN $1 = '22003' THEN -{ORA_NUMERIC_OVERFLOW} "
+    f"WHEN $1 = '23503' AND starts_with($2, {_sql_text(_PARENT_ROW_CHANGE)}) "
+    f'THEN -{_ORA_CHILD_RECORD_FOUND} '
     "WHEN $1 = '22P02' AND $2 ~ '^invalid input syntax for type json' "
     f'THEN -{_ORA_JSON_SYNTAX_ERROR} '
     + ''.join(

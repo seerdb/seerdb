@@ -209,6 +209,15 @@ def test_backend_error_uses_oracle_canonical_text_for_mapped_code() -> None:
         _FakePgError('23503', 'insert or update violates foreign key constraint')
     )
     assert fk.ora_code == 2291
+    # A parent row deleted or updated under its children is ORA-02292, child
+    # record found, which only PostgreSQL's message tells apart (#2664).
+    child = _backend_error(
+        _FakePgError(
+            '23503',
+            'update or delete on table "p" violates foreign key constraint "fk" on table "c"',
+        )
+    )
+    assert child.ora_code == 2292
 
 
 # --- DDL type translation (#500) — a pure function, no live PostgreSQL needed ---
@@ -17971,5 +17980,52 @@ def test_merge_into_a_view_from_postgresql_17() -> None:
             backend.rollback()
             backend.execute('DROP VIEW t2652mv')
             backend.execute('DROP TABLE t2652m')
+    finally:
+        backend.close()
+
+
+def test_a_parent_row_with_children_is_ora_02292() -> None:
+    # Deleting or re-keying a parent row its children still reference reported
+    # ORA-02291, parent key not found, where Oracle gives ORA-02292, child
+    # record found (#2664). An orphan child row stays ORA-02291. SQLCODE in a
+    # PL/SQL handler follows.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+
+    def code(sql: str) -> int:
+        try:
+            backend.execute(sql)
+        except BackendError as exc:
+            backend.rollback()
+            return exc.ora_code
+        raise AssertionError(f'{sql!r} did not fail')
+
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE p2664 (id NUMBER PRIMARY KEY)')
+        backend.execute(
+            'CREATE TABLE c2664 (id NUMBER, pid NUMBER, '
+            'CONSTRAINT fk2664 FOREIGN KEY (pid) REFERENCES p2664 (id))'
+        )
+        backend.execute('CREATE TABLE r2664 (c NUMBER)')
+        try:
+            backend.execute('INSERT INTO p2664 VALUES (1)')
+            backend.execute('INSERT INTO c2664 VALUES (1, 1)')
+            backend.commit()
+            assert code('DELETE FROM p2664 WHERE id = 1') == 2292
+            assert code('UPDATE p2664 SET id = 2 WHERE id = 1') == 2292
+            assert code('INSERT INTO c2664 VALUES (2, 9)') == 2291
+            assert code('UPDATE c2664 SET pid = 9') == 2291
+            backend.execute(
+                'BEGIN DELETE FROM p2664 WHERE id = 1; '
+                'EXCEPTION WHEN OTHERS THEN INSERT INTO r2664 VALUES (SQLCODE); END;'
+            )
+            assert backend.execute('SELECT c FROM r2664').rows == [(-2292,)]
+        finally:
+            backend.rollback()
+            for table in ('r2664', 'c2664', 'p2664'):
+                backend.execute(f'DROP TABLE {table}')
     finally:
         backend.close()
