@@ -88,6 +88,24 @@ class TestCoercionReachesEveryShape(unittest.TestCase):
         self.assertIsNone(_received(Var(float), None))
 
 
+class TestAPythonTypeNamesItsDatabaseType(unittest.TestCase):
+    def test_bool_is_a_boolean(self):
+        # It was refused, "unsupported var() type"; python-oracledb's
+        # var(bool) is a DB_TYPE_BOOLEAN (#2658).
+        from seerdb import DB_TYPE_BOOLEAN
+
+        self.assertIs(Var(bool).dbtype, DB_TYPE_BOOLEAN)
+        self.assertIsNot(Var(int).dbtype, DB_TYPE_BOOLEAN)
+
+    def test_datetime_is_a_timestamp(self):
+        # It was a DATE, which dropped an OUT value's microseconds; python-
+        # oracledb's var(datetime) is a TIMESTAMP (#2658). A date stays a DATE.
+        from seerdb import DB_TYPE_DATE, DB_TYPE_TIMESTAMP
+
+        self.assertIs(Var(datetime.datetime).dbtype, DB_TYPE_TIMESTAMP)
+        self.assertIs(Var(datetime.date).dbtype, DB_TYPE_DATE)
+
+
 class TestNonNumericVarsAreUntouched(unittest.TestCase):
     """Every other type has a database type of its own, which already decides."""
 

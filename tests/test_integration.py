@@ -8663,6 +8663,21 @@ class VarValueIntegration(_IntegrationBase):
             self.cur.execute('SELECT :1 FROM dual', ['12'])
         self.assertEqual(self.cur.execute('SELECT 1 FROM dual').fetchone(), (1,))
 
+    def test_a_var_of_datetime_keeps_a_timestamp_s_microseconds(self):
+        # var(datetime) was a DATE, so an OUT TIMESTAMP lost its fraction;
+        # python-oracledb's is a TIMESTAMP (#2658). 8i has no TIMESTAMP.
+        if _conn_is_8i(self.conn):
+            self.skipTest('Oracle 8i has no TIMESTAMP')
+        out = self.cur.var(datetime.datetime)
+        self.cur.execute(
+            "BEGIN :o := TO_TIMESTAMP('2026-01-01 10:00:00.123456', "
+            "'YYYY-MM-DD HH24:MI:SS.FF6'); END;",
+            [out],
+        )
+        self.assertEqual(
+            out.getvalue(), datetime.datetime(2026, 1, 1, 10, 0, 0, 123456)
+        )
+
     def test_a_binary_double_takes_a_decimal(self):
         from seerdb.common.tns_consts import FIELD_VERSION_10_2
 
@@ -9748,6 +9763,16 @@ class BooleanIntegration(_IntegrationBase):
         self.conn.commit()
         self.cur.execute(f'SELECT id, flag FROM {self.TABLE} ORDER BY id')
         self.assertEqual(self.cur.fetchall(), [(1, True), (2, False)])
+
+    def test_a_var_of_bool_is_a_boolean_out_bind(self):
+        # cursor.var(bool) was refused (#2658); python-oracledb makes it a
+        # BOOLEAN, as Transaction Guard's GET_LTXID_OUTCOME needs.
+        _skip_unless(self, _BOOLEAN)
+        out = self.cur.var(bool)
+        self.cur.execute('BEGIN :b := TRUE; END;', [out])
+        self.assertIs(out.getvalue(), True)
+        self.cur.execute('BEGIN :b := FALSE; END;', [out])
+        self.assertIs(out.getvalue(), False)
 
     def test_boolean_bind_declared_number(self):
         # A bool whose bind was declared NUMBER, as SQLAlchemy's Oracle dialect
