@@ -651,6 +651,7 @@ _DOMAINS = _Need(
 del _FV
 # By the server.
 _SODA = _Need('SODA needs an Oracle 18c+ server (DBMS_SODA)', min_server=18)
+_RETURNING_OLD_NEW = _Need('RETURNING OLD / NEW needs Oracle 23ai', min_server=23)
 _TIMESTAMP_AT_SESSION_ZONE = _Need(
     'a TIMESTAMP AT TIME ZONE is read in the session zone from 18c', min_server=18
 )
@@ -18353,6 +18354,38 @@ class AsyncTransactionGuardIntegration(
                 await cur.execute('DROP TABLE pyo_async_tg PURGE')
         finally:
             await conn.close()
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_RETURNING_OLD_NEW)
+class ReturningOldNewIntegration(_IntegrationBase):
+    """23ai's RETURNING OLD col / NEW col (#2678). Through a Mirror-over-PG it
+    needs PostgreSQL 18; on an older one it is refused (docs/MIRROR.md, *By
+    PostgreSQL version*), where a PL/SQL block used to get a garbage number."""
+
+    def setUp(self):
+        super().setUp()
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, v NUMBER)')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1, 10)')
+
+    def _vars(self, n: int) -> list:
+        return [self.cur.var(int) for _ in range(n)]
+
+    def test_old_and_new_of_an_update(self):
+        (a, b) = self._vars(2)
+        self.cur.execute(
+            f'UPDATE {self.TABLE} SET v = v + 5 RETURNING OLD v, NEW v INTO :a, :b',
+            [a, b],
+        )
+        self.assertEqual((a.getvalue(), b.getvalue()), ([10], [15]))
+
+    def test_old_in_a_plsql_block(self):
+        (a,) = self._vars(1)
+        self.cur.execute(
+            f'BEGIN UPDATE {self.TABLE} SET v = v + 5 RETURNING OLD v INTO :a; END;',
+            [a],
+        )
+        self.assertEqual(a.getvalue(), 10)
 
 
 if __name__ == '__main__':

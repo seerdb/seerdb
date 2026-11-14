@@ -11777,6 +11777,54 @@ def _unqualified_set_targets(sql: str) -> str:
     return _unmask_quoted(out, contents)
 
 
+# A RETURNING list's start, in a statement or a PL/SQL body (Oracle's RETURN
+# too), and where the list ends.
+_RETURNING_LIST = re.compile(r'(?<![\w$#."])RETURN(?:ING)?\b', re.IGNORECASE)
+_RETURNING_ENDS = frozenset({'INTO', 'BULK'})
+# An item that is Oracle 23ai's OLD col or NEW col.
+_OLD_NEW_ITEM = re.compile(
+    r'\s*(OLD|NEW)\s+("[^"]*"|[A-Za-z_][\w$#]*)\s*', re.IGNORECASE
+)
+
+
+def _returning_old_new(sql: str, supported: bool) -> str:
+    """Oracle 23ai's `RETURNING OLD col, NEW col` as PostgreSQL 18's
+    `RETURNING old.col, new.col` (#2678). PostgreSQL before 18 has no such
+    thing, and read `OLD col` as the whole old row named col: a garbage
+    number in a PL/SQL block, an unsupported type in SQL. So there it is
+    refused. `supported` is whether the server is 18 or later.
+    """
+    if not _RETURNING_LIST.search(sql):
+        return sql
+    (masked, contents) = _mask_quoted(sql)
+    edits: list[tuple[int, int, str]] = []
+    for head in _RETURNING_LIST.finditer(masked):
+        stop = masked.find(';', head.end())
+        stop = len(masked) if stop < 0 else stop
+        for at, word in _top_level_words(masked[head.end() : stop])[0]:
+            if word in _RETURNING_ENDS:
+                stop = head.end() + at
+                break
+        for start, end in _top_level_items(masked, head.end(), stop):
+            item = _OLD_NEW_ITEM.fullmatch(masked, start, end)
+            if item is not None:
+                edits.append(
+                    (
+                        item.start(1),
+                        item.end(2),
+                        f'{item.group(1).lower()}.{item.group(2)}',
+                    )
+                )
+    if not edits:
+        return sql
+    if not supported:
+        raise UnsupportedFeature('RETURNING OLD or NEW needs PostgreSQL 18 or later')
+    out = masked
+    for start, end, text in sorted(edits, reverse=True):
+        out = out[:start] + text + out[end:]
+    return _unmask_quoted(out, contents)
+
+
 def _translate_attribute_access(sql: str) -> str:
     """Oracle's object attribute access, `alias.column.attribute`, in
     PostgreSQL's spelling `(alias.column).attribute`, which reads the Oracle
@@ -19582,6 +19630,11 @@ class PostgresBackend:
         )
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('constraint-state', self._constraint_state(sql), sql)
+        sql = _ruled(
+            'returning-old-new',
+            _returning_old_new(sql, self._conn.info.server_version >= 180000),
+            sql,
+        )
         sql = _ruled('instant-index', self._instant_index_keys(sql), sql)
         sql = _ruled('index-expressions', _parenthesized_index_keys(sql), sql)
         sql = _ruled('constraint-names', self._named_constraints(sql), sql)
@@ -24332,6 +24385,8 @@ class PostgresBackend:
         }
 
     def _execute_plsql(self, sql: str, binds: Sequence) -> Result:
+        # floor: PG18 -- RETURNING OLD / NEW is refused below 18 (#2678, #2682).
+        sql = _returning_old_new(sql, self._conn.info.server_version >= 180000)
         # A call that fails undoes only itself (#1632): the caller's open work
         # survives it, as it survives any other statement that fails, where a
         # rollback of the whole transaction took it too.
