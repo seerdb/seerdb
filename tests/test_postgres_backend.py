@@ -6172,8 +6172,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # (#2617), and an interval's text: sys.ora_interval_text and
     # sys.ora_intervalym_text (#2621), and the two state functions of MAX and
     # MIN of a WITH TIME ZONE value: sys.ora_tstz_larger and smaller (#2660),
-    # and JSON_VALUE's lenient context item, three sys.ora_json_or_null (#2679).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 388
+    # and JSON_VALUE's lenient context item, three sys.ora_json_or_null, and
+    # JSON_QUERY's result by its input, two sys.ora_json_query_out (#2679).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 390
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -18394,5 +18395,83 @@ def test_json_value_before_postgresql_17_is_refused() -> None:
         backend.open_session({})
         with pytest.raises(UnsupportedFeature):
             backend.execute("SELECT JSON_VALUE('{\"a\":1}', '$.a') FROM dual")
+    finally:
+        backend.close()
+
+
+# JSON_QUERY cases and 23ai's answers (#2679), measured on 23ai Free.
+_JSON_QUERY_DOC = '{"a":{"b":1},"e":[1,2],"s":"x","n":5}'
+_JSON_QUERY_CASES = (
+    ("'$.a'", '{"b":1}'),
+    ("'$.e'", '[1,2]'),
+    ("'$.e[*]'", None),
+    ("'$.e[*]' WITH WRAPPER", '[1,2]'),
+    ("'$.e[*]' WITH ARRAY WRAPPER", '[1,2]'),
+    ("'$.e[0]' WITH CONDITIONAL WRAPPER", '1'),
+    ("'$.e' WITH CONDITIONAL WRAPPER", '[1,2]'),
+    ("'$.e' WITH UNCONDITIONAL WRAPPER", '[[1,2]]'),
+    ("'$.s'", '"x"'),
+    ("'$.s' WITH WRAPPER", '["x"]'),
+    ("'$.n'", '5'),
+    ("'$.z'", None),
+    ("'$.z' EMPTY ON EMPTY", '[]'),
+    ("'$.z' EMPTY ARRAY ON EMPTY", '[]'),
+    ("'$.z' EMPTY OBJECT ON EMPTY", '{}'),
+    ("'$.a' RETURNING VARCHAR2(100)", '{"b":1}'),
+)
+
+
+def test_json_query_is_23ai_s_from_postgresql_17() -> None:
+    # JSON_QUERY gave the first value as JSON whatever its clauses (#2679):
+    # on 17 and later it is the native one, VARCHAR2 text in Oracle's compact
+    # form for a text input, its wrappers and ON EMPTY answers 23ai's.
+    from seerdb.server.backend import BackendError
+
+    if _server_version_num() < 170000:
+        pytest.skip('JSON_QUERY clauses need PostgreSQL 17')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        for path, expected in _JSON_QUERY_CASES:
+            (got,) = backend.execute(
+                f"SELECT JSON_QUERY('{_JSON_QUERY_DOC}', {path}) FROM dual"
+            ).rows[0]
+            assert got == expected, path
+        assert backend.execute(
+            "SELECT JSON_QUERY('not json', '$.a') FROM dual"
+        ).rows == [(None,)]
+        for path, code in (
+            ("'$.z' ERROR ON EMPTY", 40462),
+            ("'$.e[*]' ERROR ON ERROR", 40480),
+        ):
+            with pytest.raises(BackendError) as raised:
+                backend.execute(
+                    f"SELECT JSON_QUERY('{_JSON_QUERY_DOC}', {path}) FROM dual"
+                )
+            backend.rollback()
+            assert raised.value.ora_code == code, path
+    finally:
+        backend.close()
+
+
+def test_json_query_clauses_before_postgresql_17_are_refused() -> None:
+    # Before 17, JSON_QUERY(x, path) is the first value as JSON, as it was; a
+    # clause it would ignore is refused, not answered wrong (#2679).
+    from seerdb.server.backend import UnsupportedFeature
+
+    if _server_version_num() >= 170000:
+        pytest.skip('PostgreSQL 17 has the clauses')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        assert backend.execute(
+            'SELECT JSON_QUERY(\'{"a":{"b":1}}\', \'$.a\') FROM dual'
+        ).rows == [({'b': 1},)]
+        with pytest.raises(UnsupportedFeature):
+            backend.execute(
+                "SELECT JSON_QUERY('{\"e\":[1,2]}', '$.e[*]' WITH WRAPPER) FROM dual"
+            )
     finally:
         backend.close()
