@@ -18029,3 +18029,72 @@ def test_a_parent_row_with_children_is_ora_02292() -> None:
                 backend.execute(f'DROP TABLE {table}')
     finally:
         backend.close()
+
+
+def test_an_index_key_that_is_an_expression_is_parenthesized() -> None:
+    # PostgreSQL wants an index key that is neither a column nor one function
+    # call in parentheses of its own; Oracle takes `(n * 2)` bare, which was a
+    # syntax error here (#2662). The order of a key stays outside.
+    from seerdb.server.backends.postgres import _parenthesized_index_keys
+
+    for oracle, postgres in (
+        ('CREATE INDEX i ON t (v * 2)', 'CREATE INDEX i ON t ((v * 2))'),
+        (
+            'CREATE INDEX i ON t (v * 2 DESC, n)',
+            'CREATE INDEX i ON t ((v * 2) DESC, n)',
+        ),
+        (
+            'CREATE INDEX i ON t ("Col", a + 1 NULLS LAST)',
+            'CREATE INDEX i ON t ("Col", (a + 1) NULLS LAST)',
+        ),
+        (
+            'CREATE INDEX i ON t (upper(a) || b)',
+            'CREATE INDEX i ON t ((upper(a) || b))',
+        ),
+        (
+            'CREATE INDEX i ON t (CASE WHEN a > 0 THEN 1 END)',
+            'CREATE INDEX i ON t ((CASE WHEN a > 0 THEN 1 END))',
+        ),
+    ):
+        assert _parenthesized_index_keys(oracle) == postgres
+    for as_is in (
+        'CREATE UNIQUE INDEX i ON s.t (UPPER(name), id ASC)',
+        "CREATE INDEX i ON t (NVL(a, 'x,y'), substr(b, 1, 3))",
+        'CREATE INDEX i ON t ((v * 2))',
+        'CREATE INDEX i ON t (((tz).utc))',
+        'CREATE INDEX i ON t (a)',
+        "SELECT 'CREATE INDEX i ON t (v * 2)' FROM dual",
+    ):
+        assert _parenthesized_index_keys(as_is) == as_is
+
+
+def test_an_index_on_an_expression_is_created_and_enforced() -> None:
+    # `CREATE INDEX ... (v * 2)` was refused with a syntax error (#2662). The
+    # index is made, the dictionary lists it as function-based, and a UNIQUE
+    # one refuses two rows with one value of the expression.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2662 (v NUMBER, w NUMBER)')
+        try:
+            backend.execute('CREATE INDEX i2662 ON t2662 (v * 2)')
+            backend.execute('CREATE UNIQUE INDEX u2662 ON t2662 (v + w DESC)')
+            assert backend.execute(
+                'SELECT index_name, index_type, uniqueness FROM user_indexes '
+                "WHERE table_name = 'T2662' ORDER BY 1"
+            ).rows == [
+                ('I2662', 'FUNCTION-BASED NORMAL', 'NONUNIQUE'),
+                ('U2662', 'FUNCTION-BASED NORMAL', 'UNIQUE'),
+            ]
+            backend.execute('INSERT INTO t2662 VALUES (1, 2)')
+            with pytest.raises(BackendError) as raised:
+                backend.execute('INSERT INTO t2662 VALUES (2, 1)')
+            assert raised.value.ora_code == 1
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2662')
+    finally:
+        backend.close()
