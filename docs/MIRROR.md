@@ -650,8 +650,8 @@ Both modes translate the same SQL and PL/SQL; only who may do what differs.
   errors, as Oracle's compiler makes it. Without it such a routine is created
   VALID and fails when it runs. Its creation needs a superuser; the Mirror runs
   `CREATE EXTENSION IF NOT EXISTS plpgsql_check` as it installs its dictionary.
-  CI pins v2.10.11: v2.10.12 crashes the server on a function that fetches from
-  a cursor parameter, and a crash in it restarts every session.
+  CI pins v2.10.16. Avoid v2.10.12: it crashes the server on a function that
+  fetches from a cursor parameter, and a crash in it restarts every session.
 
 The repository's [`examples/mirror-pg.Dockerfile`](../examples/mirror-pg.Dockerfile)
 builds PostgreSQL 16 with all three, as CI uses it.

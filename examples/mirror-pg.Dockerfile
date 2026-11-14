@@ -22,8 +22,8 @@
 FROM postgres:16-alpine
 
 ARG ORAFCE_VERSION=VERSION_4_17_1
-ARG PGVECTOR_VERSION=v0.8.0
-ARG PLPGSQL_CHECK_VERSION=v2.10.11
+ARG PGVECTOR_VERSION=v0.8.7
+ARG PLPGSQL_CHECK_VERSION=v2.10.16
 
 RUN set -eux; \
     apk add --no-cache --virtual .orafce-build \
