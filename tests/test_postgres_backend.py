@@ -18159,3 +18159,110 @@ def test_set_targets_keep_what_does_not_name_the_target() -> None:
         'UPDATE m SET v = 1',
     ):
         assert _unqualified_set_targets(as_is) == as_is
+
+
+def _disable_tables(backend) -> None:
+    backend.execute(
+        'CREATE TABLE p2663 (id NUMBER PRIMARY KEY, x NUMBER CONSTRAINT p2663_ck CHECK (x > 0))'
+    )
+    backend.execute(
+        'CREATE TABLE c2663 (pid NUMBER CONSTRAINT c2663_fk REFERENCES p2663 (id))'
+    )
+
+
+def _disable_drop(backend) -> None:
+    backend.rollback()
+    backend.execute('DROP TABLE c2663')
+    backend.execute('DROP TABLE p2663')
+
+
+def _ora(backend, statement: str) -> int:
+    from seerdb.server.backend import BackendError
+
+    try:
+        backend.execute(statement)
+    except BackendError as exc:
+        backend.rollback()
+        return exc.ora_code
+    raise AssertionError(f'{statement!r} did not fail')
+
+
+def test_disable_and_enable_a_foreign_key_from_postgresql_18() -> None:
+    # Oracle's DISABLE / ENABLE CONSTRAINT was a syntax error (#2663).
+    # PostgreSQL 18 switches a foreign key off and on, and checks its rows as
+    # it goes back on, as Oracle's ENABLE does: an orphan is ORA-02298. The
+    # dictionary says DISABLED / NOT VALIDATED as 23ai does.
+    if _server_version_num() < 180000:
+        pytest.skip('DISABLE of a foreign key needs PostgreSQL 18')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    state = (
+        'SELECT status, validated FROM user_constraints '
+        "WHERE constraint_name = 'C2663_FK'"
+    )
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        _disable_tables(backend)
+        try:
+            backend.execute('ALTER TABLE c2663 DISABLE CONSTRAINT c2663_fk')
+            assert backend.execute(state).rows == [('DISABLED', 'NOT VALIDATED')]
+            backend.execute('INSERT INTO c2663 VALUES (99)')
+            backend.commit()
+            assert _ora(backend, 'ALTER TABLE c2663 ENABLE CONSTRAINT c2663_fk') == 2298
+            backend.execute('DELETE FROM c2663')
+            backend.execute('ALTER TABLE c2663 MODIFY CONSTRAINT c2663_fk ENABLE')
+            assert backend.execute(state).rows == [('ENABLED', 'VALIDATED')]
+            assert _ora(backend, 'INSERT INTO c2663 VALUES (98)') == 2291
+        finally:
+            _disable_drop(backend)
+    finally:
+        backend.close()
+
+
+def test_disable_of_a_foreign_key_before_postgresql_18_is_refused() -> None:
+    # Before PostgreSQL 18 nothing can switch a constraint off (docs/MIRROR.md,
+    # *By PostgreSQL version*): ORA-03001, and the constraint stays enforced.
+    if _server_version_num() >= 180000:
+        pytest.skip('PostgreSQL 18 switches a foreign key off')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        _disable_tables(backend)
+        try:
+            assert (
+                _ora(backend, 'ALTER TABLE c2663 DISABLE CONSTRAINT c2663_fk') == 3001
+            )
+            assert _ora(backend, 'INSERT INTO c2663 VALUES (99)') == 2291
+        finally:
+            _disable_drop(backend)
+    finally:
+        backend.close()
+
+
+def test_disable_of_what_postgresql_cannot_switch_is_refused() -> None:
+    # On any version (#2663): a constraint other than a foreign key, ENABLE
+    # NOVALIDATE, CASCADE, a key named by its kind are ORA-03001; a constraint
+    # the table hasn't got is ORA-02431 or ORA-02430, as on 23ai; a table
+    # there isn't is ORA-00942.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        _disable_tables(backend)
+        try:
+            for statement, code in (
+                ('ALTER TABLE p2663 DISABLE CONSTRAINT p2663_ck', 3001),
+                ('ALTER TABLE p2663 DISABLE PRIMARY KEY', 3001),
+                ('ALTER TABLE c2663 ENABLE NOVALIDATE CONSTRAINT c2663_fk', 3001),
+                ('ALTER TABLE c2663 DISABLE CONSTRAINT c2663_fk CASCADE', 3001),
+                ('ALTER TABLE c2663 DISABLE CONSTRAINT no_such', 2431),
+                ('ALTER TABLE c2663 ENABLE CONSTRAINT no_such', 2430),
+                ('ALTER TABLE no_table2663 DISABLE CONSTRAINT x', 942),
+            ):
+                assert _ora(backend, statement) == code, statement
+            assert _ora(backend, 'INSERT INTO p2663 VALUES (1, -1)') == 2290
+        finally:
+            _disable_drop(backend)
+    finally:
+        backend.close()
