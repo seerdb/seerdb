@@ -10100,3 +10100,62 @@ synonym ... could not be resolved"), and the session goes on.
 
 The Mirror serves none of the three: it answers ORA-03115 ("TTC function 128")
 and the session stays usable (MIRROR.md, *Not served*).
+
+## 45. Transaction Guard — the LTXID server piggyback (#2650, #2654)
+
+A service created with `COMMIT_OUTCOME => true`, which Transaction Guard and
+Application Continuity need, gives every session a **logical transaction id**
+(LTXID). The server reports it as a server-side piggyback (token 23, opcode 7)
+in these places:
+- the login challenge (the OSESSKEY reply, or the fast-auth reply that holds it);
+- after the first call of each transaction;
+- after each commit, autocommit included.
+
+Measured on 23ai Free against python-oracledb 26.1, and with seerdb itself:
+
+```
+17 07  01 38  38 <56 bytes>
+       ub4 56  the value, a length byte then 56 bytes
+```
+
+It's `read_bytes_with_length`'s form: a ub4 byte count, then the value with its
+own length. The 56 bytes hold a commit number, which goes up by one with each
+commit. The other bytes stay the same for the session's life. A client keeps the
+latest id (`Connection.ltxid`). After an outage it passes that id to
+`DBMS_APP_CONT.GET_LTXID_OUTCOME` from another session, which reports whether
+that transaction committed and completed. An id that wasn't used yet, the one
+after the last commit, reports neither.
+
+**In the login challenge**, the LTXID comes second, after the Application
+Continuity replay context (opcode 8). A service like this sends no SYNC (opcode
+5) there. The login decoder reads every piggyback that follows the pairs, in any
+order, using the reader replies use.
+
+**The opcodes an Application Continuity service may send**, read as
+python-oracledb reads them. seerdb keeps only the LTXID:
+
+| opcode | name | body after `17 <opcode>` |
+|---|---|---|
+| 7 | `LTXID` | ub4 length, then the value with its own length |
+| 8 | `AC_REPLAY_CONTEXT` | ub2 DTY count, ub1 DTY length, ub4 flags, ub4 error code, ub1 queue, then a ub4 length and the context with its own length |
+| 9 | `EXT_SYNC` | ub2 DTY count, ub1 DTY length |
+| 10 | `SESS_SIGNATURE` | ub2 DTY count, ub1 DTY length, then three ub8: the flags, the client's and the server's signature |
+
+A thin ub8 has a ub4's form with up to 8 magnitude bytes: a length byte, then the
+value's big-endian bytes. It's the same field width a LOB amount and a row count
+use, past 4 GiB.
+
+**#2654:** seerdb read one length-prefixed value after the opcode. It took the
+ub4 `01 38` for the value and resumed at the value's own length byte, `38`,
+which it read as a response token. So on such a service every commit failed
+with "no decoder for response token 56", sometimes after the server had already
+committed.
+
+**Testing it** needs such a service and two grants: EXECUTE on `DBMS_APP_CONT`
+(for the outcome) and on `DBMS_TG_DBG`. `DBMS_TG_DBG` is a debug package.
+`set_failpoint(tg_failpoint_pre_commit | tg_failpoint_post_commit)` makes the
+session's next commit end the session just before or just after it takes effect.
+The integration suite runs these tests when `SEERDB_TEST_TG_SERVICE` names the
+service.
+
+The Mirror sends no LTXID, and its sessions' `ltxid` is `b''`.

@@ -18132,5 +18132,171 @@ class AqSubscriptionIntegration(_IntegrationBase):
             self.conn.unsubscribe(sub)
 
 
+# Transaction Guard (#2650, #2654): a service created with COMMIT_OUTCOME =>
+# true, on the bed's host and port, named by SEERDB_TEST_TG_SERVICE. The
+# outcome checks also need EXECUTE on DBMS_APP_CONT and DBMS_TG_DBG.
+_TG_SERVICE = os.environ.get('SEERDB_TEST_TG_SERVICE', '')
+_TRANSACTION_GUARD = _Need(
+    'Transaction Guard needs a 12.1+ server, and the Mirror does not serve it',
+    min_fv=FIELD_VERSION_12_1,
+    not_mirror=('*',),
+)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class LtxidIntegration(_IntegrationBase):
+    """Connection.ltxid on the suite's own service (#2650)."""
+
+    def test_empty_without_commit_outcome(self):
+        # Only a service with COMMIT_OUTCOME on reports one, and only 12.1 and
+        # later have them. The suite's service is not such a one.
+        if _TG_SERVICE and _TG_SERVICE.lower() == _SERVICE.lower():
+            self.skipTest('the suite runs on the Transaction Guard service')
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.conn.ltxid, b'')
+
+    def test_a_closed_connection_raises(self):
+        conn = _connect()
+        conn.close()
+        with self.assertRaises(seerdb.InterfaceError):
+            conn.ltxid
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@unittest.skipUnless(
+    _TG_SERVICE, 'needs a COMMIT_OUTCOME service (SEERDB_TEST_TG_SERVICE)'
+)
+@_requires(_TRANSACTION_GUARD)
+class TransactionGuardIntegration(_IntegrationBase):
+    """Commits and their outcomes on a Transaction Guard service (#2650, #2654)."""
+
+    def setUp(self):
+        super().setUp()
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+
+    def _tg_connect(self):
+        return seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_TG_SERVICE,
+            **_FV_KW,
+        )
+
+    def _commit_outcome(self, ltxid: bytes) -> tuple:
+        with self._tg_connect() as other:
+            cur = other.cursor()
+            committed = cur.var(seerdb.DB_TYPE_BOOLEAN)
+            completed = cur.var(seerdb.DB_TYPE_BOOLEAN)
+            try:
+                cur.callproc(
+                    'dbms_app_cont.get_ltxid_outcome', [ltxid, committed, completed]
+                )
+            except seerdb.DatabaseError as exc:
+                if exc.code in (904, 6550):
+                    self.skipTest('needs EXECUTE on DBMS_APP_CONT')
+                raise
+            return (committed.getvalue(), completed.getvalue())
+
+    def test_a_commit_moves_the_id_on(self):
+        # Every commit failed here: "no decoder for response token 56" (#2654).
+        with self._tg_connect() as conn:
+            login = conn.ltxid
+            self.assertEqual(len(login), 56)
+            cur = conn.cursor()
+            cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+            conn.commit()
+            first = conn.ltxid
+            cur.execute(f'INSERT INTO {self.TABLE} VALUES (2)')
+            conn.commit()
+            second = conn.ltxid
+            conn.autocommit = True
+            cur.execute(f'INSERT INTO {self.TABLE} VALUES (3)')
+            third = conn.ltxid
+            self.assertEqual(len({login, first, second, third}), 4)
+        self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
+        self.assertEqual(self.cur.fetchall(), [(3,)])
+
+    def test_a_committed_id_reports_its_outcome(self):
+        with self._tg_connect() as conn:
+            conn.cursor().execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+            ltxid = conn.ltxid
+            conn.commit()
+        self.assertEqual(self._commit_outcome(ltxid), (True, True))
+
+    def _fail_commit(self, point: str) -> bytes:
+        conn = self._tg_connect()
+        cur = conn.cursor()
+        cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+        try:
+            cur.execute(
+                'BEGIN dbms_tg_dbg.set_failpoint('
+                f'dbms_tg_dbg.tg_failpoint_{point}); END;'
+            )
+        except seerdb.DatabaseError as exc:
+            conn.close()
+            if exc.code in (904, 6550):
+                self.skipTest('needs EXECUTE on DBMS_TG_DBG')
+            raise
+        ltxid = conn.ltxid
+        with self.assertRaises(Exception):
+            conn.commit()
+        try:
+            conn.close()
+        except Exception:
+            # The server ended the session at the failpoint; closing what is
+            # left of it may fail too, and it does not matter here.
+            pass
+        return ltxid
+
+    def test_a_commit_lost_before_it_happened(self):
+        self.assertEqual(
+            self._commit_outcome(self._fail_commit('pre_commit')), (False, False)
+        )
+
+    def test_a_commit_lost_after_it_happened(self):
+        self.assertEqual(
+            self._commit_outcome(self._fail_commit('post_commit')), (True, True)
+        )
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@unittest.skipUnless(
+    _TG_SERVICE, 'needs a COMMIT_OUTCOME service (SEERDB_TEST_TG_SERVICE)'
+)
+class AsyncTransactionGuardIntegration(
+    _ThrottleRetry, unittest.IsolatedAsyncioTestCase
+):
+    """The same commit on an AsyncConnection (#2654)."""
+
+    async def test_a_commit_moves_the_id_on(self):
+        conn = await seerdb.connect_async(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_TG_SERVICE,
+            **_FV_KW,
+        )
+        try:
+            if conn.field_version < FIELD_VERSION_12_1 or os.environ.get(
+                'SEERDB_TEST_MIRROR'
+            ):
+                self.skipTest('Transaction Guard needs a 12.1+ server')
+            login = conn.ltxid
+            cur = conn.cursor()
+            await cur.execute('CREATE TABLE pyo_async_tg (n NUMBER)')
+            try:
+                await cur.execute('INSERT INTO pyo_async_tg VALUES (1)')
+                await conn.commit()
+                self.assertEqual(len(conn.ltxid), 56)
+                self.assertNotEqual(conn.ltxid, login)
+            finally:
+                await cur.execute('DROP TABLE pyo_async_tg PURGE')
+        finally:
+            await conn.close()
+
+
 if __name__ == '__main__':
     unittest.main()

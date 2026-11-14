@@ -402,7 +402,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._txn_priority_requested = _transaction_priority(transaction_priority).value
         self._txn_priority: str | None = None
         self._txn_priority_pending: str | None = None
-        self._session_keywords: dict[int, str | None] = {}
+        self._session_keywords: dict[int, str | bytes | None] = {}
+        # The logical transaction id the server last reported (#2650).
+        self._ltxid = b''
         # Whether a DRCP pooled server has answered (#2544), which a release
         # is sent only to.
         self._pooled_server = False

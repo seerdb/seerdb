@@ -221,7 +221,8 @@ What works:
   privilege the user needs is READ on the relevant DIRECTORY object —
   no server-side PL/SQL helper or CREATE PROCEDURE is installed
 - Transaction control (commit, rollback, ping); sessionless transactions
-  (start / suspend / resume by transaction id)
+  (start / suspend / resume by transaction id); Transaction Guard's logical
+  transaction id (`ltxid`)
 - End-to-end application tracing: `connection.module` / `action` /
   `client_identifier` / `clientinfo` / `dbop` flow to the server for
   monitoring (V$SESSION etc.). 12c and later, and 10g and 11g with
@@ -340,7 +341,7 @@ exercise.
 | **23ai types** — JSON / OSON, `BOOLEAN`, `VECTOR` (dense + sparse) | ✅ |
 | **23ai column annotations** — `cursor.annotations` (per-column `{name: value}` maps), via fast-auth at field version 24 | ✅ |
 | **PL/SQL** — anonymous blocks, `callproc`, `callfunc`, OUT / IN OUT binds, REF CURSOR OUT | ✅ |
-| **Transactions** — commit, rollback, autocommit, ping | ✅ |
+| **Transactions** — commit, rollback, autocommit, ping; Transaction Guard's logical transaction id (`ltxid`, 12.1 and later, on a service with `COMMIT_OUTCOME` on) | ✅ |
 | **Array DML** — `executemany`, `getbatcherrors`, `getarraydmlrowcounts` (12.1+) | ✅ |
 | **Result handling** — large-result `TTI_FETCH` drain, server-side scrollable cursors (`scroll()`, with a client-buffered fallback), `rowfactory`, `lastrowid` | ✅ |
 | **Statement validation** — `cursor.parse()` parses a statement on the server without running it (10g+, and a pooled 11g session) | ✅ |
