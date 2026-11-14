@@ -17236,6 +17236,53 @@ def _index_key_spans(
     return (masked, contents, table, keys)
 
 
+# The order a key ends with, kept outside the parentheses an expression key
+# gets: ASC or DESC, and NULLS FIRST or LAST.
+_INDEX_KEY_ORDER = re.compile(
+    r'(\s+(?:ASC|DESC))?(\s+NULLS\s+(?:FIRST|LAST))?\s*$', re.IGNORECASE
+)
+# A key PostgreSQL takes as written: a column, or one function call.
+_INDEX_KEY_AS_IS = re.compile(
+    rf'{_SQL_NAME}(?:\s*\.\s*{_SQL_NAME})*(?P<call>\s*\()?', re.IGNORECASE
+)
+
+
+def _parenthesized_index_keys(sql: str) -> str:
+    # `sql`, a CREATE INDEX, with each key that is an expression in parentheses
+    # of its own (#2662). PostgreSQL takes a column or a function call as a key
+    # and wants anything else parenthesized; Oracle takes `(n * 2)` bare. A key
+    # already in parentheses, as an instant index key is, stays as it is.
+    (masked, contents) = _masked_quoted(sql)
+    head = _CREATE_INDEX_KEYS.match(masked)
+    if head is None:
+        return sql
+    close = _matching_paren(masked, head.end() - 1)
+    out = masked
+    for start, stop in reversed(_top_level_items(masked, head.end(), close)):
+        key = masked[start:stop]
+        order = _INDEX_KEY_ORDER.search(key)
+        body_end = start + (order.start() if order else len(key))
+        lead = len(key) - len(key.lstrip())
+        body_start = start + lead
+        body = masked[body_start:body_end]
+        if not body:
+            continue
+        if body.startswith('(') and _matching_paren(masked, body_start) == body_end - 1:
+            continue
+        as_is = _INDEX_KEY_AS_IS.match(body)
+        if as_is is not None:
+            if as_is.group('call') is None and as_is.end() == len(body):
+                continue
+            if (
+                as_is.group('call') is not None
+                and _matching_paren(masked, body_start + as_is.end() - 1)
+                == body_end - 1
+            ):
+                continue
+        out = f'{out[:body_start]}({body}){out[body_end:]}'
+    return sql if out == masked else _unmask_quoted(out, list(contents))
+
+
 # What the installed database is stamped with, as the `system` schema's
 # comment (#1871): a digest of every DDL statement a setup runs -- the types,
 # the helpers, the packages, the dictionary, the DDL log -- and the extensions
@@ -19396,6 +19443,7 @@ class PostgresBackend:
         )
         sql = _ruled('admin', _translate_admin(sql), sql)
         sql = _ruled('instant-index', self._instant_index_keys(sql), sql)
+        sql = _ruled('index-expressions', _parenthesized_index_keys(sql), sql)
         sql = _ruled('constraint-names', self._named_constraints(sql), sql)
         checks = _check_conditions(sql)
         sql = _ruled('ddl', _translate_ddl(sql), sql)
