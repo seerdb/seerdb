@@ -50,7 +50,7 @@ env:
   # The SQLAlchemy the compliance suite runs against: one exact version, never a
   # range or the newest release, so a run changes only when this line does. A
   # newer SQLAlchemy is a deliberate upgrade of its own (#1199).
-  SQLALCHEMY: "2.1.0"
+  SQLALCHEMY: "2.1.6"
 
 jobs:
   mirror-compliance:
