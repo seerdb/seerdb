@@ -18266,3 +18266,35 @@ def test_disable_of_what_postgresql_cannot_switch_is_refused() -> None:
             _disable_drop(backend)
     finally:
         backend.close()
+
+
+def test_returning_old_and_new_are_postgresql_18_s() -> None:
+    # 23ai's RETURNING OLD col / NEW col is 18's old.col / new.col (#2678).
+    # Before 18 it is refused: 16 read `OLD v` as the whole old row named v.
+    from seerdb.server.backend import UnsupportedFeature
+    from seerdb.server.backends.postgres import _returning_old_new
+
+    for oracle, postgres in (
+        (
+            'UPDATE t SET v = 1 RETURNING OLD v, NEW v',
+            'UPDATE t SET v = 1 RETURNING old.v, new.v',
+        ),
+        (
+            'BEGIN UPDATE t SET v = 1 RETURNING OLD v, id INTO :a, :b; END;',
+            'BEGIN UPDATE t SET v = 1 RETURNING old.v, id INTO :a, :b; END;',
+        ),
+        (
+            'DELETE FROM t RETURN OLD "Col" INTO :a',
+            'DELETE FROM t RETURN old."Col" INTO :a',
+        ),
+    ):
+        assert _returning_old_new(oracle, True) == postgres
+        with pytest.raises(UnsupportedFeature):
+            _returning_old_new(oracle, False)
+    for as_is in (
+        'UPDATE t SET v = 1 RETURNING v, old INTO :a, :b',
+        'CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN old_value; END;',
+        "UPDATE t SET v = 'RETURNING OLD v' RETURNING v INTO :a",
+        'SELECT 1 FROM dual',
+    ):
+        assert _returning_old_new(as_is, False) == as_is

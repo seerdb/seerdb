@@ -670,6 +670,7 @@ pgvector 0.8.0 and plpgsql_check 2.10.11.
 |---|---|---|
 | A NOT NULL constraint keeps its name: `CONSTRAINT nn NOT NULL` shows as `NN` in `USER_CONSTRAINTS`, and `ALTER TABLE … DROP CONSTRAINT nn` drops it | PostgreSQL 18 | listed under a made-up name (`<oid>_<oid>_<n>_not_null`); `DROP CONSTRAINT` is refused with ORA-00942 |
 | `MERGE INTO` a view | PostgreSQL 17 | refused: "cannot execute MERGE on relation" |
+| `RETURNING OLD col` / `NEW col` (23ai) in a DML statement or a PL/SQL block | PostgreSQL 18 | refused with ORA-03001 |
 | `ALTER TABLE … DISABLE CONSTRAINT` / `ENABLE CONSTRAINT` of a foreign key, and `MODIFY CONSTRAINT … DISABLE \| ENABLE`: the constraint shows as `DISABLED` / `NOT VALIDATED`, and `ENABLE` checks the rows (an orphan is ORA-02298) | PostgreSQL 18 | refused with ORA-03001 |
 
 ### Which role to connect as
