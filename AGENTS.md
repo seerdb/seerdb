@@ -153,6 +153,10 @@ every supported version has.
 - **The oldest supported setup** has a non-blocking CI leg (#2668) and a local
   bed. Its failures are what that table should say; a gap missing from the
   table is a docs bug.
+- **Mark what an older version alone needs** with a `# floor: PGnn` comment
+  (or `# floor: pgvector x.y`, ...), naming the version whose minimum would
+  remove it, and list it in #2682, *what raising the PostgreSQL minimum would
+  remove*. `grep -n '# floor:'` then shows what a raise deletes.
 - **When a newer version would lift a documented restriction**, propose raising
   the minimum in a ticket of its own.
 
