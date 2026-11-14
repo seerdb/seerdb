@@ -17906,3 +17906,70 @@ def test_max_and_min_of_a_with_time_zone_value_keep_its_offset() -> None:
             backend.execute('DROP TABLE t2660')
     finally:
         backend.close()
+
+
+def _server_version_num() -> int:
+    # The PostgreSQL major the suite runs against, for the features only a newer
+    # one has (AGENTS.md, *PostgreSQL versions*): such a test skips below it.
+    with psycopg.connect(_CONNINFO) as conn:
+        row = conn.execute(
+            "SELECT current_setting('server_version_num')::int"
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def test_a_not_null_constraint_keeps_its_name_from_postgresql_18() -> None:
+    # PostgreSQL 18 keeps a NOT NULL as a named constraint (#2652): it shows in
+    # USER_CONSTRAINTS under the name it was given, and DROP CONSTRAINT drops
+    # it. Before 18 the name is lost (docs/MIRROR.md, *By PostgreSQL version*).
+    if _server_version_num() < 180000:
+        pytest.skip('a NOT NULL constraint has a name from PostgreSQL 18')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2652n (x NUMBER CONSTRAINT t2652n_x NOT NULL)')
+        try:
+            assert backend.execute(
+                'SELECT constraint_name, constraint_type, search_condition '
+                "FROM user_constraints WHERE table_name = 'T2652N'"
+            ).rows == [('T2652N_X', 'C', '"X" IS NOT NULL')]
+            backend.execute('ALTER TABLE t2652n DROP CONSTRAINT t2652n_x')
+            backend.execute('INSERT INTO t2652n VALUES (NULL)')
+        finally:
+            backend.rollback()
+            backend.execute('DROP TABLE t2652n')
+    finally:
+        backend.close()
+
+
+def test_merge_into_a_view_from_postgresql_17() -> None:
+    # MERGE into a simple view runs from PostgreSQL 17 (#2652); before it,
+    # PostgreSQL refuses it (docs/MIRROR.md, *By PostgreSQL version*).
+    if _server_version_num() < 170000:
+        pytest.skip('MERGE into a view needs PostgreSQL 17')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.execute('CREATE TABLE t2652m (k NUMBER, v VARCHAR2(5))')
+        try:
+            backend.execute("INSERT INTO t2652m VALUES (1, 'a')")
+            backend.execute('CREATE VIEW t2652mv AS SELECT k, v FROM t2652m')
+            backend.execute(
+                "MERGE INTO t2652mv t USING (SELECT 1 k, 'c' v FROM dual UNION ALL "
+                "SELECT 2, 'd' FROM dual) s ON (t.k = s.k) "
+                'WHEN MATCHED THEN UPDATE SET v = s.v '
+                'WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)'
+            )
+            assert [
+                (int(k), v)
+                for (k, v) in backend.execute('SELECT k, v FROM t2652m ORDER BY k').rows
+            ] == [(1, 'c'), (2, 'd')]
+        finally:
+            backend.rollback()
+            backend.execute('DROP VIEW t2652mv')
+            backend.execute('DROP TABLE t2652m')
+    finally:
+        backend.close()

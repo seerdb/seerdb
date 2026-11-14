@@ -133,6 +133,29 @@ skip them on those paths too.
   per-call benchmark of a short statement cannot see a cost that grows with the
   statement's length.
 
+### PostgreSQL versions
+
+The Mirror-over-PG supports PostgreSQL 16 and later, and uses what the newest
+PostgreSQL, orafce, pgvector and plpgsql_check offer. It doesn't keep to what
+every supported version has.
+
+- **CI's image tracks the newest releases**, each pinned exactly
+  (`examples/mirror-pg.Dockerfile`). Test a bump before moving the pin:
+  plpgsql_check v2.10.12 crashed the server.
+- **A feature only a newer version has is installed only where the server has
+  it.** Check the server's version at install, so the dictionary still installs
+  on 16. A construct the oldest version can't parse must never reach the install
+  unguarded, or the Mirror stops working there altogether.
+- **Its tests skip below that version** rather than fail.
+- **Document it**: add a row to docs/MIRROR.md's *By PostgreSQL version*,
+  saying what an older server does instead. Don't work around it for the older
+  versions.
+- **The oldest supported setup** has a non-blocking CI leg (#2668) and a local
+  bed. Its failures are what that table should say; a gap missing from the
+  table is a docs bug.
+- **When a newer version would lift a documented restriction**, propose raising
+  the minimum in a ticket of its own.
+
 ### Sharing a database or a bed
 
 - **One suite per database or bed at a time.** The Mirror-over-PG legs,
