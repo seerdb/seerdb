@@ -11690,6 +11690,87 @@ _SET_TARGET_BEFORE = re.compile(r'(?:\bSET|,)\s*$', re.IGNORECASE)
 _SET_TARGET_AFTER = re.compile(r'\s*=')
 
 
+# The table an UPDATE or a MERGE writes, and its alias (#2661), wherever a
+# statement starts: alone, or in a PL/SQL block's text.
+_SET_TARGET_HEAD = re.compile(
+    rf'(?<![\w$#."])(?:(UPDATE)\s+{_TABLE_NAME}(?:\s+(?!SET\b)([A-Za-z_][\w$#]*))?\s+SET\b'
+    rf'|MERGE\s+INTO\s+{_TABLE_NAME}(?:\s+(?!USING\b)([A-Za-z_][\w$#]*))?\s+USING\b)',
+    re.IGNORECASE,
+)
+# A column named through a qualifier, alone in its place.
+_SET_NAME = r'(?:"[^"]*"|[A-Za-z_][\w$#]*)'
+_QUALIFIED_COLUMN = re.compile(rf'\s*({_SET_NAME})\s*\.\s*({_SET_NAME})\s*')
+# Where an UPDATE's SET list ends, and where a MERGE's UPDATE SET ends.
+_UPDATE_SET_ENDS = frozenset({'WHERE', 'RETURNING', 'RETURN', 'LOG'})
+_MERGE_SET_ENDS = frozenset({'WHERE', 'DELETE', 'WHEN'})
+
+
+def _unqualified_set_targets(sql: str) -> str:
+    """An UPDATE's or a MERGE's SET targets, and a MERGE's INSERT column list,
+    with the qualifier that names the target table dropped: `SET t.v = 1` as
+    `SET v = 1` (#2661). Oracle takes a column there through the table's alias
+    or its name; PostgreSQL takes a bare column only. A qualifier naming
+    anything else is left for PostgreSQL to refuse. A PL/SQL block's
+    statements are rewritten in its text, each up to its `;`.
+    """
+    (masked, contents) = _mask_quoted(sql)
+    heads = list(_SET_TARGET_HEAD.finditer(masked))
+    if not heads:
+        return sql
+    all_words = _top_level_words(masked)[0]
+    edits: list[tuple[int, int, str]] = []
+    for head in heads:
+        merge = head.group(1) is None
+        (table, alias) = (head.group(4), head.group(5)) if merge else head.group(2, 3)
+        names = {_folded_name(table.split('.')[-1], contents)}
+        if alias is not None:
+            names.add(_folded_name(alias, contents))
+        stop = masked.find(';', head.end())
+        stop = len(masked) if stop < 0 else stop
+        words = [(at, word) for at, word in all_words if head.start() <= at < stop]
+        spans: list[tuple[int, int, bool]] = []  # (start, end, a column list)
+        ends = _MERGE_SET_ENDS if merge else _UPDATE_SET_ENDS
+        for i, (at, word) in enumerate(words):
+            if word == 'SET' and (not merge or (i and words[i - 1][1] == 'UPDATE')):
+                end = next((p for p, w in words[i + 1 :] if w in ends), stop)
+                spans.append((at + len(word), end, False))
+                if not merge:
+                    break
+            elif merge and word == 'INSERT':
+                opening = masked.find('(', at, stop)
+                if opening >= 0 and not masked[at + len(word) : opening].strip():
+                    spans.append((opening + 1, _matching_paren(masked, opening), True))
+
+        def column(start: int, end: int) -> None:
+            found = _QUALIFIED_COLUMN.fullmatch(masked, start, end)
+            if found is not None and _folded_name(found.group(1), contents) in names:
+                edits.append((found.start(1), found.end(2), found.group(2)))
+
+        for start, end, listed in spans:
+            for item_start, item_end in _top_level_items(masked, start, end):
+                if listed:
+                    column(item_start, item_end)
+                    continue
+                item = masked[item_start:item_end]
+                if '=' not in item:
+                    continue
+                lead = item_start + len(item) - len(item.lstrip())
+                if masked[lead] == '(':
+                    close = _matching_paren(masked, lead)
+                    for inner_start, inner_end in _top_level_items(
+                        masked, lead + 1, close
+                    ):
+                        column(inner_start, inner_end)
+                else:
+                    column(item_start, item_start + item.find('='))
+    if not edits:
+        return sql
+    out = masked
+    for start, stop, name in sorted(set(edits), reverse=True):
+        out = out[:start] + name + out[stop:]
+    return _unmask_quoted(out, contents)
+
+
 def _translate_attribute_access(sql: str) -> str:
     """Oracle's object attribute access, `alias.column.attribute`, in
     PostgreSQL's spelling `(alias.column).attribute`, which reads the Oracle
@@ -12272,6 +12353,7 @@ def _rewritten_idioms(sql: str) -> str:
     sql = _ruled('outer-join', _rewrite_outer_join(sql), sql)
     sql = _ruled('deref', _translate_deref(sql), sql)
     sql = _ruled('attribute-access', _translate_attribute_access(sql), sql)
+    sql = _ruled('set-targets', _unqualified_set_targets(sql), sql)
     sql = _ruled('connect-by', _translate_connect_by(sql), sql)
     sql = _ruled('fm-toggle', _translate_fm_toggle(sql), sql)
     sql = _ruled('extract', _translate_extract(sql), sql)
