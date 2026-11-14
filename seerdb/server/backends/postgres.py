@@ -4035,7 +4035,14 @@ _ORACLE_DICTIONARY_DDL = (
     'AS validated, '
     # An unnamed constraint is named SYS_Cnnnnnnn (#2141), and a NOT NULL
     # keeps information_schema's made-up name: Oracle's GENERATED NAME both.
-    "CASE WHEN nn.attnum IS NOT NULL OR tc.constraint_name ~* '^sys_c[0-9]{7}$' "
+    # 16's made-up NOT NULL name, and 18's own for an unnamed one that the
+    # Mirror didn't name, <table>_<column>_not_null, are generated too; a NOT
+    # NULL named by CONSTRAINT is the user's (#2677).
+    "CASE WHEN tc.constraint_name ~* '^sys_c[0-9]{7}$' "
+    # floor: PG18 -- 16's made-up name, the next line, goes with it (#2682).
+    "OR tc.constraint_name ~ '^[0-9]+_[0-9]+_[0-9]+_not_null$' "
+    'OR (nn.attnum IS NOT NULL AND tc.constraint_name = '
+    "left(tc.table_name || '_' || nn.attname, 54) || '_not_null') "
     "THEN 'GENERATED NAME' ELSE 'USER NAME' END AS generated "
     'FROM information_schema.table_constraints tc '
     'LEFT JOIN information_schema.referential_constraints rc '
@@ -8396,6 +8403,9 @@ _CONSTRAINT_DDL = re.compile(
     r'(?is)^\s*(?:CREATE\s+(?:GLOBAL\s+TEMPORARY\s+)?TABLE|ALTER\s+TABLE)\b'
 )
 _CONSTRAINT_KINDS = frozenset({'PRIMARY', 'UNIQUE', 'CHECK', 'REFERENCES', 'FOREIGN'})
+# A column's NOT NULL, named as the others are where a statement declares a
+# column (#2677): PostgreSQL 18 keeps its name, 16 takes and drops it.
+_NOT_NULL_KINDS = _CONSTRAINT_KINDS | {'NOT'}
 
 
 def _unnamed_constraints(sql: str) -> list[int]:
@@ -8424,6 +8434,9 @@ def _unnamed_constraints(sql: str) -> list[int]:
         return []
     found: list[int] = []
     (depth, foreign) = (0, False)
+    # A NOT NULL where a column is declared: a CREATE TABLE's, or an ALTER's
+    # ADD; MODIFY keeps its own translation.
+    kinds = _NOT_NULL_KINDS if create or 'MODIFY' not in words else _CONSTRAINT_KINDS
     for index, (kind, text, at) in enumerate(tokens):
         if text == '(':
             depth += 1
@@ -8433,10 +8446,14 @@ def _unnamed_constraints(sql: str) -> list[int]:
             continue
         if text == ',' and depth <= 1:
             foreign = False
-        if kind != 'word' or text not in _CONSTRAINT_KINDS:
+        if kind != 'word' or text not in kinds:
             continue
         if not (depth == 1 if create else depth <= 1):
             continue
+        if text == 'NOT' and (
+            index + 1 >= len(tokens) or tokens[index + 1][1] != 'NULL'
+        ):
+            continue  # NOT DEFERRABLE, and the like
         if text == 'REFERENCES' and foreign:
             continue
         foreign = text == 'FOREIGN'
