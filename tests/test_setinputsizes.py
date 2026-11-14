@@ -91,7 +91,11 @@ class TestDeclaringByName(unittest.TestCase):
 
 class TestWhatCanBeDeclared(unittest.TestCase):
     def test_a_python_type(self):
+        # A datetime declares a TIMESTAMP, as python-oracledb's does (#2658),
+        # and a date a DATE.
         [got] = _typed('select :1 from dual', [None], datetime.datetime)
+        self.assertEqual(_declared_type(got), TNS_TYPE_TIMESTAMP)
+        [got] = _typed('select :1 from dual', [None], datetime.date)
         self.assertEqual(_declared_type(got), TNS_TYPE_DATE)
 
     def test_a_database_type(self):

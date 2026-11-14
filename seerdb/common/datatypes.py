@@ -285,6 +285,9 @@ _DATE_TNS_TYPES = frozenset(
 _NUMBER_TNS_TYPES = frozenset({TNS_TYPE_NUMBER, TNS_TYPE_BFLOAT, TNS_TYPE_BDOUBLE})
 
 _PYTYPE_TO_DBTYPE = {
+    # bool before int only for the reader: the lookup is by exact type. A
+    # BOOLEAN, as python-oracledb's var(bool) is (#2658).
+    bool: DB_TYPE_BOOLEAN,
     int: NUMBER,
     float: NUMBER,
     Decimal: NUMBER,
@@ -292,7 +295,10 @@ _PYTYPE_TO_DBTYPE = {
     bytes: DB_TYPE_RAW,
     bytearray: DB_TYPE_RAW,
     datetime.date: DB_TYPE_DATE,
-    datetime.datetime: DB_TYPE_DATE,
+    # A TIMESTAMP, as python-oracledb's var(datetime) and setinputsizes(datetime)
+    # are (#2658): a DATE dropped an OUT value's microseconds. A datetime *value*
+    # bound without a declared type is unchanged.
+    datetime.datetime: DB_TYPE_TIMESTAMP,
     datetime.timedelta: DB_TYPE_INTERVAL_DS,
 }
 
