@@ -4041,6 +4041,7 @@ _ORACLE_DICTIONARY_DDL = (
     'LEFT JOIN information_schema.referential_constraints rc '
     'ON rc.constraint_schema=tc.constraint_schema '
     'AND rc.constraint_name=tc.constraint_name '
+    # floor: PG18 -- the made-up branch below goes when 18 is the minimum (#2682).
     # A NOT NULL is no constraint in PostgreSQL 16: information_schema makes
     # one up, named <schema oid>_<table oid>_<attnum>_not_null (#2171). Its
     # column; and one on a primary key's column, which Oracle does not list.
@@ -21840,6 +21841,7 @@ class PostgresBackend:
                 f'DISABLE or ENABLE of a {_DISABLE_REFUSED_KINDS.get(row[0], row[0])} '
                 'constraint: PostgreSQL switches only a foreign key off and on'
             )
+        # floor: PG18 -- this refusal goes when 18 is the minimum (#2682).
         if self._conn.info.server_version < 180000:
             raise UnsupportedFeature(
                 'DISABLE or ENABLE of a foreign key needs PostgreSQL 18 or later'
