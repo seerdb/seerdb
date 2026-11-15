@@ -18426,5 +18426,37 @@ class JsonValueIntegration(_IntegrationBase):
                 self.assertEqual(raised.exception.code, code)
 
 
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_JSON_VALUE)
+class JsonQueryIntegration(_IntegrationBase):
+    """JSON_QUERY's wrappers and ON EMPTY / ON ERROR, as Oracle answers them
+    (#2679). Through a Mirror-over-PG they need PostgreSQL 17; before, they
+    are refused (docs/MIRROR.md, *By PostgreSQL version*)."""
+
+    DOC = """{"a":{"b":1},"e":[1,2]}"""
+
+    def _query(self, path: str):
+        self.cur.execute(f"SELECT JSON_QUERY('{self.DOC}', {path}) FROM dual")
+        return self.cur.fetchone()[0]
+
+    def test_wrappers_and_empty(self):
+        self.assertEqual(self._query("'$.a'"), '{"b":1}')
+        self.assertIsNone(self._query("'$.e[*]'"))
+        self.assertEqual(self._query("'$.e[*]' WITH WRAPPER"), '[1,2]')
+        self.assertEqual(self._query("'$.e' WITH UNCONDITIONAL WRAPPER"), '[[1,2]]')
+        self.assertEqual(self._query("'$.z' EMPTY ARRAY ON EMPTY"), '[]')
+        self.assertEqual(self._query("'$.z' EMPTY OBJECT ON EMPTY"), '{}')
+
+    def test_error_on_empty_and_on_error(self):
+        for path, code in (
+            ("'$.z' ERROR ON EMPTY", 40462),
+            ("'$.e[*]' ERROR ON ERROR", 40480),
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(seerdb.DatabaseError) as raised:
+                    self._query(path)
+                self.assertEqual(raised.exception.code, code)
+
+
 if __name__ == '__main__':
     unittest.main()

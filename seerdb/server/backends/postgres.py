@@ -2526,6 +2526,14 @@ _HELPER_FUNCTIONS_DDL = (
         "WHEN 'array' THEN '[' || coalesce((SELECT string_agg(sys.ora_json_serialize(v), "
         "',' ORDER BY n) FROM jsonb_array_elements(j) WITH ORDINALITY AS a(v, n)), '') "
         "|| ']' ELSE j::text END $$;"
+        # JSON_QUERY's result as 23ai types it (#2679): JSON for a JSON
+        # input, otherwise VARCHAR2 text in Oracle's compact form. The first
+        # argument, the input, picks the overload. After sys.ora_json_serialize,
+        # which the body calls: a fresh database creates them in this order.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_query_out(jsonb, jsonb) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE AS $$ SELECT $2 $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_query_out(text, jsonb) RETURNS varchar '
+        'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_json_serialize($2) $$;'
     )
     + (
         # A BOOLEAN stored into a NUMBER column (#1705): 23ai converts it, TRUE to 1
@@ -9405,6 +9413,80 @@ _JSON_METHOD_TYPES = {
     'boolean': 'boolean',
 }
 _JSON_LAST_METHOD = re.compile(r'\.(\w+)\(\)\s*$')
+# JSON_QUERY's clauses past the path (#2679), in any order.
+_JSON_QUERY_RETURNING = re.compile(
+    r'\s*RETURNING\s+(.+?)(?=\s+(?:PRETTY|ASCII|WITH|WITHOUT|ERROR|NULL|EMPTY)\b|\s*$)',
+    re.IGNORECASE | re.DOTALL,
+)
+_JSON_QUERY_WRAPPER = re.compile(
+    r'\s*(WITH|WITHOUT)\s+(?:(CONDITIONAL|UNCONDITIONAL)\s+)?(?:ARRAY\s+)?WRAPPER\b',
+    re.IGNORECASE,
+)
+_JSON_QUERY_ON = re.compile(
+    r'\s*(ERROR|NULL|EMPTY(?:\s+(?:ARRAY|OBJECT))?)\s+ON\s+(ERROR|EMPTY)\b',
+    re.IGNORECASE,
+)
+_JSON_QUERY_PRETTY = re.compile(r'\s*PRETTY\b', re.IGNORECASE)
+
+
+def _native_json_query(context: str, path_and_clauses: str) -> str:
+    # Oracle's JSON_QUERY(x, path [RETURNING type] [PRETTY] [wrapper]
+    # [... ON ERROR] [... ON EMPTY]) as PostgreSQL 17's native JSON_QUERY
+    # (#2679). Its wrappers and ON EMPTY / ON ERROR answers are 23ai's; what
+    # differs is made the same:
+    #   - invalid JSON text is NULL unless ERROR ON ERROR: sys.ora_json_or_null;
+    #   - the result is JSON for a JSON input and VARCHAR2 otherwise, in
+    #     Oracle's compact text: sys.ora_json_query_out;
+    #   - a RETURNING type is the Mirror's for Oracle's.
+    # PRETTY is not kept: the text stays compact (docs/MIRROR.md).
+    (masked, contents) = _mask_quoted(path_and_clauses.strip())
+    path = re.match(r"\s*('[^']*'|\S+)", masked)
+    if path is None:
+        raise UnsupportedFeature('JSON_QUERY without a path')
+    path_text = _unmask_quoted(path.group(1), contents)
+    rest = masked[path.end() :]
+    pg_type = None
+    clauses: list[str] = []
+    error_on_error = False
+    while rest.strip():
+        returning = _JSON_QUERY_RETURNING.match(rest)
+        wrapper = _JSON_QUERY_WRAPPER.match(rest)
+        answer = _JSON_QUERY_ON.match(rest)
+        pretty = _JSON_QUERY_PRETTY.match(rest)
+        if returning is not None and pg_type is None:
+            pg_type = _translate_column_types(
+                _unmask_quoted(returning.group(1).strip(), contents)
+            )
+            rest = rest[returning.end() :]
+        elif wrapper is not None:
+            clauses.append(' '.join(wrapper.group(0).upper().split()))
+            rest = rest[wrapper.end() :]
+        elif answer is not None:
+            (what, event) = (
+                ' '.join(answer.group(1).upper().split()),
+                answer.group(2).upper(),
+            )
+            error_on_error = error_on_error or (what == 'ERROR' and event == 'ERROR')
+            clauses.append(f'{what} ON {event}')
+            rest = rest[answer.end() :]
+        elif pretty is not None:
+            rest = rest[pretty.end() :]
+        else:
+            raise UnsupportedFeature(
+                f'JSON_QUERY clause {_unmask_quoted(rest.strip(), contents)}'
+            )
+    item = _JSON_FORMAT.sub('', context).strip()
+    function = 'sys.ora_json' if error_on_error else 'sys.ora_json_or_null'
+    tail = ''.join(f' {c}' for c in clauses)
+    query = f'JSON_QUERY({function}({item}), {path_text} RETURNING jsonb{tail})'
+    if pg_type is None:
+        return f'sys.ora_json_query_out({item}, {query})'
+    if pg_type.lower() in ('jsonb', 'json'):
+        return query
+    if pg_type == 'ora_clob':
+        # A CLOB as the Mirror describes one in a select list: TO_CLOB's (#1351).
+        return f'TO_CLOB(sys.ora_json_serialize({query}))'
+    return f'sys.ora_json_serialize({query})::{pg_type}'
 
 
 def _native_json_value(context: str, path_and_clauses: str) -> str:
@@ -9491,6 +9573,17 @@ def _translate_json_functions(sql: str) -> str:
                 # floor: PG17 -- refused below 17 (#2679, #2682).
                 raise UnsupportedFeature('JSON_VALUE needs PostgreSQL 17 or later')
             return _native_json_value(inner[0], inner[1])
+        if upper == 'JSON_QUERY' and len(inner) == 2:
+            if _SERVER_VERSION.get() >= 170000:
+                return _native_json_query(inner[0], inner[1])
+            # floor: PG17 -- below 17, JSON_QUERY(x, path) gives the first
+            # value as JSON, as before, and a clause it would ignore is
+            # refused rather than answered wrong (#2679, #2682).
+            if len(_mask_quoted(inner[1].strip())[0].split()) > 1:
+                raise UnsupportedFeature(
+                    'JSON_QUERY with RETURNING, a wrapper or ON ERROR / ON EMPTY '
+                    'needs PostgreSQL 17 or later'
+                )
         if upper in ('JSON_QUERY', 'JSON_EXISTS') and len(inner) >= 2:
             path = _JSON_RETURNING.sub('', inner[1]).strip().split()[0]
             function = (
@@ -15597,6 +15690,7 @@ _INTERVAL_OIDS = frozenset({_INTERVAL_OID})
 # and failed every test in setUp. Anything unmapped falls back to ORA-00900.
 _ORA_JSON_NON_SCALAR = 40456
 _ORA_JSON_NO_VALUE = 40462
+_ORA_JSON_WRAPPER_NEEDED = 40480
 _SQLSTATE_TO_ORA = {
     '42P01': ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,  # undefined_table
     '42704': ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,  # undefined_object (type), for DROP TYPE cleanup
@@ -15612,6 +15706,8 @@ _SQLSTATE_TO_ORA = {
     # JSON_VALUE ... ERROR ON ERROR | EMPTY (#2679): a value that isn't a
     # scalar, and no value at all.
     '2203F': _ORA_JSON_NON_SCALAR,  # sql_json_scalar_required
+    # JSON_QUERY of several values with no wrapper, ERROR ON ERROR.
+    '22034': _ORA_JSON_WRAPPER_NEEDED,  # more_than_one_sql_json_item
     '22035': _ORA_JSON_NO_VALUE,  # no_sql_json_item
     '22P02': ORA_INVALID_NUMBER,  # invalid_text_representation (TO_NUMBER)
     '3B001': ORA_SAVEPOINT_NEVER_ESTABLISHED,  # invalid_savepoint_specification
