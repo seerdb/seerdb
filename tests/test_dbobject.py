@@ -591,10 +591,11 @@ class TestRefBindEncode(unittest.TestCase):
 
 
 class TestPreTwelveObjectBindRefusal(unittest.TestCase):
-    # Before 12.1 an object bind is refused up front, the server answering it
-    # with a fatal ORA-03106 (#116) -- an object value, and an object or
-    # collection Var, the OUT bind, which got through and lost the connection
-    # (#2039). From 12.1 both go out.
+    # Below 10g's thin session an object bind is refused up front, the server
+    # answering it with a fatal ORA-03106 (#116) -- an object value, and an
+    # object or collection Var, the OUT bind, which got through and lost the
+    # connection (#2039). A 10g or 11g thin session sends both, without the
+    # descriptor's oaccolid (#2704), and so does 12.1.
     def _check(self, field_version, bind):
         from types import SimpleNamespace
 
@@ -602,9 +603,9 @@ class TestPreTwelveObjectBindRefusal(unittest.TestCase):
 
         _check_object_bind_support(SimpleNamespace(field_version=field_version), bind)
 
-    def test_object_binds_are_refused_below_12_1(self):
+    def test_object_binds_are_refused_below_10g(self):
         from seerdb.common.datatypes import Var
-        from seerdb.common.tns_consts import FIELD_VERSION_11_2
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2
 
         for bind in (
             [_ADDR_TYPE.newobject()],
@@ -612,7 +613,15 @@ class TestPreTwelveObjectBindRefusal(unittest.TestCase):
             {'o': Var(_ADDR_TYPE)},
         ):
             with self.subTest(bind=bind), self.assertRaises(NotSupportedError):
-                self._check(FIELD_VERSION_11_2, bind)
+                self._check(FIELD_VERSION_9_2, bind)
+
+    def test_object_binds_go_out_on_10g_and_11g_thin_sessions(self):
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2, FIELD_VERSION_11_2
+
+        for version in (FIELD_VERSION_10_2, FIELD_VERSION_11_2):
+            with self.subTest(version=version):
+                self._check(version, [_ADDR_TYPE.newobject(), Var(_ADDR_TYPE)])
 
     def test_object_binds_go_out_from_12_1(self):
         from seerdb.common.datatypes import Var

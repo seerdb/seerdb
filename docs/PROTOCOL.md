@@ -2253,7 +2253,22 @@ a fixed flag byte (`TNS_BIND_USE_INDICATORS = 1`), `ContFlags` as a `ub8`, an
 only — a trailing `oaccolid` `ub4`. A 12.1 session sent the `oaccolid` answers
 `ORA-03106`; one sent the 11g layout, `ORA-03120` (#1144). The hand-built OACs
 (LOB, object, REF) follow the same rule, except that below 12.1 the LOB one
-keeps the trailing field it has always carried. Sending the 11g OAC to a 12c server is rejected with
+keeps the trailing field it has always carried.
+
+**An object bind on 10g and 11g thin sessions** (#2704) uses 12c's object
+descriptor without the trailing `oaccolid`, as JDBC thin 11.2 sends it. With
+the field, 11g answers a fatal ORA-03106 (SeerODBC saw the same).
+- **The value is 12c's:** the 36-byte extended type id
+  (`00 22 02 08 <OID> <extent OID>`), an empty object OID, snapshot and
+  version, the image's length, flags 1 and the pickled image.
+- **JDBC's differences aren't needed:** it sends an empty type id in the value,
+  descriptor flags 3, a size of 11 and charset 2, and 11g takes seerdb's
+  values as well.
+- **Measured on 11g XE and 10.2.0.5:** an object IN bind, a nested table IN
+  bind and an object OUT bind.
+- **The type's layout:** JDBC reads it with `dbms_pickler.get_type_shape` from a
+  PL/SQL block. seerdb's `gettype()` reads the dictionary, and works on both
+  servers. Sending the 11g OAC to a 12c server is rejected with
 `ORA-03115` (unsupported network datatype). The bind *value* (TTI_RXD) is the
 same in both, except long values use the version-gated `bytes_with_length`
 chunking described in §6.4 (`encode_chr`): 11g chunks anything over 64 bytes

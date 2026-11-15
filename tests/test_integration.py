@@ -303,7 +303,8 @@ class _Target(NamedTuple):
     # in the native form (#2466).
     refcursor_in: bool = False
     # Whether the session binds an object or a collection, IN and OUT: 12.1+,
-    # and 11g's native form, pooled or dedicated with oall8 (#2463).
+    # a 10g or 11g thin session (#2704), and 11g's native form, pooled or
+    # dedicated with oall8 (#2463).
     object_binds: bool = False
     # Whether the session writes to a persistent LOB: 10g closes the
     # connection on the converted form's write (#964), not on the native
@@ -359,7 +360,11 @@ def _target_of(conn) -> _Target:
         or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False))
-        or _dialect_binds_objects(conn),
+        or _dialect_binds_objects(conn)
+        or (
+            getattr(conn, '_dialect', None) is None
+            and conn.field_version >= FIELD_VERSION_10_2
+        ),
         conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
@@ -623,7 +628,8 @@ _ASSOC_ARRAY_BIND = _Need(
     assoc_arrays=True,
 )
 _OBJECT_BIND = _Need(
-    "an object bind needs the 12.1+ OAC, or 11g's native form (#2463)",
+    'an object bind needs 12.1+, a 10g or 11g thin session (#2704), or '
+    "11g's native form (#2463)",
     object_binds=True,
 )
 _ARRAY_DML_ROWCOUNTS = _Need('arraydmlrowcounts needs a 12.1+ server', min_fv=_FV)
@@ -12313,6 +12319,7 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         (value,) = self.cur.fetchone()
         self.assertEqual([e.read() for e in value.aslist()], ['a', 'bc'])
 
+    @_requires(_TEMP_LOB)
     @_requires(_OBJECT_BIND)
     def test_a_lob_attribute_binds_from_str_and_bytes(self):
         typ = self.conn.gettype(self.TYPE)
@@ -12325,6 +12332,7 @@ class ObjectLobAttributeIntegration(_IntegrationBase):
         # The caller's object keeps what it was set to.
         self.assertEqual(obj.C, 'bound text')
 
+    @_requires(_TEMP_LOB)
     @_requires(_OBJECT_BIND)
     def test_a_lob_attribute_binds_a_temporary_lob(self):
         typ = self.conn.gettype(self.TYPE)
