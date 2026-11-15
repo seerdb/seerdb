@@ -7074,6 +7074,47 @@ from `bfile_read_native` (sync + async). This replaced an earlier `DBMS_LOB`
 temp-BLOB helper, removing its `CREATE PROCEDURE` requirement and the stored
 function it left in the user's schema — the same win #46 brought to 10g+/21c.
 
+### 19.17a REF CURSOR OUT binds and CURSOR() columns before 10g (#2246, #2254, #2288, #2710, #2711)
+
+**9i, the compact TTI_ALL7 form** (ojdbc14 on 9.2.0.4):
+- **A REF CURSOR OUT bind** is declared as type 102 (REF CURSOR) with length 1.
+  When the block's prompt asks for IN values, its slot is empty, `01 00`; a NULL
+  there is a bind the server can't use. The OUT value is the opened cursor's id.
+- **The client reads that cursor with a query's own calls, naming its id:**
+  describe (`0x62`), the ALL7 execute + fetch (`02 80 50`) to ORA-01403, close
+  (`03 14 <seq> <ub4 id>`), then **free** (`03 08 <seq> <ub4 id>`). Each reply is
+  a bare `09`. Without the free a REF CURSOR stays open, and a session runs out
+  at open_cursors.
+- **A `CURSOR(...)` column's cell** is the nested cursor's id, a value like any
+  other (`02 01 02`, then the indicator).
+- **ojdbc14 reads each nested cursor as its row arrives,** between the parent's
+  fetch batches: describe, fetch, close, free. Read after the parent's last
+  batch, the earlier ones are invalid (ORA-01001). Closed and not freed, a query
+  of more of them than open_cursors runs out. On a query of 400 rows ojdbc14
+  sends 402 each of describe, close and free.
+- **From 10g the server keeps each nested cursor open while its parent is.**
+  python-oracledb fails the same 400-row query with ORA-01000, so a `CURSOR()`
+  column is capped at open_cursors rows a query there, whatever the client does.
+
+**8i, the OALL8 form** (sqlplus 9.2 against 8.1.7):
+- **A REF CURSOR OUT bind** is type `0x66` with length 1, and the same empty
+  slot.
+- **Its cell, after the reply's IOV and `07`, is the opened cursor's describe:**
+  a query's TTI_DCB body (§19.10) with its first two fields the other way
+  round, the row size (`ub4`) before an empty preamble (`00`); then the column
+  count, the reserved byte and the columns, and the date. After the describe
+  come the cursor id (`ub4`) and a `ub2`.
+- **The client then fetches the rows by that id,** with OALL8's fetch (options
+  0x40), and closes it with the close-cursors piggyback on its next call
+  (#2286). A fetch carries the piggyback too: a long query's nested cursors
+  stayed open otherwise, and 8i ran out at about 200.
+- **A `CURSOR(...)` column's row cell** is the same cell with a return code
+  after it, as every row cell has. As on 9i, each batch's nested cursors are
+  read before the parent's next fetch; read after the last, 8i answered
+  ORA-01002.
+- **ojdbc14 on 8.1.7 speaks TTI_ALL7 instead,** the 9i form above, call for
+  call.
+
 ### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals

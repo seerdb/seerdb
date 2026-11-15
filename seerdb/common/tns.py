@@ -2174,6 +2174,22 @@ _O8I_DESCRIBE: wire_schema.Schema = (
     ('n4', 'date_length'),
     ('when', 'date_length', (('value', 'date'),)),
 )
+# An 8i REF CURSOR OUT bind's cell in a block reply (#2710): the opened
+# cursor's describe -- a query's TTI_DCB body with its first two fields the
+# other way round, the row size before an empty preamble -- then its cursor
+# id and a ub2. Read from sqlplus 9.2's `OPEN :c FOR` against 8.1.7 (two
+# columns, cursor 2); sqlplus then fetches the rows by that id.
+_O8I_REFCURSOR_OUT: wire_schema.Schema = (
+    ('n4', 'max_row_size'),
+    ('value', 'preamble'),
+    ('n4', 'count'),
+    ('when', 'count', (('u8', 'reserved'),)),
+    ('each', 'columns', 'count', _O7_DESCRIBE_COLUMN),
+    ('n4', 'date_length'),
+    ('when', 'date_length', (('value', 'date'),)),
+    ('n4', 'cursor'),
+    ('n2', 'trailer'),
+)
 # 8i's rows (#2284, PROTOCOL.md §19.10) are 9i's row header (`_O7_RXH` and
 # `_O7_VECTORS`) at the 8i codec's widths -- the bit vector a ub4 length and
 # a value, set in a fetch whose row repeats columns -- and then each cell: the
@@ -2685,6 +2701,7 @@ _O7_LOBOPS_REPLY_FROM_THIN = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _THIN
 _O7_LOBOPS_O8I = wire_schema.compile_encoder(_O7_LOBOPS, _O8I)
 _O7_LOBOPS_REPLY_FROM_O8I = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _O8I)
 _O8I_RPA_FROM_O8I = wire_schema.compile_decoder(_O8I_RPA, _O8I)
+_O8I_REFCURSOR_OUT_FROM_O8I = wire_schema.compile_decoder(_O8I_REFCURSOR_OUT, _O8I)
 _O8I_STATUS_FROM_O8I = wire_schema.compile_decoder(_O8I_STATUS, _O8I)
 _O8I_DESCRIBE_FROM_O8I = wire_schema.compile_decoder(_O8I_DESCRIBE, _O8I)
 _O7_RXH_FROM_O8I = wire_schema.compile_decoder(_O7_RXH, _O8I)
@@ -15479,23 +15496,30 @@ def decode_o8i_bfile_getlen(Packet: bytes) -> int:
     return Reply.get('short_amount', 0) if Reply else 0
 
 
-def decode_8i_block_out(Data: bytes, NumOut: int) -> list:
+def decode_8i_block_out(
+    Data: bytes, NumOut: int, Cursors: frozenset[int] = frozenset()
+) -> list:
     # Decode the OUT / IN OUT return values from an 8i PL/SQL block reply
     # (docs/PROTOCOL.md §19.14). After the I/O vector (`_O8I_IOV`), the values
     # ride a single TTI_RXD (07), `NumOut` cells (`_O8I_OUT_CELL`) in OUT-bind
     # position order. Returns the raw value bytes per OUT bind (None for empty /
     # NULL, and for one the block never assigned), decoded against each Var's
-    # declared type by the cursor.
-    return _decode_8i_block_values(Data, NumOut)[0]
+    # declared type by the cursor. The OUT values at `Cursors` are REF CURSORs,
+    # each (cursor id, columns) (#2710).
+    return _decode_8i_block_values(Data, NumOut, Cursors)[0]
 
 
-def decode_8i_block_cursor(Data: bytes, NumOut: int) -> int:
+def decode_8i_block_cursor(
+    Data: bytes, NumOut: int, Cursors: frozenset[int] = frozenset()
+) -> int:
     # The cursor an 8i PL/SQL block's reply names, from the status behind its
     # bind prompt and OUT values (#2286).
-    return decode_8i_cursor_id(_decode_8i_block_values(Data, NumOut)[1])
+    return decode_8i_cursor_id(_decode_8i_block_values(Data, NumOut, Cursors)[1])
 
 
-def _decode_8i_block_values(Data: bytes, NumOut: int) -> tuple[list, bytes]:
+def _decode_8i_block_values(
+    Data: bytes, NumOut: int, Cursors: frozenset[int] = frozenset()
+) -> tuple[list, bytes]:
     # The OUT values of an 8i block's reply and the status after them; a reply
     # without the I/O vector -- the status alone of a block that failed -- has
     # none.
@@ -15504,10 +15528,14 @@ def _decode_8i_block_values(Data: bytes, NumOut: int) -> tuple[list, bytes]:
     OutValues: list = []
     if NumOut > 0 and Rest[:1] == bytes([TTI_RXD]):
         Rest = Rest[1:]
-        for _ in range(NumOut):
+        for i in range(NumOut):
             if Rest[:1] == b'\xff':
                 Rest = _O8I_OUT_UNASSIGNED_FROM_O8I(Rest)[1]
                 OutValues.append(None)
+                continue
+            if i in Cursors:
+                (Opened, Rest) = _o8i_refcursor_cell(Rest)
+                OutValues.append(Opened)
                 continue
             (Cell, Rest) = _O8I_OUT_CELL_FROM_O8I(Rest)
             OutValues.append(bytes(Cell['value']) or None)
@@ -17415,7 +17443,15 @@ def decode_8i_exec_response(
                         )
                         continue
                     Type = Col.get('data_type')
-                    if Type in _O8I_LOCATED_CELLS:
+                    Value: object
+                    if Type == TNS_TYPE_REFCURSOR:
+                        # A CURSOR(...) column: the nested cursor's describe and
+                        # id, as a REF CURSOR OUT's cell, with a return code
+                        # after it as every row cell has (#2710). The caller
+                        # fetches its rows by that id.
+                        (Value, Rest) = _o8i_refcursor_cell(Rest)
+                        Rest = Rest[2:]
+                    elif Type in _O8I_LOCATED_CELLS:
                         (Value, Rest) = _o8i_located_cell(Type, Rest)
                     elif Rest[:1] == b'\xff':
                         # NULL: the trailer alone.
@@ -17490,8 +17526,13 @@ def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
         (Describe, Rest) = _O8I_DESCRIBE_FROM_O8I(Data)
     except IndexError as Exc:
         raise Truncated(f'8i describe: {Exc}') from Exc
+    return (_o8i_columns(Describe['columns']), Rest)
+
+
+def _o8i_columns(Oacs: list) -> list[dict]:
+    # An 8i describe's columns as decode_token_dcb's column dicts.
     Columns: list[dict] = []
-    for Oac in Describe['columns']:
+    for Oac in Oacs:
         Scale = Oac['scale'] - 256 if Oac['scale'] > 127 else Oac['scale']
         Columns.append(
             {
@@ -17508,7 +17549,14 @@ def decode_8i_dcb_describe(Data: bytes) -> tuple[list[dict], bytes]:
                 'column_name': Oac['name'],
             }
         )
-    return (Columns, Rest)
+    return Columns
+
+
+def _o8i_refcursor_cell(Data: bytes) -> tuple[tuple[int, list], bytes]:
+    # A REF CURSOR OUT bind's cell in an 8i block reply (_O8I_REFCURSOR_OUT):
+    # ((cursor id, columns), rest), for the caller to fetch the rows by that id.
+    (Cell, Rest) = _O8I_REFCURSOR_OUT_FROM_O8I(Data)
+    return ((Cell['cursor'], _o8i_columns(Cell['columns'])), Rest)
 
 
 def _o7_status(Data: bytes) -> dict | None:
