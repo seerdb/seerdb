@@ -159,6 +159,18 @@ def certificate_names_host(PeerCert: dict | None, Host: str) -> bool:
     return False
 
 
+# The XA names a 9i login gives with xa=True (#2691): 9.2 begins a distributed
+# transaction only on a session that logged on with them, ORA-02048 otherwise.
+# The keys carry their NUL, as JDBC thin's XA connection sends them; 10g and
+# later take the names in the transaction switch instead (PROTOCOL.md §28). A
+# session that gave them keeps answering ORA-02091 after a refused commit until
+# it rolls back, so a plain session doesn't give them.
+_O7_XA_NAMES: list[tuple[bytes, bytes]] = [
+    (b'AUTH_INTERNALNAME\x00', b'seerdb'),
+    (b'AUTH_EXTERNALNAME\x00', b'seerdb_1'),
+]
+
+
 class _ConnectionLogic:
     """Shared non-I/O logic for `OracleConnect` / `AsyncOracleConnect` (#553)."""
 
@@ -196,6 +208,7 @@ class _ConnectionLogic:
     machine: str | None
     terminal: str | None
     osuser: str | None
+    xa: bool
     driver_name: str | None
     edition: str | None
     sdu: int

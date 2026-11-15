@@ -6130,7 +6130,9 @@ same fields as 10g+: `ub4` data object, `ub4` relative file, one reserved byte,
 ```
 
 The third of the six single bytes is a `ub2` flags field (`00` when zero), as at
-10g and 11g (#1995); the sixth is the warning flags, `0x20` for an object that
+10g and 11g (#1995). The fourth, the cursor options, is a compressed integer
+too: `00` on a plain session, `01 08` on one that logged on with the XA names
+(§28, #2691). The sixth is the warning flags, `0x20` for an object that
 compiled with errors (#2262). After the rowid come the OS error (`ub4`), the
 statement and call numbers (a byte each), padding (`ub2`), the successful
 iterations (`ub4`), the oerrdd -- a `ub4` length and the value, the 13-byte
@@ -8477,12 +8479,31 @@ function messages carry it:
   `tpc_rollback` expects `ABORTED`.
 
 Use `autocommit=False` so the DML between `tpc_begin` and `tpc_end` is part of
-the branch. Sync + async. **seerdb's thin form is 12c+ only:** python-oracledb
-requires 12.1+. seerdb's thin DML reply inside a global transaction desynced
-before 12c, so `tpc_begin` raises `NotSupportedError` on field version < 12.1
-(before any wire activity — the connection stays usable). The native 10g and 11g
-form (`oall8=True`) follows OCI 11.2. Verified on 21c/23ai (two-phase commit,
-one-phase commit, rollback, read-only prepare), sync + async.
+the branch. Sync + async. **seerdb serves it from 9.2 on** (#2691), in the
+thin form below, and in the native 10g and 11g form (`oall8=True`), which
+follows OCI 11.2. Verified on 9.2, 10.2, 11g, 21c and 23ai: two-phase commit,
+one-phase commit, rollback and read-only prepare. `tpc_begin` raises
+`NotSupportedError`, before any wire activity, on 8i and on a 9i session with
+`oall8=True`, whose switch hangs.
+
+**9.2 takes the XA names at login.** It begins a distributed transaction only on
+a session that logged on with `AUTH_INTERNALNAME` and `AUTH_EXTERNALNAME` in
+the OAUTH call, and answers ORA-02048 ("attempt to begin distributed
+transaction without logging on") otherwise. JDBC thin's keys carry their NUL
+(`AUTH_INTERNALNAME\0`, 18 bytes), and so do seerdb's (`seerdb`,
+`seerdb_1`). From 10g the names travel in the switch instead.
+
+**Such a session behaves differently in two ways:**
+- Its status reports the cursor options as a compressed integer, `01 08`,
+  where a plain session's is `00` (§19.2).
+- After a refused commit (ORA-02091, a deferred constraint), it raises ORA-02091
+  again on the next statement until the transaction is rolled back. A plain
+  session moves on.
+
+So seerdb gives the names only to a connection opened with `xa=True`, as JDBC
+gives them only to its XA connection. `tpc_begin` on a 9i session without it
+raises NotSupportedError, naming the option. SeerODBC measured the names and
+the status width first.
 
 **Before 12c, in thin's encoding (measured 2026-11-15).** The reference is
 Oracle's JDBC thin 11.2 driver (ojdbc6) with native XA
