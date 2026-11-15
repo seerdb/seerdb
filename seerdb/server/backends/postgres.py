@@ -2457,9 +2457,13 @@ _HELPER_FUNCTIONS_DDL = (
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
         # JSON_VALUE's context item when no ERROR ON ERROR is given (#2679):
         # invalid JSON is NULL, as 23ai's default NULL ON ERROR makes it.
+        # PL/pgSQL, not SQL: PostgreSQL 18 plans a SQL function's statement
+        # with its argument folded in, and folding the immutable jsonb_in of
+        # a CASE's THEN raised for invalid text before the WHEN ran (#2692).
         'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(text) RETURNS jsonb '
-        "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE WHEN pg_input_is_valid($1, 'jsonb') "
-        'THEN jsonb_in($1::cstring) END $$;'
+        'LANGUAGE plpgsql IMMUTABLE STRICT AS $$ BEGIN '
+        "IF pg_input_is_valid($1, 'jsonb') THEN RETURN jsonb_in($1::cstring); END IF; "
+        'RETURN NULL; END $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(character) RETURNS jsonb '
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_json_or_null($1::text) $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(jsonb) RETURNS jsonb '

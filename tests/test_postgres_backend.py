@@ -18383,6 +18383,30 @@ def test_json_value_is_23ai_s_from_postgresql_17() -> None:
         backend.close()
 
 
+def test_invalid_json_is_null_from_a_session_s_first_call() -> None:
+    # On PostgreSQL 18, invalid JSON raised ORA-40441 in JSON_VALUE and
+    # JSON_QUERY, where 23ai answers NULL (#2692): the helper's SQL body was
+    # planned with the text folded in for a session's first calls, and folding
+    # jsonb_in raised. A later call took a generic plan and passed, so each
+    # case runs in a session of its own, invalid JSON first.
+    if _server_version_num() < 170000:
+        pytest.skip('JSON_VALUE needs PostgreSQL 17')
+    for expression in (
+        "JSON_VALUE('not json', '$.a')",
+        "JSON_QUERY('not json', '$')",
+        "JSON_VALUE('{bad', '$.a' RETURNING NUMBER)",
+    ):
+        backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+        try:
+            backend.authenticate('PYO')
+            backend.open_session({})
+            assert backend.execute(f'SELECT {expression} FROM dual').rows == [
+                (None,)
+            ], expression
+        finally:
+            backend.close()
+
+
 def test_json_value_before_postgresql_17_is_refused() -> None:
     # PostgreSQL 16 has no JSON_VALUE (docs/MIRROR.md, *By PostgreSQL version*).
     from seerdb.server.backend import UnsupportedFeature
