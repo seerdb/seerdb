@@ -1502,8 +1502,12 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
                     'or a 10g or 11g session with oall8=True'
                 )
             if isinstance(V, Var) and getattr(V, 'is_array', False):
-                # OCI 11.2's form serves it on the native session.
-                if Native11:
+                # OCI 11.2's form serves it on the native session, and a 10g
+                # or 11g thin session binds it as JDBC thin 11.2 does (#2706).
+                if Native11 or (
+                    Dialect is None
+                    and getattr(Connection, 'field_version', 0) >= FIELD_VERSION_10_2
+                ):
                     continue
                 raise NotSupportedError(
                     'binding a PL/SQL associative array (arrayvar) requires an '

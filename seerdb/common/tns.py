@@ -7320,9 +7320,11 @@ def decode_oac_fields(Data: bytes) -> tuple[int, int, int, int, int, bytes, byte
     return (DataType, MaxDataLength, DataScale, Charset, Csfrm, ToId, Rest)
 
 
-# A PL/SQL associative-array bind's capacity (#122): where TNS_BIND_ARRAY is set,
-# the max-array-size field of the 12.2+ OAC layout or the trailing field of the
-# 11g one (the two places encode_token_raw writes it); 0 for a scalar bind.
+# A PL/SQL associative-array bind's capacity (#122): where TNS_BIND_ARRAY is set
+# in the flags byte, the max-array-size field, as 12c and JDBC thin 11.2 write
+# it, and seerdb from 10g (#2706). An 11g layout with the bit in the cont flags,
+# as seerdb wrote it before, has the capacity in the trailing field; 0 for a
+# scalar bind.
 def _oac_array_capacity(Data: bytes, field_version: int) -> int:
     (
         _DataType,
@@ -7338,9 +7340,11 @@ def _oac_array_capacity(Data: bytes, field_version: int) -> int:
         Mxlc,
         _Rest,
     ) = _decode_oac_walk(Data)
-    if field_version >= FIELD_VERSION_12_1:
-        return Mal if Flg & TNS_BIND_ARRAY else 0
-    return Mxlc if Fl2 & TNS_BIND_ARRAY else 0
+    if Flg & TNS_BIND_ARRAY:
+        return Mal
+    if field_version < FIELD_VERSION_12_1 and Fl2 & TNS_BIND_ARRAY:
+        return Mxlc
+    return 0
 
 
 def decode_token_oac(Data: bytes, Acc: tuple) -> tuple[int, int, int, int, bytes]:
@@ -22715,17 +22719,31 @@ def encode_token_raw(
             + encode_sb4(0)  # LOB prefetch length
             + _oac_col_id()  # oaccolid (12.2+)
         )
-    FlagOut = (Flag | TNS_BIND_ARRAY) if Array else Flag
-    MaxOut = Array if Array else Max
+    if Array:
+        # An associative array before 12c, as JDBC thin 11.2 binds one on 11g
+        # (#2706): the ARRAY bit in the flags byte, its capacity as the max
+        # number of array elements, each element's length as the length, and
+        # no form for a type without a charset. The bit in the cont flags and
+        # the capacity as max chars made 11g answer PLS-00306.
+        return (
+            bytes([DataType, 3 | TNS_BIND_ARRAY, 0, 0])
+            + encode_sb4(Length)
+            + encode_sb4(Array)
+            + encode_sb4(Flag)
+            + bytes([0, 0])
+            + encode_sb4(Charset)
+            + bytes([FormOfUse if Charset else 0])
+            + encode_sb4(Max)
+        )
     return (
         bytes([DataType, 3, 0, 0])
         + encode_sb4(Length)
         + bytes([0])
-        + encode_sb4(FlagOut)
+        + encode_sb4(Flag)
         + bytes([0, 0])
         + encode_sb4(Charset)
         + bytes([FormOfUse])
-        + encode_sb4(MaxOut)
+        + encode_sb4(Max)
     )
 
 

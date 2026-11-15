@@ -313,8 +313,8 @@ class _Target(NamedTuple):
     # Whether the session sends the end-to-end tracing attributes: 12.1+, and
     # the native form on 10g and 11g.
     end_to_end: bool = False
-    # Whether the session binds a PL/SQL associative array: 12.1+, and the
-    # native form on 10g and 11g.
+    # Whether the session binds a PL/SQL associative array: 12.1+, a 10g or
+    # 11g thin session (#2706), and the native form on 10g and 11g.
     assoc_arrays: bool = False
     # Whether the session runs two-phase commit: 9.2 and later in the thin form,
     # and the native form on 10g and 11g (#2691).
@@ -369,7 +369,11 @@ def _target_of(conn) -> _Target:
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
-        or bool(getattr(conn, '_native11', False)),
+        or bool(getattr(conn, '_native11', False))
+        or (
+            getattr(conn, '_dialect', None) is None
+            and conn.field_version >= FIELD_VERSION_10_2
+        ),
         _session_runs_tpc(conn),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
@@ -624,7 +628,7 @@ _PACKAGE_TYPE_BIND = _Need(
     min_fv=_FV,
 )
 _ASSOC_ARRAY_BIND = _Need(
-    'an associative-array bind needs 12.1+ (#122), or the native form on 10g and 11g',
+    'an associative-array bind needs 12.1+ (#122), or 10g or 11g (#2706)',
     assoc_arrays=True,
 )
 _OBJECT_BIND = _Need(
