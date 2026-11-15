@@ -9404,7 +9404,15 @@ def _rr_format(fmt: str, parsing: bool) -> str:
 # Oracle's SQL/JSON functions and the PostgreSQL calls that do their work
 # over jsonb (#1707).
 _JSON_FUNCTION_NAMES = frozenset(
-    {'JSON', 'JSON_SCALAR', 'JSON_QUERY', 'JSON_EXISTS', 'JSON_SERIALIZE', 'JSON_VALUE'}
+    {
+        'JSON',
+        'JSON_SCALAR',
+        'JSON_QUERY',
+        'JSON_EXISTS',
+        'JSON_SERIALIZE',
+        'JSON_VALUE',
+        'JSON_TABLE',
+    }
 )
 # JSON_VALUE's clauses past the path (#2679): RETURNING a type, and the
 # answer for an error and for no value. Anything else is refused.
@@ -9647,6 +9655,188 @@ def _split_masked_commas(text: str) -> list[str]:
     return parts
 
 
+# JSON_TABLE (#2679): its row path's answer for an error, and its columns.
+_JSON_TABLE_ON_ERROR = re.compile(r'\s*(ERROR|NULL)\s+ON\s+ERROR\s*$', re.IGNORECASE)
+_JSON_TABLE_NESTED = re.compile(
+    r"^NESTED\s+(?:PATH\s+)?('[^']*')\s+COLUMNS\s*\((.*)\)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_JSON_TABLE_ORDINALITY = re.compile(
+    r'^("[^"]*"|\w+)\s+FOR\s+ORDINALITY\s*$', re.IGNORECASE
+)
+_JSON_TABLE_COLUMN = re.compile(
+    r'^("[^"]*"|\w+)'
+    r'(?:\s+(?!(?:FORMAT|EXISTS|PATH|WITH|WITHOUT|ERROR|NULL|DEFAULT|EMPTY)\b)'
+    r'(\w+(?:\s*\([^)]*\))?))?'
+    r'(\s+FORMAT\s+JSON)?'
+    r'(\s+(?:WITH|WITHOUT)\s+(?:(?:CONDITIONAL|UNCONDITIONAL)\s+)?(?:ARRAY\s+)?WRAPPER)?'
+    r'(\s+EXISTS)?'
+    r"(?:\s+PATH\s+('[^']*'))?"
+    r'((?:\s+(?:ERROR|NULL|TRUE|FALSE|EMPTY(?:\s+(?:ARRAY|OBJECT))?|DEFAULT\s+\S+?)'
+    r'\s+ON\s+(?:ERROR|EMPTY))*)\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+_JSON_TABLE_BEHAVIOUR = re.compile(
+    r'\s+((?:ERROR|NULL|TRUE|FALSE|EMPTY(?:\s+(?:ARRAY|OBJECT))?|DEFAULT\s+\S+?)'
+    r'\s+ON\s+(ERROR|EMPTY))',
+    re.IGNORECASE,
+)
+
+
+def _json_table(args: list[str]) -> str:
+    # Oracle's JSON_TABLE(x [FORMAT JSON] [, path] [ERROR | NULL ON ERROR]
+    # COLUMNS (...)) as PostgreSQL 17's native JSON_TABLE, answering as 23ai
+    # does (#2679), in a LATERAL subquery that gives each column 23ai's type:
+    #   - invalid JSON or NULL is no rows, unless ERROR ON ERROR, which also
+    #     becomes every column's (PostgreSQL keeps it to the row path);
+    #   - the row path is '$' when left out;
+    #   - a column without a path reads the key named as the column is
+    #     written, and without a type is VARCHAR2(4000);
+    #   - FORMAT JSON is Oracle's compact text, EXISTS 'true' / 'false' or
+    #     1 / 0, a CLOB a LOB the describe sees, FOR ORDINALITY a NUMBER.
+    (masked, contents) = _mask_quoted(','.join(args).strip())
+    opening = _depth_zero_columns(masked)
+    if opening is None:
+        raise UnsupportedFeature('JSON_TABLE without COLUMNS')
+    closing = _matching_paren(masked, opening)
+    if closing >= len(masked):
+        raise UnsupportedFeature('JSON_TABLE with an unclosed COLUMNS list')
+    if masked[closing + 1 :].strip():
+        raise UnsupportedFeature(
+            f'JSON_TABLE {_unmask_quoted(masked[closing + 1 :].strip(), contents)}'
+        )
+    head = _split_masked_commas(masked[: _columns_start(masked, opening)])
+    context = _JSON_FORMAT.sub('', _unmask_quoted(head[0], contents)).strip()
+    path_text = "'$'"
+    error_on_error = False
+    if len(head) > 2:
+        raise UnsupportedFeature('JSON_TABLE PASSING')
+    if len(head) == 2:
+        rest = head[1]
+        found = _JSON_TABLE_ON_ERROR.search(rest)
+        if found is not None:
+            error_on_error = found.group(1).upper() == 'ERROR'
+            rest = rest[: found.start()]
+        path_text = _unmask_quoted(rest.strip(), contents)
+        if not re.fullmatch(r"'[^']*'", path_text, re.DOTALL):
+            raise UnsupportedFeature(f'JSON_TABLE path {path_text}')
+    (inner, outer) = _json_table_columns(
+        masked[opening + 1 : closing], contents, error_on_error
+    )
+    item = (
+        f'sys.ora_json({context})'
+        if error_on_error
+        else f'sys.ora_json_or_null({context})'
+    )
+    tail = ' ERROR ON ERROR' if error_on_error else ''
+    return (
+        f'LATERAL (SELECT {", ".join(outer)} FROM JSON_TABLE({item}, {path_text} '
+        f'COLUMNS ({", ".join(inner)}){tail}) AS sys_jt)'
+    )
+
+
+def _depth_zero_columns(masked: str) -> int | None:
+    # The index of the `(` that opens JSON_TABLE's depth-zero COLUMNS list.
+    depth = 0
+    for found in re.finditer(r'\(|\)|\bCOLUMNS\s*\(', masked, re.IGNORECASE):
+        text = found.group(0)
+        if text == '(':
+            depth += 1
+        elif text == ')':
+            depth -= 1
+        elif depth == 0:
+            return found.end() - 1
+        else:
+            depth += 1
+    return None
+
+
+def _columns_start(masked: str, opening: int) -> int:
+    # Where the COLUMNS keyword before the list's `(` at `opening` starts.
+    found = re.search(r'\bCOLUMNS\s*$', masked[:opening], re.IGNORECASE)
+    assert found is not None
+    return found.start()
+
+
+def _json_table_columns(
+    masked: str, contents: list[str], error_on_error: bool
+) -> tuple[list[str], list[str]]:
+    # A COLUMNS list, quotes masked, as PostgreSQL's column definitions and
+    # the subquery's select list that gives each its 23ai type.
+    (inner, outer) = ([], [])
+    for entry in _split_masked_commas(masked):
+        entry = entry.strip()
+        nested = _JSON_TABLE_NESTED.match(entry)
+        if nested is not None:
+            (columns, projections) = _json_table_columns(
+                nested.group(2), contents, error_on_error
+            )
+            path = _unmask_quoted(nested.group(1), contents)
+            inner.append(f'NESTED PATH {path} COLUMNS ({", ".join(columns)})')
+            outer.extend(projections)
+            continue
+        ordinality = _JSON_TABLE_ORDINALITY.match(entry)
+        if ordinality is not None:
+            name = _unmask_quoted(ordinality.group(1), contents)
+            inner.append(f'{name} FOR ORDINALITY')
+            outer.append(f'{name}::numeric AS {name}')
+            continue
+        column = _JSON_TABLE_COLUMN.match(entry)
+        if column is None:
+            raise UnsupportedFeature(
+                f'JSON_TABLE column {_unmask_quoted(entry, contents)}'
+            )
+        (name, oracle_type, format_json, wrapper, exists, path, clauses) = (
+            column.groups()
+        )
+        name = _unmask_quoted(name, contents)
+        if path is None:
+            key = name[1:-1] if name.startswith('"') else name
+            path = '\'$."' + key.replace("'", "''") + '"\''
+        else:
+            path = _unmask_quoted(path, contents)
+        oracle_type = (oracle_type or 'VARCHAR2(4000)').upper()
+        pg_type = _translate_column_types(_unmask_quoted(oracle_type, contents))
+        behaviours = {
+            event.upper(): ' '.join(answer.split())
+            for (answer, event) in _JSON_TABLE_BEHAVIOUR.findall(
+                _unmask_quoted(clauses or '', contents)
+            )
+        }
+        if error_on_error and 'ERROR' not in behaviours:
+            behaviours['ERROR'] = 'ERROR ON ERROR'
+        on = ''.join(f' {behaviours[e]}' for e in ('EMPTY', 'ERROR') if e in behaviours)
+        if exists:
+            inner.append(f'{name} boolean EXISTS PATH {path}{on}')
+            (yes, no) = (
+                ('1', '0')
+                if pg_type.startswith(('numeric', 'double'))
+                else (
+                    "'true'",
+                    "'false'",
+                )
+            )
+            outer.append(
+                f'(CASE WHEN {name} THEN {yes} WHEN NOT {name} THEN {no} END)::{pg_type} AS {name}'
+            )
+        elif format_json or oracle_type == 'JSON':
+            shape = f' {" ".join(wrapper.upper().split())}' if wrapper else ''
+            inner.append(f'{name} jsonb FORMAT JSON PATH {path}{shape}{on}')
+            if oracle_type == 'JSON':
+                outer.append(name)
+            elif oracle_type == 'CLOB':
+                outer.append(f'TO_CLOB(sys.ora_json_serialize({name})) AS {name}')
+            else:
+                outer.append(f'sys.ora_json_serialize({name})::{pg_type} AS {name}')
+        elif oracle_type == 'CLOB':
+            inner.append(f'{name} text PATH {path}{on}')
+            outer.append(f'TO_CLOB({name}) AS {name}')
+        else:
+            inner.append(f'{name} {pg_type} PATH {path}{on}')
+            outer.append(name)
+    return (inner, outer)
+
+
 _JSON_EXTENDED = re.compile(r'\s+EXTENDED\s*$', re.IGNORECASE)
 _JSON_RETURNING = re.compile(r'\s+RETURNING\b.*$', re.IGNORECASE | re.DOTALL)
 
@@ -9686,6 +9876,11 @@ def _translate_json_functions(sql: str) -> str:
                     'JSON_QUERY with RETURNING, a wrapper or ON ERROR / ON EMPTY '
                     'needs PostgreSQL 17 or later'
                 )
+        if upper == 'JSON_TABLE':
+            if _SERVER_VERSION.get() < 170000:
+                # floor: PG17 -- refused below 17 (#2679, #2682).
+                raise UnsupportedFeature('JSON_TABLE needs PostgreSQL 17 or later')
+            return _json_table(inner)
         if upper == 'JSON_EXISTS' and len(inner) >= 2:
             # PASSING's commas split the call's arguments: they are one clause.
             return _json_exists(inner[0], ','.join(inner[1:]))

@@ -18423,6 +18423,73 @@ def test_json_value_before_postgresql_17_is_refused() -> None:
         backend.close()
 
 
+# JSON_TABLE cases and 23ai's answers (#2679), measured on 23ai Free.
+_JSON_TABLE_DOC = '{"id":7,"name":"x","items":[{"k":1},{"k":2}],"o":{"z":1}}'
+_JSON_TABLE_CASES = (
+    (
+        "'$' COLUMNS (id NUMBER PATH '$.id', name VARCHAR2(10) PATH '$.name')",
+        [(7, 'x')],
+    ),
+    ("'$' COLUMNS (id, name)", [('7', 'x')]),
+    ("'$.items[*]' COLUMNS (n FOR ORDINALITY, k NUMBER PATH '$.k')", [(1, 1), (2, 2)]),
+    (
+        "'$' COLUMNS (id NUMBER PATH '$.id', NESTED '$.items[*]' COLUMNS (k NUMBER PATH '$.k'))",
+        [(7, 1), (7, 2)],
+    ),
+    (
+        "'$' COLUMNS (e VARCHAR2(5) EXISTS PATH '$.o', n NUMBER EXISTS PATH '$.q')",
+        [('true', 0)],
+    ),
+    ("'$' COLUMNS (o VARCHAR2(20) FORMAT JSON PATH '$.o')", [('{"z":1}',)]),
+    ("'$' COLUMNS (n NUMBER PATH '$.name')", [(None,)]),
+    ("COLUMNS (id NUMBER PATH '$.id')", [(7,)]),
+)
+
+
+def test_json_table_is_23ai_s_from_postgresql_17() -> None:
+    # The Mirror passed JSON_TABLE through untranslated, so an Oracle column
+    # type failed with ORA-00902 (#2679). On 17 and later it is the native one
+    # with 23ai's types: implied paths read the key as written, EXISTS is
+    # 'true' / 'false' or 1 / 0, FORMAT JSON is compact, and invalid JSON is
+    # no rows.
+    if _server_version_num() < 170000:
+        pytest.skip('JSON_TABLE needs PostgreSQL 17')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        for rest, expected in _JSON_TABLE_CASES:
+            separator = ' ' if rest.startswith('COLUMNS') else ', '
+            sql = f"SELECT * FROM JSON_TABLE('{_JSON_TABLE_DOC}'{separator}{rest})"
+            assert backend.execute(sql).rows == expected, rest
+        assert (
+            backend.execute(
+                "SELECT * FROM JSON_TABLE('bad', '$' COLUMNS (a PATH '$.a'))"
+            ).rows
+            == []
+        )
+    finally:
+        backend.close()
+
+
+def test_json_table_before_postgresql_17_is_refused() -> None:
+    # PostgreSQL 16 has no JSON_TABLE (docs/MIRROR.md, *By PostgreSQL version*).
+    from seerdb.server.backend import UnsupportedFeature
+
+    if _server_version_num() >= 170000:
+        pytest.skip('PostgreSQL 17 has JSON_TABLE')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        with pytest.raises(UnsupportedFeature):
+            backend.execute(
+                "SELECT * FROM JSON_TABLE('{\"a\":1}', '$' COLUMNS (a PATH '$.a'))"
+            )
+    finally:
+        backend.close()
+
+
 # JSON_QUERY cases and 23ai's answers (#2679), measured on 23ai Free.
 _JSON_QUERY_DOC = '{"a":{"b":1},"e":[1,2],"s":"x","n":5}'
 _JSON_QUERY_CASES = (

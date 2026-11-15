@@ -18517,5 +18517,102 @@ class JsonExistsIntegration(_IntegrationBase):
                 self.assertEqual(raised.exception.code, code)
 
 
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_JSON_VALUE)
+class JsonTableIntegration(_IntegrationBase):
+    """JSON_TABLE's columns, paths and answers for an error, as Oracle gives
+    them (#2679). Through a Mirror-over-PG it needs PostgreSQL 17; before, it
+    is refused (docs/MIRROR.md, *By PostgreSQL version*)."""
+
+    DOC = (
+        '{"id":7,"name":"x","when":"2024-05-06",'
+        '"items":[{"k":1,"v":"a"},{"k":2,"v":"b"}],"o":{"z":1}}'
+    )
+
+    def _table(self, rest: str, binds=()):
+        self.cur.execute(f'SELECT * FROM JSON_TABLE({rest})', list(binds))
+        return self.cur.fetchall()
+
+    def test_columns_and_their_types(self):
+        rows = self._table(
+            f"'{self.DOC}', '$' COLUMNS (id NUMBER PATH '$.id', "
+            "name VARCHAR2(10) PATH '$.name', w DATE PATH '$.when', name2 PATH '$.name')"
+        )
+        self.assertEqual(rows, [(7, 'x', datetime.datetime(2024, 5, 6), 'x')])
+        types = [d[1] for d in self.cur.description]
+        self.assertEqual(
+            types,
+            [
+                seerdb.DB_TYPE_NUMBER,
+                seerdb.DB_TYPE_VARCHAR,
+                seerdb.DB_TYPE_DATE,
+                seerdb.DB_TYPE_VARCHAR,
+            ],
+        )
+
+    def test_an_implied_path_reads_the_key_as_written(self):
+        self.assertEqual(self._table("""'{"id":2}', '$' COLUMNS (id)"""), [('2',)])
+        self.assertEqual(self._table("""'{"ID":1}', '$' COLUMNS (id)"""), [(None,)])
+        self.assertEqual(self._table("""'{"ID":1}', '$' COLUMNS ("ID")"""), [('1',)])
+
+    def test_row_path_nested_and_ordinality(self):
+        self.assertEqual(
+            self._table(
+                f"'{self.DOC}', '$.items[*]' COLUMNS (n FOR ORDINALITY, v PATH '$.v')"
+            ),
+            [(1, 'a'), (2, 'b')],
+        )
+        self.assertEqual(
+            self._table(
+                f"'{self.DOC}', '$' COLUMNS (id NUMBER PATH '$.id', "
+                "NESTED PATH '$.items[*]' COLUMNS (k NUMBER PATH '$.k'))"
+            ),
+            [(7, 1), (7, 2)],
+        )
+        self.assertEqual(
+            self._table(f"'{self.DOC}' COLUMNS (id NUMBER PATH '$.id')"), [(7,)]
+        )
+
+    def test_exists_and_format_json(self):
+        self.assertEqual(
+            self._table(
+                f"'{self.DOC}', '$' COLUMNS (e VARCHAR2(5) EXISTS PATH '$.o', "
+                "n NUMBER EXISTS PATH '$.q', "
+                "o VARCHAR2(50) FORMAT JSON PATH '$.o', "
+                "v VARCHAR2(50) FORMAT JSON WITH WRAPPER PATH '$.items[*].v')"
+            ),
+            [('true', 0, '{"z":1}', '["a","b"]')],
+        )
+
+    def test_errors_and_invalid_json(self):
+        doc = f"'{self.DOC}'"
+        self.assertEqual(
+            self._table(f"{doc}, '$' COLUMNS (n NUMBER PATH '$.name')"), [(None,)]
+        )
+        self.assertEqual(
+            self._table(f"{doc}, '$' COLUMNS (m NUMBER PATH '$.q' DEFAULT 0 ON EMPTY)"),
+            [(0,)],
+        )
+        self.assertEqual(
+            self._table(":1, '$' COLUMNS (a NUMBER PATH '$.a')", ['bad']), []
+        )
+        for rest, code in (
+            (f"{doc}, '$' COLUMNS (m NUMBER PATH '$.q' ERROR ON EMPTY)", 40462),
+            (f"{doc}, '$' ERROR ON ERROR COLUMNS (n NUMBER PATH '$.name')", 1722),
+        ):
+            with self.subTest(rest=rest):
+                with self.assertRaises(seerdb.DatabaseError) as raised:
+                    self._table(rest)
+                self.assertEqual(raised.exception.code, code)
+
+    def test_a_lateral_join(self):
+        self.cur.execute(
+            'SELECT t.n, jt.k FROM (SELECT 1 n, \'{"items":[{"k":1},{"k":2}]}\' doc FROM dual '
+            "UNION ALL SELECT 2, 'bad' FROM dual) t, "
+            "JSON_TABLE(t.doc, '$.items[*]' COLUMNS (k NUMBER PATH '$.k')) jt ORDER BY t.n, jt.k"
+        )
+        self.assertEqual(self.cur.fetchall(), [(1, 1), (1, 2)])
+
+
 if __name__ == '__main__':
     unittest.main()
