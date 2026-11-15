@@ -8477,12 +8477,57 @@ function messages carry it:
   `tpc_rollback` expects `ABORTED`.
 
 Use `autocommit=False` so the DML between `tpc_begin` and `tpc_end` is part of
-the branch. Sync + async. **12c+ only:** python-oracledb requires 12.1+ and
-there's no pre-12c reference; pre-12c the global-transaction DML response is
-framed differently and desyncs, so `tpc_begin` raises `NotSupportedError` on
-field version < 12.1 (before any wire activity — the connection stays usable).
-Verified on 21c/23ai (two-phase commit, one-phase commit, rollback, read-only
-prepare), sync + async.
+the branch. Sync + async. **seerdb's thin form is 12c+ only:** python-oracledb
+requires 12.1+. seerdb's thin DML reply inside a global transaction desynced
+before 12c, so `tpc_begin` raises `NotSupportedError` on field version < 12.1
+(before any wire activity — the connection stays usable). The native 10g and 11g
+form (`oall8=True`) follows OCI 11.2. Verified on 21c/23ai (two-phase commit,
+one-phase commit, rollback, read-only prepare), sync + async.
+
+**Before 12c, in thin's encoding (measured 2026-11-15).** The reference is
+Oracle's JDBC thin 11.2 driver (ojdbc6) with native XA
+(`OracleXADataSource.setNativeXA(true)`), captured on 11g XE, 10.2.0.5 and
+9.2.0.4. It ran start, DML, end, prepare, then commit or rollback, and a
+one-phase commit; each worked. It uses the same two functions, in thin's
+compressed integers, with fewer fields the older the server:
+
+| server | TransactionSwitch (103) | TransactionChangeState (104) |
+|---|---|---|
+| 11g | as above, names included (JDBC's internal name 13 bytes, external 6) | as above |
+| 10.2 | no internal or external name: the two pointer + length pairs and the names are absent | as above, byte for byte the same as 11g's |
+| 9.2 | as 10.2's, byte for byte | as 10.2's **without `flags`**: the context follows the out-state pointer |
+
+So on 10.2 and 9.2 the switch is: operation, the context pointer and length,
+`format_id`, `len(gtrid)`, `len(bqual)`, the xid pointer and length (128),
+flags, timeout, the three return pointers, then the context (on detach), the
+128-byte xid and the application value (`00`). A start is 153 bytes of body,
+a detach 321, with 168 bytes of context. The replies are the same on all three
+servers:
+- the switch reply is the RPA, the application value (`ub4`), the context
+  length (`ub2`, 168) and the context, then the status;
+- the change-state reply is the RPA and the final state (`ub4`), then the
+  status.
+
+JDBC's own XA flags, as captured:
+- start: flags 1 (new), timeout 60;
+- end: flags 0;
+- prepare: state 0, returning 1 (`REQUIRES_COMMIT`);
+- commit after prepare: state 2, returning 5 (`FORGOTTEN`).
+
+**8.1.7 has no native form in any reference client.** ojdbc14 (9.0.2) has no
+native XA. Against 8.1.7 its XA runs as PL/SQL blocks on `SYS.JAVA_XA`, read
+back from `v$sqlarea`:
+- `begin :1 := JAVA_XA.xa_start_new(:2,:3,:4,:5,:6); end;`, with format id,
+  gtrid (RAW), bqual (RAW), timeout and flag;
+- `xa_end_new(formatid, gtrid, bqual, flag)`;
+- `xa_prepare_new(formatid, gtrid, bqual)`;
+- `xa_commit_new(formatid, gtrid, bqual, commit)`;
+- `xa_rollback_new(formatid, gtrid, bqual)`;
+- `xa_forget_new(formatid, gtrid, bqual)`.
+
+Each returns an XA code as a NUMBER, and start, end, prepare, commit, rollback
+and a one-phase commit all worked. 9.2 has the package too, so the same calls
+serve a client that can't send the native form there.
 
 **Recovering in-doubt branches (#2457).**
 - **`tpc_recover`** isn't a wire message. It is a query on
