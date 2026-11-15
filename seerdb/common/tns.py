@@ -2433,14 +2433,21 @@ _O7_LOBOPS_REPLY: wire_schema.Schema = (
     ),
 )
 # The RPA in front of an 8i call's status (#2284): a ub2 count, four, and that
-# many ub4s, the third the statement's cursor, as its status has it; then
-# four bytes zero in every reply measured, the two ub2 lengths 10g sends
-# there. 23 bytes on 8.1.7.
+# many ub4s, the third the statement's cursor, as its status has it. Then the
+# words 10g's RPA has (`_ROWCOUNTS_BLOCK`) as ub2s: the transaction id's
+# length, zero in every reply measured, and the count of keyword-value pairs,
+# laid out as the SYNC piggyback's (#2687). A successful ALTER SESSION
+# reports the session's NLS settings this way: 16 pairs on 8.1.7, 18 on 9.2
+# (NLS_DATE_FORMAT under keyword 7). A failed one, and any other statement,
+# sends none: 23 bytes on 8.1.7.
 _O8I_RPA: wire_schema.Schema = (
     ('const', bytes([TTI_RPA])),
     ('n2', 'count'),
     ('each', 'parameters', 'count', (('n4', 'value'),)),
-    ('pad', 4),
+    ('n2', 'transaction_length'),
+    ('bytes', 'transaction', 'transaction_length'),
+    ('n2', 'pair_count'),
+    ('each', 'pairs', 'pair_count', _SYNC_PAIR),
 )
 # Oracle 8i's status (PROTOCOL.md §19.12, #2284): the fields of 9i's short
 # status (`_O7_STATUS_HEAD`, `_O7_STATUS_TAIL`) at fixed widths, as 8.1.7
@@ -2779,7 +2786,8 @@ _O8I_OUT_UNASSIGNED_FROM_O9I = wire_schema.compile_decoder(_O8I_OUT_UNASSIGNED, 
 _O8I_LONG_CELL_FROM_O9I = wire_schema.compile_decoder(_O8I_LONG_CELL, _O9I)
 _O7_LOBOPS_REPLY_FROM_O9I = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _O9I)
 # The session-state RPA ahead of a 9.2 status is 8i's (_O8I_RPA): five ub4s, the
-# third the statement's cursor, and four bytes -- 27 (#798).
+# third the statement's cursor, and the two ub2 counts -- 27 bytes with no
+# pairs (#798, #2687).
 _O8I_RPA_FROM_O9I = wire_schema.compile_decoder(_O8I_RPA, _O9I)
 _O9I_IOV_FROM_O9I = wire_schema.compile_decoder(_O9I_IOV, _O9I)
 _O9I_RXH_FROM_O9I = wire_schema.compile_decoder(_O9I_RXH, _O9I)
