@@ -315,8 +315,8 @@ class _Target(NamedTuple):
     # Whether the session binds a PL/SQL associative array: 12.1+, and the
     # native form on 10g and 11g.
     assoc_arrays: bool = False
-    # Whether the session runs two-phase commit: 12.1+, and the native form on
-    # 10g and 11g.
+    # Whether the session runs two-phase commit: 9.2 and later in the thin form,
+    # and the native form on 10g and 11g (#2691).
     tpc: bool = False
     # Whether the session binds a REF: 12.1+, and the native form on 10g and 11g.
     ref_binds: bool = False
@@ -328,6 +328,19 @@ def _dialect_binds_objects(conn) -> bool:
 
     Dialect = getattr(conn, '_dialect', None)
     return Dialect is not None and CAP_OBJECT_BIND in Dialect.capabilities()
+
+
+def _session_runs_tpc(conn) -> bool:
+    # Two-phase commit: the thin form on 9.2 and later, and the native form on
+    # 10g and 11g; not 8i, nor 9i's native OALL8 form (#2691).
+    from seerdb.client.dialect import CAP_TPC, Fv2Dialect
+
+    Dialect = getattr(conn, '_dialect', None)
+    return (
+        Dialect is None
+        or isinstance(Dialect, Fv2Dialect)
+        or CAP_TPC in Dialect.capabilities()
+    )
 
 
 def _target_of(conn) -> _Target:
@@ -352,8 +365,7 @@ def _target_of(conn) -> _Target:
         or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
-        conn.field_version >= FIELD_VERSION_12_1
-        or bool(getattr(conn, '_native11', False)),
+        _session_runs_tpc(conn),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
     )
@@ -7592,6 +7604,7 @@ class TpcIntegration(_ThrottleRetry, unittest.TestCase):
             user=_USER,
             password=_PASSWORD,
             service_name=_SERVICE,
+            xa=True,
             **_FV_KW,
         )
 
@@ -7637,6 +7650,26 @@ class TpcIntegration(_ThrottleRetry, unittest.TestCase):
         conn.tpc_end(xid)
         self.assertTrue(conn.tpc_prepare(xid))
         return xid
+
+    @_requires(_TPC)
+    def test_9i_two_phase_commit_needs_the_xa_option(self):
+        # 9.2 needs the XA names at login (#2691), which only xa=True gives: a
+        # plain session would answer ORA-02048, so it is refused before any
+        # wire activity, naming the option.
+        from seerdb.client.dialect import Fv2Dialect
+
+        with seerdb.connect(
+            host=_HOST,
+            port=_PORT,
+            user=_USER,
+            password=_PASSWORD,
+            service_name=_SERVICE,
+            **_FV_KW,
+        ) as conn:
+            if not isinstance(getattr(conn, '_dialect', None), Fv2Dialect):
+                self.skipTest('only a 9i session takes the XA names at login')
+            with self.assertRaisesRegex(seerdb.NotSupportedError, 'xa=True'):
+                conn.tpc_begin(_tpc_xid('plain'))
 
     @_requires(_TPC)
     def test_a_branch_prepares_and_commits(self):
@@ -13769,6 +13802,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         table = 'PYO_ATPC_BRANCHES'
         Kwargs = self._kwargs()
         Kwargs['autocommit'] = False
+        Kwargs['xa'] = True  # 9.2 takes the XA names at login (#2691)
         (keep, drop) = (_tpc_xid('akeep'), _tpc_xid('adrop'))
         Preparers = []
         async with await seerdb.connect_async(**Kwargs) as Conn:

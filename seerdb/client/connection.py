@@ -18,6 +18,7 @@ import time
 import uuid
 
 from seerdb.client._conn_logic import (
+    _O7_XA_NAMES,
     SESSION_SHUTDOWN_MESSAGE,
     _ConnectionLogic,
     _pre10_tier_name_for,
@@ -1045,6 +1046,7 @@ class OracleConnect(_ConnectionLogic):
         dsn: str | None = None,
         negotiation_cache: bool = False,
         oall8: bool = False,
+        xa: bool = False,
         access_token: object = None,
         externalauth: bool = False,
         shardingkey: object = None,
@@ -1149,6 +1151,9 @@ class OracleConnect(_ConnectionLogic):
         # Over TCPS, send the service as the TLS server name, which a listener
         # can route on before the CONNECT (#2467).
         self.use_sni = bool(use_sni)
+        # Whether a 9i login gives the XA names two-phase commit needs there
+        # (#2691): 9.2 answers ORA-02048 to a session without them.
+        self.xa = bool(xa)
         # The DRCP implicit pooling boundary, written into (POOL_BOUNDARY=...)
         # after (SERVER=...); the server does the pooling (#2542).
         self.pool_boundary = pool_boundary_value(pool_boundary)
@@ -2279,7 +2284,9 @@ class OracleConnect(_ConnectionLogic):
                 UserB,
                 self._o7_logon_mode() | 0x100,
                 PwdField,
-                self._o7_session_pairs() + [(b'AUTH_ACL', b'8000')],
+                self._o7_session_pairs()
+                + (_O7_XA_NAMES if self.xa else [])
+                + [(b'AUTH_ACL', b'8000')],
             ),
         )
 
@@ -3990,12 +3997,22 @@ class OracleConnect(_ConnectionLogic):
                 ),
             )
             return
-        if self.field_version < FIELD_VERSION_12_1:
+        if isinstance(self._dialect, Fv2Dialect) and not self.xa:
+            # 9.2 begins a distributed transaction only on a session that
+            # logged on with the XA names, ORA-02048 otherwise (#2691).
             from seerdb.common.exceptions import NotSupportedError
 
             raise NotSupportedError(
-                'two-phase commit (TPC/XA) requires an Oracle 12.1+ server, or a '
-                '10g or 11g session with oall8=True'
+                'two-phase commit on Oracle 9i needs a connection opened with xa=True'
+            )
+        if self._dialect is not None and not isinstance(self._dialect, Fv2Dialect):
+            # 8i has no native form, and 9i's native OALL8 session hangs on
+            # the switch (#2691): the thin form serves 9.2 and later.
+            from seerdb.common.exceptions import NotSupportedError
+
+            raise NotSupportedError(
+                'two-phase commit (TPC/XA) needs Oracle 9.2 or later, in the thin '
+                'form: not 8i, nor a 9i session with oall8=True'
             )
         Data = encode_tpc_switch(
             self._next_seq(),

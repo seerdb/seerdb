@@ -2285,9 +2285,11 @@ _O8I_OUT_UNASSIGNED: wire_schema.Schema = (
 # call status and sequence number. The head runs to the rowid of the row a DML
 # touched (#1079): row count, ORA code, the two array-error fields, cursor id,
 # the error's offset in the SQL (#2263), then the SQL type, fatal flag, flags --
-# a ub2, `00` when zero, as at 10g and 11g (#1995) -- cursor options, UPI
-# parameter and warning flags, 0x20 for an object that compiled with errors
-# (#2262), and the rowid: data object, file, a reserved byte, block, slot.
+# a ub2, `00` when zero, as at 10g and 11g (#1995) -- cursor options, a
+# compressed integer, `01 08` on a session that logged on with the XA names
+# (#2691) and `00` otherwise, UPI parameter and warning flags, 0x20 for an
+# object that compiled with errors (#2262), and the rowid: data object, file,
+# a reserved byte, block, slot.
 _O7_STATUS_HEAD: wire_schema.Schema = (
     ('const', bytes([TTI_OER])),
     ('n4', 'rows'),
@@ -2299,7 +2301,7 @@ _O7_STATUS_HEAD: wire_schema.Schema = (
     ('u8', 'sql_type'),
     ('u8', 'fatal'),
     ('n2', 'flags'),
-    ('u8', 'cursor_options'),
+    ('n4', 'cursor_options'),
     ('u8', 'upi_param'),
     ('u8', 'warnings'),
     ('n4', 'rowid_object'),
@@ -2657,7 +2659,10 @@ _OER_HEAD: wire_schema.Schema = (
     # on its own (the warning bit is read later, as `warnings`).
     ('when', 'flags_ub2', (('n2', 'flags_wide'),)),
     ('when', 'flags_u8', (('u8', 'flags_narrow'),)),
-    *_O7_STATUS_HEAD[10:],
+    # Cursor options: one byte from 10g, a capture's non-zero one included;
+    # 9i's is a compressed integer (#2691).
+    ('u8', 'cursor_options'),
+    *_O7_STATUS_HEAD[11:],
 )
 _OER_TAIL: wire_schema.Schema = (
     *_O7_STATUS_TAIL[:-1],
@@ -8994,16 +8999,19 @@ def encode_tpc_switch(
     Out += _tpc_xid_descriptor(Parts)
     Out += encode_sb4(Flags) + encode_sb4(Timeout)
     Out += bytes([1, 1, 1])  # ptrs: app value, return context, len
-    Out += (
-        bytes([1]) + encode_sb4(len(InternalName))
-        if InternalName
-        else bytes([0]) + encode_sb4(0)
-    )
-    Out += (
-        bytes([1]) + encode_sb4(len(ExternalName))
-        if ExternalName
-        else bytes([0]) + encode_sb4(0)
-    )
+    # The internal and external names are 11g's: 10.2 and 9.2 have neither
+    # field (#2691, PROTOCOL.md §28, measured against JDBC thin 11.2).
+    if FieldVersion >= FIELD_VERSION_11_2:
+        Out += (
+            bytes([1]) + encode_sb4(len(InternalName))
+            if InternalName
+            else bytes([0]) + encode_sb4(0)
+        )
+        Out += (
+            bytes([1]) + encode_sb4(len(ExternalName))
+            if ExternalName
+            else bytes([0]) + encode_sb4(0)
+        )
     if Context is not None:
         Out += Context
     if Parts is not None:
@@ -9066,7 +9074,9 @@ def encode_tpc_change_state(
     Out += encode_sb4(0)  # timeout
     Out += encode_sb4(State)
     Out += bytes([1])  # ptr (out state)
-    Out += encode_sb4(Flags)
+    # 9.2's change of state has no flags (#2691, PROTOCOL.md §28).
+    if FieldVersion >= FIELD_VERSION_10_2:
+        Out += encode_sb4(Flags)
     if Context is not None:
         Out += Context
     if Parts is not None:
