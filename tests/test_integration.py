@@ -18648,11 +18648,11 @@ class JsonTableIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchall(), [(1, 1), (1, 2)])
 
 
-# Advanced Queuing of a RAW message: 12.1 and later, and 11g's thin session
-# (#2697); the Mirror serves no AQ.
+# Advanced Queuing of a RAW message: 12.1 and later, and a 10g or 11g thin
+# session (#2697, #2702); the Mirror serves no AQ.
 _AQ_RAW = _Need(
-    'AQ of a RAW message needs 11g or later, and no Mirror',
-    min_server=11,
+    'AQ of a RAW message needs 10g or later, and no Mirror',
+    min_server=10,
     not_mirror=('*',),
 )
 
