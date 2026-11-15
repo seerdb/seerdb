@@ -143,7 +143,6 @@ from seerdb.common.tns_consts import (
     CONN_STATE_DISCONNECTED,
     DEFAULT_SDU,
     FIELD_VERSION_10_2,
-    FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1_EXT_1,
     FIELD_VERSION_23_4,
@@ -3418,13 +3417,15 @@ class AsyncOracleConnect(_ConnectionLogic):
         if self.field_version < FIELD_VERSION_12_1 and (
             payload_type is not None
             or self._dialect is not None
-            or self.field_version < FIELD_VERSION_11_2
+            or self.field_version < FIELD_VERSION_10_2
         ):
-            # 11g's thin session takes a RAW queue (#2697); an object or JSON
-            # payload, 10g and the native forms are measured from 12.1 only.
+            # A 10g or 11g thin session takes a RAW queue (#2697, #2702); an
+            # object or JSON payload and the native forms are measured from
+            # 12.1 only. 9.2 drops a seerdb session on the enqueue, though it
+            # answers JDBC thin's: there, DBMS_AQ from PL/SQL is the route.
             raise NotSupportedError(
                 'Advanced Queuing requires an Oracle 12.1+ server, or a RAW queue '
-                'on an 11g session'
+                'on a 10g or 11g session; on 9i and 8i, call DBMS_AQ from PL/SQL'
             )
         if payload_type is _JSON:
             return AsyncQueue(self, name, payload_type=None, is_json=True)

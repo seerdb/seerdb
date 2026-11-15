@@ -8613,7 +8613,7 @@ server errors — ORA-00600 even from python-oracledb — on these editions), an
 payload whose OSON exceeds ~254 bytes is bounded by the native-encoder limit
 tracked in #88.
 
-**From 12c**, verified on 21c and 23ai, and **on 11g for a RAW queue** (#2697).
+**From 12c**, verified on 21c and 23ai, and **on 11g and 10g for a RAW queue** (#2697, #2702).
 
 **11g (measured 2026-11-15).** The reference is Oracle's JDBC thin 11.2 driver,
 with its native AQ API (`OracleConnection.enqueue` / `dequeue`), captured on 11g
@@ -8636,9 +8636,43 @@ places, none of which 11g needs:
 - enqueue flags `0x20`.
 
 It also writes an expiration of -1 as `04 ff ff ff ff` where 12c writes
-`81 01`, and 11g accepts both. seerdb takes RAW queues on an 11g thin session.
-Object and JSON payloads, array enqueue and dequeue, 10g and the native forms
-are not measured, and are refused.
+`81 01`, and 11g accepts both.
+
+**10.2 takes 11g's form** (#2702). JDBC's enqueue and dequeue on 10.2.0.5 are
+byte for byte the same as on 11g, and seerdb's 11g code works there unchanged:
+- a RAW round trip;
+- dequeues by correlation, by condition, and by a subscriber's name.
+
+**9.2: a native form, not served to seerdb.** JDBC thin 11.2's native AQ works
+on 9.2.0.4. Its dequeue is 10g's, and its enqueue is shorter:
+- one field fewer in the message properties before the four keyword pairs;
+- nothing after the pairs;
+- nine empty bytes in the tail where 10g has seventeen.
+
+But 9.2 closes a seerdb session, thin or `oall8`, on the enqueue, even one that
+carries JDBC's exact bytes. So the difference is in the session JDBC
+negotiates, not in the message.
+
+**9.2 and 8.1.7 take AQ from PL/SQL.** `DBMS_AQ.ENQUEUE` and `DEQUEUE` work from
+plain blocks with RAW binds. 8.1.7 has no native form in any reference client,
+since the 8i-era JDBC has no native AQ API. Measured with seerdb on both:
+```
+DECLARE eo DBMS_AQ.ENQUEUE_OPTIONS_T; mp DBMS_AQ.MESSAGE_PROPERTIES_T; m RAW(16);
+BEGIN mp.correlation := 'corr-1'; DBMS_AQ.ENQUEUE('Q', eo, mp, :p, m); :m := m; END;
+
+DECLARE do DBMS_AQ.DEQUEUE_OPTIONS_T; mp DBMS_AQ.MESSAGE_PROPERTIES_T; m RAW(16); p RAW(100);
+BEGIN do.wait := DBMS_AQ.NO_WAIT; do.correlation := 'corr-1';
+  DBMS_AQ.DEQUEUE('Q', do, mp, p, m); :p := p; :c := mp.correlation; END;
+```
+Each option is a field of those records.
+
+**What seerdb takes:**
+- RAW queues on a 10g or 11g thin session;
+- on 9i and 8i, `connection.queue()` raises NotSupportedError, naming the
+  `DBMS_AQ` route.
+
+Object and JSON payloads, array enqueue and dequeue, and the native forms are
+not measured, and are refused.
 
 ## 30. DRCP / implicit connection pooling (#130)
 
