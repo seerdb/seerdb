@@ -232,6 +232,11 @@ would cost far more than anyone gains from it.
   any other text value stored into a JSON column, and `JSON('...')`.
   `IS JSON WITH UNIQUE KEYS` still answers as Oracle's does
   ([#2421](https://github.com/seerdb/seerdb/issues/2421)).
+- **`strict` JSON paths.** 23ai refuses a path that starts with `strict` as a
+  syntax error (ORA-40442) and takes `lax`, its default. PostgreSQL's jsonpath
+  has both modes, and the Mirror passes either through. In `JSON_EXISTS`, a
+  strict path's structural error is the ON ERROR answer, as a lax path's
+  errors are ([#2679](https://github.com/seerdb/seerdb/issues/2679)).
 - **JSON key order.** JSON objects are unordered, and two documents that differ
   only in key order are equal, by `JSON_EQUAL` on Oracle and by `=` here. A
   JSON column is stored as PostgreSQL's `jsonb`, which keeps its keys in its
@@ -1282,6 +1287,11 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **Invalid UTF-8** cannot be stored in a string column (#1659).
 - **`JSON_QUERY … PRETTY`** returns the compact text: PostgreSQL's pretty
   form isn't Oracle's, so the clause is not kept
+  ([#2679](https://github.com/seerdb/seerdb/issues/2679)).
+- **A `JSON_EXISTS … PASSING` text value compared with a JSON number** is
+  false: `PASSING '2' AS "v"` doesn't match `2` in `$?(@.a == $v)`. 23ai
+  converts the text and answers true. PostgreSQL's jsonpath never equates a
+  string with a number. Pass the value as a number
   ([#2679](https://github.com/seerdb/seerdb/issues/2679)).
 - **A JSON path's Oracle-only item methods** are refused by PostgreSQL's
   jsonpath as a syntax error: `numberOnly()`, `stringOnly()`, `booleanOnly()`,
