@@ -6878,9 +6878,9 @@ class TestFv2NestedCursor(unittest.TestCase):
     """A 9i CURSOR(...) column (#2254), from ojdbc14 on 9.2.0.4: `select o.n,
     cursor(select i.v from t2254 i where i.n <= o.n order by i.n) c from t2254 o
     order by o.n`. Each row's cell is its nested cursor's id (2, 3, 4), read by
-    that id before the query's own cursor closes, as ojdbc14 does. The replies
-    are the captured ones, in seerdb's order: it frees a cursor with the close
-    alone, where ojdbc14 follows it with `03 08`."""
+    that id before the query's own cursor closes, as ojdbc14 does: closed
+    (`03 14`), then freed (`03 08`), each answered with a bare `09` (#2711).
+    The replies are the captured ones."""
 
     REPLIES = [
         bytes.fromhex(
@@ -6906,6 +6906,7 @@ class TestFv2NestedCursor(unittest.TestCase):
             '666f756e640a'
         ),
         bytes.fromhex('09'),
+        bytes.fromhex('09'),
         bytes.fromhex(
             '08010101800000011400000000011f0101010101015600000401010000000103'
             '000300000000000000000000000000000101'
@@ -6916,6 +6917,7 @@ class TestFv2NestedCursor(unittest.TestCase):
             '6e6f206461746120666f756e640a'
         ),
         bytes.fromhex('09'),
+        bytes.fromhex('09'),
         bytes.fromhex(
             '08010101800000011400000000011f0101010101015600000401020000000104'
             '000300000000000000000000000000000101'
@@ -6925,6 +6927,7 @@ class TestFv2NestedCursor(unittest.TestCase):
             '04010302057b00000104000300000000000000000000000000000101194f5241'
             '2d30313430333a206e6f206461746120666f756e640a'
         ),
+        bytes.fromhex('09'),
         bytes.fromhex('09'),
         bytes.fromhex('09'),
     ]
@@ -6958,11 +6961,12 @@ class TestFv2NestedCursor(unittest.TestCase):
             [[list(r) for r in n['rows']] for n in nested],
             [[['row 1']], [['row 1'], ['row 2']], [['row 1'], ['row 2'], ['row 3']]],
         )
-        from seerdb.common.tns import encode_o7_close
+        from seerdb.common.tns import encode_o7_close, encode_o7_free
 
-        # The nested cursors close before the query's own.
+        # The nested cursors close and are freed before the query's own closes,
+        # as ojdbc14 does (#2711).
         self.assertEqual(sent[-1], encode_o7_close(0, 1))
-        self.assertEqual(sent[-2], encode_o7_close(0, 4))
+        self.assertEqual(sent[-3:-1], [encode_o7_close(0, 4), encode_o7_free(0, 4)])
 
 
 class TestFv2BatchErrors(unittest.TestCase):
