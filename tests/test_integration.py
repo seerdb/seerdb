@@ -18458,5 +18458,64 @@ class JsonQueryIntegration(_IntegrationBase):
                 self.assertEqual(raised.exception.code, code)
 
 
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_JSON_VALUE)
+class JsonExistsIntegration(_IntegrationBase):
+    """JSON_EXISTS's PASSING and ON ERROR, and its answer for invalid JSON and
+    for NULL, as Oracle gives them (#2679). The Mirror-over-PG answers the same
+    on every supported PostgreSQL."""
+
+    DOC = """{"a":{"b":1},"e":[1,2,3],"s":"x"}"""
+
+    def _rows(self, condition: str, binds=()) -> int:
+        self.cur.execute(f'SELECT COUNT(*) FROM dual WHERE {condition}', list(binds))
+        return self.cur.fetchone()[0]
+
+    def _exists(self, args: str, binds=()) -> bool:
+        return self._rows(f'JSON_EXISTS({args})', binds) == 1
+
+    def test_paths_filters_and_passing(self):
+        doc = f"'{self.DOC}'"
+        for args, expected in (
+            (f"{doc}, '$.a.b'", True),
+            (f"{doc}, '$.q'", False),
+            (f"{doc}, '$.e[*]?(@ > 2)'", True),
+            (f"{doc}, '$.e[*]?(@ > 9)'", False),
+            (f'{doc}, \'$?(@.s == "x")\'', True),
+            (f'{doc}, \'$.e?(@ == $v)\' PASSING 2 AS "v"', True),
+            (
+                f"{doc}, '$?(@.s == $v && @.a.b == $W)' PASSING 'x' AS \"v\", 1 AS w",
+                True,
+            ),
+            (f"{doc}, '$?(@.s == $v)' PASSING 'y' AS \"v\"", False),
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(self._exists(args), expected)
+
+    def test_a_passing_bind(self):
+        self.assertTrue(
+            self._exists(f"'{self.DOC}', '$.e?(@ == $v)' PASSING :1 AS \"v\"", [3])
+        )
+
+    def test_invalid_json_and_null(self):
+        # Invalid JSON is the ON ERROR answer, FALSE by default; NULL is
+        # neither true nor false, so NOT JSON_EXISTS doesn't take it either.
+        self.assertFalse(self._exists(":1, '$.a'", ['bad']))
+        self.assertEqual(self._rows("NOT JSON_EXISTS(:1, '$.a')", ['bad']), 1)
+        self.assertTrue(self._exists(":1, '$.a' TRUE ON ERROR", ['bad']))
+        self.assertEqual(self._rows("NOT JSON_EXISTS(NULL, '$.a')"), 0)
+        self.assertEqual(self._rows("NOT JSON_EXISTS(NULL, '$.a' TRUE ON ERROR)"), 0)
+
+    def test_errors(self):
+        for args, code in (
+            (":1, '$.a' ERROR ON ERROR", 40441),
+            (f"'{self.DOC}', '$?(@.s == $q)' PASSING 'x' AS \"v\"", 40656),
+        ):
+            with self.subTest(args=args):
+                with self.assertRaises(seerdb.DatabaseError) as raised:
+                    self._exists(args, ['bad'] if args.startswith(':1') else [])
+                self.assertEqual(raised.exception.code, code)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -6174,7 +6174,7 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # MIN of a WITH TIME ZONE value: sys.ora_tstz_larger and smaller (#2660),
     # and JSON_VALUE's lenient context item, three sys.ora_json_or_null, and
     # JSON_QUERY's result by its input, two sys.ora_json_query_out (#2679).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 390
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 394
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL

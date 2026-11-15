@@ -2466,6 +2466,16 @@ _HELPER_FUNCTIONS_DDL = (
         'RETURN NULL; END $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(character) RETURNS jsonb '
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_json_or_null($1::text) $$;'
+        # A JSON_EXISTS PASSING value as the path's variable (#2679): jsonb's
+        # value, an untyped literal a string. to_jsonb alone can't take one.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_var(text) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE AS $$ SELECT to_jsonb($1) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_var(numeric) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE AS $$ SELECT to_jsonb($1) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_var(boolean) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE AS $$ SELECT to_jsonb($1) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_var(jsonb) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE AS $$ SELECT $1 $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(jsonb) RETURNS jsonb '
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
         # A text value stored into a JSON column (#2441): 23ai converts a
@@ -9550,15 +9560,103 @@ def _native_json_value(context: str, path_and_clauses: str) -> str:
     return f"(JSON_VALUE({item}, {path_text} RETURNING jsonb{tail}) #>> '{{}}')::varchar(4000)"
 
 
+# JSON_EXISTS's clauses past the path (#2679): PASSING's variables, and the
+# answer for an error and for no value.
+_JSON_EXISTS_PASSING = re.compile(r'\s*PASSING\s+', re.IGNORECASE)
+_JSON_EXISTS_ON = re.compile(
+    r'\s*(ERROR|TRUE|FALSE)\s+ON\s+(ERROR|EMPTY)\b', re.IGNORECASE
+)
+_JSON_EXISTS_ALIAS = re.compile(
+    r'^(.+?)\s+AS\s+("[^"]*"|\w+)\s*$', re.IGNORECASE | re.DOTALL
+)
+
+
+def _json_exists(context: str, path_and_clauses: str) -> str:
+    # Oracle's JSON_EXISTS(x [FORMAT JSON], path [PASSING e AS v, ...]
+    # [ERROR | TRUE | FALSE ON ERROR] [... ON EMPTY]) as jsonb_path_exists,
+    # which every supported PostgreSQL has, answering as 23ai does (#2679):
+    #   - a SQL NULL is NULL, invalid JSON text the ON ERROR answer (FALSE
+    #     unless given), and ERROR ON ERROR raises ORA-40441 for it;
+    #   - a path error is the ON ERROR answer: `silent`, then that answer;
+    #   - PASSING's variables are jsonb's, an unquoted name in upper case;
+    #   - ON EMPTY changes nothing on 23ai, so it is dropped.
+    item = _JSON_FORMAT.sub('', context).strip()
+    (masked, contents) = _mask_quoted(path_and_clauses.strip())
+    path = re.match(r"\s*('[^']*'|\S+)", masked)
+    if path is None:
+        raise UnsupportedFeature('JSON_EXISTS without a path')
+    path_text = _unmask_quoted(path.group(1), contents)
+    rest = masked[path.end() :]
+    variables: list[str] = []
+    passing = _JSON_EXISTS_PASSING.match(rest)
+    if passing is not None:
+        rest = rest[passing.end() :]
+        end = _JSON_EXISTS_ON.search(rest)
+        listed = rest[: end.start()] if end is not None else rest
+        rest = rest[len(listed) :]
+        for entry in _split_masked_commas(listed):
+            alias = _JSON_EXISTS_ALIAS.match(entry.strip())
+            if alias is None:
+                raise UnsupportedFeature(
+                    f'JSON_EXISTS PASSING {_unmask_quoted(entry.strip(), contents)}'
+                )
+            (value, name) = alias.groups()
+            name = (
+                _unmask_quoted(name[1:-1], contents)
+                if name.startswith('"')
+                else name.upper()
+            )
+            quoted = "'" + name.replace("'", "''") + "'"
+            variables.append(
+                f'{quoted}, sys.ora_json_var({_unmask_quoted(value, contents)})'
+            )
+    on_error = 'FALSE'
+    while rest.strip():
+        found = _JSON_EXISTS_ON.match(rest)
+        if found is None:
+            raise UnsupportedFeature(
+                f'JSON_EXISTS clause {_unmask_quoted(rest.strip(), contents)}'
+            )
+        if found.group(2).upper() == 'ERROR':
+            on_error = found.group(1).upper()
+        rest = rest[found.end() :]
+    passed = (
+        f'jsonb_build_object({", ".join(variables)})' if variables else "'{}'::jsonb"
+    )
+    path_sql = f'CAST({path_text} AS jsonpath)'
+    if on_error == 'ERROR':
+        return f'jsonb_path_exists(sys.ora_json({item}), {path_sql}, {passed}, false)'
+    return (
+        f'COALESCE(jsonb_path_exists(sys.ora_json_or_null({item}), {path_sql}, '
+        f'{passed}, true), CASE WHEN ({item}) IS NULL THEN NULL ELSE {on_error} END)'
+    )
+
+
+def _split_masked_commas(text: str) -> list[str]:
+    # `text`, quotes masked, split on its depth-zero commas.
+    (parts, depth, start) = ([], 0, 0)
+    for i, ch in enumerate(text):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == ',' and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
 _JSON_EXTENDED = re.compile(r'\s+EXTENDED\s*$', re.IGNORECASE)
 _JSON_RETURNING = re.compile(r'\s+RETURNING\b.*$', re.IGNORECASE | re.DOTALL)
 
 
 def _translate_json_functions(sql: str) -> str:
     """JSON(x [EXTENDED]), JSON_SCALAR(x), JSON_QUERY(x, path),
-    JSON_EXISTS(x, path) and JSON_SERIALIZE(x) as PostgreSQL computes them over
-    jsonb (#1707). A path is SQL/JSON's on both sides. Clauses past the
-    arguments -- RETURNING, a wrapper, ON ERROR -- are not kept."""
+    JSON_EXISTS(x, path ...) and JSON_SERIALIZE(x) as PostgreSQL computes them
+    over jsonb (#1707). A path is SQL/JSON's on both sides. JSON_VALUE and
+    JSON_QUERY keep their clauses from PostgreSQL 17 on, JSON_EXISTS on every
+    version (#2679)."""
     if 'json' not in sql.lower():
         return sql
 
@@ -9588,14 +9686,15 @@ def _translate_json_functions(sql: str) -> str:
                     'JSON_QUERY with RETURNING, a wrapper or ON ERROR / ON EMPTY '
                     'needs PostgreSQL 17 or later'
                 )
-        if upper in ('JSON_QUERY', 'JSON_EXISTS') and len(inner) >= 2:
+        if upper == 'JSON_EXISTS' and len(inner) >= 2:
+            # PASSING's commas split the call's arguments: they are one clause.
+            return _json_exists(inner[0], ','.join(inner[1:]))
+        if upper == 'JSON_QUERY' and len(inner) >= 2:
             path = _JSON_RETURNING.sub('', inner[1]).strip().split()[0]
-            function = (
-                'jsonb_path_query_first'
-                if upper == 'JSON_QUERY'
-                else 'jsonb_path_exists'
+            return (
+                f'jsonb_path_query_first(sys.ora_json({inner[0].strip()}), '
+                f'CAST({path} AS jsonpath))'
             )
-            return f'{function}(sys.ora_json({inner[0].strip()}), CAST({path} AS jsonpath))'
         return None
 
     return _rewrite_calls(sql, _JSON_FUNCTION_NAMES, call, '_$#."')
@@ -15695,6 +15794,7 @@ _INTERVAL_OIDS = frozenset({_INTERVAL_OID})
 _ORA_JSON_NON_SCALAR = 40456
 _ORA_JSON_NO_VALUE = 40462
 _ORA_JSON_WRAPPER_NEEDED = 40480
+_ORA_JSON_VARIABLE_UNBOUND = 40656
 _SQLSTATE_TO_ORA = {
     '42P01': ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,  # undefined_table
     '42704': ORA_TABLE_OR_VIEW_DOES_NOT_EXIST,  # undefined_object (type), for DROP TYPE cleanup
@@ -15812,6 +15912,11 @@ def _ora_code_for(exc) -> int:
         # ORA-02291, "parent key not found". PostgreSQL gives both one SQLSTATE
         # and tells them apart in its message only (#2664).
         return _ORA_CHILD_RECORD_FOUND
+    if sqlstate == '42704' and _primary_message(exc).startswith(
+        'could not find jsonpath variable'
+    ):
+        # A path's $variable that PASSING didn't give: ORA-40656 (#2679).
+        return _ORA_JSON_VARIABLE_UNBOUND
     if sqlstate == '42601':
         primary = _primary_message(exc)
         for text, code in _INSERT_ARITY:
