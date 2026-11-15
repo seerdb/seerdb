@@ -2268,7 +2268,24 @@ the field, 11g answers a fatal ORA-03106 (SeerODBC saw the same).
   bind and an object OUT bind.
 - **The type's layout:** JDBC reads it with `dbms_pickler.get_type_shape` from a
   PL/SQL block. seerdb's `gettype()` reads the dictionary, and works on both
-  servers. Sending the 11g OAC to a 12c server is rejected with
+  servers.
+
+**An associative-array bind on 10g and 11g thin sessions** (#2706) uses the 11g
+descriptor with the array marked as JDBC thin 11.2 marks it:
+- the `TNS_BIND_ARRAY` bit (0x40) in the flags byte (`43`);
+- the capacity as the max number of array elements;
+- each element's length as the length, so 22 for a NUMBER. JDBC says 88, and
+  11g takes both;
+- no form for a type without a charset.
+
+JDBC's TABLE OF NUMBER INDEX BY BINARY_INTEGER of three elements:
+`02 43 00 00 01 58 01 03 00 00 00 00 00 00`. The value is the element count
+(`ub4`), then each element as a scalar value, as from 12c.
+
+seerdb had put the bit in the continuation flags and the capacity in the
+trailing field, which 11g answered PLS-00306. The Mirror reads both layouts.
+Measured on 11g XE and 10.2.0.5: NUMBER and VARCHAR2 tables IN, and a NUMBER
+table OUT. Sending the 11g OAC to a 12c server is rejected with
 `ORA-03115` (unsupported network datatype). The bind *value* (TTI_RXD) is the
 same in both, except long values use the version-gated `bytes_with_length`
 chunking described in §6.4 (`encode_chr`): 11g chunks anything over 64 bytes

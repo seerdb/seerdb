@@ -412,8 +412,9 @@ about 0.3 ms an execute on the 11g bed.
 native form at 10.2's widths, in place of the converted form (#2518). It adds
 what it adds on 11g, the temporary LOBs, the LOB Var binds and the REF CURSOR
 bound IN, and writes to a LOB, on which 10g closes the converted form's
-connection. Validated on 10.2.0.5 only. Object and collection binds need no
-flag on 10g or 11g: the converted form binds them too (#2704).
+connection. Validated on 10.2.0.5 only. Object, collection and
+associative-array binds need no flag on 10g or 11g: the converted form binds
+them too (#2704, #2706).
 
 The flag is ignored on other tiers.
 
