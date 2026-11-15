@@ -18758,6 +18758,42 @@ class AqRawIntegration(_IntegrationBase):
         finally:
             self._drop_queue(name, table)
 
+    def test_an_object_payload_comes_back(self):
+        # An object queue: the payload is the type's image, which a 10g or
+        # 11g thin session sends as from 12c (#2708).
+        (name, table, typ) = (
+            self.QUEUE + '_O',
+            self.QUEUE_TABLE + '_O',
+            'PYO_AQ_IT_OBJ',
+        )
+        self._drop_queue(name, table)
+        self.cur.execute(
+            f'CREATE OR REPLACE TYPE {typ} AS OBJECT (n NUMBER, s VARCHAR2(20))'
+        )
+        self.cur.execute(
+            f"BEGIN DBMS_AQADM.CREATE_QUEUE_TABLE('{table}', '{typ}'); "
+            f"DBMS_AQADM.CREATE_QUEUE('{name}', '{table}'); "
+            f"DBMS_AQADM.START_QUEUE('{name}'); END;"
+        )
+        try:
+            otype = self.conn.gettype(typ)
+            queue = self.conn.queue(name, otype)
+            queue.deqoptions.wait = 0
+            sent = otype.newobject()
+            (sent.N, sent.S) = (9, 'nine')
+            queue.enqone(self.conn.msgproperties(payload=sent))
+            self.conn.commit()
+            got = queue.deqone()
+            self.conn.commit()
+            self.assertEqual((got.payload.N, got.payload.S), (9, 'nine'))
+        finally:
+            self._drop_queue(name, table)
+            try:
+                self.cur.execute(f'DROP TYPE {typ}')
+            except seerdb.DatabaseError:
+                # Still in use or gone: leave it for the next run.
+                pass
+
     def test_array_calls_before_12c_are_refused(self):
         if self.conn.field_version >= FIELD_VERSION_12_1:
             self.skipTest('12.1 serves array enqueue and dequeue')

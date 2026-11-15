@@ -8628,7 +8628,7 @@ server errors — ORA-00600 even from python-oracledb — on these editions), an
 payload whose OSON exceeds ~254 bytes is bounded by the native-encoder limit
 tracked in #88.
 
-**From 12c**, verified on 21c and 23ai, and **on 11g and 10g for a RAW queue** (#2697, #2702).
+**From 12c**, verified on 21c and 23ai, and **on 11g and 10g for a RAW or an object queue** (#2697, #2702, #2708).
 
 **11g (measured 2026-11-15).** The reference is Oracle's JDBC thin 11.2 driver,
 with its native AQ API (`OracleConnection.enqueue` / `dequeue`), captured on 11g
@@ -8681,13 +8681,17 @@ BEGIN do.wait := DBMS_AQ.NO_WAIT; do.correlation := 'corr-1';
 ```
 Each option is a field of those records.
 
+**An object payload on 10g and 11g** (#2708) needs nothing new. The TOID is the
+type's OID, and the payload is the type's pickled image, as from 12c. seerdb's
+12c form enqueues and dequeues it on 11g XE and 10.2.0.5 unchanged.
+
 **What seerdb takes:**
-- RAW queues on a 10g or 11g thin session;
+- RAW and object queues on a 10g or 11g thin session;
 - on 9i and 8i, `connection.queue()` raises NotSupportedError, naming the
   `DBMS_AQ` route.
 
-Object and JSON payloads, array enqueue and dequeue, and the native forms are
-not measured, and are refused.
+JSON payloads (no JSON type before 21c), array enqueue and dequeue, and the
+native forms are not measured, and are refused.
 
 ## 30. DRCP / implicit connection pooling (#130)
 
