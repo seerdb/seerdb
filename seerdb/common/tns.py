@@ -22141,8 +22141,9 @@ _OBJECT_OAC_BUFFER_SIZE = 2000
 def _object_oac(oid: bytes, version: int, buffer_size: int) -> bytes:
     # The bind OAC for an object (type 109): the 12c+ metadata layout injecting
     # the type's 16-byte OID + version (precision/scale 0, no charset). Mirrors
-    # python-oracledb _write_column_metadata's object branch. 12c+ only — pre-12c
-    # object binds are gated in the cursor (no thin reference for that OAC).
+    # python-oracledb _write_column_metadata's object branch. Below 12.1 it has
+    # no oaccolid: 11g answered the byte with a fatal ORA-03106, and takes the
+    # descriptor without it, as JDBC thin 11.2 sends it (#2704).
     return (
         bytes([TNS_TYPE_ADT, 1, 0, 0])  # type, flag (USE_INDICATORS), p, s
         + encode_sb4(buffer_size)  # buffer size
@@ -22153,7 +22154,7 @@ def _object_oac(oid: bytes, version: int, buffer_size: int) -> bytes:
         + encode_sb4(0)  # charset id (ub2)
         + bytes([0])  # character set form
         + encode_sb4(0)  # LOB prefetch length
-        + _oac_col_id()
+        + (_oac_col_id() if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1 else b'')
     )  # oaccolid (12.2+)
 
 

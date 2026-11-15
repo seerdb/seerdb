@@ -1460,8 +1460,15 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
     from seerdb.client.dialect import CAP_OBJECT_BIND
 
     Dialect = getattr(Connection, '_dialect', None)
-    Objects = Native11 or (
-        Dialect is not None and CAP_OBJECT_BIND in Dialect.capabilities()
+    # A 10g or 11g thin session binds them too, in 12c's form without the
+    # descriptor's oaccolid, as JDBC thin 11.2 does (#2704).
+    Objects = (
+        Native11
+        or (Dialect is not None and CAP_OBJECT_BIND in Dialect.capabilities())
+        or (
+            Dialect is None
+            and getattr(Connection, 'field_version', 0) >= FIELD_VERSION_10_2
+        )
     )
     Rows = [Bind] + (Batch or []) if Bind else (Batch or [])
     for Row in Rows:
