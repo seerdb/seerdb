@@ -6790,9 +6790,35 @@ at trailer offset +28 (`1` SELECT, `2` UPDATE, `3` DELETE, `4` INSERT, `5` CREAT
   fetch) and `1` otherwise.
 
 There is no describe or fetch. The response is an RPA, then the status. The RPA
-(`_O8I_RPA`, 23 bytes) is `08`, a `ub2` count (4), that many `ub4`s, the third the
-statement's cursor, and four zero bytes, where 10g sends two `ub2` lengths. An
-error, and a fetch that ends with ORA-01403, sends the status alone.
+(`_O8I_RPA`) is:
+
+- `08`, a `ub2` count (4), and that many `ub4`s, the third the statement's
+  cursor;
+- a `ub2` transaction id length and its bytes, zero in every reply measured;
+- a `ub2` count of keyword-value pairs and the pairs. Each pair is laid out as
+  in the SYNC piggyback: a `ub4` length and the text, a `ub4` length and the
+  value (each a `ub1` length and bytes, absent at length 0), then a `ub2`
+  keyword (#2687).
+
+Most statements send no pairs, which makes the RPA 23 bytes. A successful
+`ALTER SESSION` sends the session's NLS settings as pairs: 16 on 8.1.7, 18 on
+9.2, which adds keywords 61 (`BYTE`) and 62 (`FALSE`). Every value is in the
+binary slot. Keyword 7 is NLS_DATE_FORMAT, the setting changed. The rest is
+listed as captured after `SET NLS_DATE_FORMAT = 'YYYY'`, in wire order; their
+names are not measured:
+
+| keyword | 8.1.7 | 9.2.0.4 |
+|---|---|---|
+| 16, 9, 0, 1, 2 | `AMERICAN`, `AMERICA`, `$`, `AMERICA`, `.,` | the same |
+| 10, 12, 7, 8, 11 | `WE8ISO8859P1`, `GREGORIAN`, `YYYY`, `AMERICAN`, `BINARY` | the same |
+| 57, 58 | `HH.MI.SSXFF AM`, `DD-MON-RR HH.MI.SSXFF AM` | the same |
+| 59, 60 | the same two with ` TZH:TZM` | with ` TZR` |
+| 52, 50 | `$`, `BINARY` | the same |
+| 61, 62 | — | `BYTE`, `FALSE` |
+
+A failed `ALTER SESSION` sends no pairs. Before #2687 the decoder read the two
+counts as padding, so the status after the pairs went unread. An error, and a
+fetch that ends with ORA-01403, send the status alone.
 
 The status (`_O8I_STATUS`, #2284) holds **the same fields as 9i's short status
 (§19.2), at fixed widths and little-endian** — 8i is x86/Windows, so they ride

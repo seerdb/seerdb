@@ -100,3 +100,75 @@ class TestTheRowidInTheShortStatus(unittest.TestCase):
             + b'(ORA-00942: table or view does not exist\n'
         )
         self.assertIsNone(decode_8i_dml_rowid(failed))
+
+
+# A successful ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY', captured live from 8.1.7 and
+# from 9.2.0.4 over the native OALL8 form (#2687): the RPA carries the session's
+# NLS settings as keyword-value pairs, and the status follows them.
+_8I_ALTER_SESSION = bytes.fromhex(
+    '0804004bec280000000000010000000000000000001000000000000800000008414d4552'
+    '4943414e1000000000000700000007414d45524943410900000000000100000001240000'
+    '000000000700000007414d455249434101000000000002000000022e2c0200000000000c'
+    '0000000c57453849534f3838353950310a00000000000900000009475245474f5249414e'
+    '0c00000000000400000004595959590700000000000800000008414d45524943414e0800'
+    '00000000060000000642494e4152590b00000000000e0000000e48482e4d492e53535846'
+    '4620414d390000000000180000001844442d4d4f4e2d52522048482e4d492e5353584646'
+    '20414d3a0000000000160000001648482e4d492e535358464620414d20545a483a545a4d'
+    '3b0000000000200000002044442d4d4f4e2d52522048482e4d492e535358464620414d20'
+    '545a483a545a4d3c0000000000010000000124340000000000060000000642494e415259'
+    '32000400000000000000000000010000002a004000000000000000000000000000000000'
+    '0000000000060000010000000000000000000000000000000000'
+)
+_9I_ALTER_SESSION = bytes.fromhex(
+    '080500032e95020000000001000000000000000000000000001200000000000800000008'
+    '414d45524943414e1000000000000700000007414d455249434109000000000001000000'
+    '01240000000000000700000007414d455249434101000000000002000000022e2c020000'
+    '0000000c0000000c57453849534f3838353950310a00000000000900000009475245474f'
+    '5249414e0c00000000000400000004595959590700000000000800000008414d45524943'
+    '414e080000000000060000000642494e4152590b00000000000e0000000e48482e4d492e'
+    '535358464620414d390000000000180000001844442d4d4f4e2d52522048482e4d492e53'
+    '5358464620414d3a0000000000120000001248482e4d492e535358464620414d20545a52'
+    '3b00000000001c0000001c44442d4d4f4e2d52522048482e4d492e535358464620414d20'
+    '545a523c0000000000010000000124340000000000060000000642494e41525932000000'
+    '00000400000004425954453d0000000000050000000546414c53453e0004010000000100'
+    '000000000000000000010000002a00000000000000000000000000000000000000000000'
+    '00000000070000010000003601000000000000000000000000000080d0d4030000000000'
+    '000000000000000000000000000000000000000000000000000000000000000000000000'
+    '00000000000000000000000000000000000000'
+)
+
+
+class TestTheRpaCarriesTheSessionsSettings(unittest.TestCase):
+    # The RPA's last two words are a transaction id's length and a pair count
+    # (#2687). Read as four bytes of padding, the pairs hid the status, and the
+    # reply decoded as one with no status at all.
+
+    def test_8i_reads_the_pairs_and_the_status_after_them(self):
+        from seerdb.common.tns import _O8I_RPA_FROM_O8I, TTI_OER, _o8i_status
+
+        (rpa, rest) = _O8I_RPA_FROM_O8I(_8I_ALTER_SESSION)
+        self.assertEqual(rpa['pair_count'], 16)
+        settings = {pair['keyword']: pair.get('binary') for pair in rpa['pairs']}
+        self.assertEqual(settings[7], b'YYYY')
+        self.assertEqual(settings[10], b'WE8ISO8859P1')
+        self.assertEqual(rest[:1], bytes([TTI_OER]))
+        status = _o8i_status(_8I_ALTER_SESSION)
+        self.assertIsNotNone(status)
+        self.assertEqual(status['code'], 0)
+
+    def test_9i_reads_the_pairs_and_the_status_after_them(self):
+        from seerdb.common.tns import _O8I_RPA_FROM_O9I, TTI_OER
+
+        (rpa, rest) = _O8I_RPA_FROM_O9I(_9I_ALTER_SESSION)
+        self.assertEqual(rpa['pair_count'], 18)
+        settings = {pair['keyword']: pair.get('binary') for pair in rpa['pairs']}
+        self.assertEqual(settings[7], b'YYYY')
+        self.assertEqual(settings[62], b'FALSE')
+        self.assertEqual(rest[:1], bytes([TTI_OER]))
+
+    def test_a_reply_cut_inside_the_pairs_is_refused(self):
+        from seerdb.common.exceptions import DataError
+        from seerdb.common.tns import _o8i_status_strict
+
+        with self.assertRaises(DataError):
+            _o8i_status_strict(_8I_ALTER_SESSION[:200])
