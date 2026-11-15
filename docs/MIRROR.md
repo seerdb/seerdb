@@ -677,6 +677,7 @@ pgvector 0.8.0 and plpgsql_check 2.10.11.
 | `MERGE INTO` a view | PostgreSQL 17 | refused: "cannot execute MERGE on relation" |
 | `JSON_VALUE`, with `RETURNING`, `ERROR \| NULL \| DEFAULT … ON ERROR \| ON EMPTY` and a path's item methods (`.number()`, `.date()`, …), as 23ai answers it | PostgreSQL 17 | refused with ORA-03001 |
 | `JSON_QUERY` as 23ai answers it: VARCHAR2 text in Oracle's compact form for a text input, JSON for a JSON input, `RETURNING`, `WITH [CONDITIONAL \| UNCONDITIONAL] [ARRAY] WRAPPER`, `ERROR \| NULL \| EMPTY [ARRAY \| OBJECT] ON ERROR \| ON EMPTY` | PostgreSQL 17 | `JSON_QUERY(x, path)` alone gives the path's first value as JSON; any clause is refused with ORA-03001 |
+| `JSON_TABLE` as 23ai answers it: Oracle's column types, an implied path read as the column is written, no row path, `NESTED [PATH]`, `FOR ORDINALITY`, `EXISTS`, `FORMAT JSON` in Oracle's compact form, a column's and the table's `ON ERROR` / `ON EMPTY`, and invalid JSON as no rows | PostgreSQL 17 | refused with ORA-03001 |
 | `RETURNING OLD col` / `NEW col` (23ai) in a DML statement or a PL/SQL block | PostgreSQL 18 | refused with ORA-03001 |
 | `ALTER TABLE … DISABLE CONSTRAINT` / `ENABLE CONSTRAINT` of a foreign key, and `MODIFY CONSTRAINT … DISABLE \| ENABLE`: the constraint shows as `DISABLED` / `NOT VALIDATED`, and `ENABLE` checks the rows (an orphan is ORA-02298) | PostgreSQL 18 | refused with ORA-03001 |
 
@@ -1288,6 +1289,13 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **`JSON_QUERY … PRETTY`** returns the compact text: PostgreSQL's pretty
   form isn't Oracle's, so the clause is not kept
   ([#2679](https://github.com/seerdb/seerdb/issues/2679)).
+- **A `JSON_TABLE` column** differs from 23ai in three places
+  ([#2679](https://github.com/seerdb/seerdb/issues/2679)):
+  - a BOOLEAN column over a JSON number is TRUE or FALSE, where 23ai gives NULL;
+  - a CLOB column is described as VARCHAR2, as any CLOB coming out of a subquery
+    is ([#2694](https://github.com/seerdb/seerdb/issues/2694));
+  - sibling `NESTED` columns' rows come in the other order. They are the same
+    rows, and neither side orders them without an ORDER BY.
 - **A `JSON_EXISTS … PASSING` text value compared with a JSON number** is
   false: `PASSING '2' AS "v"` doesn't match `2` in `$?(@.a == $v)`. 23ai
   converts the text and answers true. PostgreSQL's jsonpath never equates a
