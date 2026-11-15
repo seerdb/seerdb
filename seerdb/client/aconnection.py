@@ -142,6 +142,7 @@ from seerdb.common.tns_consts import (
     CONN_STATE_DISCONNECTED,
     DEFAULT_SDU,
     FIELD_VERSION_10_2,
+    FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1_EXT_1,
     FIELD_VERSION_23_4,
@@ -3397,8 +3398,17 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.client.aq import AsyncQueue
         from seerdb.common.datatypes import JSON as _JSON
 
-        if self.field_version < FIELD_VERSION_12_1:
-            raise NotSupportedError('Advanced Queuing requires an Oracle 12.1+ server')
+        if self.field_version < FIELD_VERSION_12_1 and (
+            payload_type is not None
+            or self._dialect is not None
+            or self.field_version < FIELD_VERSION_11_2
+        ):
+            # 11g's thin session takes a RAW queue (#2697); an object or JSON
+            # payload, 10g and the native forms are measured from 12.1 only.
+            raise NotSupportedError(
+                'Advanced Queuing requires an Oracle 12.1+ server, or a RAW queue '
+                'on an 11g session'
+            )
         if payload_type is _JSON:
             return AsyncQueue(self, name, payload_type=None, is_json=True)
         return AsyncQueue(self, name, payload_type=payload_type)

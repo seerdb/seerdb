@@ -107,6 +107,19 @@ class _QueueBase:
         self.enqoptions = EnqOptions()
         self.deqoptions = DeqOptions()
 
+    def _check_array_version(self):
+        # Array enqueue and dequeue (AQ_ARRAY) are measured from 12.1 only: an
+        # 11g RAW queue takes single messages (#2697).
+        from seerdb.common.tns_consts import FIELD_VERSION_12_1
+
+        if self._connection.field_version < FIELD_VERSION_12_1:
+            from seerdb.common.exceptions import NotSupportedError
+
+            raise NotSupportedError(
+                'array enqueue/dequeue (enqmany/deqmany) requires an Oracle 12.1+ '
+                'server; use enqone/deqone'
+            )
+
     def _check_array_json(self):
         # Array enqueue/dequeue of JSON payloads is not supported: the server
         # errors (ORA-00600 from python-oracledb too) on these editions, so it's
@@ -134,12 +147,14 @@ class Queue(_QueueBase):
 
     def enqmany(self, messages: list) -> list:
         """Enqueue several messages (each a MessageProperties)."""
+        self._check_array_version()
         self._check_array_json()
         self._connection._aq_enq_many(self, list(messages))
         return messages
 
     def deqmany(self, max_messages: int) -> list:
         """Dequeue up to ``max_messages`` messages (empty list if none)."""
+        self._check_array_version()
         self._check_array_json()
         return self._connection._aq_deq_many(self, max_messages)
 
@@ -155,10 +170,12 @@ class AsyncQueue(_QueueBase):
         return await self._connection._aq_deq_one(self)
 
     async def enqmany(self, messages: list) -> list:
+        self._check_array_version()
         self._check_array_json()
         await self._connection._aq_enq_many(self, list(messages))
         return messages
 
     async def deqmany(self, max_messages: int) -> list:
+        self._check_array_version()
         self._check_array_json()
         return await self._connection._aq_deq_many(self, max_messages)

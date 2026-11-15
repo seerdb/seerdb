@@ -8592,7 +8592,25 @@ server errors — ORA-00600 even from python-oracledb — on these editions), an
 payload whose OSON exceeds ~254 bytes is bounded by the native-encoder limit
 tracked in #88.
 
-**12c+** (no pre-12c reference); verified on 21c and 23ai.
+**From 12c**, verified on 21c and 23ai, and **on 11g for a RAW queue** (#2697).
+
+**11g (measured 2026-11-15).** The reference is Oracle's JDBC thin 11.2 driver,
+with its native AQ API (`OracleConnection.enqueue` / `dequeue`), captured on 11g
+XE 11.2.0.2. It uses the same two functions. The one change that matters: **the
+queue name in the data section has no length byte**. 12c's form writes a `ub1`
+length (`0a 'PYO_AQ_RAW'`). 11g reads that byte as the start of the name, then
+the TOID and the payload one byte off, and fails with ORA-00600 [kpoaqeq:
+payload]. Without the byte, 12c's enqueue and dequeue work on 11g unchanged, and
+the dequeue reply decodes as it does from 12c. JDBC differs in three more
+places, none of which 11g needs:
+- user property 1 and a 36-byte value;
+- five more bytes before the recipients;
+- enqueue flags `0x20`.
+
+It also writes an expiration of -1 as `04 ff ff ff ff` where 12c writes
+`81 01`, and 11g accepts both. seerdb takes RAW queues on an 11g thin session.
+Object and JSON payloads, array enqueue and dequeue, 10g and the native forms
+are not measured, and are refused.
 
 ## 30. DRCP / implicit connection pooling (#130)
 
