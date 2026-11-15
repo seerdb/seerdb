@@ -96,6 +96,29 @@ class TestTheQueueNameBefore12c(unittest.TestCase):
         )
 
 
+class TestTheDequeueStringsBefore12c(unittest.TestCase):
+    # 11g takes each string of the dequeue's data section without a length
+    # byte: consumer, correlation and condition, as JDBC thin 11.2 writes them
+    # (#2700).
+    def _dequeue(self, version: int) -> bytes:
+        q = Queue(_FakeConn(), 'PYO_AQ_RAW')
+        q.deqoptions.consumer_name = 'SUB1'
+        q.deqoptions.correlation = 'corr-1'
+        q.deqoptions.condition = 'tab.priority = 5'
+        return encode_aq_deq(1, version, q)
+
+    def test_11g_writes_them_as_they_stand(self):
+        out = self._dequeue(FIELD_VERSION_11_2)
+        self.assertIn(
+            b'PYO_AQ_RAWSUB1corr-1' + bytes(15) + b'\x17tab.priority = 5', out
+        )
+
+    def test_12c_keeps_their_lengths(self):
+        out = self._dequeue(FIELD_VERSION_12_1)
+        self.assertIn(b'\x04SUB1\x06corr-1', out)
+        self.assertTrue(out.endswith(b'\x10tab.priority = 5'))
+
+
 class TestArrayJsonGate(unittest.TestCase):
     # array enqueue/dequeue of JSON is gated (server-side ORA-00600 on these
     # editions); single enqone/deqone JSON works (#150).
