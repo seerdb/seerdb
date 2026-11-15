@@ -22383,18 +22383,20 @@ def encode_aq_deq(Seq: int, FieldVersion: int, Queue) -> bytes:
     if FieldVersion >= FIELD_VERSION_21_1:
         Out += _encode_sb4i(-1)  # shard id
     # data section
-    # 11g reads the queue name as it stands, with no length byte: one made
-    # it read the payload a byte off, ORA-00600 [kpoaqeq: payload] (#2697).
-    Out += QName if FieldVersion < FIELD_VERSION_12_1 else _bytes_with_length(QName)
+    # 11g reads each string of the data section as it stands, with no length
+    # byte: the queue name (#2697), and the consumer, the correlation and the
+    # condition, as JDBC thin 11.2 writes them (#2700).
+    Text = (lambda b: b) if FieldVersion < FIELD_VERSION_12_1 else _bytes_with_length
+    Out += Text(QName)
     if Consumer is not None:
-        Out += _bytes_with_length(Consumer)
+        Out += Text(Consumer)
     if Opts.msgid:
         Out += bytes(Opts.msgid[:16]).ljust(16, b'\x00')
     if Correlation is not None:
-        Out += _bytes_with_length(Correlation)
+        Out += Text(Correlation)
     Out += Queue.payload_toid  # 16-byte type OID (raw)
     if Condition is not None:
-        Out += _bytes_with_length(Condition)
+        Out += Text(Condition)
     return Out
 
 

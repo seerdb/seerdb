@@ -18653,11 +18653,12 @@ class AqRawIntegration(_IntegrationBase):
         self._drop_queue()
         super().tearDown()
 
-    def _drop_queue(self):
+    def _drop_queue(self, name=None, table=None):
+        (name, table) = (name or self.QUEUE, table or self.QUEUE_TABLE)
         for call in (
-            f"DBMS_AQADM.STOP_QUEUE('{self.QUEUE}')",
-            f"DBMS_AQADM.DROP_QUEUE('{self.QUEUE}')",
-            f"DBMS_AQADM.DROP_QUEUE_TABLE('{self.QUEUE_TABLE}', TRUE)",
+            f"DBMS_AQADM.STOP_QUEUE('{name}')",
+            f"DBMS_AQADM.DROP_QUEUE('{name}')",
+            f"DBMS_AQADM.DROP_QUEUE_TABLE('{table}', TRUE)",
         ):
             try:
                 self.cur.execute(f'BEGIN {call}; END;')
@@ -18676,6 +18677,44 @@ class AqRawIntegration(_IntegrationBase):
         self.assertEqual(got.payload, b'hello-seerdb')
         self.assertEqual(got.msgid, sent.msgid)
         self.assertIsNone(queue.deqone())
+
+    def test_a_dequeue_by_correlation_and_by_condition(self):
+        # The dequeue's correlation and condition are strings of its data
+        # section, which 11g takes without a length byte (#2700).
+        queue = self.conn.queue(self.QUEUE)
+        queue.deqoptions.wait = 0
+        queue.enqone(self.conn.msgproperties(payload=b'a', correlation='corr-1'))
+        queue.enqone(self.conn.msgproperties(payload=b'b', priority=5))
+        self.conn.commit()
+        queue.deqoptions.correlation = 'corr-1'
+        got = queue.deqone()
+        self.assertEqual((got.payload, got.correlation), (b'a', 'corr-1'))
+        queue.deqoptions.correlation = None
+        queue.deqoptions.condition = 'tab.priority = 5'
+        self.assertEqual(queue.deqone().payload, b'b')
+        self.conn.commit()
+
+    def test_a_subscriber_dequeues_by_its_name(self):
+        # A multi-consumer queue: the consumer name is a data-section string
+        # too (#2700).
+        (name, table) = (self.QUEUE + '_M', self.QUEUE_TABLE + '_M')
+        self._drop_queue(name, table)
+        self.cur.execute(
+            f"BEGIN DBMS_AQADM.CREATE_QUEUE_TABLE('{table}', 'RAW', "
+            f"multiple_consumers => TRUE); DBMS_AQADM.CREATE_QUEUE('{name}', '{table}'); "
+            f"DBMS_AQADM.START_QUEUE('{name}'); DBMS_AQADM.ADD_SUBSCRIBER('{name}', "
+            "sys.aq$_agent('SUB1', NULL, NULL)); END;"
+        )
+        try:
+            queue = self.conn.queue(name)
+            queue.deqoptions.wait = 0
+            queue.enqone(self.conn.msgproperties(payload=b'm'))
+            self.conn.commit()
+            queue.deqoptions.consumer_name = 'SUB1'
+            self.assertEqual(queue.deqone().payload, b'm')
+            self.conn.commit()
+        finally:
+            self._drop_queue(name, table)
 
     def test_array_calls_before_12c_are_refused(self):
         if self.conn.field_version >= FIELD_VERSION_12_1:

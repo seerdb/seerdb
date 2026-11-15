@@ -8597,11 +8597,18 @@ tracked in #88.
 **11g (measured 2026-11-15).** The reference is Oracle's JDBC thin 11.2 driver,
 with its native AQ API (`OracleConnection.enqueue` / `dequeue`), captured on 11g
 XE 11.2.0.2. It uses the same two functions. The one change that matters: **the
-queue name in the data section has no length byte**. 12c's form writes a `ub1`
-length (`0a 'PYO_AQ_RAW'`). 11g reads that byte as the start of the name, then
-the TOID and the payload one byte off, and fails with ORA-00600 [kpoaqeq:
-payload]. Without the byte, 12c's enqueue and dequeue work on 11g unchanged, and
-the dequeue reply decodes as it does from 12c. JDBC differs in three more
+strings of the data section have no length byte**. These are the queue name,
+and a dequeue's consumer name, correlation and condition (#2700); an enqueue's
+correlation is in the message properties, with its two lengths, as from 12c.
+
+12c's form writes a `ub1` length before each (`0a 'PYO_AQ_RAW'`). 11g reads that
+byte as the start of the string, so everything after it is a byte off:
+- before the TOID, the queue name's byte gives ORA-00600 [kpoaqeq: payload];
+- a correlation's gives ORA-21700;
+- a condition's ends the connection.
+
+Without the bytes, 12c's enqueue and dequeue work on 11g unchanged, and the
+dequeue reply decodes as it does from 12c. JDBC differs in three more
 places, none of which 11g needs:
 - user property 1 and a 36-byte value;
 - five more bytes before the recipients;
