@@ -404,6 +404,20 @@ class Fv2Dialect:
             if resp is False:
                 raise connection_closed('9i fetch')
             (rows, err_code, message) = decode_fv2_exec_status(resp[1], columns)
+            # A CURSOR(...) column's cell is its nested cursor's id. Read each
+            # one before the next batch, then free it, as ojdbc14 does: read
+            # after the last batch, the earlier batches' nested cursors were
+            # invalid (ORA-01001), and closed but not freed, a query of more of
+            # them than open_cursors ran out (#2254, #2711).
+            for j, col in enumerate(columns):
+                if col.get('data_type') != TNS_TYPE_REFCURSOR:
+                    continue
+                for row in rows:
+                    if row[j]:
+                        nested = decode_ub4(row[j])[0]
+                        (nested_columns, nested_rows) = yield from self._drain(nested)
+                        yield from self._free(nested)
+                        row[j] = _cursor_marker(nested, nested_columns, nested_rows)
             all_rows.extend(rows)
             if err_code or not rows:
                 break
@@ -411,17 +425,6 @@ class Fv2Dialect:
         # decode_fv2_exec_response left LOB objects in the rows; replace each with
         # its content.
         yield from self.resolve_lobs(all_rows, columns)
-        # A CURSOR(...) column's cell is its nested cursor's id. Read each one
-        # now, while this cursor is open -- ojdbc14 closes the parent last --
-        # and the same way, so a cursor nested in it is read in turn (#2254).
-        for j, col in enumerate(columns):
-            if col.get('data_type') != TNS_TYPE_REFCURSOR:
-                continue
-            for row in all_rows:
-                if row[j]:
-                    nested = decode_ub4(row[j])[0]
-                    (nested_columns, nested_rows) = yield from self._drain(nested)
-                    row[j] = _cursor_marker(nested, nested_columns, nested_rows)
         yield Send(encode_o7_close(0, cursor))
         yield RECV  # close STA
         if err_code != ORA_NO_DATA_FOUND:

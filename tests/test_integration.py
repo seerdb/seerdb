@@ -3716,6 +3716,24 @@ class CursorIntegration(_IntegrationBase):
             self.cur.execute('BEGIN OPEN :1 FOR SELECT :2 FROM dual; END;', [rc, n])
             self.assertEqual(rc.getvalue().fetchall(), [(n,)])
 
+    def test_a_refcursor_column_per_row_outlasts_open_cursors(self):
+        # A CURSOR() column in a query of more rows than open_cursors (300) and
+        # than one fetch batch: on 9i its nested cursors were read only after
+        # the last batch, by then invalid (ORA-01001), and never freed (#2711).
+        # ojdbc14 frees each, and so does seerdb's 9i path now. From 10g the
+        # server keeps each nested cursor open while its parent is, and
+        # python-oracledb meets ORA-01000 there too, so this is 9i's.
+        from seerdb.client.dialect import Fv2Dialect
+
+        if not isinstance(getattr(self.conn, '_dialect', None), Fv2Dialect):
+            self.skipTest("frees each nested cursor mid-query: 9i's compact path only")
+        self.cur.execute(
+            'SELECT CURSOR(SELECT 1 FROM dual), rownum FROM all_objects WHERE rownum <= 400'
+        )
+        rows = self.cur.fetchall()
+        self.assertEqual(len(rows), 400)
+        self.assertEqual([r[0].fetchall() for r in rows[::133]], [[(1,)]] * 4)
+
     @_requires(_IMPLICIT_RESULTS)
     def test_implicit_results_outlast_open_cursors(self):
         # More implicit result sets than open_cursors (300): each one read was
