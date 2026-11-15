@@ -22329,7 +22329,9 @@ def encode_aq_enq(Seq: int, FieldVersion: int, Queue, Props) -> bytes:
     if FieldVersion >= FIELD_VERSION_20_1:
         Out += bytes([1 if Queue.is_json else 0])  # JSON payload ptr
     # data section
-    Out += _bytes_with_length(QName)
+    # 11g reads the queue name as it stands, with no length byte: one made
+    # it read the payload a byte off, ORA-00600 [kpoaqeq: payload] (#2697).
+    Out += QName if FieldVersion < FIELD_VERSION_12_1 else _bytes_with_length(QName)
     Out += Queue.payload_toid  # 16-byte type OID (raw)
     Out += _aq_write_payload(Queue, Props)
     return Out
@@ -22381,7 +22383,9 @@ def encode_aq_deq(Seq: int, FieldVersion: int, Queue) -> bytes:
     if FieldVersion >= FIELD_VERSION_21_1:
         Out += _encode_sb4i(-1)  # shard id
     # data section
-    Out += _bytes_with_length(QName)
+    # 11g reads the queue name as it stands, with no length byte: one made
+    # it read the payload a byte off, ORA-00600 [kpoaqeq: payload] (#2697).
+    Out += QName if FieldVersion < FIELD_VERSION_12_1 else _bytes_with_length(QName)
     if Consumer is not None:
         Out += _bytes_with_length(Consumer)
     if Opts.msgid:

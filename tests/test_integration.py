@@ -18614,5 +18614,76 @@ class JsonTableIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchall(), [(1, 1), (1, 2)])
 
 
+# Advanced Queuing of a RAW message: 12.1 and later, and 11g's thin session
+# (#2697); the Mirror serves no AQ.
+_AQ_RAW = _Need(
+    'AQ of a RAW message needs 11g or later, and no Mirror',
+    min_server=11,
+    not_mirror=('*',),
+)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+@_requires(_AQ_RAW)
+class AqRawIntegration(_IntegrationBase):
+    """A RAW message enqueued and dequeued, as Oracle's own clients do it from
+    11g on (#2697). 11g reads the queue name without the length byte 12c's
+    form writes."""
+
+    QUEUE = 'PYO_AQ_RAW_IT'
+    # Not TABLE: the base class drops that with DROP TABLE, which an AQ queue
+    # table refuses (ORA-24005).
+    QUEUE_TABLE = 'PYO_AQ_RAW_IT_T'
+
+    def setUp(self):
+        super().setUp()
+        if getattr(self.conn, '_dialect', None) is not None:
+            self.skipTest('AQ is not served on a pre-12c native-form session')
+        self._drop_queue()
+        try:
+            self.cur.execute(
+                f"BEGIN DBMS_AQADM.CREATE_QUEUE_TABLE('{self.QUEUE_TABLE}', 'RAW'); "
+                f"DBMS_AQADM.CREATE_QUEUE('{self.QUEUE}', '{self.QUEUE_TABLE}'); "
+                f"DBMS_AQADM.START_QUEUE('{self.QUEUE}'); END;"
+            )
+        except seerdb.DatabaseError as exc:
+            self.skipTest(f'the test user cannot create a queue: {exc}')
+
+    def tearDown(self):
+        self._drop_queue()
+        super().tearDown()
+
+    def _drop_queue(self):
+        for call in (
+            f"DBMS_AQADM.STOP_QUEUE('{self.QUEUE}')",
+            f"DBMS_AQADM.DROP_QUEUE('{self.QUEUE}')",
+            f"DBMS_AQADM.DROP_QUEUE_TABLE('{self.QUEUE_TABLE}', TRUE)",
+        ):
+            try:
+                self.cur.execute(f'BEGIN {call}; END;')
+            except seerdb.DatabaseError:
+                # Not there: nothing to stop or drop.
+                pass
+
+    def test_a_raw_message_comes_back(self):
+        queue = self.conn.queue(self.QUEUE)
+        queue.deqoptions.wait = 0
+        sent = queue.enqone(self.conn.msgproperties(payload=b'hello-seerdb'))
+        self.conn.commit()
+        got = queue.deqone()
+        self.conn.commit()
+        self.assertIsNotNone(got)
+        self.assertEqual(got.payload, b'hello-seerdb')
+        self.assertEqual(got.msgid, sent.msgid)
+        self.assertIsNone(queue.deqone())
+
+    def test_array_calls_before_12c_are_refused(self):
+        if self.conn.field_version >= FIELD_VERSION_12_1:
+            self.skipTest('12.1 serves array enqueue and dequeue')
+        queue = self.conn.queue(self.QUEUE)
+        with self.assertRaises(seerdb.NotSupportedError):
+            queue.enqmany([self.conn.msgproperties(payload=b'x')])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -13,9 +13,12 @@ from seerdb.client.connection import _aq_error_info, _decode_aq_deq, _decode_aq_
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _DECODE_SERVER_FIELD_VERSION,
+    encode_aq_deq,
     encode_aq_enq,
 )
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
     TNS_AQ_DEQ_REMOVE,
     TNS_FUNC_AQ_ENQ,
     TTI_FUN,
@@ -66,6 +69,31 @@ class TestEncode(unittest.TestCase):
         out = encode_aq_enq(3, 16, q, MessageProperties(payload={'id': 7}))
         self.assertIn(_AQ_JSON_DESCRIPTOR, out)
         self.assertIn(bytes.fromhex('ff4a5a'), out)  # OSON magic
+
+
+class TestTheQueueNameBefore12c(unittest.TestCase):
+    # 11g reads the queue name in the data section as it stands; a length
+    # byte in front made it read the payload a byte off, ORA-00600 [kpoaqeq:
+    # payload] (#2697). Measured against JDBC thin 11.2 on 11g XE.
+    def _before_the_name(self, out: bytes) -> int:
+        at = out.index(b'PYO_AQ_RAW' + bytes(15) + b'\x17')
+        return out[at - 1]
+
+    def test_11g_writes_the_name_without_a_length(self):
+        q = Queue(_FakeConn(), 'PYO_AQ_RAW')
+        enq = encode_aq_enq(1, FIELD_VERSION_11_2, q, MessageProperties(payload=b'hi'))
+        self.assertEqual(self._before_the_name(enq), 0)
+        self.assertEqual(
+            self._before_the_name(encode_aq_deq(1, FIELD_VERSION_11_2, q)), 0
+        )
+
+    def test_12c_keeps_the_length(self):
+        q = Queue(_FakeConn(), 'PYO_AQ_RAW')
+        enq = encode_aq_enq(1, FIELD_VERSION_12_1, q, MessageProperties(payload=b'hi'))
+        self.assertEqual(self._before_the_name(enq), 10)
+        self.assertEqual(
+            self._before_the_name(encode_aq_deq(1, FIELD_VERSION_12_1, q)), 10
+        )
 
 
 class TestArrayJsonGate(unittest.TestCase):
