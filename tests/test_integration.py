@@ -7723,16 +7723,6 @@ def _tpc_xid(tag: str) -> seerdb.Xid:
     return seerdb.Xid(_TPC_FORMAT, f'seerdb-{tag}-{os.getpid()}'.encode(), b'1')
 
 
-# On a class that isn't an _IntegrationBase a class-level _requires is never
-# checked, so each test carries it. Through the Mirror over PostgreSQL the loop
-# never ends: SYSDATE becomes the transaction's fixed localtimestamp (#2717).
-_REAL_SERVER_BREAK = _Need(
-    "a break interrupts a real server's call; a Mirror backend's SYSDATE loop "
-    'need not end',
-    not_mirror=('*',),
-)
-
-
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class CallTimeoutIntegration(_ThrottleRetry, unittest.TestCase):
     """call_timeout bounds a call that runs too long (#123, #144).
@@ -7750,7 +7740,6 @@ class CallTimeoutIntegration(_ThrottleRetry, unittest.TestCase):
         'BEGIN WHILE SYSDATE < t LOOP NULL; END LOOP; END;'
     )
 
-    @_requires(_REAL_SERVER_BREAK)
     def test_a_call_timeout_ends_a_long_call(self):
         import time
 
