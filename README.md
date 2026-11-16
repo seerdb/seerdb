@@ -389,6 +389,8 @@ a native 9.2 OCI client does: the 64-bit `OALL8` form, on the same call sequence
 as 8i. Over the 9.2 bed it passes the integration suite like the default path
 does, with these differences:
 - **No cursor cache**, as on 8i, so a repeated statement is parsed again.
+- **It binds PL/SQL associative arrays** (`arrayvar`) in a block, as OCI 9.2
+  does; the compact form refuses them.
 - **Only the 8-byte O3LOGON key.** The 16-byte variant native sqlplus gets is not
   supported.
 - **9.2's own answers can differ.** A bare `CONNECT BY LEVEL` on `dual` returns
@@ -424,7 +426,7 @@ The flag is ignored on other tiers.
 tier. It runs connect (`O3LOGON`), SELECT, single-row DML / DDL, PL/SQL blocks
 with IN / OUT binds, REF CURSOR OUT binds and `CURSOR()` columns, object and
 collection columns and binds, IN and OUT, as `DbObject`s, REF columns and binds,
-CLOB / BLOB and
+PL/SQL associative-array binds (`arrayvar`) in a block, CLOB / BLOB and
 native BFILE reads, CLOB / BLOB OUT binds and `RETURNING` (their value is the
 text or bytes, as a fetched LOB's is: 8i serves no LOB object calls, and makes
 no temporary LOB, so an IN OUT LOB Var holding text and a block value past

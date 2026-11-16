@@ -1464,7 +1464,7 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
     # 11g's native form binds an object or a collection, IN and OUT, as OCI
     # 11.2 does (#2463); its dialect refuses what it does not serve yet.
     Native11 = bool(getattr(Connection, '_native11', False))
-    from seerdb.client.dialect import CAP_OBJECT_BIND, CAP_REF_BIND
+    from seerdb.client.dialect import CAP_ARRAY_BIND, CAP_OBJECT_BIND, CAP_REF_BIND
 
     Dialect = getattr(Connection, '_dialect', None)
     # A 10g or 11g thin session binds them too, in 12c's form without the
@@ -1513,15 +1513,24 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
                 )
             if isinstance(V, Var) and getattr(V, 'is_array', False):
                 # OCI 11.2's form serves it on the native session, and a 10g
-                # or 11g thin session binds it as JDBC thin 11.2 does (#2706).
-                if Native11 or (
-                    Dialect is None
-                    and getattr(Connection, 'field_version', 0) >= FIELD_VERSION_10_2
+                # or 11g thin session binds it as JDBC thin 11.2 does (#2706);
+                # 8i and 9i's native form as OCI 9.2 does (SeerODBC #172).
+                if (
+                    Native11
+                    or (
+                        Dialect is None
+                        and getattr(Connection, 'field_version', 0)
+                        >= FIELD_VERSION_10_2
+                    )
+                    or (
+                        Dialect is not None and CAP_ARRAY_BIND in Dialect.capabilities()
+                    )
                 ):
                     continue
                 raise NotSupportedError(
                     'binding a PL/SQL associative array (arrayvar) requires an '
-                    'Oracle 12.1+ server, or a 10g or 11g session with oall8=True'
+                    'Oracle 10g+ server, Oracle 8i, or a 9i session with '
+                    'oall8=True'
                 )
             if (
                 isinstance(V, Var) and V.dbtype.tns_type == TNS_TYPE_VECTOR
