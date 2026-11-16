@@ -8492,13 +8492,36 @@ byte yet (#1349).
 - Marker packet form `01 00 <type>`: BREAK=1, RESET=2, INTERRUPT=3 (seerdb
   sends INTERRUPT to cancel and replies RESET=2 to a server break).
 
-**Verified** end-to-end on 10g/11g/21c/23ai, sync + async: `cancel()` (from
-another thread) and `call_timeout` interrupt a long-running query with
-`ORA-01013`, and the connection is reusable afterwards. None of these Free/XE
-servers advertise `CAN_RECV_ATTENTION`, so the **in-band** path is what's
-exercised live; the OOB path is taken automatically against a server that does
-advertise it. The async break reaches the real socket under the asyncio
-`TransportSocket` wrapper.
+**What answers a break,** measured 2026-11-16 with `call_timeout` on a PL/SQL
+busy loop and on an UPDATE waiting for another session's row lock (SeerODBC
+found the 10g/11g and row-lock cases). `tests/test_integration.py`'s
+`CallTimeoutIntegration` runs both on every bed:
+
+| Server | Break | Busy loop | Row-lock wait |
+|---|---|---|---|
+| 8.1.7 (VM) | in-band (no OOB advertised) | answered | not answered |
+| 9.2.0.4 (VM) | OOB | answered | answered |
+| 10.2.0.5, 11.2.0.2 (containers) | OOB | not answered | not answered |
+| 21c (container) | in-band | answered | not answered |
+| 23ai (container) | in-band | answered | answered |
+
+- **Answered** means the call fails with the timeout within about 0.1 to 1 s of it,
+  and the connection is reusable.
+- **Not answered** means the client drops the connection after `call_timeout`
+  again (#1570), so the call still ends within twice the timeout.
+- **10g and 11g advertise OOB, but the beds' rootless-podman port forward
+  (pasta) drops the urgent byte** (#144), and these servers don't act on the
+  in-band marker during a call either. A path that carries urgent data, a
+  direct install or a forwarder that keeps it, is unverified here.
+- **9i takes the in-band marker only at the end of a call:** forced in-band, a
+  busy loop's ORA-01013 came when the loop ended.
+- **An ORA-01013 can come back as a DML's status rather than an error.** It's
+  the timeout all the same, and is reported as one.
+- **8i, 9i and the native forms** honour `call_timeout` since #2715; before,
+  only the thin execute armed its timer, and a dialect's call ran to its end.
+  `cancel()` always sent its break there.
+- **None of the containers advertise OOB except 10g and 11g.** The async break
+  reaches the real socket under the asyncio `TransportSocket` wrapper.
 
 ## 26. PL/SQL associative-array binds (#122)
 

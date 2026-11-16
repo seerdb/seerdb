@@ -1379,6 +1379,14 @@ class AsyncOracleConnect(_ConnectionLogic):
         # packet; RECV -> the next data packet; return value is the result.
         from seerdb.client.dialect import RECV, Send
 
+        # call_timeout bounds a dialect's call, as the sync twin's does.
+        Timer = None
+        if self._call_timeout and not self._call_in_progress:
+            self._timed_out = False
+            self._call_in_progress = True
+            Timer = asyncio.get_running_loop().call_later(
+                self._call_timeout / 1000.0, self._on_call_timeout
+            )
         to_send: object = None
         try:
             while True:
@@ -1402,7 +1410,40 @@ class AsyncOracleConnect(_ConnectionLogic):
                 else:  # pragma: no cover - defensive
                     raise TypeError(f'unknown dialect intent: {intent!r}')
         except StopIteration as done:
+            # A DML's ORA-01013 comes back as its status, not raised: the
+            # answered break is the timeout all the same.
+            if (
+                Timer is not None
+                and self._timed_out
+                and _error_code(done.value) == ORA_USER_REQUESTED_CANCEL
+            ):
+                raise OperationalError(
+                    f'call timeout of {self._call_timeout} ms exceeded (ORA-03136)'
+                ) from None
             return done.value
+        except Exception as exc:
+            if Timer is None:
+                raise
+            if self._call_abandoned:
+                await self.disconnect()
+                raise OperationalError(
+                    _abandoned_call_message(self._call_timeout)
+                ) from exc
+            if self._timed_out:
+                raise OperationalError(
+                    f'call timeout of {self._call_timeout} ms exceeded (ORA-03136)'
+                ) from exc
+            raise
+        finally:
+            if Timer is not None:
+                Timer.cancel()
+                if self._break_deadline is not None:
+                    self._break_deadline.cancel()
+                    self._break_deadline = None
+                self._call_in_progress = False
+                self._break_in_progress = False
+                self._timed_out = False
+                self._call_abandoned = False
 
     async def _handle_rpa(self, Data: bytes) -> int | None:
         from seerdb.common.tns_consts import TTI_AUTH

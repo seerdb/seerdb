@@ -8,9 +8,9 @@
 # _supports_oob), else an in-band INTERRUPT marker packet (TNS_MARKER, body
 # 01 00 03). The in-band path works on any server over any network path; the
 # OOB-only break from #123 silently did nothing where OOB isn't advertised /
-# carried. None of the local Free/XE testbeds advertise OOB, so the in-band
-# interruption -> ORA-01013 and connection reuse are what's verified live on
-# 10g/11g/21c/23ai; these cover the client wiring for both paths.
+# carried. Which servers answer which break, and where, is PROTOCOL.md 25's
+# table, which tests/test_integration.py's CallTimeoutIntegration checks on
+# every bed; these cover the client wiring for both paths.
 
 import socket
 import unittest
@@ -154,3 +154,86 @@ class TestAnsweredCallTimeout(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def _dialect_call(conn, wait_for_timeout: bool):
+    # A dialect's call (a generator _drive runs): one read, which the fake
+    # transport answers with the server's ORA-01013 once the call timeout's
+    # timer has fired, or at once with a reply.
+    import time
+
+    from seerdb.client.dialect import RECV
+    from seerdb.common.exceptions import OperationalError
+
+    def next_packet():
+        if not wait_for_timeout:
+            return (6, b'reply')
+        deadline = time.monotonic() + 5
+        while not conn._timed_out and time.monotonic() < deadline:
+            time.sleep(0.005)
+        raise OperationalError('ORA-01013: user requested cancel of current operation')
+
+    def gen():
+        reply = yield RECV
+        return reply
+
+    return (gen(), next_packet)
+
+
+class TestDialectCallTimeout(unittest.TestCase):
+    # call_timeout bounds a dialect's call (8i, 9i, the native forms) as it
+    # bounds a thin one. It was armed only around the thin execute, so on those
+    # sessions it was ignored and a long call ran to its end.
+
+    def test_sync_reports_the_timeout(self):
+        from seerdb.common.exceptions import OperationalError
+
+        c = _conn()
+        c.sock = _FakeSock()
+        c.call_timeout = 50
+        (gen, c._next_data_packet) = _dialect_call(c, True)
+        with self.assertRaisesRegex(OperationalError, 'call timeout of 50 ms'):
+            c._drive(gen)
+        self.assertEqual(len(c.sock.normal), 1)  # the break went out
+        self.assertFalse(c._call_in_progress or c._timed_out or c._break_in_progress)
+
+    def test_sync_call_inside_the_timeout(self):
+        c = _conn()
+        c.sock = _FakeSock()
+        c.call_timeout = 5000
+        (gen, c._next_data_packet) = _dialect_call(c, False)
+        self.assertEqual(c._drive(gen), (6, b'reply'))
+        self.assertEqual(c.sock.normal, [])
+        self.assertFalse(c._call_in_progress)
+
+    def test_async_reports_the_timeout(self):
+        import asyncio
+
+        from seerdb.client.aconnection import AsyncOracleConnect
+        from seerdb.client.dialect import RECV
+        from seerdb.common.exceptions import OperationalError
+
+        async def run():
+            c = AsyncOracleConnect(host='x', user='u', password='p', service_name='s')
+            c.call_timeout = 50
+            breaks = []
+            c._send_break = lambda: breaks.append(1)
+
+            async def next_packet():
+                for _ in range(1000):
+                    if c._timed_out:
+                        break
+                    await asyncio.sleep(0.005)
+                raise OperationalError('ORA-01013: user requested cancel')
+
+            def gen():
+                reply = yield RECV
+                return reply
+
+            c._next_data_packet = next_packet
+            with self.assertRaisesRegex(OperationalError, 'call timeout of 50 ms'):
+                await c._drive(gen())
+            self.assertEqual(breaks, [1])
+            self.assertFalse(c._call_in_progress or c._timed_out)
+
+        asyncio.run(run())

@@ -2152,6 +2152,17 @@ class OracleConnect(_ConnectionLogic):
         # errors) propagate. The async connection has the awaited twin of this.
         from seerdb.client.dialect import RECV, Send
 
+        # call_timeout bounds a dialect's call as it bounds a thin one: a timer
+        # breaks it, and the server's ORA-01013 is reported as the timeout. Not
+        # armed here, it was ignored on 8i, 9i and the native forms, and a long
+        # call ran to its end. A drive inside another's call is under its timer.
+        Timer = None
+        if self._call_timeout and not self._call_in_progress:
+            self._timed_out = False
+            Timer = threading.Timer(self._call_timeout / 1000.0, self._on_call_timeout)
+            Timer.daemon = True
+            self._call_in_progress = True
+            Timer.start()
         to_send: object = None
         try:
             while True:
@@ -2175,7 +2186,40 @@ class OracleConnect(_ConnectionLogic):
                 else:  # pragma: no cover - defensive
                     raise TypeError(f'unknown dialect intent: {intent!r}')
         except StopIteration as done:
+            # A DML's ORA-01013 comes back as its status, not raised: the
+            # answered break is the timeout all the same.
+            if (
+                Timer is not None
+                and self._timed_out
+                and _error_code(done.value) == ORA_USER_REQUESTED_CANCEL
+            ):
+                raise OperationalError(
+                    f'call timeout of {self._call_timeout} ms exceeded (ORA-03136)'
+                ) from None
             return done.value
+        except Exception as exc:
+            if Timer is None:
+                raise
+            if self._call_abandoned:
+                self.disconnect()
+                raise OperationalError(
+                    _abandoned_call_message(self._call_timeout)
+                ) from exc
+            if self._timed_out:
+                raise OperationalError(
+                    f'call timeout of {self._call_timeout} ms exceeded (ORA-03136)'
+                ) from exc
+            raise
+        finally:
+            if Timer is not None:
+                Timer.cancel()
+                if self._break_deadline is not None:
+                    self._break_deadline.cancel()
+                    self._break_deadline = None
+                self._call_in_progress = False
+                self._break_in_progress = False
+                self._timed_out = False
+                self._call_abandoned = False
 
     def _handle_rpa(self, Data: bytes) -> int | None:
         with recording_session_keywords(self._session_keywords, self._call_status):
