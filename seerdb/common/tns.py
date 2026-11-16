@@ -47,6 +47,7 @@ from seerdb.common.features import _SESSION_FEATURES, Carry
 from seerdb.common.sqltext import (
     bind_placeholders,
     is_plsql,
+    is_query,
     returning_bind_positions,
 )
 from seerdb.common.vector import (
@@ -15896,7 +15897,10 @@ _O8I_STMT_TYPES = {
 def o8i_stmt_type(Head: str) -> int:
     # Map an upper-cased, stripped statement to its 8i OALL8 statement-type code.
     # COMMIT / ROLLBACK / SAVEPOINT / SET (transaction control) fall through to
-    # O8I_STMT_TXN (0), which the encoder treats as a cursor-less statement.
+    # O8I_STMT_TXN (0), which the encoder treats as a cursor-less statement. A
+    # query starting WITH or with a parenthesis is a SELECT (#2731).
+    if is_query(Head):
+        return O8I_STMT_SELECT
     return _O8I_STMT_TYPES.get(Head.split(None, 1)[0] if Head else '', O8I_STMT_TXN)
 
 
