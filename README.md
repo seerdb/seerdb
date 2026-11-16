@@ -371,12 +371,14 @@ surface — DB-API, scalar and national-charset binds, DATE / TIMESTAMP / INTERV
 RAW, LONG / LONG RAW, LOB reads, DML, PL/SQL blocks with IN / OUT / IN OUT binds,
 transactions, and the full async API — and much of what later versions add:
 array DML (`executemany`, with `batcherrors`), REF CURSOR OUT binds and nested
-`CURSOR()` columns, LOB objects (read, write, trim, size, open / close), object
+`CURSOR()` columns, CLOB / BLOB OUT binds and LOBs returned by `RETURNING`,
+LOB objects (read, write, trim, size, open / close), object
 types fetched as `DbObject`s, the cursor cache, `DatabaseError.offset`,
 `cursor.warning` and `cursor.bind_directions`. It lacks `BINARY_FLOAT` /
 `BINARY_DOUBLE`, a plain bind past 4000 bytes (declare a LONG / LONG RAW
 column's value `DB_TYPE_LONG` / `DB_TYPE_LONG_RAW`, and write a CLOB / BLOB
-through its locator), object and REF binds, array DML with `RETURNING`, and
+through its locator), an IN OUT CLOB / BLOB Var holding text or bytes (it has no
+temporary LOB to bind as), object and REF binds, array DML with `RETURNING`, and
 `changepassword`. Its DB charset also can't store text it doesn't cover, so use
 `DB_TYPE_NVARCHAR` / `NCHAR` for full Unicode there rather than a plain `str`
 bind.
@@ -421,7 +423,8 @@ The flag is ignored on other tiers.
 **Oracle 8i** (8.1.7, the 9.2-era `OALL8` dialect) is the oldest and most limited
 tier. It runs connect (`O3LOGON`), SELECT, single-row DML / DDL, PL/SQL blocks
 with IN / OUT binds, REF CURSOR OUT binds and `CURSOR()` columns, CLOB / BLOB and
-native BFILE reads, LONG / LONG RAW, ROWID / UROWID, and transactions — sync and
+native BFILE reads, CLOB / BLOB OUT binds and `RETURNING` (their value is the
+text or bytes, as a fetched LOB's is: 8i serves no LOB object calls), LONG / LONG RAW, ROWID / UROWID, and transactions — sync and
 async. 8i has no `SYS_REFCURSOR`: declare a package's `REF CURSOR` type. On top of the 9i gaps above it predates
 `TIMESTAMP` and `INTERVAL` (only `DATE`), the AL16UTF16 national charset
 (`WE8ISO8859P1` only), and returns a single row for `CONNECT BY LEVEL`. Oracle

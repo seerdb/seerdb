@@ -308,6 +308,23 @@ def _is_cursor_var(value: object) -> bool:
     return isinstance(value, Var) and value.dbtype.tns_type == TNS_TYPE_REFCURSOR
 
 
+def _lob_outs(bind: list, out_positions: list[int]) -> dict[int, tuple[int, int]]:
+    # The OUT binds a pre-10g block returns a LOB locator for (SeerODBC #167):
+    # each CLOB / BLOB Var's index among the OUT values, with its type and charset
+    # form.
+    from seerdb.common.datatypes import Var
+
+    lobs = {}
+    for i, pos in enumerate(out_positions):
+        value = bind[pos]
+        if isinstance(value, Var) and value.dbtype.tns_type in (
+            TNS_TYPE_CLOB,
+            TNS_TYPE_BLOB,
+        ):
+            lobs[i] = (value.dbtype.tns_type, getattr(value.dbtype, 'csfrm', 1))
+    return lobs
+
+
 def _cursor_marker(cursor_id: int, columns: list, rows: list) -> dict:
     # A cursor 9i already read, in the marker a 10g+ REF CURSOR leaves, with its
     # rows, so the cursor wraps them where 10g+ fetches by id (#2246, #2254).
@@ -577,7 +594,7 @@ class Fv2Dialect:
             packet, end_of_fetch_ok=False, with_offset=True
         )
         (out_values, row_count, err_code) = decode_fv2_block_out(
-            packet, len(out_positions)
+            packet, len(out_positions), _lob_outs(bind, out_positions)
         )
         yield Send(encode_o7_close(0, cursor))
         yield RECV  # close STA
@@ -1153,6 +1170,7 @@ class Oall8Dialect:
         # OUT-value RXD + RPA + OER. OUT / IN OUT binds are Var objects whose
         # returned values ride back and go to the cursor's _assign_out_binds.
         from seerdb.common.datatypes import Var
+        from seerdb.common.types import decode_fv2_lob
 
         bind = bind or []
         out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
@@ -1167,7 +1185,7 @@ class Oall8Dialect:
         # 8i marks no packet as a reply's last: read on until the reply is whole.
         # Read alone, the first packet of a long OUT value's reply ran off its
         # end, and the rest answered the next call (#2334).
-        while not o8i_block_complete(packet):
+        while not o8i_block_complete(packet, _lob_outs(bind, out_positions)):
             received = yield RECV
             if received is False:
                 raise connection_closed('8i PL/SQL block')
@@ -1190,7 +1208,8 @@ class Oall8Dialect:
         # Its cursor is in the status behind the prompt and the OUT values.
         self._finished(decode_8i_block_cursor(packet, len(out_positions), cursors))
         if out_positions:
-            out_values = decode_8i_block_out(packet, len(out_positions), cursors)
+            lobs = _lob_outs(bind, out_positions)
+            out_values = decode_8i_block_out(packet, len(out_positions), cursors, lobs)
             # Fetch each REF CURSOR's rows by its id now, into the marker the
             # cursor wraps, as sqlplus 9.2 reads one from 8.1.7 (#2710).
             for i in cursors:
@@ -1198,6 +1217,15 @@ class Oall8Dialect:
                     (cursor_id, columns) = out_values[i]
                     rows = yield from self._read_cursor(cursor_id, columns)
                     out_values[i] = _cursor_marker(cursor_id, columns, rows)
+            # And each CLOB's or BLOB's content by its locator, as sqlplus does:
+            # 8i serves no LOB object's calls, so the value is its text or bytes,
+            # as a fetched one's is (SeerODBC #167).
+            for i, (lob_type, _csfrm) in lobs.items():
+                if out_values[i] is not None:
+                    content = yield from self.lob_read(out_values[i].raw)
+                    out_values[i] = decode_fv2_lob(
+                        lob_type, content, self._clob_charset({})
+                    )
             record = {'out_positions': out_positions, 'out_values': out_values}
             return (0, 0, 0, (None, None), [record], None, None, [], None)
         return (0, 0, 0, (0, None), [], None, None, [], None)

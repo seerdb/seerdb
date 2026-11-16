@@ -331,6 +331,23 @@ class _Target(NamedTuple):
     tpc: bool = False
     # Whether the session binds a REF: 12.1+, and the native form on 10g and 11g.
     ref_binds: bool = False
+    # Whether a CLOB or BLOB comes back from an OUT bind or a RETURNING: where
+    # a LOB Var binds (temp_lobs), and on 8i and 9i's compact form, which bind
+    # one by its locator (SeerODBC #167).
+    lob_out: bool = False
+
+
+def _dialect_binds_lob_outs(conn) -> bool:
+    from seerdb.client.dialect import Fv2Dialect, O8iDialect
+
+    return isinstance(getattr(conn, '_dialect', None), (Fv2Dialect, O8iDialect))
+
+
+def _lob_content(conn, value):
+    # A CLOB's or BLOB's content from an OUT bind: what the LOB reads, except on
+    # 8i, which serves no LOB object's calls and hands back the text or bytes
+    # (SeerODBC #167).
+    return value if _conn_is_8i(conn) else value.read()
 
 
 def _dialect_binds_objects(conn) -> bool:
@@ -387,6 +404,7 @@ def _target_of(conn) -> _Target:
         _session_runs_tpc(conn),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False)),
+        temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
     )
 
 
@@ -442,6 +460,8 @@ class _Need(NamedTuple):
     tpc: bool = False
     # Whether it binds a REF.
     ref_binds: bool = False
+    # Whether a CLOB or BLOB comes back from an OUT bind.
+    lob_out: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = target.field_version
@@ -464,6 +484,8 @@ class _Need(NamedTuple):
         if self.tpc and not target.tpc:
             return True
         if self.ref_binds and not target.ref_binds:
+            return True
+        if self.lob_out and not target.lob_out:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -626,6 +648,10 @@ _ROWS_RETURNING = _Need(
 _LOB_VAR_BIND = _Need(
     'a LOB Var bind needs the 12.1+ OAC and temp-LOB path (#902), or the native form',
     temp_lobs=True,
+)
+_LOB_OUT_BIND = _Need(
+    'a LOB OUT bind needs a session that binds a LOB Var, or 8i or 9i (SeerODBC #167)',
+    lob_out=True,
 )
 _REFCURSOR_IN_BIND = _Need(
     'a REF CURSOR IN bind needs the 12c+ bind OAC, or a pooled 11g session',
@@ -9731,7 +9757,7 @@ class LOBObjectIntegration(_IntegrationBase):
         self.assertIsInstance(value, str)
 
 
-@_requires(_LOB_VAR_BIND)
+@_requires(_LOB_OUT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class LOBOutBindIntegration(_IntegrationBase):
     """A LOB-class Var bound OUT / IN OUT to a PL/SQL block (#978).
@@ -9742,15 +9768,24 @@ class LOBOutBindIntegration(_IntegrationBase):
     left most of the block in the stream, where its next byte decoded as a
     bogus response token, so EVERY LOB OUT bind failed.
 
-    12.1+ only: below that the CLOB / BLOB bind itself has no encoding (#902),
-    which is a separate gap -- the block never gets as far as a reply.
+    An IN OUT one is 12.1+ only: below that a LOB Var's value has no temporary
+    LOB to bind as (#902). A pure OUT one runs on 8i and 9i too, which bind it by
+    its locator and send back a fetched LOB column's cell (SeerODBC #167).
     """
 
     def test_out_clob_var(self):
         # Pure OUT: the block creates the LOB, the bind brings back its locator.
         Var = self.cur.var(seerdb.DB_TYPE_CLOB)
-        self.cur.execute("BEGIN :d := TO_CLOB(LPAD('x', 200, 'x')); END;", [Var])
-        self.assertEqual(Var.getvalue().read(), 'x' * 200)
+        if _conn_is_8i(self.conn):
+            # 8.1.7's PL/SQL has no TO_CLOB, and makes a LOB through DBMS_LOB.
+            Block = (
+                'DECLARE x CLOB; BEGIN DBMS_LOB.CREATETEMPORARY(x, TRUE); '
+                "DBMS_LOB.WRITEAPPEND(x, 200, LPAD('x', 200, 'x')); :d := x; END;"
+            )
+        else:
+            Block = "BEGIN :d := TO_CLOB(LPAD('x', 200, 'x')); END;"
+        self.cur.execute(Block, [Var])
+        self.assertEqual(_lob_content(self.conn, Var.getvalue()), 'x' * 200)
 
     def test_out_clob_var_left_null(self):
         # A block that assigns NULL sends a one-byte block, not a locator.
@@ -9758,6 +9793,7 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.cur.execute('BEGIN :d := NULL; END;', [Var])
         self.assertIsNone(Var.getvalue())
 
+    @_requires(_LOB_VAR_BIND)
     def test_inout_clob_var_small(self):
         # PL/SQL-bound: DBMS_LOB.WRITEAPPEND is a PL/SQL procedure with an IN OUT LOB (#1127).
         # Under the 32767-byte promotion threshold, so the bind stays a Var.
@@ -9766,6 +9802,7 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.cur.execute("BEGIN DBMS_LOB.WRITEAPPEND(:d, 3, 'END'); END;", [Var])
         self.assertEqual(Var.getvalue().read(), 'smallEND')
 
+    @_requires(_LOB_VAR_BIND)
     def test_inout_clob_var_over_the_promotion_threshold(self):
         # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
         # Over it, so the Var is promoted to a temp-LOB marker on the way out
@@ -9787,6 +9824,7 @@ class LOBOutBindIntegration(_IntegrationBase):
         self.assertEqual(len(Value), 50005)
         self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
 
+    @_requires(_LOB_VAR_BIND)
     def test_inout_blob_var_over_the_promotion_threshold(self):
         # PL/SQL-bound: the IN OUT LOB is filled by a multi-statement DECLARE block (#1127).
         Var = self.cur.var(seerdb.DB_TYPE_BLOB)
@@ -11425,7 +11463,7 @@ class CursorWarningIntegration(_IntegrationBase):
         self.assertIsNone(self.cur.warning)
 
 
-@_requires(_LOB_VAR_BIND)
+@_requires(_LOB_OUT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class LOBReturningIntegration(_IntegrationBase):
     """`DML ... RETURNING <lob column> INTO :b` (#985).
@@ -11458,7 +11496,9 @@ class LOBReturningIntegration(_IntegrationBase):
             f'INSERT INTO {self.TABLE} (n, c) VALUES (1, :a) RETURNING c INTO :b',
             ['the returned clob', Var],
         )
-        self.assertEqual([V.read() for V in Var.getvalue()], ['the returned clob'])
+        self.assertEqual(
+            [_lob_content(self.conn, V) for V in Var.getvalue()], ['the returned clob']
+        )
 
     def test_returning_a_blob(self):
         Var = self.cur.var(seerdb.DB_TYPE_BLOB)
@@ -11466,7 +11506,9 @@ class LOBReturningIntegration(_IntegrationBase):
             f'INSERT INTO {self.TABLE} (n, b) VALUES (1, :a) RETURNING b INTO :b',
             [b'the returned blob', Var],
         )
-        self.assertEqual([V.read() for V in Var.getvalue()], [b'the returned blob'])
+        self.assertEqual(
+            [_lob_content(self.conn, V) for V in Var.getvalue()], [b'the returned blob']
+        )
 
     @_requires(_ROWS_RETURNING)
     def test_returning_several_lobs_from_one_update(self):

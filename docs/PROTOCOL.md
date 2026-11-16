@@ -7115,6 +7115,45 @@ function it left in the user's schema — the same win #46 brought to 10g+/21c.
 - **ojdbc14 on 8.1.7 speaks TTI_ALL7 instead,** the 9i form above, call for
   call.
 
+### 19.17b CLOB / BLOB OUT binds before 10g (SeerODBC #167)
+
+A CLOB or BLOB comes back from a PL/SQL block as its **locator**, in a fetched
+LOB column's cell, and is then read with the LOB calls a column's is. A DML
+`RETURNING` of a LOB column is the same OUT bind, because below 10g it runs as
+a block (#801, #802).
+
+**9i, the compact TTI_ALL7 form** (ojdbc14 on 9.2.0.4):
+- **The bind** is declared as its own type (112 / 113); seerdb's size, 32767,
+  works as ojdbc14's 3876 does. A pure OUT bind sends no value.
+- **Its OUT value is a column's LOB cell** (§19.5): a `ub4` length (`01 56`,
+  86), the locator (`56 | 00 54 <84 bytes>`), then the `ub4` indicator. A NULL
+  is `00 81 01`. Read as an ordinary value, the length's first byte was taken
+  for a one-byte value.
+- **A RETURNING of a NULL LOB** sends an uninitialised locator instead: the
+  86-byte length, then `00 54` and zeros. A real locator's body is never all
+  zero, so the client reads that as NULL.
+- **The value is read with the GETLEN + READ pair** (§19.5), and 9i's LOB
+  object calls serve it after the call.
+
+**8i, the OALL8 form** (sqlplus 9.2 against 8.1.7):
+- **The bind's OAC** (§19.11) has flag `0x01` where other binds have `0x03`,
+  a size of 32, and a CLOB's charset (31) and form; a BLOB's are zero.
+- **Its value is a locator, even for an OUT bind:** sqlplus sends an empty one,
+  the `ub4` 86 and then `56 | 00 54` and 84 zeros. Given the OUT placeholder
+  (`fd 01`) that other OUT binds send, 8.1.7 waited for the value and never
+  answered.
+- **The OUT cell** is a `ub4` length, the locator, then a `ub2` indicator, with
+  none of a row's return code. A NULL is `00000000 ffff`.
+- **The content is read with 8i's single READ** (§19.15) before the next call.
+  8i serves no LOB object calls, so the value is the LOB's text or bytes, as a
+  fetched LOB's is.
+- **ojdbc14 on 8.1.7 speaks TTI_ALL7 instead,** with the 9i bytes above.
+
+**An IN OUT LOB needs a locator to send.** Below 10g seerdb makes no temporary
+LOB on these forms, so a Var holding text or bytes has none: 9i answers
+ORA-24813, and 8i (which gets an empty locator) ORA-22275. A Var holding a LOB
+an earlier call returned sends its locator.
+
 ### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals
