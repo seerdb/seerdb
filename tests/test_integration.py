@@ -12629,6 +12629,30 @@ class ObjectCollectionFetchIntegration(_IntegrationBase):
             [(int(e.ID), e.NAME) for e in value.aslist()], [(1, 'a'), (2, 'b')]
         )
 
+    def test_text_past_ascii_in_a_fetched_object(self):
+        # An object's and a collection's text past ASCII reads as a column's:
+        # on 8i it is WE8ISO8859P1 inside the image, which was read as UTF-8.
+        self.cur.execute(
+            f"SELECT {self.ELEM}(1, 'café'), {self.ELEMS}({self.ELEM}(2, 'naïve')) "
+            'FROM dual'
+        )
+        (obj, coll) = self.cur.fetchone()
+        self.assertEqual(obj.NAME, 'café')
+        self.assertEqual([e.NAME for e in coll.aslist()], ['naïve'])
+
+    @_requires(_OBJECT_BIND)
+    def test_text_past_ascii_in_a_bound_object(self):
+        # The server reads a bound object's text as it stores it: on the 8i and
+        # 9i beds, in WE8ISO8859P1, where the UTF-8 bytes stored 'cafÃ©'.
+        obj = self.conn.gettype(self.ELEM).newobject({'ID': 1, 'NAME': 'café'})
+        Text = self.cur.var(seerdb.DB_TYPE_VARCHAR, 40)
+        Length = self.cur.var(seerdb.DB_TYPE_NUMBER)
+        self.cur.execute(
+            f'DECLARE o {self.ELEM} := :1; BEGIN :2 := o.name; :3 := LENGTH(o.name); END;',
+            [obj, Text, Length],
+        )
+        self.assertEqual((Text.getvalue(), Length.getvalue()), ('café', 4))
+
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class NestedAttributeIntegration(_IntegrationBase):

@@ -3009,9 +3009,13 @@ class OracleConnect(_ConnectionLogic):
             return None
         self._object_type_describing.add(Key)
         try:
-            return self._describe_object_type_uncached(Owner, name, Key)
+            Typ = self._describe_object_type_uncached(Owner, name, Key)
         finally:
             self._object_type_describing.discard(Key)
+        if Typ is not None:
+            # Its images' text is in the database's charset.
+            Typ.db_charset = getattr(self, '_server_charset', None)
+        return Typ
 
     def _describe_object_type_uncached(
         self, Owner: str, name: str, Key: tuple
