@@ -8198,9 +8198,10 @@ class TempLobBindIntegration(_IntegrationBase):
 
     A str / bytes bind over the 32767-byte PL/SQL limit can't go through the
     streamed path (ORA-01460). The driver transparently routes it through a
-    server temp LOB (CREATE_TEMP -> WRITE -> bind locator). 12c+ only — 11g
-    rejects CREATE_TEMP, so the feature is gated and large PL/SQL binds keep
-    their prior (ORA-01460) behaviour there.
+    server temp LOB (CREATE_TEMP -> WRITE -> bind locator). 12c+, 9i past the
+    32512 bytes its block takes inline (SeerODBC #169), and the native forms;
+    11g's converted form rejects CREATE_TEMP, so large PL/SQL binds keep their
+    prior (ORA-01460) behaviour there.
     """
 
     def setUp(self):

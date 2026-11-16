@@ -1151,6 +1151,9 @@ class _ConnectionLogic:
                 if getattr(self, '_oall8', False)
                 else Fv2Dialect()
             )
+            if isinstance(self._dialect, Fv2Dialect):
+                self._dialect._db_charset = getattr(self, '_server_charset', None)
+                self._dialect._db_ncharset = getattr(self, '_server_ncharset', None)
         else:
             self._dialect = None
 
@@ -1378,8 +1381,14 @@ def dialect_scrolls(Dialect) -> 'TypeGuard[Oci11Dialect]':
 def plsql_inline_limit(Conn) -> int:
     """The most bytes of a str or bytes bound into PL/SQL as itself; past it a
     session that can make one binds a temporary LOB (#91). 9i binds 4000."""
+    from seerdb.client.connection import _FV2_MAX_BLOCK_BIND
+    from seerdb.client.dialect import Fv2Dialect
     from seerdb.common.tns_consts import FIELD_VERSION_10_2
 
+    if isinstance(getattr(Conn, '_dialect', None), Fv2Dialect):
+        # 9i's compact form takes a block's value up to 32512 bytes itself
+        # (#2637), so only a longer one goes as a temporary LOB (SeerODBC #169).
+        return _FV2_MAX_BLOCK_BIND
     return 4000 if getattr(Conn, 'field_version', 0) < FIELD_VERSION_10_2 else 32767
 
 

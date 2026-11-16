@@ -2426,6 +2426,8 @@ _O7_LOBOPS: wire_schema.Schema = (
     # A wide count, as in _LOBOPS_READ: a ub8 from a 64-bit 9.2 client (#798).
     ('wn4', 'scn_length'),
     ('bytes', 'locator', 'source_length'),
+    # CREATE_TEMP's charset, which ojdbc14 sets, as `01 1f` (SeerODBC #169).
+    ('when', 'charset_present', (('n2', 'charset'),)),
     ('when', 'short_amount_present', (('n4', 'short_amount'),)),
 )
 # Its reply, on 8i at the 8i codec's widths: the RPA, the locator as the
@@ -14788,6 +14790,12 @@ def _o7_oac(
     )
 
 
+# The size ojdbc14 declares a LOB bound by its locator at, on 9.2.
+_O7_LOB_BIND_SIZE = 0x0F24
+# The empty 86-byte locator a 9i CREATE_TEMP names as its source.
+_O7_EMPTY_LOCATOR = b'\x00\x54' + bytes(84)
+
+
 def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
     # fv2 bind descriptor (same 13/14-byte shape as a define entry): the
     # client's declared type for an input bind. Number → VARNUM(6); str →
@@ -14815,13 +14823,24 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
     # or AL16UTF16 for national (csfrm 2) binds, which ride as UTF-16BE (see
     # encode_token_rxd). The charset field is ignored for non-char types. #174.
     def _oac(Type, MaxSize, Csfrm):
-        if Type in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR):
+        # A national LOB too: an NCLOB bound by its locator with charset 31 was
+        # PLS-553, "character set name is not recognized" (SeerODBC #169).
+        if Type in (TNS_TYPE_VARCHAR, TNS_TYPE_CHAR) or Csfrm == 2:
             Charset = AL16UTF16_CHARSET if Csfrm == 2 else AL32UTF8_CHARSET
         else:
             Charset = 31  # ignored by the server for non-char types (NUMBER /
             # DATE / RAW / INTERVAL); keep the historical value
         return _o7_oac(Type, MaxSize, Csfrm, Charset)
 
+    if isinstance(Value, TempLob):
+        # A temporary LOB bound by its locator (SeerODBC #169), declared as
+        # ojdbc14 declares one to 9.2: its type at 3876, under the 4000 past
+        # which a statement's bind is LONG-class and read after the others.
+        return _oac(
+            TNS_TYPE_BLOB if Value.is_blob else TNS_TYPE_CLOB,
+            _O7_LOB_BIND_SIZE,
+            1 if Value.is_blob else Value.csfrm,
+        )
     if isinstance(Value, Var):
         VType = Value.dbtype.tns_type
         Vcsfrm = getattr(Value.dbtype, 'csfrm', 1)
@@ -15202,6 +15221,44 @@ def _encode_o7_lobop(
     }
     Values.update(_O7_LOBOP_FLAGS.get(Operation, {}))
     return (_O7_LOBOPS_O8I if O8i else _O7_LOBOPS_THIN)(Values)
+
+
+def encode_o7_create_temp(Seq: int, is_blob: bool, csfrm: int, charset: int) -> bytes:
+    """A 9i CREATE_TEMP (SeerODBC #169), as ojdbc14 sends 9.2.0.4: an empty
+    86-byte locator as the source, the session duration (10) in the
+    destination length and the amount, the charset form and the LOB type in
+    the two offsets, and the charset after the locator. The reply is the RPA
+    with the new locator (decode_o7_create_temp)."""
+    Values = {
+        'seq': Seq,
+        'token_number': None,
+        'source_present': True,
+        'source_length': len(_O7_EMPTY_LOCATOR),
+        'dest_present': False,
+        'dest_length': _OCI11_LOB_DURATION_SESSION,
+        'short_source_offset': csfrm,
+        'short_dest_offset': TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB,
+        'charset_present': True,
+        'short_amount_present': True,
+        'null_lob_present': True,
+        'operation': TNS_LOB_OP_CREATE_TEMP,
+        'scn_present': False,
+        'scn_length': 0,
+        'locator': _O7_EMPTY_LOCATOR,
+        'charset': charset,
+        'short_amount': _OCI11_LOB_DURATION_SESSION,
+    }
+    return _O7_LOBOPS_THIN(Values)
+
+
+def decode_o7_create_temp(Data: bytes) -> bytes:
+    """The new temporary LOB's locator from a 9i CREATE_TEMP reply, bare -- the
+    RPA's ub2-length locator without its length, as a dialect's create_temp_lob
+    returns one."""
+    if not Data or Data[0] != TTI_RPA or len(Data) < 3:
+        raise DataError(f'unexpected 9i CREATE_TEMP reply: {bytes(Data[:8]).hex()!r}')
+    Length = (Data[1] << 8) | Data[2]
+    return bytes(Data[3 : 3 + Length])
 
 
 def encode_o7_lob_getlen(Seq: int, Locator: bytes) -> bytes:
@@ -21392,12 +21449,14 @@ def encode_token_rxd(Token: object) -> bytes:
         # with their length, the locator as a row carries it, its ub2 length in
         # front. A temporary one's is 40 bytes (`01 28 28`); a persistent CLOB's
         # 114 (`01 72 72`), measured against python-oracledb on 21c.
-        Prefixed = (
-            Token.locator
-            if isinstance(Token, BfileBind)
-            else prefixed_locator(Token.locator)
-        )
-        return encode_sb4(len(Prefixed)) + _bytes_with_length(Prefixed)
+        if isinstance(Token, BfileBind):
+            Prefixed = Token.locator
+            return encode_sb4(len(Prefixed)) + _bytes_with_length(Prefixed)
+        # encode_chr is _bytes_with_length at 12.1+; below it, it chunks past 64
+        # bytes, as ojdbc14 sends 9.2 a temporary CLOB's 86-byte locator
+        # (SeerODBC #169).
+        Prefixed = prefixed_locator(Token.locator)
+        return encode_sb4(len(Prefixed)) + encode_chr(Prefixed)
     if Token is None:
         return bytes([0])
     from seerdb.common.dbobject import DbObject, DbRef
