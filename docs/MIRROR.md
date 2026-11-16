@@ -1352,6 +1352,14 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   per statement, as in Oracle. A query inside a block, though, reads the clock
   again on every row, where Oracle gives it one time for the statement
   ([#2717](https://github.com/seerdb/seerdb/issues/2717)).
+- **`CURRENT_DATE`** is the date alone, at midnight, where Oracle's is the
+  session zone's date and time to the second. `CAST(LOCALTIMESTAMP AS DATE)`
+  gives Oracle's value
+  ([#2733](https://github.com/seerdb/seerdb/issues/2733)).
+- **A function in a `WITH` clause** (`WITH FUNCTION f ... SELECT f() ...`,
+  12c and later) is a syntax error: PostgreSQL has no function local to a
+  query. Create the function instead
+  ([#2734](https://github.com/seerdb/seerdb/issues/2734)).
 - **`MEDIAN`** works as an aggregate, exact over a `NUMBER` and a `DATE`. As an
   analytic function (`MEDIAN(x) OVER (PARTITION BY ...)`) it is refused, since
   PostgreSQL has no exact median it can window.
