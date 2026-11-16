@@ -6381,9 +6381,14 @@ the same schemas at its fixed little-endian widths (§19.17).
 
 An **empty** LOB (`EMPTY_CLOB()` / `EMPTY_BLOB()`) has a valid locator but GETLEN
 returns amount 0, so no READ is issued and the value is `""` / `b""`. CLOB content
-arrives in the column's **DB charset** (a single-byte run on a typical 9i, **not**
-the UTF-16BE the modern path uses) and is decoded with that charset; BLOB content
-is returned as raw bytes.
+goes both ways in the **session's charset**, not the column's or the database's
+(#2383): AL32UTF8 for a session that negotiated it, as seerdb's does, or
+AL16UTF16 for an NCLOB. The server converts to and from the database charset.
+Read by the column's charset, `é` on a WE8ISO8859P1 database came back as
+`Ã©`. A WRITE converted to the database charset, with a non-ASCII text,
+answered ORA-22993 (SeerODBC, 9.2.0.4); an ASCII text hides both. BLOB content is
+raw bytes. A temporary LOB is still made in the database's charset
+(§19.3.1).
 
 A `Var` in a plain statement is an IN bind whose type was declared
 (`setinputsizes`); its descriptor carries the Var's type and size like a block's
