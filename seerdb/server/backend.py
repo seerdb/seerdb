@@ -508,6 +508,15 @@ class Backend(Protocol):
         ``DBMS_OUTPUT.GET_LINES`` under ``set serveroutput on`` (#1411). Without
         it the describe is refused with an ORA error.
 
+    ``cancel() -> None``
+        Stop the call this session is running, because the client broke it --
+        its ``cancel()``, or the break a call timeout sends (#2717). It is called
+        from another thread while the call runs, so it must be safe to call
+        then. The call should then fail, and the Mirror answers the break with
+        ORA-01013, dropping the call's own reply. Without it the call runs to
+        its end before the break is answered, and one that never ends is never
+        answered.
+
     ``field_version`` (int) / ``tns_version`` (int)
         The Oracle protocol version this backend presents. A backend that
         declares ``field_version`` makes the Mirror advertise it -- its identity

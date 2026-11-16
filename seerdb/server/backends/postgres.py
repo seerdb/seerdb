@@ -350,6 +350,7 @@ from seerdb.common.tns_consts import (
     ORA_UNIQUE_CONSTRAINT_VIOLATED,
     ORA_USER_DOES_NOT_EXIST,
     ORA_USER_NAME_CONFLICT,
+    ORA_USER_REQUESTED_CANCEL,
     ORA_VALUE_LARGER_THAN_PRECISION,
     ORA_VALUE_TOO_LARGE_FOR_COLUMN,
     ORA_VECTOR_BINARY_DIMENSIONS,
@@ -16011,6 +16012,9 @@ _SQLSTATE_TO_ORA = {
     '22P02': ORA_INVALID_NUMBER,  # invalid_text_representation (TO_NUMBER)
     '3B001': ORA_SAVEPOINT_NEVER_ESTABLISHED,  # invalid_savepoint_specification
     '55P03': ORA_RESOURCE_BUSY,  # lock_not_available (a DDL's lock wait, #1191)
+    # A statement a client's break cancelled (#2717): its reply is dropped, but
+    # one that began before the break says what happened.
+    '57014': ORA_USER_REQUESTED_CANCEL,  # query_canceled
     # A string too long for its VARCHAR2(n) column: Oracle's ORA-12899, "value
     # too large for column". Unlike 22003 below, this SQLSTATE means exactly one
     # Oracle error, so the table can carry it (#1127).
@@ -19220,6 +19224,15 @@ class PostgresBackend:
         except (OSError, ValueError, psycopg.Error):
             return True
         return bool(self._conn.closed)
+
+    def cancel(self) -> None:
+        # The client broke the call this session is running (#2717): cancel
+        # the statement on the server, as Oracle stops its own. Called from the
+        # Mirror's break watcher, on another thread while the call runs, which
+        # psycopg's cancel allows. The statement fails, rolled back to the
+        # call's savepoint, and the Mirror answers the break. A cancel that
+        # fails is the watcher's to report.
+        self._conn.cancel_safe(timeout=5.0)
 
     def ping(self) -> None:
         # A health check -- conn.ping(), or a pool checking a connection before
