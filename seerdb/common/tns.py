@@ -15590,10 +15590,18 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
     # byte-identical to a 3-byte big-endian field, which is why short binds
     # worked; at >= 256 the little-endian form is required — otherwise the 8i
     # server mis-reads the size and rejects the bind as a LONG value (ORA-01461).
+    # An associative array, as OCI 9.2 binds an index-by table to 8.1.7: the
+    # array bit, and the most elements it may hold as a ub4 at +8, where a
+    # scalar's descriptor has zeros (SeerODBC #172).
+    MaxArray = 0
+    if _is_oci11_array_var(Value):
+        Flag |= _OCI11_BIND_ARRAY
+        MaxArray = cast(Any, Value).num_elements
     return (
         bytes([DType, Flag, 0, 0])
-        + min(MaxSize, 0xFFFF).to_bytes(2, 'little')
-        + bytes(13)
+        + min(MaxSize, 0xFFFF).to_bytes(4, 'little')
+        + MaxArray.to_bytes(4, 'little')
+        + bytes(7)
         + Charset.to_bytes(4, 'big')
         + bytes([0, Csform])
     )
@@ -15602,6 +15610,19 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
 # A pure-OUT bind sends no input value: the 8i value section carries this fixed
 # placeholder in the bind's slot (#362, captured verbatim).
 _O8I_OUT_PLACEHOLDER = bytes([0xFD, 0x01])
+
+
+def _encode_pre10_array_value(Value: Any, Element: Callable[[object], bytes]) -> bytes:
+    # An associative array's value, as OCI 9.2 binds an index-by table to 8.1.7
+    # and to 9.2's native form: a ub4 count of its elements, then each one's
+    # value, a NULL element the OUT placeholder (`fd 01`). A pure OUT array is
+    # the count 0 alone (SeerODBC #172).
+    Elements = cast(list, Value._value or [])
+    return len(Elements).to_bytes(4, 'little') + b''.join(
+        _O8I_OUT_PLACEHOLDER if Item is None else Element(Item) for Item in Elements
+    )
+
+
 # A CLOB / BLOB bind's cell (SeerODBC #167): a ub4 length and, when it is not
 # zero, the locator; then the indicator, -1 for NULL. The value sqlplus 9.2
 # sends 8.1.7 for an OUT one is an empty 86-byte locator: its ub2 length and 84
@@ -15645,6 +15666,8 @@ def _encode_8i_bind_value(Value: object) -> bytes:
     if _is_oci11_object_bind(Value):
         # An object's cell; an OUT one's that of a NULL object.
         return _oci11_object_bind_value(Value, _O9I_OBJECT_CELL_O8I)
+    if _is_oci11_array_var(Value):
+        return _encode_pre10_array_value(Value, _encode_8i_bind_value)
     if isinstance(Value, Var) and Value.dbtype.tns_type in (
         TNS_TYPE_CLOB,
         TNS_TYPE_BLOB,
@@ -15702,12 +15725,32 @@ def decode_o8i_bfile_getlen(Packet: bytes) -> int:
     return Reply.get('short_amount', 0) if Reply else 0
 
 
+def _read_pre10_array(Data: bytes, Cell: Callable) -> tuple[dict, bytes]:
+    # An associative array's OUT value, as 8.1.7 and 9.2's native form return
+    # an index-by table to OCI 9.2: a ub4 count of its elements, then each as a
+    # value and its indicator, -1 for a NULL with an empty value (SeerODBC
+    # #172). A return code follows each when the descriptor's flag asks for one
+    # (0x04): 9i's native descriptor does (_O8I_CELL, 1405 for a NULL), 8i's
+    # does not (_O8I_OUT_CELL). The elements' bytes, an empty one for a NULL,
+    # as the other tiers hand the cursor an array.
+    if len(Data) < 4:
+        raise IndexError('an array OUT value cut short')
+    Count = int.from_bytes(Data[:4], 'little')
+    Rest = Data[4:]
+    Elements = []
+    for _ in range(Count):
+        (Element, Rest) = Cell(Rest)
+        Elements.append(bytes(Element['value']))
+    return ({'_array': True, 'values': Elements}, Rest)
+
+
 def decode_8i_block_out(
     Data: bytes,
     NumOut: int,
     Cursors: frozenset[int] = frozenset(),
     Lobs: Mapping[int, tuple[int, int]] | None = None,
     Objects: frozenset[int] = frozenset(),
+    Arrays: frozenset[int] = frozenset(),
 ) -> list:
     # Decode the OUT / IN OUT return values from an 8i PL/SQL block reply
     # (docs/PROTOCOL.md §19.14). After the I/O vector (`_O8I_IOV`), the values
@@ -15717,8 +15760,9 @@ def decode_8i_block_out(
     # declared type by the cursor. The OUT values at `Cursors` are REF CURSORs,
     # each (cursor id, columns) (#2710); those at `Lobs` CLOBs and BLOBs, each a
     # LOB of its locator (SeerODBC #167); those at `Objects` objects and
-    # collections, each its image (SeerODBC #172).
-    return _decode_8i_block_values(Data, NumOut, Cursors, Lobs, Objects)[0]
+    # collections, each its image; those at `Arrays` associative arrays, each
+    # {'_array': True, 'values': the elements' bytes} (SeerODBC #172).
+    return _decode_8i_block_values(Data, NumOut, Cursors, Lobs, Objects, Arrays)[0]
 
 
 def decode_8i_block_cursor(
@@ -15727,11 +15771,12 @@ def decode_8i_block_cursor(
     Cursors: frozenset[int] = frozenset(),
     Lobs: Mapping[int, tuple[int, int]] | None = None,
     Objects: frozenset[int] = frozenset(),
+    Arrays: frozenset[int] = frozenset(),
 ) -> int:
     # The cursor an 8i PL/SQL block's reply names, from the status behind its
     # bind prompt and OUT values (#2286), each read in its own form to find it.
     return decode_8i_cursor_id(
-        _decode_8i_block_values(Data, NumOut, Cursors, Lobs, Objects)[1]
+        _decode_8i_block_values(Data, NumOut, Cursors, Lobs, Objects, Arrays)[1]
     )
 
 
@@ -15741,6 +15786,7 @@ def _decode_8i_block_values(
     Cursors: frozenset[int] = frozenset(),
     Lobs: Mapping[int, tuple[int, int]] | None = None,
     Objects: frozenset[int] = frozenset(),
+    Arrays: frozenset[int] = frozenset(),
 ) -> tuple[list, bytes]:
     # The OUT values of an 8i block's reply and the status after them; a reply
     # without the I/O vector -- the status alone of a block that failed -- has
@@ -15759,6 +15805,10 @@ def _decode_8i_block_values(
             if i in Cursors:
                 (Opened, Rest) = _o8i_refcursor_cell(Rest)
                 OutValues.append(Opened)
+                continue
+            if i in Arrays:
+                (Array, Rest) = _read_pre10_array(Rest, _O8I_OUT_CELL_FROM_O8I)
+                OutValues.append(Array)
                 continue
             if i in Lobs:
                 (LobCell, Rest) = _O8I_LOB_OUT_CELL_FROM_O8I(Rest)
@@ -15781,6 +15831,7 @@ def o8i_block_complete(
     Data: bytes,
     Lobs: Mapping[int, tuple[int, int]] | None = None,
     Objects: frozenset[int] = frozenset(),
+    Arrays: frozenset[int] = frozenset(),
 ) -> bool:
     """Whether an 8i PL/SQL block's reply has arrived whole (#2334).
 
@@ -15803,7 +15854,9 @@ def o8i_block_complete(
             return False
         NumOut = sum(1 for Mask in Rest[:Count] if Mask & FV2_BIND_OUT)
         try:
-            Rest = _decode_8i_block_values(Data, NumOut, Lobs=Lobs, Objects=Objects)[1]
+            Rest = _decode_8i_block_values(
+                Data, NumOut, Lobs=Lobs, Objects=Objects, Arrays=Arrays
+            )[1]
         except (IndexError, Truncated):
             return False
         except (ValueError, DataError):
@@ -16215,14 +16268,18 @@ def _encode_9i_bind_oac(Value: object) -> bytes:
     # A national bind declares AL16UTF16 and charset form 2 -- where a native
     # client's VARCHAR bind carries 31 / 1 (native_9i_array_dml.pcap) -- and its
     # value rides as UTF-16BE (#798; through the database charset it lost every
-    # character Latin-1 lacks, as on the compact path, #174).
+    # character Latin-1 lacks, as on the compact path, #174). An associative
+    # array, as OCI 9.2 binds an index-by table, adds the array bit and the most
+    # elements it may hold (SeerODBC #172).
     National = _is_national_var(Value)
+    Array = _is_oci11_array_var(Value)
     return _native_bind_oac(
         DType,
-        Flag,
+        Flag | _OCI11_BIND_ARRAY if Array else Flag,
         Size,
         AL16UTF16_CHARSET if National else 0,
         2 if National else 0,
+        cast(Any, Value).num_elements if Array else 0,
     )
 
 
@@ -16664,6 +16721,17 @@ def _encode_9i_bind_value(Value: object) -> bytes:
 
     if _is_oci11_object_bind(Value):
         return _oci11_object_bind_value(Value)
+    if _is_oci11_array_var(Value):
+        # A national array's elements go as AL16UTF16, as its descriptor says.
+        National = _is_national_var(Value)
+        return _encode_pre10_array_value(
+            Value,
+            lambda Item: (
+                encode_token_rxd(Item.encode('utf-16-be'))
+                if National and isinstance(Item, str)
+                else _encode_9i_bind_value(Item)
+            ),
+        )
     Lob = _oci11_lob_bind(Value)
     if Lob is not None:
         # A LOB bound by its locator, the length ahead of it as a ub4; a NULL
@@ -17410,6 +17478,7 @@ def decode_9i_oall8_block_out(
     Cursors: frozenset[int] = frozenset(),
     Lobs: frozenset[int] = frozenset(),
     Objects: frozenset[int] = frozenset(),
+    Arrays: frozenset[int] = frozenset(),
 ) -> tuple[list, int, int, str | None]:
     # The OUT / IN OUT values a 9i OALL8 PL/SQL block returns (#794). The reply is
     # the IOV bind prompt, then (when the block writes binds) a TTI_RXD carrying one
@@ -17423,7 +17492,7 @@ def decode_9i_oall8_block_out(
     # with the bare status, no IOV: skipping the IOV's length there landed past the
     # status and read the error as success.
     (OutValues, Rest) = _o9i_oall8_block_parts(
-        Data, NumBinds, NumOut, Cursors, Lobs, Objects
+        Data, NumBinds, NumOut, Cursors, Lobs, Objects, Arrays
     )
     # `Rest` now sits on the RPA + OER, so read the status from there rather than
     # rescanning `Data` from the start -- the IOV and the OUT RXD hold value bytes
@@ -17440,15 +17509,17 @@ def decode_9i_oall8_block_cursor(
     Cursors: frozenset[int] = frozenset(),
     Lobs: frozenset[int] = frozenset(),
     Objects: frozenset[int] = frozenset(),
+    Arrays: frozenset[int] = frozenset(),
 ) -> int:
     # The cursor a 9i OALL8 block reply's status names, for the close that follows
     # (#798), read past the IOV and the OUT values as decode_9i_oall8_block_out
     # reads the status: a scan from the start landed on a `04` inside a 300-bind
     # IOV, and closing that bogus cursor (256) drew ORA-00600 [12209] and lost the
     # session.
-    return decode_9i_oall8_cursor_id(
-        _o9i_oall8_block_parts(Data, NumBinds, NumOut, Cursors, Lobs, Objects)[1]
+    (_, Rest) = _o9i_oall8_block_parts(
+        Data, NumBinds, NumOut, Cursors, Lobs, Objects, Arrays
     )
+    return decode_9i_oall8_cursor_id(Rest)
 
 
 # A LOB's OUT value on a native 9i session: the locator's length as a ub4, the
@@ -17470,6 +17541,7 @@ def _o9i_oall8_block_parts(
     Cursors: frozenset[int],
     Lobs: frozenset[int] = frozenset(),
     Objects: frozenset[int] = frozenset(),
+    Arrays: frozenset[int] = frozenset(),
 ) -> tuple[list, bytes]:
     # A 9i OALL8 block reply's OUT values, and the bytes after them -- the RPA and
     # the status (decode_9i_oall8_block_out).
@@ -17486,6 +17558,10 @@ def _o9i_oall8_block_parts(
                 # none for a NULL object.
                 (Cell, Rest) = _O9I_OBJECT_CELL_FROM_O9I(Rest)
                 OutValues.append(bytes(Cell['image']) if Cell['image_length'] else None)
+                continue
+            if Index in Arrays:
+                (Array, Rest) = _read_pre10_array(Rest, _O8I_CELL_FROM_O9I)
+                OutValues.append(Array)
                 continue
             if Index in Lobs and Length != 0xFF:
                 # A NULL comes back as the empty locator, its body all zero.

@@ -277,6 +277,8 @@ CAP_TPC = 'tpc'
 CAP_OBJECT_BIND = 'object_bind'
 # The dialect binds a REF itself (SeerODBC #172).
 CAP_REF_BIND = 'ref_bind'
+# The dialect binds a PL/SQL associative array in a block itself (SeerODBC #172).
+CAP_ARRAY_BIND = 'array_bind'
 # The dialect serves a server-side scrollable cursor -- its open and its
 # positioned fetches -- in its own form (#2466).
 CAP_SCROLL = 'scroll'
@@ -339,6 +341,26 @@ def _object_outs(bind: list, out_positions: list[int]) -> frozenset[int]:
         for i, pos in enumerate(out_positions)
         if isinstance(bind[pos], DbObject)
         or isinstance(getattr(_block_var(bind[pos]), 'dbtype', None), DbObjectType)
+    )
+
+
+def _o8i_out_positions(packet: bytes, bind: list, guess: list[int]) -> list[int]:
+    # The binds an 8i block's reply returns a value for: those its prompt marks
+    # OUT, as on 9i (#1242), with the count in 8i's encoding; the guess (every
+    # Var) for a reply without one.
+    directions = decode_fv2_bind_directions(packet, O8i=True)
+    if directions is not None and len(directions) == len(bind):
+        return [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
+    return guess
+
+
+def _array_outs(bind: list, out_positions: list[int]) -> frozenset[int]:
+    # The OUT binds a 9i or 8i block returns an associative array for (SeerODBC
+    # #172): each array Var's index among the OUT values.
+    return frozenset(
+        i
+        for i, pos in enumerate(out_positions)
+        if getattr(_block_var(bind[pos]), 'is_array', False)
     )
 
 
@@ -1189,8 +1211,8 @@ class Oall8Dialect:
 
     def capabilities(self) -> frozenset[str]:
         # 8i does query / DML / PL/SQL / LOB and drives its own COMMIT / ROLLBACK
-        # (no modern TTI_COMMIT); no array DML. It binds objects, collections
-        # and REFs as OCI 9.2 does (SeerODBC #172).
+        # (no modern TTI_COMMIT); no array DML. It binds objects, collections,
+        # REFs and associative arrays as OCI 9.2 does (SeerODBC #172).
         return frozenset(
             {
                 CAP_QUERY,
@@ -1200,6 +1222,7 @@ class Oall8Dialect:
                 CAP_OWN_TXN,
                 CAP_OBJECT_BIND,
                 CAP_REF_BIND,
+                CAP_ARRAY_BIND,
             }
         )
 
@@ -1267,10 +1290,19 @@ class Oall8Dialect:
         packet = received[1]
         # 8i marks no packet as a reply's last: read on until the reply is whole.
         # Read alone, the first packet of a long OUT value's reply ran off its
-        # end, and the rest answered the next call (#2334).
-        while not o8i_block_complete(
-            packet, _lob_outs(bind, out_positions), _object_outs(bind, out_positions)
-        ):
+        # end, and the rest answered the next call (#2334). Its OUT values are
+        # those the prompt marks, which an IN Var ahead of them is not: counted
+        # as one, the array behind it was read in the place of an IN OUT one
+        # and the reply never looked whole (SeerODBC #172).
+        while True:
+            outs = _o8i_out_positions(packet, bind, out_positions)
+            if o8i_block_complete(
+                packet,
+                _lob_outs(bind, outs),
+                _object_outs(bind, outs),
+                _array_outs(bind, outs),
+            ):
+                break
             received = yield RECV
             if received is False:
                 raise connection_closed('8i PL/SQL block')
@@ -1283,9 +1315,7 @@ class Oall8Dialect:
         _raise_ora(err_code, message)
         # Values come back only for the binds the block writes; the prompt says
         # which, as on 9i (#1242), with the count in 8i's encoding.
-        directions = decode_fv2_bind_directions(packet, O8i=True)
-        if directions is not None and len(directions) == len(bind):
-            out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
+        out_positions = _o8i_out_positions(packet, bind, out_positions)
         # A REF CURSOR's cell is the opened cursor's describe and id (#2710).
         cursors = frozenset(
             i for (i, pos) in enumerate(out_positions) if _is_cursor_var(bind[pos])
@@ -1293,12 +1323,15 @@ class Oall8Dialect:
         # Its cursor is in the status behind the prompt and the OUT values.
         lobs = _lob_outs(bind, out_positions)
         objects = _object_outs(bind, out_positions)
+        arrays = _array_outs(bind, out_positions)
         self._finished(
-            decode_8i_block_cursor(packet, len(out_positions), cursors, lobs, objects)
+            decode_8i_block_cursor(
+                packet, len(out_positions), cursors, lobs, objects, arrays
+            )
         )
         if out_positions:
             out_values = decode_8i_block_out(
-                packet, len(out_positions), cursors, lobs, objects
+                packet, len(out_positions), cursors, lobs, objects, arrays
             )
             # An object's image, of the Var's type, for the cursor to build the
             # DbObject from, as on 9i's native form.
@@ -1549,6 +1582,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 CAP_TEMP_LOB,
                 CAP_OBJECT_BIND,
                 CAP_REF_BIND,
+                CAP_ARRAY_BIND,
             }
         )
 
@@ -1819,16 +1853,17 @@ class Fv2Oall8Dialect(Oall8Dialect):
             for (i, pos) in enumerate(out_positions)
             if pos in Oci11Dialect._object_outs(bind)
         )
+        arrays = _array_outs(bind, out_positions)
         # The block's own cursor, closed with the next call, read from its status
         # past the IOV and the OUT values (#798).
         self._finished(
             decode_9i_oall8_block_cursor(
-                buf, len(bind), len(out_positions), cursors, lobs, objects
+                buf, len(bind), len(out_positions), cursors, lobs, objects, arrays
             )
         )
         if out_positions:
             (out_values, _row_count, err_code, message) = decode_9i_oall8_block_out(
-                buf, len(bind), len(out_positions), cursors, lobs, objects
+                buf, len(bind), len(out_positions), cursors, lobs, objects, arrays
             )
             _raise_ora(err_code, message)
             for i in lobs:

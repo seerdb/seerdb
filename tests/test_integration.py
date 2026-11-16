@@ -167,6 +167,7 @@ _8I_UNSUPPORTED = (
     ('multilevel', 'a collection of collections is a 9i+ type; Oracle 8i lacks it'),
     ('national_char', 'Oracle 8i predates AL16UTF16 NCHAR (WE8ISO8859P1 only)'),
     ('national_attribute', 'an Oracle 8i object type takes no NVARCHAR2 attribute'),
+    ('national_array', 'Oracle 8i predates AL16UTF16 NCHAR (WE8ISO8859P1 only)'),
     (
         'attributes_metadata',
         'the type covers TIMESTAMP and AL16UTF16 NVARCHAR2, which Oracle 8i lacks',
@@ -363,6 +364,15 @@ def _dialect_binds_objects(conn) -> bool:
     return Dialect is not None and CAP_OBJECT_BIND in Dialect.capabilities()
 
 
+def _dialect_binds_arrays(conn) -> bool:
+    # A pre-10g dialect that binds an associative array itself: 8i, and 9i's
+    # native form.
+    from seerdb.client.dialect import CAP_ARRAY_BIND
+
+    Dialect = getattr(conn, '_dialect', None)
+    return Dialect is not None and CAP_ARRAY_BIND in Dialect.capabilities()
+
+
 def _dialect_binds_refs(conn) -> bool:
     # A pre-12c dialect that binds a REF itself: 9i's compact form.
     from seerdb.client.dialect import CAP_REF_BIND
@@ -413,7 +423,8 @@ def _target_of(conn) -> _Target:
         or (
             getattr(conn, '_dialect', None) is None
             and conn.field_version >= FIELD_VERSION_10_2
-        ),
+        )
+        or _dialect_binds_arrays(conn),
         _session_runs_tpc(conn),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False))
@@ -679,7 +690,8 @@ _PACKAGE_TYPE_BIND = _Need(
     min_fv=_FV,
 )
 _ASSOC_ARRAY_BIND = _Need(
-    'an associative-array bind needs 12.1+ (#122), or 10g or 11g (#2706)',
+    'an associative-array bind needs 12.1+ (#122), 10g or 11g (#2706), 8i, '
+    "or 9i's native form",
     assoc_arrays=True,
 )
 _OBJECT_BIND = _Need(

@@ -7301,6 +7301,25 @@ NULLs of both, and an object IN and OUT through a block, in the OALL8 form of
   ORA-00600 [kokeermd1] on both servers. seerdb binds no NULL REF: a `None`
   names no type.
 
+**Associative arrays in the OALL8 form** (SeerODBC #172), measured with OCI 9.2
+against 8.1.7 and 9.2.0.4. It binds index-by tables (`OCIBindByPos` with a
+maximum array length) into a block: a `TABLE OF NUMBER` IN, a `TABLE OF
+VARCHAR2(20)` IN OUT, and a pure OUT one. Both servers take the same form:
+- **The descriptor** is a scalar's with the array bit (`0x40`) in the flags and
+  the most elements the array may hold as a ub4 behind the size: at +8 on 8i,
+  inside what §19.11 calls reserved (`02 43 00 00 16 00 00 00 03 00 00 00` and 13
+  zero bytes for three NUMBERs), and in the `max_array` field of OCI's own
+  descriptor on 9i.
+- **The value** is a ub4 count of the elements, then each element's value; a
+  NULL element is the OUT placeholder `fd 01`. A pure OUT array is the count 0
+  alone (`00 00 00 00`).
+- **An OUT array comes back** as the count, then each element as its value and
+  a ub2 indicator, `ffff` with an empty value for a NULL, then a ub2 return code
+  when the descriptor's flags ask for one (`0x04`), 1405 (`7d 05`) for a NULL.
+  OCI set it on the array it gave a return-code buffer; seerdb's 9i native
+  descriptor sets it (`0x45`), its 8i one (`0x43`) does not, and 8.1.7 then
+  sends no code.
+
 ### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals
@@ -8714,7 +8733,8 @@ OUT array with the count and one value plus return code per element.
 OCI 11.2 binds one the same way on 10g and 11g: flag `0x40` and the capacity in
 its descriptor's max-array field, the value as a ub4 count and the elements. An
 OUT array comes back as a ub4 count and each element's value, then a ub2
-indicator when the bind's flags ask for one.
+indicator when the bind's flags ask for one. OCI 9.2 binds one so to 8.1.7 and
+to 9.2's native form too (§19.17c); 9i's compact form does not bind one.
 
 ## 27. Proxy authentication (#126)
 
