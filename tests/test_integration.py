@@ -74,10 +74,6 @@ _FV2_UNSUPPORTED = (
         'error_then_large_lob',
         '9i takes no bind over 4000 bytes into a LOB column (#2260)',
     ),
-    # Behavioural features the fv2 path does not implement (#168): they now
-    # raise a clean NotSupportedError or exercise a capability 9i lacks, rather
-    # than silently misbehaving, so the tests skip on 9i.
-    ('ref_bind', 'REF / object types are not supported on Oracle 9i'),
     # 9i fetches objects over TTI_ALL7 (#2258). These read national text the
     # test writes as a SQL literal, which the 9i bed's WE8ISO8859P1 database
     # cannot hold (#174).
@@ -367,6 +363,14 @@ def _dialect_binds_objects(conn) -> bool:
     return Dialect is not None and CAP_OBJECT_BIND in Dialect.capabilities()
 
 
+def _dialect_binds_refs(conn) -> bool:
+    # A pre-12c dialect that binds a REF itself: 9i's compact form.
+    from seerdb.client.dialect import CAP_REF_BIND
+
+    Dialect = getattr(conn, '_dialect', None)
+    return Dialect is not None and CAP_REF_BIND in Dialect.capabilities()
+
+
 def _session_runs_tpc(conn) -> bool:
     # Two-phase commit: the thin form on 9.2 and later, and the native form on
     # 10g and 11g; not 8i, nor 9i's native OALL8 form (#2691).
@@ -412,7 +416,8 @@ def _target_of(conn) -> _Target:
         ),
         _session_runs_tpc(conn),
         conn.field_version >= FIELD_VERSION_12_1
-        or bool(getattr(conn, '_native11', False)),
+        or bool(getattr(conn, '_native11', False))
+        or _dialect_binds_refs(conn),
         temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
     )
 
@@ -647,7 +652,8 @@ _LOB_MODIFY = _Need(
 _FV = FIELD_VERSION_12_1
 _INVISIBLE_COLUMNS = _Need('INVISIBLE columns are 12.1+', min_fv=_FV)
 _REF_BIND = _Need(
-    'REF bind needs a 12.1+ server, or the native form on 10g and 11g', ref_binds=True
+    "REF bind needs a 12.1+ server, the native form on 10g and 11g, or 9i's compact form",
+    ref_binds=True,
 )
 _ROWS_RETURNING = _Need(
     'a RETURNING over several rows runs as a PL/SQL block below 10g and on a pooled '

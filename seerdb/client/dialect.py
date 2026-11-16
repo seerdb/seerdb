@@ -274,6 +274,8 @@ CAP_PING = 'ping'
 CAP_TPC = 'tpc'
 # The dialect binds an object or a collection, IN and OUT, itself.
 CAP_OBJECT_BIND = 'object_bind'
+# The dialect binds a REF itself (SeerODBC #172).
+CAP_REF_BIND = 'ref_bind'
 # The dialect serves a server-side scrollable cursor -- its open and its
 # positioned fetches -- in its own form (#2466).
 CAP_SCROLL = 'scroll'
@@ -402,6 +404,7 @@ class Fv2Dialect:
                 CAP_LOB_OBJECT,
                 CAP_TEMP_LOB,
                 CAP_OBJECT_BIND,
+                CAP_REF_BIND,
             }
         )
 

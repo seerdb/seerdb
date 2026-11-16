@@ -14842,8 +14842,22 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
             # DATE / RAW / INTERVAL); keep the historical value
         return _o7_oac(Type, MaxSize, Csfrm, Charset)
 
-    from seerdb.common.dbobject import DbObject, DbObjectType
+    from seerdb.common.dbobject import DbObject, DbObjectType, DbRef
 
+    if isinstance(Value, DbRef):
+        # A REF (SeerODBC #172), declared as ojdbc14 declares one to 9.2: type
+        # 111 at its length, with the OID of the type it refers to, version 1,
+        # charset 31 and form 0. Its value is its bytes.
+        if Value.type_oid is None:
+            from seerdb.common.exceptions import NotSupportedError
+
+            raise NotSupportedError(
+                'cannot bind a REF without its referenced type OID; the value must '
+                'come from a fetched DbRef whose describe carried the type identity'
+            )
+        return _o7_oac(
+            TNS_TYPE_REF, len(Value.bytes), 0, 31, Toid=Value.type_oid, Version=1
+        )
     Held = Value.getvalue(0) if isinstance(Value, Var) else Value
     if isinstance(Held, DbObject) or (
         isinstance(Value, Var) and isinstance(Value.dbtype, DbObjectType)

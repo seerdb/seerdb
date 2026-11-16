@@ -373,12 +373,12 @@ transactions, and the full async API — and much of what later versions add:
 array DML (`executemany`, with `batcherrors`), REF CURSOR OUT binds and nested
 `CURSOR()` columns, CLOB / BLOB OUT binds and LOBs returned by `RETURNING`,
 LOB objects (read, write, trim, size, open / close), object
-types fetched as `DbObject`s and bound IN and OUT, the cursor cache, `DatabaseError.offset`,
+types fetched as `DbObject`s and bound IN and OUT, REF binds, the cursor cache, `DatabaseError.offset`,
 `cursor.warning` and `cursor.bind_directions`. It lacks `BINARY_FLOAT` /
 `BINARY_DOUBLE`, a plain bind past 4000 bytes (declare a LONG / LONG RAW
 column's value `DB_TYPE_LONG` / `DB_TYPE_LONG_RAW`, and write a CLOB / BLOB
 through its locator; in a PL/SQL block a value past 32512 bytes goes as a
-temporary LOB), REF binds, array DML with `RETURNING`, and
+temporary LOB), array DML with `RETURNING`, and
 `changepassword`. Its DB charset also can't store text it doesn't cover, so use
 `DB_TYPE_NVARCHAR` / `NCHAR` for full Unicode there rather than a plain `str`
 bind.
