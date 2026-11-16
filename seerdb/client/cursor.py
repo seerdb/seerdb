@@ -1050,6 +1050,13 @@ def _assign_out_binds(Bind, Result, Connection=None) -> list:
             Variable._value = [
                 decode_value(Column, V if V else None) for V in Value['values']
             ]
+        elif isinstance(Value, (str, bytes)) and Variable.dbtype.tns_type in (
+            TNS_TYPE_CLOB,
+            TNS_TYPE_BLOB,
+        ):
+            # 8i's: the dialect read the LOB's content while the block's reply
+            # was in hand, as it reads a fetched one's (SeerODBC #167).
+            Variable._value = Value
         elif isinstance(Value, LOB):
             # A LOB-class OUT value arrives already built by the IOV reader
             # (#978); the connection is attached, and `fetch_lobs` honoured, by

@@ -4,7 +4,7 @@
 import base64
 import datetime
 import platform
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -15398,9 +15398,20 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
     # OUT / IN OUT `Var` declares its registered type + return-buffer size (#362).
     from seerdb.common.datatypes import Var
 
+    Flag = 0x03
     if isinstance(Value, Var):
         DType = Value.dbtype.tns_type
-        if DType == 2:  # NUMBER
+        if DType in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+            # A CLOB / BLOB is bound by its locator, as sqlplus 9.2 binds one to
+            # 8.1.7: flag 0x01, a size of 32, a CLOB's charset and form. Bound
+            # as the other Vars are, the server waited for a value that never
+            # came (SeerODBC #167).
+            Flag, MaxSize = 0x01, 0x20
+            if DType == TNS_TYPE_CLOB:
+                Charset, Csform = 31, Value.dbtype.csfrm
+            else:
+                Charset, Csform = 0, 0
+        elif DType == 2:  # NUMBER
             Charset, Csform, MaxSize = 0, 0, 22
         elif DType in (1, 96):  # VARCHAR2, CHAR
             Charset, Csform, MaxSize = 31, Value.dbtype.csfrm, max(Value.size, 1)
@@ -15429,7 +15440,7 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
     # worked; at >= 256 the little-endian form is required — otherwise the 8i
     # server mis-reads the size and rejects the bind as a LONG value (ORA-01461).
     return (
-        bytes([DType, 0x03, 0, 0])
+        bytes([DType, Flag, 0, 0])
         + min(MaxSize, 0xFFFF).to_bytes(2, 'little')
         + bytes(13)
         + Charset.to_bytes(4, 'big')
@@ -15440,6 +15451,36 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
 # A pure-OUT bind sends no input value: the 8i value section carries this fixed
 # placeholder in the bind's slot (#362, captured verbatim).
 _O8I_OUT_PLACEHOLDER = bytes([0xFD, 0x01])
+# A CLOB / BLOB bind's cell (SeerODBC #167): a ub4 length and, when it is not
+# zero, the locator; then the indicator, -1 for NULL. The value sqlplus 9.2
+# sends 8.1.7 for an OUT one is an empty 86-byte locator: its ub2 length and 84
+# zero bytes, `56000000 56 0054 00...`.
+_O8I_LOB_OUT_CELL: wire_schema.Schema = (
+    ('n4', 'length'),
+    ('when', 'length', (('value', 'locator'),)),
+    ('n2', 'indicator'),
+)
+_O8I_LOB_OUT_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_LOB_OUT_CELL, _O8I)
+_O8I_EMPTY_LOCATOR = b'\x00\x54' + bytes(84)
+
+
+def _pre10_lob_out(LobType: int, Csfrm: int, Cell: dict) -> object:
+    # A pre-10g CLOB / BLOB OUT bind's value (SeerODBC #167): a LOB of its
+    # locator, None for NULL. A RETURNING that returned a NULL LOB answers 9i
+    # with an uninitialised locator -- its ub2 length and zeros, the one the 8i
+    # bind sends -- not a NULL cell; a real locator's body is never all zero.
+    from seerdb.common.lob import LOB
+
+    Locator = bytes(Cell['locator']) if Cell['length'] else b''
+    if not any(Locator[2:]):
+        return None
+    return LOB(LobType, Locator, csfrm=Csfrm)
+
+
+def _encode_8i_lob_locator(Locator: bytes) -> bytes:
+    # A locator as an 8i CLOB / BLOB bind's value: a ub4 length, then the
+    # locator as a length-prefixed value.
+    return len(Locator).to_bytes(4, 'little') + bytes([len(Locator)]) + Locator
 
 
 def _encode_8i_bind_value(Value: object) -> bytes:
@@ -15448,7 +15489,18 @@ def _encode_8i_bind_value(Value: object) -> bytes:
     # value encoder (Oracle NUMBER, DATE, RAW, …). A pure-OUT `Var` sends the OUT
     # placeholder; an IN OUT `Var` (has_value) sends its input value inline.
     from seerdb.common.datatypes import Var
+    from seerdb.common.lob import LOB
 
+    if isinstance(Value, Var) and Value.dbtype.tns_type in (
+        TNS_TYPE_CLOB,
+        TNS_TYPE_BLOB,
+    ):
+        # A LOB goes as its locator, an OUT one's empty; 8i makes no temporary
+        # LOB, so text or bytes the Var holds have no locator to go as.
+        Held = Value._value if Value.has_value else None
+        if isinstance(Held, LOB):
+            return _encode_8i_lob_locator(bytes(Held.raw))
+        return _encode_8i_lob_locator(_O8I_EMPTY_LOCATOR)
     if isinstance(Value, Var):
         return (
             _encode_8i_bind_value(Value._value)
@@ -15497,7 +15549,10 @@ def decode_o8i_bfile_getlen(Packet: bytes) -> int:
 
 
 def decode_8i_block_out(
-    Data: bytes, NumOut: int, Cursors: frozenset[int] = frozenset()
+    Data: bytes,
+    NumOut: int,
+    Cursors: frozenset[int] = frozenset(),
+    Lobs: Mapping[int, tuple[int, int]] | None = None,
 ) -> list:
     # Decode the OUT / IN OUT return values from an 8i PL/SQL block reply
     # (docs/PROTOCOL.md §19.14). After the I/O vector (`_O8I_IOV`), the values
@@ -15505,8 +15560,9 @@ def decode_8i_block_out(
     # position order. Returns the raw value bytes per OUT bind (None for empty /
     # NULL, and for one the block never assigned), decoded against each Var's
     # declared type by the cursor. The OUT values at `Cursors` are REF CURSORs,
-    # each (cursor id, columns) (#2710).
-    return _decode_8i_block_values(Data, NumOut, Cursors)[0]
+    # each (cursor id, columns) (#2710); those at `Lobs` CLOBs and BLOBs, each a
+    # LOB of its locator (SeerODBC #167).
+    return _decode_8i_block_values(Data, NumOut, Cursors, Lobs)[0]
 
 
 def decode_8i_block_cursor(
@@ -15518,11 +15574,15 @@ def decode_8i_block_cursor(
 
 
 def _decode_8i_block_values(
-    Data: bytes, NumOut: int, Cursors: frozenset[int] = frozenset()
+    Data: bytes,
+    NumOut: int,
+    Cursors: frozenset[int] = frozenset(),
+    Lobs: Mapping[int, tuple[int, int]] | None = None,
 ) -> tuple[list, bytes]:
     # The OUT values of an 8i block's reply and the status after them; a reply
     # without the I/O vector -- the status alone of a block that failed -- has
     # none.
+    Lobs = Lobs or {}
     Iov = _o8i_iov(Data)
     Rest = Data if Iov is None else Iov[1]
     OutValues: list = []
@@ -15537,12 +15597,18 @@ def _decode_8i_block_values(
                 (Opened, Rest) = _o8i_refcursor_cell(Rest)
                 OutValues.append(Opened)
                 continue
+            if i in Lobs:
+                (LobCell, Rest) = _O8I_LOB_OUT_CELL_FROM_O8I(Rest)
+                OutValues.append(_pre10_lob_out(*Lobs[i], LobCell))
+                continue
             (Cell, Rest) = _O8I_OUT_CELL_FROM_O8I(Rest)
             OutValues.append(bytes(Cell['value']) or None)
     return OutValues, Rest
 
 
-def o8i_block_complete(Data: bytes) -> bool:
+def o8i_block_complete(
+    Data: bytes, Lobs: Mapping[int, tuple[int, int]] | None = None
+) -> bool:
     """Whether an 8i PL/SQL block's reply has arrived whole (#2334).
 
     8i caps each data packet at the SDU and marks none as a message's last, so
@@ -15564,7 +15630,7 @@ def o8i_block_complete(Data: bytes) -> bool:
             return False
         NumOut = sum(1 for Mask in Rest[:Count] if Mask & FV2_BIND_OUT)
         try:
-            Rest = _decode_8i_block_values(Data, NumOut)[1]
+            Rest = _decode_8i_block_values(Data, NumOut, Lobs=Lobs)[1]
         except (IndexError, Truncated):
             return False
         except (ValueError, DataError):
@@ -17945,7 +18011,9 @@ def decode_fv2_bind_directions(Data: bytes, O8i: bool = False) -> list[int] | No
 _FV2_OUT_UNASSIGNED = bytes.fromhex('ff020c21')
 
 
-def decode_fv2_block_out(Data: bytes, NumOut: int) -> tuple[list, int, int]:
+def decode_fv2_block_out(
+    Data: bytes, NumOut: int, Lobs: Mapping[int, tuple[int, int]] | None = None
+) -> tuple[list, int, int]:
     # Parse a 9i PL/SQL block reply that returns OUT / IN OUT values (#102,
     # PROTOCOL §19.7). After any bind prompt is stripped, the reply is an
     # optional TTI_RXD (07) carrying `NumOut` × (DALC value + 1-byte indicator)
@@ -17953,12 +18021,20 @@ def decode_fv2_block_out(Data: bytes, NumOut: int) -> tuple[list, int, int]:
     # (out_values, rowcount, ora_code); out_values holds the raw value bytes per
     # OUT bind (None for a NULL OUT), to be decoded by the caller against each
     # Var's declared type.
+    #
+    # The OUT values at `Lobs` -- each OUT index's (CLOB or BLOB type, csfrm) --
+    # are a column's LOB cell, not a value: a ub4 length, the locator and the
+    # indicator (`_O7_LOB_CELL`, §19.5), `00 81 01` for NULL, as ojdbc14 reads
+    # them. Each comes back as a LOB of the locator, read as a fetched one is.
+    # Read as a value, the length's first byte was taken for a one-byte value
+    # (SeerODBC #167).
+    Lobs = Lobs or {}
     Iov = _o7_iov(Data)
     Rest = Data if Iov is None else Iov[1]
     OutValues: list = []
     if NumOut > 0 and Rest and Rest[0] == TTI_RXD:
         Rest = Rest[1:]
-        for _ in range(NumOut):
+        for i in range(NumOut):
             if Rest[:4] == _FV2_OUT_UNASSIGNED:
                 # The block never assigned this OUT bind, which is what a
                 # `RETURNING ... INTO` that matched no rows produces. It is a
@@ -17968,6 +18044,10 @@ def decode_fv2_block_out(Data: bytes, NumOut: int) -> tuple[list, int, int]:
                 # bytes and desynced every OUT bind after it (#801).
                 Rest = Rest[4:]
                 OutValues.append(None)
+                continue
+            if i in Lobs:
+                (LobCell, Rest) = _O7_LOB_CELL_FROM_THIN(Rest)
+                OutValues.append(_pre10_lob_out(*Lobs[i], LobCell))
                 continue
             # A value and its indicator, as in a row (`_O7_CELL`): -1 for NULL.
             (Cell, Rest) = _O7_CELL_FROM_THIN(Rest)
