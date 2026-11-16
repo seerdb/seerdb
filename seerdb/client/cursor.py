@@ -1131,7 +1131,7 @@ def _decode_returned_object(Typ: object, Image: object, Connection=None) -> obje
         # A Var declared with a plain DB_TYPE_OBJECT carries no layout, so the
         # image cannot be walked; hand back the placeholder rather than guess.
         return Image
-    Charset = Image.charset or AL32UTF8_CHARSET
+    Charset = _image_charset(Image, Connection)
     Name = Typ.name or Image.type_name
     if Typ.is_collection:
         (Elements, Keys) = decode_collection_keyed(
@@ -1568,6 +1568,20 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
                 )
 
 
+def _image_charset(Image, Connection) -> int:
+    # The charset an object's or a collection's image holds its text in: the
+    # database's, as the login's TTI_PRO names it, not the session's. A
+    # WE8ISO8859P1 database (the 8i and 9i beds) sends `'café'` as `63 61 66 e9`
+    # inside the image where a VARCHAR2 column of it comes as the session's
+    # UTF-8; read as UTF-8, the attribute came back `'caf\ufffd'`. AL32UTF8
+    # when the login named none.
+    return (
+        Image.charset
+        or getattr(Connection, '_server_charset', None)
+        or AL32UTF8_CHARSET
+    )
+
+
 def _resolve_objects(Connection, Row: list) -> list:
     # Turn any object (ADT) placeholders into DbObjects (#115). The row decoder
     # kept the packed image without decoding it (the attribute layout isn't
@@ -1600,7 +1614,7 @@ def _resolve_objects(Connection, Row: list) -> list:
                     Out[I] = XmlVal
                 continue
             Typ = Connection._describe_object_type(Val.type_schema, Val.type_name)
-            Charset = Val.charset or AL32UTF8_CHARSET
+            Charset = _image_charset(Val, Connection)
             if Typ is not None and Typ.is_collection:
                 (Elements, Keys) = decode_collection_keyed(
                     Val.image, Typ.element or {}, Charset

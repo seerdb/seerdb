@@ -344,6 +344,11 @@ class DbObjectType:
         self.collection_type = collection_type
         self.element = element  # one layout dict, or None
         self.max_elements = max_elements
+        # The charset an image of the type holds its text in: the database's,
+        # which the connection that describes the type sets. The server reads
+        # and writes an image's text in it, not the session's: a WE8ISO8859P1
+        # database stored an image's UTF-8 'café' as 'cafÃ©'. None: AL32UTF8.
+        self.db_charset: int | None = None
 
     @property
     def full_name(self) -> str:

@@ -7637,8 +7637,16 @@ raises `NotSupportedError`.
 
 That includes the character set (#1433). An `NVARCHAR2` / `NCHAR` attribute, or
 a collection of them, carries **AL16UTF16** (UTF-16BE) in the image, as a
-national column does. Everything else carries the session's AL32UTF8. Measured
-on 23ai: `N'žába 猫'` stored correctly dumps as 12 bytes
+national column does. Everything else carries the **database's** charset, the
+one the login's TTI_PRO names, not the session's. They are the same on an
+AL32UTF8 database. On the WE8ISO8859P1 8i and 9i beds a column of `'café'`
+comes in the session's charset, but `SELECT t('café') FROM dual` for `t (s
+VARCHAR2(20))` sends `84 01 08 04 63 61 66 e9` to every form, 8i's, 9i's compact
+and native. 10g, 11g and 23ai send `63 61 66 c3 a9`. Both ways: an image bound
+with the UTF-8 bytes was stored by 8.1.7 and 9.2 as `'cafÃ©'`, five characters.
+seerdb reads an image in the connection's database charset and writes one in
+the charset of the database its type was described on
+(`DbObjectType.db_charset`), AL32UTF8 when neither is known. Measured on 23ai: `N'žába 猫'` stored correctly dumps as 12 bytes
 (`01 7e 00 e1 00 62 …`). An image that writes the attribute as UTF-8 stores its
 10 UTF-8 bytes in their place, a different 5-character string. The server takes
 the bytes as they come, and seerdb read its own UTF-8 back as the right text, so

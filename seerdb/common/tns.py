@@ -22258,10 +22258,11 @@ def _encode_object_attr(DataType: int, Charset: int, Value: Any) -> bytes:
         if isinstance(Value, (bytes, bytearray)):
             return bytes(Value)
         # A national attribute (NVARCHAR2 / NCHAR) is AL16UTF16 in the image,
-        # as in a column (#1433); everything else is the AL32UTF8 session's.
-        if Charset == AL16UTF16_CHARSET:
-            return str(Value).encode('utf-16-be')
-        return str(Value).encode('utf-8')
+        # as in a column (#1433); everything else is in the database's charset
+        # (DbObjectType.db_charset), AL32UTF8 when none is known.
+        from seerdb.common.types import _CHARSET_PYTHON_NAME
+
+        return str(Value).encode(_CHARSET_PYTHON_NAME.get(Charset, 'utf-8'))
     if DataType == TNS_TYPE_NUMBER:
         if isinstance(Value, Decimal):
             return encode_token_decimal(Value)
@@ -22336,8 +22337,14 @@ def encode_object_image(Obj: 'DbObject') -> bytes:
     return _encode_object_image(Obj, header=True)
 
 
-def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
+def _encode_object_image(
+    Obj: 'DbObject', *, header: bool, Charset: int | None = None
+) -> bytes:
+    # `Charset`: the text's, the database's the type was described in
+    # (DbObjectType.db_charset), handed down to the members of a nested object
+    # whose own type names none.
     Typ = Obj._dbtype
+    Charset = (Typ.db_charset if Typ is not None else None) or Charset
     if Typ is not None and Typ.is_collection:
         from seerdb.common.dbobject import (
             _COLL_HAS_INDEXES,
@@ -22367,7 +22374,9 @@ def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
                 # 23ai sends -1048576 as ff f0 00 00). Packing '>I' agrees for
                 # every key a dense 1..N array has and raises on a real one.
                 Body += struct.pack('>i', Key)
-            Body += _encode_object_member(Value, Element, in_collection=True)
+            Body += _encode_object_member(
+                Value, Element, in_collection=True, Charset=Charset
+            )
         # Collection header = flags, version, long-form length, prefix seg (01 01).
         Total = 9 + len(Body)
         return (
@@ -22385,7 +22394,7 @@ def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
     Body = b''
     for Attr in Typ.attrs:
         Body += _encode_object_member(
-            Obj._attrs.get(Attr['name']), Attr, in_collection=False
+            Obj._attrs.get(Attr['name']), Attr, in_collection=False, Charset=Charset
         )
     if not header:
         # A nested object attribute embeds its attributes inline, no header.
@@ -22400,7 +22409,9 @@ def _encode_object_image(Obj: 'DbObject', *, header: bool) -> bytes:
     )
 
 
-def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> bytes:
+def _encode_object_member(
+    Value: object, Attr: dict, *, in_collection: bool, Charset: int | None = None
+) -> bytes:
     from seerdb.common.dbobject import (
         _IMAGE_INT32_TYPES,
         _OBJ_ATOMIC_NULL,
@@ -22421,16 +22432,22 @@ def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> 
     if Nested is not None and getattr(Nested, 'is_collection', False):
         if Value is None:
             return bytes([TNS_NULL_LENGTH_INDICATOR])
-        Image = _encode_object_image(cast(DbObject, Value), header=True)
+        Image = _encode_object_image(
+            cast(DbObject, Value), header=True, Charset=Charset
+        )
         return _obj_write_length(len(Image)) + Image
     if Nested is not None:
         if Value is None:
             return bytes([_OBJ_ATOMIC_NULL])
         if in_collection:
-            Image = _encode_object_image(cast(DbObject, Value), header=True)
+            Image = _encode_object_image(
+                cast(DbObject, Value), header=True, Charset=Charset
+            )
             return _obj_write_length(len(Image)) + Image
         # An object attribute of an object: its attributes inline, no header.
-        return _encode_object_image(cast(DbObject, Value), header=False)
+        return _encode_object_image(
+            cast(DbObject, Value), header=False, Charset=Charset
+        )
     if Attr.get('data_type') in _IMAGE_INT32_TYPES:
         # A BOOLEAN or PL/SQL integer member is a ub4 in the image (#1607).
         if Value is None:
@@ -22438,7 +22455,7 @@ def _encode_object_member(Value: object, Attr: dict, *, in_collection: bool) -> 
         return encode_image_int32(cast(int, Value))
     return _encode_object_attr_field(
         cast(int, Attr.get('data_type')),
-        Attr.get('charset') or AL32UTF8_CHARSET,
+        Attr.get('charset') or Charset or AL32UTF8_CHARSET,
         Value,
     )
 

@@ -17,6 +17,7 @@ from seerdb.client.cursor import (
     _col_annotations,
     _column_description,
     _extract_implicit_results,
+    _image_charset,
     _iov_directions,
     _object_bind_lob_values,
     _object_with_lobs,
@@ -450,7 +451,7 @@ class AsyncCursor(_CursorLogic):
                     Typ = await self._connection._describe_object_type(
                         Val.type_schema, Val.type_name
                     )
-                    Charset = Val.charset or AL32UTF8_CHARSET
+                    Charset = _image_charset(Val, self._connection)
                     if Typ is not None and Typ.is_collection:
                         (Elements, Keys) = decode_collection_keyed(
                             Val.image, Typ.element or {}, Charset
