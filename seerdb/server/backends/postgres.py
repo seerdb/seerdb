@@ -267,7 +267,14 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from collections.abc import (
+    Callable,
+    Collection,
+    Container,
+    Iterable,
+    Iterator,
+    Sequence,
+)
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -11003,8 +11010,9 @@ def _computed_national_columns(sql: str) -> dict[int, int]:
     return found
 
 
-@_kept_per_text
-def _computed_column_types(sql: str) -> dict[int, int]:
+def _computed_column_types(
+    sql: str, names: Sequence[str] = (), untraced: Container[int] = ()
+) -> dict[int, int]:
     """The select-list positions of a query whose Oracle type the item says.
 
     An IntervalYM bind reaches PostgreSQL as `make_interval(months => ...)`, a
@@ -11019,44 +11027,341 @@ def _computed_column_types(sql: str) -> dict[int, int]:
     call inside an expression, or a statement that is not a plain SELECT, maps
     nothing. TO_NCLOB is left out: an NCLOB is a CLOB in the national character
     set, which the LOB column shape does not carry.
+
+    Such an item inside a derived table, a LATERAL subquery (as JSON_TABLE's
+    translation writes one) or a CTE loses its type all the same: PostgreSQL
+    gives a domain's base type wherever the value passes through (#2694). So a
+    column ``untraced`` lists, one with no table origin, takes the type of the
+    source item it names, by ``name`` or ``q.name``, or by ``*`` or ``q.*``.
+    A star expands to columns the text does not list, so those are matched by
+    the names the description gives (``names``), and only a name that no other
+    candidate gives with another type maps.
     """
-    words, _rownums = _top_level_words(sql)
-    if not words or words[0][1] != 'SELECT':
-        return {}
-    start = words[0][0] + len('SELECT')
-    end = next((pos for pos, word in words if word == 'FROM'), len(sql))
-    items = [sql[s:e].strip() for s, e in _top_level_items(sql, start, end)]
-    if any(item == '*' or item.endswith('.*') for item in items):
-        return {}  # the positions are the expanded columns', not the items'
+    (own, referenced, by_name) = _column_reading(sql)
+    if by_name is None:
+        found = dict(own)
+        found.update((i, kind) for i, kind in referenced.items() if i in untraced)
+        return found
     found = {}
-    for index, item in enumerate(items):
-        ym = _INTERVALYM_BIND_ITEM.match(item) or _INTERVALYM_LITERAL_ITEM.match(item)
-        if ym is not None and _ITEM_ALIAS.fullmatch(item[ym.end() :].strip()):
-            found[index] = TNS_TYPE_INTERVALYM
-            continue
-        call = _INTERVALYM_CALL_ITEM.match(item)
-        if call is not None:
-            close = _matching_paren(item, call.end() - 1)
-            if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
-                found[index] = TNS_TYPE_INTERVALYM
-                continue
-        rowid = _ROWID_CALL_ITEM.match(item)
-        if rowid is not None:
-            # The ROWID pseudo-column, as the rewrite writes it: text here, a
-            # ROWID to Oracle (#2083).
-            close = _matching_paren(item, rowid.end() - 1)
-            if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
-                found[index] = TNS_TYPE_RID
-            continue
-        call = _LOB_CALL_ITEM.match(item)
-        if call is None:
-            continue
-        close = _matching_paren(item, call.end() - 1)
-        if close >= len(item) or not _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
-            continue
-        name = call.group(1).lower()
-        found[index] = TNS_TYPE_CLOB if name.endswith('clob') else TNS_TYPE_BLOB
+    for index, name in enumerate(names):
+        kind = by_name.get(name)
+        if kind is not None and index in untraced:
+            found[index] = kind
     return found
+
+
+@_kept_per_text
+def _column_reading(
+    sql: str,
+) -> tuple[dict[int, int], dict[int, int], dict[str, int] | None]:
+    # What _computed_column_types reads of a query's text, kept per text: the
+    # positions whose item says its type, those whose column reference takes
+    # one from a source, and, where a star leaves the positions unknown
+    # instead, the types by column name (a name some item gives with another
+    # type, or none, left out).
+    shape = _query_shape(sql, {})
+    if shape is None:
+        return ({}, {}, None)
+    (items, sources) = shape
+    if not any(_is_star(item) for item in items):
+        own: dict[int, int] = {}
+        referenced: dict[int, int] = {}
+        for index, item in enumerate(items):
+            kind = _item_type(item)
+            if kind is not None:
+                own[index] = kind
+                continue
+            kind = _referenced_type(item, sources)
+            if kind is not None:
+                referenced[index] = kind
+        return (own, referenced, None)
+    candidates: dict[str, set[int | None]] = {}
+    for item in items:
+        for name, kind in _item_columns(item, sources).items():
+            candidates.setdefault(name, set()).add(kind)
+    by_name: dict[str, int] = {}
+    for name, kinds in candidates.items():
+        if len(kinds) == 1:
+            (kind,) = kinds
+            if kind is not None:
+                by_name[name] = kind
+    return ({}, {}, by_name)
+
+
+def _item_type(item: str) -> int | None:
+    # The Oracle type a select-list item says by itself (_computed_column_types),
+    # or None.
+    ym = _INTERVALYM_BIND_ITEM.match(item) or _INTERVALYM_LITERAL_ITEM.match(item)
+    if ym is not None and _ITEM_ALIAS.fullmatch(item[ym.end() :].strip()):
+        return TNS_TYPE_INTERVALYM
+    call = _INTERVALYM_CALL_ITEM.match(item)
+    if call is not None:
+        close = _matching_paren(item, call.end() - 1)
+        if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+            return TNS_TYPE_INTERVALYM
+    rowid = _ROWID_CALL_ITEM.match(item)
+    if rowid is not None:
+        # The ROWID pseudo-column, as the rewrite writes it: text here, a
+        # ROWID to Oracle (#2083).
+        close = _matching_paren(item, rowid.end() - 1)
+        if close < len(item) and _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+            return TNS_TYPE_RID
+        return None
+    call = _LOB_CALL_ITEM.match(item)
+    if call is None:
+        return None
+    close = _matching_paren(item, call.end() - 1)
+    if close >= len(item) or not _ITEM_ALIAS.fullmatch(item[close + 1 :].strip()):
+        return None
+    return TNS_TYPE_CLOB if call.group(1).lower().endswith('clob') else TNS_TYPE_BLOB
+
+
+# The parts of a query that _computed_column_types follows into its sources
+# (#2694): a name as written, an item that is one column reference, a CTE's
+# head, and the words that end a FROM clause or cannot be a source's alias.
+_SOURCE_NAME = r'(?:"[^"]*"|[A-Za-z_][\w$#]*)'
+_REFERENCE_ITEM = re.compile(
+    rf'(?:({_SOURCE_NAME})\s*\.\s*)?({_SOURCE_NAME})'
+    rf'(?:\s+(?:AS\s+)?({_SOURCE_NAME}))?',
+    re.IGNORECASE,
+)
+_ALIASED_ITEM = re.compile(
+    rf'.*?\s(?:AS\s+)?({_SOURCE_NAME})', re.IGNORECASE | re.DOTALL
+)
+_CALL_NAME = re.compile(r'(?:[A-Za-z_][\w$#]*\s*\.\s*)?([A-Za-z_][\w$#]*)\s*\(')
+_CTE_NAME = re.compile(rf'\s*(?:RECURSIVE\s+)?({_SOURCE_NAME})\s*', re.IGNORECASE)
+_CTE_BODY = re.compile(r'\s*AS\s+(?:NOT\s+)?(?:MATERIALIZED\s+)?\(', re.IGNORECASE)
+_FROM_END_WORDS = frozenset(
+    {
+        'WHERE',
+        'GROUP',
+        'HAVING',
+        'ORDER',
+        'CONNECT',
+        'START',
+        'UNION',
+        'INTERSECT',
+        'EXCEPT',
+        'MINUS',
+        'FETCH',
+        'OFFSET',
+        'LIMIT',
+        'WINDOW',
+        'FOR',
+        'RETURNING',
+    }
+)
+_NOT_AN_ALIAS = _FROM_END_WORDS | {
+    'AS',
+    'JOIN',
+    'INNER',
+    'LEFT',
+    'RIGHT',
+    'FULL',
+    'OUTER',
+    'CROSS',
+    'NATURAL',
+    'ON',
+    'USING',
+    'LATERAL',
+    'TABLESAMPLE',
+}
+
+# A source's columns by output name: the Oracle type an item says, or None.
+_SourceColumns = dict[str, int | None]
+
+
+def _output_name(name: str) -> str:
+    # A name as PostgreSQL gives it: a quoted one as written, else folded.
+    return name[1:-1] if name.startswith('"') else name.lower()
+
+
+def _is_star(item: str) -> bool:
+    return item == '*' or item.endswith('.*')
+
+
+def _query_shape(
+    sql: str, ctes: dict[str, _SourceColumns]
+) -> tuple[list[str], dict[str, _SourceColumns]] | None:
+    # A query's select-list items, and the columns of each source in its FROM
+    # clause that is a derived table, a LATERAL subquery or one of the CTEs
+    # (by alias, else a key of its own); None when `sql` is no query.
+    words, _rownums = _top_level_words(sql)
+    if not words:
+        return None
+    if words[0][1] == 'WITH':
+        ctes = dict(ctes)
+        pos = _cte_columns(sql, words[0][0] + len('WITH'), ctes)
+        return None if pos is None else _query_shape(sql[pos:], ctes)
+    if words[0][1] != 'SELECT':
+        return None
+    start = words[0][0] + len('SELECT')
+    from_at = next((pos for pos, word in words if word == 'FROM'), None)
+    end = len(sql) if from_at is None else from_at
+    items = [sql[s:e].strip() for s, e in _top_level_items(sql, start, end)]
+    if from_at is None:
+        return (items, {})
+    from_end = next(
+        (pos for pos, word in words if pos > from_at and word in _FROM_END_WORDS),
+        len(sql),
+    )
+    return (items, _from_sources(sql, from_at + len('FROM'), from_end, ctes))
+
+
+def _cte_columns(sql: str, pos: int, ctes: dict[str, _SourceColumns]) -> int | None:
+    # Read the CTEs of a WITH from `pos` into `ctes`; where its query begins, or
+    # None when the list is not one this reads.
+    while True:
+        head = _CTE_NAME.match(sql, pos)
+        if head is None:
+            return None
+        name = _output_name(head.group(1))
+        pos = head.end()
+        renamed = None
+        if sql.startswith('(', pos):
+            close = _matching_paren(sql, pos)
+            renamed = [
+                _output_name(sql[s:e].strip())
+                for s, e in _top_level_items(sql, pos + 1, close)
+            ]
+            pos = close + 1
+        body = _CTE_BODY.match(sql, pos)
+        if body is None:
+            return None
+        close = _matching_paren(sql, body.end() - 1)
+        columns = _source_columns(sql[body.end() : close], ctes)
+        if renamed is not None:
+            # A column list renames the query's columns by position, which a
+            # star leaves unknown; a list as long as the columns renames them.
+            values = list(columns.values())
+            columns = dict(zip(renamed, values)) if len(values) == len(renamed) else {}
+        ctes[name] = columns
+        rest = re.compile(r'\s*,').match(sql, close + 1)
+        if rest is None:
+            return close + 1
+        pos = rest.end()
+
+
+def _from_sources(
+    sql: str, start: int, end: int, ctes: dict[str, _SourceColumns]
+) -> dict[str, _SourceColumns]:
+    # The columns of each query source in sql[start:end], a FROM clause.
+    if '(' not in sql[start:end] and not ctes:
+        return {}
+    tokens = [
+        token
+        for token in _token_tuple(sql)
+        if start <= token.start < end and token.kind not in ('space', 'comment')
+    ]
+    sources: dict[str, _SourceColumns] = {}
+    skip_to = start
+    for index, token in enumerate(tokens):
+        if token.start < skip_to:
+            continue
+        text = sql[token.start : token.end]
+        columns = None
+        if text == '(':
+            close = _matching_paren(sql, token.start)
+            skip_to = close + 1
+            inner = sql[token.start + 1 : close]
+            words, _rownums = _top_level_words(inner)
+            if words and words[0][1] in ('SELECT', 'WITH'):
+                columns = _source_columns(inner, ctes)
+            after = next(
+                (i for i in range(index + 1, len(tokens)) if tokens[i].start > close),
+                len(tokens),
+            )
+        elif token.kind in ('word', 'identifier') and _output_name(text) in ctes:
+            previous = sql[tokens[index - 1].start] if index else ''
+            if previous == '.' or text.upper() in _NOT_AN_ALIAS:
+                continue
+            columns = ctes[_output_name(text)]
+            after = index + 1
+        if columns is None:
+            continue
+        alias = None
+        if (
+            after < len(tokens)
+            and sql[tokens[after].start : tokens[after].end].upper() == 'AS'
+        ):
+            after += 1
+        if after < len(tokens) and tokens[after].kind in ('word', 'identifier'):
+            word = sql[tokens[after].start : tokens[after].end]
+            if word.upper() not in _NOT_AN_ALIAS:
+                alias = _output_name(word)
+                skip_to = max(skip_to, tokens[after].end)
+        if alias is None and text != '(':
+            alias = _output_name(text)
+        sources[alias if alias is not None else f'\x00{len(sources)}'] = columns
+    return sources
+
+
+def _source_columns(sql: str, ctes: dict[str, _SourceColumns]) -> _SourceColumns:
+    # The columns a query gives as a source, by output name, with the Oracle
+    # type each item says or passes on from a source of its own.
+    shape = _query_shape(sql, ctes)
+    if shape is None:
+        return {}
+    (items, sources) = shape
+    columns: _SourceColumns = {}
+    for item in items:
+        for name, kind in _item_columns(item, sources).items():
+            columns[name] = kind if columns.get(name, kind) == kind else None
+    return columns
+
+
+def _item_columns(item: str, sources: dict[str, _SourceColumns]) -> _SourceColumns:
+    # The columns one select-list item gives, by output name: a star a
+    # source's (every source's, for `*`), else the item's own.
+    if _is_star(item):
+        if item == '*':
+            picked = list(sources.values())
+        else:
+            qualifier = _output_name(item[:-1].rstrip().rstrip('.').strip())
+            picked = [sources[qualifier]] if qualifier in sources else []
+        columns: _SourceColumns = {}
+        for source in picked:
+            for name, kind in source.items():
+                columns[name] = kind if columns.get(name, kind) == kind else None
+        return columns
+    kind = _item_type(item)
+    if kind is None:
+        kind = _referenced_type(item, sources)
+    output = _item_output_name(item)
+    return {} if output is None else {output: kind}
+
+
+def _item_output_name(item: str) -> str | None:
+    # The name PostgreSQL gives an item's column: its alias, a referenced
+    # column's own, or a call's function's; None when none of these says.
+    reference = _REFERENCE_ITEM.fullmatch(item)
+    if reference is not None:
+        return _output_name(reference.group(3) or reference.group(2))
+    call = _CALL_NAME.match(item)
+    if call is not None:
+        close = _matching_paren(item, call.end() - 1)
+        tail = item[close + 1 :].strip()
+        if not tail:
+            return call.group(1).lower()
+    aliased = _ALIASED_ITEM.fullmatch(item)
+    if aliased is not None and aliased.group(1).upper() not in _NOT_AN_ALIAS:
+        return _output_name(aliased.group(1))
+    return None
+
+
+def _referenced_type(item: str, sources: dict[str, _SourceColumns]) -> int | None:
+    # The Oracle type of the source column an item that is one column
+    # reference names, when its source says one and no other source gives the
+    # name another; else None.
+    reference = _REFERENCE_ITEM.fullmatch(item)
+    if reference is None or not sources:
+        return None
+    name = _output_name(reference.group(2))
+    if reference.group(1) is not None:
+        source = sources.get(_output_name(reference.group(1)))
+        return None if source is None else source.get(name)
+    kinds = {source[name] for source in sources.values() if name in source}
+    return kinds.pop() if len(kinds) == 1 else None
 
 
 # A select-list item Oracle describes with nine fractional digits, where a
@@ -22812,7 +23117,19 @@ class PostgresBackend:
         # its binds, whose declared sizes an expression over them describes by.
         if cursor.description is None:
             return Result(rowcount=max(cursor.rowcount, 0))
-        computed = _computed_column_types(sql) if sql else {}
+        computed = (
+            _computed_column_types(
+                sql,
+                [desc.name for desc in cursor.description],
+                {
+                    i
+                    for i in range(len(cursor.description))
+                    if not cursor.pgresult.ftable(i)
+                },
+            )
+            if sql
+            else {}
+        )
         constructors = _constructor_items(sql) if sql else {}
         rows = [list(r) for r in cursor.fetchall()]
         # Re-tag the zoned cells before they reach the wire encoder (_wire_cell).
