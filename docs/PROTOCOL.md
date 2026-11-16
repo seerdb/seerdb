@@ -7285,6 +7285,22 @@ NULLs of both, and an object IN and OUT through a block, in the OALL8 form of
 - **ojdbc14 speaks the compact form to 8.1.7 too** (`03 47`), with the same
   bytes as on 9i above.
 
+**REFs in the OALL8 form** (SeerODBC #168/#172), measured with OCI 9.2 against
+8.1.7 and 9.2.0.4. It fetches `REF(o)` from an object table, defined as a REF
+(`SQLT_REF`), and binds it into an INSERT:
+- **8.1.7 serves the fetch in the execute's reply**, with no define call. The
+  describe gives type `6f` with the referred-to type's OID, schema and name, as
+  an object column's does. The row cell is the REF's bytes as a value (`2a` + 42
+  bytes), then the indicator and return code every 8i cell has. sqlplus 9.2
+  gets ORA-00932 for the same query: it has no REF to define.
+- **The descriptor** is the object's with type `6f`: on 8i the 42 bytes above;
+  on 9i's native form OCI 11.2's to 10g and 11g, `00 6f 00 00 00 d0 07 00 00`, 9
+  zero bytes, the OID's length and the OID, version `01 00`, 8 zero bytes. The
+  value is the REF's bytes as a value.
+- **No NULL REF.** An OCIRef never filled in, bound with a NULL indicator, was
+  ORA-00600 [kokeermd1] on both servers. seerdb binds no NULL REF: a `None`
+  names no type.
+
 ### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals

@@ -15493,6 +15493,41 @@ def decode_fv2_describe(Data: bytes) -> list[dict]:
     return Columns
 
 
+def _o8i_typed_bind_oac(DType: int, Toid: bytes, Version: int) -> bytes:
+    # An 8i bind descriptor that names a type -- an object's, a collection's or,
+    # for a REF, the referred-to type's -- as OCI 9.2 sends one to 8.1.7: 9i's
+    # descriptor at 8i's widths, OCI's size and flags, no charset.
+    return _O7_OAC_O8I(
+        {
+            'data_type': DType,
+            'flags': _OCI11_OBJECT_BIND_FLAGS,
+            'precision': 0,
+            'scale': 0,
+            'max_length': _OCI11_OBJECT_BIND_SIZE,
+            'max_array': 0,
+            'cont_flags': 0,
+            'toid_length': len(Toid),
+            'toid': Toid,
+            'version': Version,
+            'charset': 0,
+            'csfrm': 0,
+        }
+    )
+
+
+def _ref_type_oid(Ref: Any) -> bytes:
+    # The OID of the type a REF refers to, which its descriptor names: a fetched
+    # DbRef has it from its describe. Without it the bind cannot be built.
+    if Ref.type_oid is None:
+        from seerdb.common.exceptions import NotSupportedError
+
+        raise NotSupportedError(
+            'cannot bind a REF without its referenced type OID; the value must '
+            'come from a fetched DbRef whose describe carried the type identity'
+        )
+    return bytes(Ref.type_oid)
+
+
 def _encode_8i_bind_oac(Value: object) -> bytes:
     # 25-byte 8i bind descriptor, mirroring the describe column OAC
     # (decode_8i_dcb_describe): data type, ub4be [flag 0x03 | max_size], 14 bytes
@@ -15502,27 +15537,18 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
     # for numbers, 7 for DATE, and the value byte length for VARCHAR2 / RAW. An
     # OUT / IN OUT `Var` declares its registered type + return-buffer size (#362).
     from seerdb.common.datatypes import Var
+    from seerdb.common.dbobject import DbRef
 
+    if isinstance(Value, DbRef):
+        # A REF, as OCI 9.2 binds one to 8.1.7 (SQLT_REF, SeerODBC #172): the
+        # object's descriptor with the REF type, naming the type it refers to,
+        # version 1. Its value is its bytes, as on every tier.
+        return _o8i_typed_bind_oac(TNS_TYPE_REF, _ref_type_oid(Value), 1)
     if _is_oci11_object_bind(Value):
         # An object or a collection, as OCI 9.2 binds one to 8.1.7: 9i's
         # descriptor at 8i's widths, naming the type (SeerODBC #168/#172).
         Typ = cast(Any, _oci11_object_type(Value))
-        return _O7_OAC_O8I(
-            {
-                'data_type': TNS_TYPE_ADT,
-                'flags': _OCI11_OBJECT_BIND_FLAGS,
-                'precision': 0,
-                'scale': 0,
-                'max_length': _OCI11_OBJECT_BIND_SIZE,
-                'max_array': 0,
-                'cont_flags': 0,
-                'toid_length': len(Typ.oid),
-                'toid': Typ.oid,
-                'version': Typ.version,
-                'charset': 0,
-                'csfrm': 0,
-            }
-        )
+        return _o8i_typed_bind_oac(TNS_TYPE_ADT, Typ.oid, Typ.version)
     Flag = 0x03
     if isinstance(Value, Var):
         DType = Value.dbtype.tns_type
@@ -16161,6 +16187,12 @@ def _lob_bind_csfrm(Value: object) -> int:
 
 
 def _encode_9i_bind_oac(Value: object) -> bytes:
+    from seerdb.common.dbobject import DbRef
+
+    if isinstance(Value, DbRef):
+        # A REF, as OCI 9.2 binds one (SQLT_REF, SeerODBC #172): the descriptor
+        # OCI 11.2 sends 10g and 11g, which is 9.2's too.
+        return _oci11_ref_bind_oac(Value)
     if _is_oci11_object_bind(Value):
         # An object or a collection, as OCI 9.2 binds one (SQLT_NTY).
         return _oci11_object_bind_oac(Value, _OCI11_OBJECT_BIND_FLAGS)
