@@ -1464,7 +1464,7 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
     # 11g's native form binds an object or a collection, IN and OUT, as OCI
     # 11.2 does (#2463); its dialect refuses what it does not serve yet.
     Native11 = bool(getattr(Connection, '_native11', False))
-    from seerdb.client.dialect import CAP_OBJECT_BIND
+    from seerdb.client.dialect import CAP_OBJECT_BIND, CAP_REF_BIND
 
     Dialect = getattr(Connection, '_dialect', None)
     # A 10g or 11g thin session binds them too, in 12c's form without the
@@ -1501,8 +1501,11 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
                     'binding a SQL OBJECT value requires an Oracle 12.1+ server'
                 )
             if isinstance(V, DbRef):
-                # OCI 11.2's form serves it on the native session.
-                if Native11:
+                # OCI 11.2's form serves it on the native session, and 9i's
+                # compact form as ojdbc14 binds one (SeerODBC #172).
+                if Native11 or (
+                    Dialect is not None and CAP_REF_BIND in Dialect.capabilities()
+                ):
                     continue
                 raise NotSupportedError(
                     'binding a REF value requires an Oracle 12.1+ server, '

@@ -7232,7 +7232,14 @@ NULLs of both, and an object IN and OUT through a block:
 - **seerdb sends its 12c frame instead,** with the type's OID in the
   type-OID field, and 9.2.0.4 takes it. A NULL object sent as a bare NULL
   (`00`) left the server waiting for the frame.
-- **REF binds are not measured.**
+- **A REF** (SeerODBC #172), measured the same way with a REF fetched from an
+  object table, bound into an INSERT, as a NULL and into a block. Its
+  descriptor is the object's with type `6f` (111): the size is the REF's length
+  (`01 2a`, 42 bytes), 4000 (`02 0f a0`) for a NULL or an OUT bind, then the OID
+  of the type it refers to, version `01 01`, charset 31, form 0. The value is the
+  REF's bytes as a plain value (`2a` + 42 bytes), a NULL `00`, and an OUT REF comes
+  back in that form. seerdb binds a fetched `DbRef`, whose describe gave it the
+  type's OID.
 
 **On 8i** (SeerODBC #168, sqlplus 9.2 against 8.1.7):
 - **The cell** is 9.2's native one at 8i's widths, followed by the indicator and
