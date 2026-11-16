@@ -327,8 +327,8 @@ def _lob_outs(bind: list, out_positions: list[int]) -> dict[int, tuple[int, int]
 
 
 def _object_outs(bind: list, out_positions: list[int]) -> frozenset[int]:
-    # The OUT binds a 9i block returns an object or collection for (SeerODBC
-    # #172): each object Var's index among the OUT values.
+    # The OUT binds a 9i or 8i block returns an object or collection for
+    # (SeerODBC #172): each object Var's index among the OUT values.
     from seerdb.common.dbobject import DbObject, DbObjectType
 
     return frozenset(
@@ -1185,8 +1185,11 @@ class Oall8Dialect:
 
     def capabilities(self) -> frozenset[str]:
         # 8i does query / DML / PL/SQL / LOB and drives its own COMMIT / ROLLBACK
-        # (no modern TTI_COMMIT); no array DML.
-        return frozenset({CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_OWN_TXN})
+        # (no modern TTI_COMMIT); no array DML. It binds objects and collections
+        # as OCI 9.2 does (SeerODBC #172).
+        return frozenset(
+            {CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_OWN_TXN, CAP_OBJECT_BIND}
+        )
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
         # The OALL8 SELECT execute. 8i sends the 32-bit form; the 9i OALL8 dialect
@@ -1253,7 +1256,9 @@ class Oall8Dialect:
         # 8i marks no packet as a reply's last: read on until the reply is whole.
         # Read alone, the first packet of a long OUT value's reply ran off its
         # end, and the rest answered the next call (#2334).
-        while not o8i_block_complete(packet, _lob_outs(bind, out_positions)):
+        while not o8i_block_complete(
+            packet, _lob_outs(bind, out_positions), _object_outs(bind, out_positions)
+        ):
             received = yield RECV
             if received is False:
                 raise connection_closed('8i PL/SQL block')
@@ -1274,10 +1279,21 @@ class Oall8Dialect:
             i for (i, pos) in enumerate(out_positions) if _is_cursor_var(bind[pos])
         )
         # Its cursor is in the status behind the prompt and the OUT values.
-        self._finished(decode_8i_block_cursor(packet, len(out_positions), cursors))
+        lobs = _lob_outs(bind, out_positions)
+        objects = _object_outs(bind, out_positions)
+        self._finished(
+            decode_8i_block_cursor(packet, len(out_positions), cursors, lobs, objects)
+        )
         if out_positions:
-            lobs = _lob_outs(bind, out_positions)
-            out_values = decode_8i_block_out(packet, len(out_positions), cursors, lobs)
+            out_values = decode_8i_block_out(
+                packet, len(out_positions), cursors, lobs, objects
+            )
+            # An object's image, of the Var's type, for the cursor to build the
+            # DbObject from, as on 9i's native form.
+            for i in objects:
+                out_values[i] = Oci11Dialect._object_out_value(
+                    bind[out_positions[i]], out_values[i]
+                )
             # Fetch each REF CURSOR's rows by its id now, into the marker the
             # cursor wraps, as sqlplus 9.2 reads one from 8.1.7 (#2710).
             for i in cursors:

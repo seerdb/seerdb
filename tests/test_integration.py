@@ -200,13 +200,18 @@ _8I_UNSUPPORTED = (
         "8.1.7 takes no N'' literal into a VARCHAR2 element (ORA-12704)",
     ),
     ('collection_value_of_bfile_or_xmltype', 'Oracle 8i has no XMLType'),
+    # 8i binds them too (SeerODBC #172); this type's attribute it lacks.
+    (
+        'attribute_keeps_its_offset',
+        'TIMESTAMP WITH TIME ZONE is a 9i+ type; Oracle 8i has only DATE',
+    ),
     (
         'collection_of_collections',
-        'object types are not supported on Oracle 8i (9i: #2258)',
+        'a collection of collections is a 9i+ type; Oracle 8i lacks it',
     ),
     (
         'local_time_zone_attribute',
-        'object types are not supported on Oracle 8i (9i: #2258)',
+        'TIMESTAMP WITH LOCAL TIME ZONE is a 9i+ type; Oracle 8i has only DATE',
     ),
     ('cache_evicts', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
     ('reuses_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),

@@ -15489,6 +15489,26 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
     # OUT / IN OUT `Var` declares its registered type + return-buffer size (#362).
     from seerdb.common.datatypes import Var
 
+    if _is_oci11_object_bind(Value):
+        # An object or a collection, as OCI 9.2 binds one to 8.1.7: 9i's
+        # descriptor at 8i's widths, naming the type (SeerODBC #168/#172).
+        Typ = cast(Any, _oci11_object_type(Value))
+        return _O7_OAC_O8I(
+            {
+                'data_type': TNS_TYPE_ADT,
+                'flags': _OCI11_OBJECT_BIND_FLAGS,
+                'precision': 0,
+                'scale': 0,
+                'max_length': _OCI11_OBJECT_BIND_SIZE,
+                'max_array': 0,
+                'cont_flags': 0,
+                'toid_length': len(Typ.oid),
+                'toid': Typ.oid,
+                'version': Typ.version,
+                'charset': 0,
+                'csfrm': 0,
+            }
+        )
     Flag = 0x03
     if isinstance(Value, Var):
         DType = Value.dbtype.tns_type
@@ -15582,6 +15602,9 @@ def _encode_8i_bind_value(Value: object) -> bytes:
     from seerdb.common.datatypes import Var
     from seerdb.common.lob import LOB
 
+    if _is_oci11_object_bind(Value):
+        # An object's cell; an OUT one's that of a NULL object.
+        return _oci11_object_bind_value(Value, _O9I_OBJECT_CELL_O8I)
     if isinstance(Value, Var) and Value.dbtype.tns_type in (
         TNS_TYPE_CLOB,
         TNS_TYPE_BLOB,
@@ -15644,6 +15667,7 @@ def decode_8i_block_out(
     NumOut: int,
     Cursors: frozenset[int] = frozenset(),
     Lobs: Mapping[int, tuple[int, int]] | None = None,
+    Objects: frozenset[int] = frozenset(),
 ) -> list:
     # Decode the OUT / IN OUT return values from an 8i PL/SQL block reply
     # (docs/PROTOCOL.md §19.14). After the I/O vector (`_O8I_IOV`), the values
@@ -15652,16 +15676,23 @@ def decode_8i_block_out(
     # NULL, and for one the block never assigned), decoded against each Var's
     # declared type by the cursor. The OUT values at `Cursors` are REF CURSORs,
     # each (cursor id, columns) (#2710); those at `Lobs` CLOBs and BLOBs, each a
-    # LOB of its locator (SeerODBC #167).
-    return _decode_8i_block_values(Data, NumOut, Cursors, Lobs)[0]
+    # LOB of its locator (SeerODBC #167); those at `Objects` objects and
+    # collections, each its image (SeerODBC #172).
+    return _decode_8i_block_values(Data, NumOut, Cursors, Lobs, Objects)[0]
 
 
 def decode_8i_block_cursor(
-    Data: bytes, NumOut: int, Cursors: frozenset[int] = frozenset()
+    Data: bytes,
+    NumOut: int,
+    Cursors: frozenset[int] = frozenset(),
+    Lobs: Mapping[int, tuple[int, int]] | None = None,
+    Objects: frozenset[int] = frozenset(),
 ) -> int:
     # The cursor an 8i PL/SQL block's reply names, from the status behind its
-    # bind prompt and OUT values (#2286).
-    return decode_8i_cursor_id(_decode_8i_block_values(Data, NumOut, Cursors)[1])
+    # bind prompt and OUT values (#2286), each read in its own form to find it.
+    return decode_8i_cursor_id(
+        _decode_8i_block_values(Data, NumOut, Cursors, Lobs, Objects)[1]
+    )
 
 
 def _decode_8i_block_values(
@@ -15669,6 +15700,7 @@ def _decode_8i_block_values(
     NumOut: int,
     Cursors: frozenset[int] = frozenset(),
     Lobs: Mapping[int, tuple[int, int]] | None = None,
+    Objects: frozenset[int] = frozenset(),
 ) -> tuple[list, bytes]:
     # The OUT values of an 8i block's reply and the status after them; a reply
     # without the I/O vector -- the status alone of a block that failed -- has
@@ -15692,13 +15724,23 @@ def _decode_8i_block_values(
                 (LobCell, Rest) = _O8I_LOB_OUT_CELL_FROM_O8I(Rest)
                 OutValues.append(_pre10_lob_out(*Lobs[i], LobCell))
                 continue
+            if i in Objects:
+                # The object's cell in the form it went out, as OCI 9.2 reads
+                # one from 8.1.7: its image, none for a NULL object.
+                (ObjCell, Rest) = _O9I_OBJECT_CELL_FROM_O8I(Rest)
+                OutValues.append(
+                    bytes(ObjCell['image']) if ObjCell['image_length'] else None
+                )
+                continue
             (Cell, Rest) = _O8I_OUT_CELL_FROM_O8I(Rest)
             OutValues.append(bytes(Cell['value']) or None)
     return OutValues, Rest
 
 
 def o8i_block_complete(
-    Data: bytes, Lobs: Mapping[int, tuple[int, int]] | None = None
+    Data: bytes,
+    Lobs: Mapping[int, tuple[int, int]] | None = None,
+    Objects: frozenset[int] = frozenset(),
 ) -> bool:
     """Whether an 8i PL/SQL block's reply has arrived whole (#2334).
 
@@ -15721,7 +15763,7 @@ def o8i_block_complete(
             return False
         NumOut = sum(1 for Mask in Rest[:Count] if Mask & FV2_BIND_OUT)
         try:
-            Rest = _decode_8i_block_values(Data, NumOut, Lobs=Lobs)[1]
+            Rest = _decode_8i_block_values(Data, NumOut, Lobs=Lobs, Objects=Objects)[1]
         except (IndexError, Truncated):
             return False
         except (ValueError, DataError):
@@ -16329,6 +16371,14 @@ _OCI11_OBJECT_BIND_SIZE = 2000
 # binds carry 3 (sqlplus binds no object).
 _OCI11_OBJECT_BIND_FLAGS = 0
 _O9I_OBJECT_CELL_OCI = wire_schema.compile_encoder(_O9I_OBJECT_CELL, _OCI)
+# And on 8i, as OCI 9.2 binds one to 8.1.7 (SeerODBC #168/#172): 9i's
+# descriptor at the 8i codec's widths -- a scalar's 25 bytes with the type's OID
+# and version filled in, 42 in all -- with OCI's size and flags; the value the
+# same native cell at those widths, an 8i row's without its indicator and return
+# code. An OUT object comes back in the value's form.
+_O7_OAC_O8I = wire_schema.compile_encoder(_O7_OAC, _O8I)
+_O9I_OBJECT_CELL_O8I = wire_schema.compile_encoder(_O9I_OBJECT_CELL, _O8I)
+_O9I_OBJECT_CELL_FROM_O8I = wire_schema.compile_decoder(_O9I_OBJECT_CELL, _O8I)
 
 
 def _is_oci11_object_bind(Value: object) -> bool:
@@ -16373,10 +16423,11 @@ def _oci11_object_bind_oac(Value: object, Flags: int) -> bytes:
     )
 
 
-def _oci11_object_bind_value(Value: object) -> bytes:
+def _oci11_object_bind_value(Value: object, Cell: Any = _O9I_OBJECT_CELL_OCI) -> bytes:
     # A Var's value, or none: an unset one -- the OUT bind -- goes as the cell
     # of a NULL object, as OCI 11.2 binds an atomically NULL instance: the toid,
-    # an image length of 0 and no image.
+    # an image length of 0 and no image. `Cell` is the cell's encoder, 8i's
+    # narrower one there.
     from seerdb.common.datatypes import Var
     from seerdb.common.dbobject import DbObject
 
@@ -16384,7 +16435,7 @@ def _oci11_object_bind_value(Value: object) -> bytes:
     Toid = _OBJ_TOID_PREFIX + Typ.oid + _OBJ_EXTENT_OID
     Obj = Value._value if isinstance(Value, Var) else Value
     Image = encode_object_image(Obj) if isinstance(Obj, DbObject) else b''
-    return _O9I_OBJECT_CELL_OCI(
+    return Cell(
         {
             'toid_length': len(Toid),
             'toid': Toid,
