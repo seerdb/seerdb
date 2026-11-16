@@ -7660,6 +7660,124 @@ def _tpc_xid(tag: str) -> seerdb.Xid:
     return seerdb.Xid(_TPC_FORMAT, f'seerdb-{tag}-{os.getpid()}'.encode(), b'1')
 
 
+# On a class that isn't an _IntegrationBase a class-level _requires is never
+# checked, so each test carries it. Through the Mirror over PostgreSQL the loop
+# never ends -- SYSDATE becomes the transaction's fixed localtimestamp -- and the
+# Mirror answers the break without cancelling the backend's statement, which
+# then spins on (#2717).
+_REAL_SERVER_BREAK = _Need(
+    "a break interrupts a real server's call; a Mirror backend's SYSDATE loop "
+    'need not end',
+    not_mirror=('*',),
+)
+
+
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class CallTimeoutIntegration(_ThrottleRetry, unittest.TestCase):
+    """call_timeout bounds a call that runs too long (#123, #144).
+
+    The loop ends on its own after 6 seconds, so a break that never arrives
+    leaves nothing running on the bed. Where the server answers the break the
+    call fails with the timeout and the connection is reusable; where nothing
+    answers it -- 10g and 11g behind a forwarder that drops the OOB byte they
+    advertise -- the connection is dropped after call_timeout again. Either way
+    the call ends within twice the timeout. A dialect's session (8i, 9i, the
+    native forms) used to ignore call_timeout, and the call ran to its end."""
+
+    LOOP = (
+        'DECLARE t DATE := SYSDATE + 6/86400; '
+        'BEGIN WHILE SYSDATE < t LOOP NULL; END LOOP; END;'
+    )
+
+    @_requires(_REAL_SERVER_BREAK)
+    def test_a_call_timeout_ends_a_long_call(self):
+        import time
+
+        from seerdb.common.exceptions import OperationalError
+
+        conn = _connect()
+        try:
+            conn.call_timeout = 1000
+            started = time.monotonic()
+            with self.assertRaises(OperationalError) as caught:
+                conn.cursor().execute(self.LOOP)
+            self.assertLess(time.monotonic() - started, 4.5)
+            if 'call timeout of 1000 ms' in str(caught.exception):
+                conn.call_timeout = 0
+                cur = conn.cursor()
+                cur.execute('SELECT 1 FROM dual')
+                self.assertEqual(cur.fetchall(), [(1,)])
+            else:
+                self.assertIn('did not answer the break', str(caught.exception))
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass  # dropped already, when the break went unanswered
+
+    @_requires(_REAL_SERVER_BREAK)
+    def test_a_call_timeout_ends_a_row_lock_wait(self):
+        # An UPDATE waiting on another session's lock. Its ORA-01013 comes back
+        # as the DML's status, which 9i's dialect reported as itself rather
+        # than as the timeout. The holder rolls back after 6 seconds whatever
+        # happens, so the wait ends on its own.
+        import threading
+        import time
+
+        from seerdb.common.exceptions import OperationalError
+
+        table = 'PYORACLE_CTO_LOCK'
+        holder = _connect()
+        waiter = _connect()
+        holder.autocommit = waiter.autocommit = False
+        try:
+            cur = holder.cursor()
+            try:
+                cur.execute(f'DROP TABLE {table}')
+            except Exception:
+                pass  # not there
+            cur.execute(f'CREATE TABLE {table} (n NUMBER)')
+            cur.execute(f'INSERT INTO {table} VALUES (1)')
+            holder.commit()
+            cur.execute(f'UPDATE {table} SET n = 2')
+            release = threading.Timer(6.0, holder.rollback)
+            release.start()
+            waiter.call_timeout = 1000
+            started = time.monotonic()
+            with self.assertRaises(OperationalError) as caught:
+                waiter.cursor().execute(f'UPDATE {table} SET n = 3')
+            self.assertLess(time.monotonic() - started, 4.5)
+            if 'call timeout of 1000 ms' in str(caught.exception):
+                waiter.call_timeout = 0
+                waiter.rollback()
+                check = waiter.cursor()
+                check.execute('SELECT 1 FROM dual')
+                self.assertEqual(check.fetchall(), [(1,)])
+            else:
+                self.assertIn('did not answer the break', str(caught.exception))
+            release.join()
+            # A waiter whose break went unanswered leaves its session on the
+            # server: once the holder lets go, that orphaned UPDATE takes the
+            # row until the server finds the client gone, and a DROP meanwhile
+            # answers ORA-00054. Give it the time.
+            from seerdb.common.exceptions import DatabaseError
+
+            for attempt in range(30):
+                try:
+                    cur.execute(f'DROP TABLE {table}')
+                    break
+                except DatabaseError as exc:
+                    if exc.code != 54 or attempt == 29:
+                        raise
+                    time.sleep(0.5)
+        finally:
+            for conn in (waiter, holder):
+                try:
+                    conn.close()
+                except Exception:
+                    pass  # dropped already, when the break went unanswered
+
+
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class TpcIntegration(_ThrottleRetry, unittest.TestCase):
     """Two-phase commit, end to end (#131, #2457). Each test settles every
