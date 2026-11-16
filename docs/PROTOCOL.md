@@ -7154,6 +7154,41 @@ LOB on these forms, so a Var holding text or bytes has none: 9i answers
 ORA-24813, and 8i (which gets an empty locator) ORA-22275. A Var holding a LOB
 an earlier call returned sends its locator.
 
+### 19.17c Object and collection columns on 9i (#2258)
+
+On 9i's compact form an object or collection column's row cell is the 10g+
+object framing (`read_dbobject`), with a type block in front where 10g+ sends
+the type's OID, then the row's indicator. The image inside is the same pickled
+image 10g+ sends, so it decodes against the type's layout from the dictionary
+(`ALL_TYPE_ATTRS`, `ALL_COLL_TYPES`) as there. The describe names the column's
+type (§19.1). Captured from seerdb on 9.2.0.4 (2026-11-16), for `id NUMBER, p
+seerdb_pt9, v seerdb_va9`, with `seerdb_pt9` an object `(n NUMBER, s
+VARCHAR2(10))` and `seerdb_va9` a `VARRAY(5) OF NUMBER`:
+
+| Field | `seerdb_pt9(7, 'seven')` | `seerdb_va9(1, 2, 3)` | NULL |
+|---|---|---|---|
+| type block: ub4 length, then a value | `01 24 24` and 36 bytes | the same, its type's OID inside | the same |
+| object OID, snapshot: ub4 lengths | `00 00` | `00 00` | `00 00` |
+| version | `00` | `00` | `00` |
+| image length: ub4, 0 for NULL | `01 0c` (12) | `01 10` (16) | `00` |
+| flags | `01 01` | `01 01` | `01 01` |
+| image: a value, chunked past 64 bytes | `0c 84 01 0c 02 c1 08 05 73 65 76 65 6e` | `10 88 01 10 01 01 00 03 02 c1 02 02 c1 03 02 c1 04` | none |
+| the row's indicator | `00` | `00` | `81 01` |
+
+- **The type block** is 36 bytes: `00 22 02 08`, the type's 16-byte OID, and 16
+  more (`00 … 00 01 00 01` in every cell measured). seerdb takes the type's
+  identity from the describe instead.
+- **The image** is 10g+'s pickled form:
+  - an object's starts `84 01 <length>`, then its attributes, each a value
+    (`02 c1 08`, NUMBER 7; `05 'seven'`);
+  - a collection's starts `88 01 <length>`, then `01 01 00 <count>` and each
+    element.
+- **A NULL** keeps the framing, with an image length of 0 and no image, then the
+  NULL indicator.
+
+9i's native form (§19.18) carries the same image in fixed-width fields
+(`_O9I_OBJECT_CELL`).
+
 ### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals
