@@ -7252,6 +7252,27 @@ NULLs of both, and an object IN and OUT through a block:
   (`03 5c`, answered by type descriptors, `0d`). The server sends the first rows
   in the execute's reply, ahead of those calls, so a client doesn't need them.
 
+**Binding one on 8i** (SeerODBC #172), measured with OCI 9.2's `OCIBindObject`
+against 8.1.7. It binds `seerdb_obt8c(7, 'seven')` and a VARRAY into an INSERT,
+NULLs of both, and an object IN and OUT through a block, in the OALL8 form of
+§19.11:
+- **The descriptor** is 9i's (`_O7_OAC`) at 8i's widths, 42 bytes: `6d`, flags
+  `00`, `00 00`, a size of 2000 (`d0 07 00 00`), 8 zero bytes, the OID's ub4
+  length (`10 00 00 00`) and the OID as a value (`10` + 16 bytes), the version
+  (`01 00`), charset `00 00`, form `00`. An OUT bind is declared the same way.
+- **The value** is the row cell above without its indicator and return code. A
+  NULL is the framing with an image length of 0, flags `01 00` and no image.
+- **OCI writes the image's header length in the short form** (`84 01 0c`).
+  seerdb writes the long one (`84 01 fe 00 00 00 10`), as ojdbc14 does on 9i, and
+  8.1.7 takes it.
+- **In a block** OCI sends a value for the OUT bind too: the object with its
+  attributes NULL. 8.1.7 takes a NULL there just as well, which seerdb sends. The
+  reply is the I/O vector (`… 20 10`), then `07` and the OUT object in the
+  value's form, then the status. Read as a plain value, the cell leaves the
+  status misaligned and its cursor id wrong.
+- **ojdbc14 speaks the compact form to 8.1.7 too** (`03 47`), with the same
+  bytes as on 9i above.
+
 ### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals
