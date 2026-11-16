@@ -762,6 +762,13 @@ class Oall8Dialect:
     so the 9i subclass — not being an O8iDialect — logs in as an ordinary 9i
     client."""
 
+    # Whether a fetch carries the pending close piggyback: 8i's, whose server
+    # frees a nested cursor only when told (#2710). On 9i's native form a
+    # close ahead of a nested cursor's fetch emptied it, and OCI 11.2's
+    # measured native sequence sends none; from 10g the server keeps a nested
+    # cursor open while its parent is anyway.
+    _close_on_fetch = False
+
     def __init__(self, next_seq: Callable[[], int]) -> None:
         self._next_seq = next_seq
         # The cursors finished statements left open, closed in front of the
@@ -917,11 +924,14 @@ class Oall8Dialect:
         (rows, terminal, last_row) = yield from self.recv_rows(rest, columns, None)
         cursor = self._cursor_id(terminal)
         try:
+            # Each batch's nested cursors are read before the next fetch: read
+            # after the last, the earlier ones were out of sequence on 8i
+            # (ORA-01002), as on 9i (#2711, #2710).
+            yield from self._read_nested(rows, columns)
             if not self._fetch_ended(terminal):
                 rows.extend(
                     (yield from self._fetch_rest(cursor, columns, last_row, fetch))
                 )
-            yield from self._read_nested(rows, columns)
         finally:
             self._finished(cursor)
         # CLOB / BLOB cells came back as locators: read their content while the
@@ -935,7 +945,6 @@ class Oall8Dialect:
         # cursors nested in its own rows, then closed with the next call (#798).
         try:
             rows = yield from self._fetch_rest(cursor, columns, None)
-            yield from self._read_nested(rows, columns)
         finally:
             self._finished(cursor)
         yield from self.resolve_lobs(rows, columns)
@@ -943,7 +952,7 @@ class Oall8Dialect:
 
     def _read_nested(self, rows: list, columns: list):
         # A CURSOR(...) column's cell came back as its cursor's (id, columns), the
-        # dialect's _decode_rows reading it so (9.2's; 8i's has none). Read each
+        # dialect's _decode_rows reading it so (9.2's and 8i's, #2710). Read each
         # while the parent is open -- ojdbc14 closes the parent last -- into the
         # marker the cursor wraps, as the compact path does (#2254).
         for j, col in enumerate(columns):
@@ -982,7 +991,12 @@ class Oall8Dialect:
         rows: list = []
         ended = False
         while cursor and not ended:
-            yield Send(self._encode_fetch(cursor, row_count, long_size))
+            # The nested cursors read since the last call close with this one,
+            # where the dialect closes on a fetch: a query's own fetches carried
+            # none, so a long query kept every one open and ran out on 8i at
+            # about 200 (#2710).
+            closing = self._closing() if self._close_on_fetch else b''
+            yield Send(closing + self._encode_fetch(cursor, row_count, long_size))
             (more, terminal, last_row) = yield from self.recv_rows(
                 b'', columns, last_row
             )
@@ -992,6 +1006,8 @@ class Oall8Dialect:
             ended = self._fetch_ended(terminal)
             if not more:
                 break
+            # A batch's nested cursors, read before the next fetch (#2710).
+            yield from self._read_nested(more, columns)
             rows.extend(more)
         return rows
 
@@ -1167,10 +1183,21 @@ class Oall8Dialect:
         directions = decode_fv2_bind_directions(packet, O8i=True)
         if directions is not None and len(directions) == len(bind):
             out_positions = [i for i, d in enumerate(directions) if d & FV2_BIND_OUT]
+        # A REF CURSOR's cell is the opened cursor's describe and id (#2710).
+        cursors = frozenset(
+            i for (i, pos) in enumerate(out_positions) if _is_cursor_var(bind[pos])
+        )
         # Its cursor is in the status behind the prompt and the OUT values.
-        self._finished(decode_8i_block_cursor(packet, len(out_positions)))
+        self._finished(decode_8i_block_cursor(packet, len(out_positions), cursors))
         if out_positions:
-            out_values = decode_8i_block_out(packet, len(out_positions))
+            out_values = decode_8i_block_out(packet, len(out_positions), cursors)
+            # Fetch each REF CURSOR's rows by its id now, into the marker the
+            # cursor wraps, as sqlplus 9.2 reads one from 8.1.7 (#2710).
+            for i in cursors:
+                if isinstance(out_values[i], tuple):
+                    (cursor_id, columns) = out_values[i]
+                    rows = yield from self._read_cursor(cursor_id, columns)
+                    out_values[i] = _cursor_marker(cursor_id, columns, rows)
             record = {'out_positions': out_positions, 'out_values': out_values}
             return (0, 0, 0, (None, None), [record], None, None, [], None)
         return (0, 0, 0, (0, None), [], None, None, [], None)
@@ -1276,6 +1303,8 @@ class O8iDialect(Oall8Dialect):
     base — 8i uses the 32-bit ``_encode_dml`` the base provides — but is its own
     type so the login tier stays detectable and the 9i OALL8 dialect distinct."""
 
+    _close_on_fetch = True
+
     def _unfetchable(self, columns: list) -> list:
         # 8i describes SQL's BITAND as type 29, which no client fetches: its
         # sqlplus is refused with ORA-00932, and the fetch seerdb sent was an
@@ -1300,8 +1329,8 @@ class Fv2Oall8Dialect(Oall8Dialect):
     blocks with IN, OUT, IN OUT and REF CURSOR binds, and DML...RETURNING
     (through its PL/SQL wrap) -- all over the native 64-bit OALL8 reply decode
     (decode_9i_oall8_*), array DML and LOB objects (fetch_lobs=False).
-    Synchronous only, and no cursor cache. Not yet: nested cursors (CURSOR()
-    columns) and object / collection types."""
+    Synchronous only, and no cursor cache. Nested cursors (CURSOR() columns)
+    are read batch by batch (#2710). Not yet: object / collection types."""
 
     _caches_cursors = True
 

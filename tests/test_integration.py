@@ -186,8 +186,6 @@ _8I_UNSUPPORTED = (
     ('executemany', 'executemany (array DML) is not supported on Oracle 8i'),
     ('mixed_batch', 'executemany (array DML) is not supported on Oracle 8i'),
     ('pipeline', 'the pipeline test uses array DML, unsupported on Oracle 8i'),
-    # 9i reads a REF CURSOR by its id over TTI_ALL7 (#2246); 8i's dialect does not.
-    ('refcursor', 'REF CURSOR is not supported on Oracle 8i'),
     ('batcherror', 'executemany (array DML) is not supported on Oracle 8i'),
     ('error_offset', 'the 8i error reply carries no offset (#719)'),
     (
@@ -248,6 +246,18 @@ def _conn_is_8i(conn) -> bool:
     from seerdb.client.dialect import O8iDialect
 
     return isinstance(getattr(conn, '_dialect', None), O8iDialect)
+
+
+# A procedure's REF CURSOR parameter type: SYS_REFCURSOR from 9i, which 8i
+# lacks; there a package's REF CURSOR type stands in (#2710). The DDL makes
+# it, or None when SYS_REFCURSOR serves.
+_RC_PACKAGE_DDL = 'CREATE OR REPLACE PACKAGE seerdb_rc AS TYPE t IS REF CURSOR; END;'
+
+
+def _refcursor_type(conn) -> tuple[str, str | None]:
+    if _conn_is_8i(conn):
+        return ('seerdb_rc.t', _RC_PACKAGE_DDL)
+    return ('SYS_REFCURSOR', None)
 
 
 def _target_is_8i() -> bool:
@@ -2743,8 +2753,15 @@ class TypesIntegration(_IntegrationBase):
             [(2, 's2'), (3, 's3'), (4, 's4')],
         )
         out = self.cur.var(seerdb.DB_TYPE_CURSOR)
+        # 8i has no SYS_REFCURSOR, so the block declares a REF CURSOR type of
+        # its own there (#2710).
+        decl = (
+            'TYPE rc IS REF CURSOR; t rc;'
+            if _conn_is_8i(self.conn)
+            else 't SYS_REFCURSOR;'
+        )
         self.cur.execute(
-            'DECLARE t SYS_REFCURSOR; BEGIN '
+            f'DECLARE {decl} BEGIN '
             f'OPEN t FOR SELECT s FROM {self.TABLE} WHERE k = :k; :c := t; END;',
             [5, out],
         )
@@ -3720,13 +3737,18 @@ class CursorIntegration(_IntegrationBase):
         # A CURSOR() column in a query of more rows than open_cursors (300) and
         # than one fetch batch: on 9i its nested cursors were read only after
         # the last batch, by then invalid (ORA-01001), and never freed (#2711).
-        # ojdbc14 frees each, and so does seerdb's 9i path now. From 10g the
-        # server keeps each nested cursor open while its parent is, and
-        # python-oracledb meets ORA-01000 there too, so this is 9i's.
-        from seerdb.client.dialect import Fv2Dialect
+        # ojdbc14 frees each, and so does seerdb's 9i path now; 8i's closes
+        # ride on the next fetch. From 10g the server keeps each nested cursor
+        # open while its parent is, and python-oracledb meets ORA-01000 there
+        # too, so this is 8i's and 9i's.
+        from seerdb.client.dialect import Fv2Dialect, O8iDialect
 
-        if not isinstance(getattr(self.conn, '_dialect', None), Fv2Dialect):
-            self.skipTest("frees each nested cursor mid-query: 9i's compact path only")
+        if not isinstance(
+            getattr(self.conn, '_dialect', None), (Fv2Dialect, O8iDialect)
+        ):
+            self.skipTest(
+                'frees each nested cursor mid-query: the 8i and 9i compact paths only'
+            )
         self.cur.execute(
             'SELECT CURSOR(SELECT 1 FROM dual), rownum FROM all_objects WHERE rownum <= 400'
         )
@@ -16242,9 +16264,12 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
     async def test_async_callproc_refcursor(self):
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
             async with Conn.cursor() as Cur:
+                (rc_type, rc_ddl) = _refcursor_type(Conn)
+                if rc_ddl:
+                    await Cur.execute(rc_ddl)
                 await Cur.execute(
                     'CREATE OR REPLACE PROCEDURE PYORACLE_ASYNC_RC'
-                    '(p_rc OUT SYS_REFCURSOR) AS BEGIN OPEN p_rc FOR '
+                    f'(p_rc OUT {rc_type}) AS BEGIN OPEN p_rc FOR '
                     "SELECT 1 AS a, 'x' AS b FROM dual "
                     "UNION ALL SELECT 2, 'y' FROM dual; END;"
                 )
@@ -16991,8 +17016,11 @@ class CallprocIntegration(_IntegrationBase):
         self.assertEqual(y.getvalue(), 42)
 
     def test_callproc_refcursor(self):
+        (rc_type, rc_ddl) = _refcursor_type(self.conn)
+        if rc_ddl:
+            self.cur.execute(rc_ddl)
         self._make(
-            '(p_rc OUT SYS_REFCURSOR) AS BEGIN OPEN p_rc FOR '
+            f'(p_rc OUT {rc_type}) AS BEGIN OPEN p_rc FOR '
             "SELECT 1 AS a, 'x' AS b FROM dual "
             "UNION ALL SELECT 2, 'y' FROM dual; END;"
         )
@@ -17019,8 +17047,14 @@ class CallprocIntegration(_IntegrationBase):
         # A REF CURSOR whose rows hold a CURSOR(...) column: the inner cursor
         # fetches too. The Mirror parked the REF CURSOR but not the cursors in
         # its rows, and the session died when the client drained it (#1465).
+        if _conn_is_8i(self.conn):
+            # 8i's PL/SQL parses no CURSOR(...) in static SQL (PLS-00103).
+            self.skipTest("Oracle 8i's PL/SQL takes no CURSOR() expression")
+        (rc_type, rc_ddl) = _refcursor_type(self.conn)
+        if rc_ddl:
+            self.cur.execute(rc_ddl)
         self._make(
-            '(p_rc OUT SYS_REFCURSOR) AS BEGIN OPEN p_rc FOR '
+            f'(p_rc OUT {rc_type}) AS BEGIN OPEN p_rc FOR '
             "SELECT 2 a, CURSOR(SELECT 'deep' FROM dual) c FROM dual; END;"
         )
         rc = self.cur.var(seerdb.CURSOR)
