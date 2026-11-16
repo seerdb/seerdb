@@ -2242,6 +2242,15 @@ _O9I_OBJECT_CELL: wire_schema.Schema = (
     ('n2', 'flags'),
     ('when', 'image_length', (('value', 'image'),)),
 )
+# An object or collection column's cell in an 8i row (SeerODBC #168): 9.2's
+# native cell above at the 8i codec's widths, then a row cell's indicator and
+# return code. A NULL keeps the framing, with no image and the -1 indicator.
+# Read from sqlplus 9.2 against 8.1.7.
+_O8I_OBJECT_CELL: wire_schema.Schema = (
+    *_O9I_OBJECT_CELL,
+    ('n2', 'indicator'),
+    ('n2', 'return_code'),
+)
 # A rowid at fixed widths, as an 8i status and ROWID cell carry it (#1079): the
 # data object, the file, a reserved byte, the block, the slot. A 9.2 server
 # writes it to a 9.2 client aligned, the file and the slot each padded to four
@@ -2818,6 +2827,7 @@ _O9I_RXH_FROM_O9I = wire_schema.compile_decoder(_O9I_RXH, _O9I)
 _O9I_ROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_ROWID_CELL, _O9I)
 _O9I_LOB_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_LOB_CELL, _O9I)
 _O9I_OBJECT_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_OBJECT_CELL, _O9I)
+_O8I_OBJECT_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_OBJECT_CELL, _O8I)
 _O9I_UROWID_CELL_FROM_O9I = wire_schema.compile_decoder(_O9I_UROWID_CELL, _O9I)
 # The describe's columns are the OCI dialect's own fields, read with its codec.
 _O9I_DESCRIBE_FROM_OCI = wire_schema.compile_decoder(_O9I_DESCRIBE, _OCI)
@@ -16935,6 +16945,29 @@ def _o9i_oall8_cell(Data: bytes) -> tuple[bytes | None, bytes]:
     return _OCI.read_value(Data)
 
 
+def _o8i_object_cell(Col: dict, Data: bytes) -> tuple[object, bytes]:
+    # An object or collection column's cell in an 8i row (_O8I_OBJECT_CELL),
+    # as 9i's native one: None for a NULL, else an ObjectImage the cursor turns
+    # into a DbObject once it has described the type (SeerODBC #168). Read as a
+    # plain value, its framing came back as the value and the rest of the rows
+    # were lost.
+    from seerdb.common.dbobject import ObjectImage
+
+    (Cell, Rest) = _O8I_OBJECT_CELL_FROM_O8I(Data)
+    if not Cell['image_length']:
+        return (None, Rest)
+    return (
+        ObjectImage(
+            Col.get('type_oid', b''),
+            Col.get('type_schema'),
+            Col.get('type_name'),
+            Col.get('charset'),
+            bytes(Cell['image']),
+        ),
+        Rest,
+    )
+
+
 def _o9i_oall8_object_cell(Col: dict, Data: bytes) -> tuple[object, bytes]:
     # An object or collection column's cell in a 9i OALL8 row (_O9I_OBJECT_CELL):
     # None for a NULL value (no image), else an ObjectImage the cursor turns into
@@ -17598,6 +17631,8 @@ def decode_8i_exec_response(
                         # fetches its rows by that id.
                         (Value, Rest) = _o8i_refcursor_cell(Rest)
                         Rest = Rest[2:]
+                    elif Type == TNS_TYPE_ADT:
+                        (Value, Rest) = _o8i_object_cell(Col, Rest)
                     elif Type in _O8I_LOCATED_CELLS:
                         (Value, Rest) = _o8i_located_cell(Type, Rest)
                     elif Rest[:1] == b'\xff':
@@ -17696,6 +17731,11 @@ def _o8i_columns(Oacs: list) -> list[dict]:
                 'column_name': Oac['name'],
             }
         )
+        if Oac['data_type'] in (TNS_TYPE_ADT, TNS_TYPE_REF):
+            # The column's type, as 9i's describe names it (SeerODBC #168).
+            Columns[-1]['type_oid'] = Oac.get('toid', b'')
+            Columns[-1]['type_schema'] = _fv2_type_name(Oac.get('type_schema'))
+            Columns[-1]['type_name'] = _fv2_type_name(Oac.get('type_name'))
     return Columns
 
 

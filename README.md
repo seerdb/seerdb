@@ -422,7 +422,8 @@ The flag is ignored on other tiers.
 
 **Oracle 8i** (8.1.7, the 9.2-era `OALL8` dialect) is the oldest and most limited
 tier. It runs connect (`O3LOGON`), SELECT, single-row DML / DDL, PL/SQL blocks
-with IN / OUT binds, REF CURSOR OUT binds and `CURSOR()` columns, CLOB / BLOB and
+with IN / OUT binds, REF CURSOR OUT binds and `CURSOR()` columns, object and
+collection columns fetched as `DbObject`s, CLOB / BLOB and
 native BFILE reads, CLOB / BLOB OUT binds and `RETURNING` (their value is the
 text or bytes, as a fetched LOB's is: 8i serves no LOB object calls, and makes
 no temporary LOB, so an IN OUT LOB Var holding text and a block value past

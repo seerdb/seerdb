@@ -7234,6 +7234,24 @@ NULLs of both, and an object IN and OUT through a block:
   (`00`) left the server waiting for the frame.
 - **REF binds are not measured.**
 
+**On 8i** (SeerODBC #168, sqlplus 9.2 against 8.1.7):
+- **The cell** is 9.2's native one at 8i's widths, followed by the indicator and
+  return code every 8i row cell has:
+  - `24 00 00 00`, then the 36-byte type block as a value (`24 …`);
+  - the object OID's and the snapshot's ub4 lengths (`00 00 00 00` each);
+  - a ub2 version, a ub4 image length and ub2 flags (`00 00`, `0c 00 00 00`,
+    `01 00`);
+  - the image as a value (`0c 84 01 0c 02 c1 08 05 'seven'`);
+  - `00 00`, `00 00`.
+- **A NULL** keeps the framing, with an image length of 0 and the indicator
+  `ff ff`.
+- **The describe** names the column's type, its 16-byte OID, schema and name, as
+  9i's does. seerdb reads the layout from `ALL_TYPE_ATTRS` / `ALL_COLL_TYPES`
+  there too.
+- **sqlplus also pins each type before it fetches,** with calls of its own
+  (`03 5c`, answered by type descriptors, `0d`). The server sends the first rows
+  in the execute's reply, ahead of those calls, so a client doesn't need them.
+
 ### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals
