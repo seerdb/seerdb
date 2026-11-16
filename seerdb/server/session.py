@@ -294,7 +294,7 @@ from seerdb.server.backend import (
     UnsupportedFeature,
     VarcharValue,
 )
-from seerdb.server.framing import PacketStream, ProtocolLimitError
+from seerdb.server.framing import BreakWatch, PacketStream, ProtocolLimitError
 from seerdb.server.handshake import (
     client_compile_cap,
     client_field_version,
@@ -1555,17 +1555,35 @@ def serve_session(
             'serving field version %s (advertised %s)', negotiated, field_version
         )
         field_version = negotiated
-    if sqlplus:
-        return _serve_oci_session(
-            stream, backend, user, conn_key, identity, field_version=field_version
-        )
-    stats.open_session(session_id)
+    # A client's break cancels the backend's call as it runs (#2717).
+    watch = BreakWatch(stream, getattr(backend, 'cancel', None))
     try:
-        return _serve_thin_session(
-            stream, backend, user, conn_key, session_id, field_version, advertised
-        )
+        if sqlplus:
+            return _serve_oci_session(
+                stream,
+                backend,
+                user,
+                conn_key,
+                identity,
+                field_version=field_version,
+                watch=watch,
+            )
+        stats.open_session(session_id)
+        try:
+            return _serve_thin_session(
+                stream,
+                backend,
+                user,
+                conn_key,
+                session_id,
+                field_version,
+                advertised,
+                watch,
+            )
+        finally:
+            stats.close_session(session_id)
     finally:
-        stats.close_session(session_id)
+        watch.close()
 
 
 def _serve_thin_session(
@@ -1576,6 +1594,7 @@ def _serve_thin_session(
     session_id: int,
     field_version: int,
     advertised: int,
+    watch: BreakWatch | None = None,
 ) -> str:
     # A logged-in thin client's calls, answered until its logoff or EOF; returns
     # the user. Every request it sends -- one call, however many packets carry it
@@ -1605,6 +1624,7 @@ def _serve_thin_session(
     _LOB_EMIT_LOG.set(lob_emit_log)
     # The thin reply path's OER sequence, advanced per message below (#842).
     oer_seq = 0
+    watch = watch or BreakWatch(stream, None)
     while True:
         # The codec's per-message state defaults to 11g (and token auth leaves it
         # at 12.2); pin it to the field version this session negotiated so each
@@ -1621,6 +1641,8 @@ def _serve_thin_session(
         # by one in exactly this field: 0x1816 then 0x1817.
         oer_seq = _next_reply_sequence(oer_seq)
         _ENCODE_OER_SEQ.set(oer_seq)
+        # The last call is answered: a break from here on is read as one.
+        watch.disarm()
         received = stream.read_packet()
         if received is None:
             return user
@@ -1631,6 +1653,8 @@ def _serve_thin_session(
             continue
         if packet_type != TNS_DATA:
             continue
+        # A call: a break while it runs cancels the backend's work (#2717).
+        watch.arm()
         # A pipelined call is marked END_OF_REQUEST, and its reply must open with
         # the token the client put in its header (#1059). Read it before the
         # piggybacks are stripped: on the first call of a burst the header that
@@ -1873,6 +1897,7 @@ def _serve_oci_session(
     identity: ServerIdentity = IDENTITY_11_2,
     *,
     field_version: int = FIELD_VERSION_11_2,
+    watch: BreakWatch | None = None,
 ) -> str:
     # The sqlplus / thick-OCI query loop (#265), built up one message shape at a
     # time. So far: the post-login version call (-> banner), the OCI execute
@@ -1909,11 +1934,14 @@ def _serve_oci_session(
     # field version its handshake advertised, which from 12.1 is not the
     # session's own (#1282).
     oci_version = oci_field_version(field_version)
+    watch = watch or BreakWatch(stream, None)
     while True:
         # Pinned per message, as the thin loop does: the backend runs in a copied
         # context, so nothing it does can move it.
         _DECODE_FIELD_VERSION.set(oci_version)
         _ENCODE_FIELD_VERSION.set(oci_version)
+        # As in the thin loop: watched for a break while a call runs (#2717).
+        watch.disarm()
         received = stream.read_packet()
         if received is None:
             return user
@@ -1925,6 +1953,7 @@ def _serve_oci_session(
             continue
         if packet_type != TNS_DATA:
             continue
+        watch.arm()
         if is_version_call_oci(body):
             # What sqlplus prints after "Connected to:" — the release this
             # session introduced itself as (naming the Mirror itself is a

@@ -124,7 +124,13 @@ clients are not served. What is checked, and how (measured 2026-10-31):
     clients*);
   - scrollable cursors;
   - `DBMS_OUTPUT`;
-  - object and collection binds and fetches.
+  - object and collection binds and fetches;
+  - a client's break, from its `cancel()` or a call timeout: a backend with a
+    `cancel` hook, as the PostgreSQL one has, stops the call as it runs, and
+    the client gets ORA-01013, as from Oracle. Over TCPS the Mirror can't read
+    the break before the call is done, so there only a client that hangs up
+    stops the call
+    ([#2717](https://github.com/seerdb/seerdb/issues/2717)).
 - **Transactions:** commit and rollback, savepoints, sessionless transactions
   (within one Mirror process), and transaction priority as session state.
 - **Pooled (DRCP) connections:** a client asking for a pooled server

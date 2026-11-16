@@ -7696,9 +7696,7 @@ def _tpc_xid(tag: str) -> seerdb.Xid:
 
 # On a class that isn't an _IntegrationBase a class-level _requires is never
 # checked, so each test carries it. Through the Mirror over PostgreSQL the loop
-# never ends -- SYSDATE becomes the transaction's fixed localtimestamp -- and the
-# Mirror answers the break without cancelling the backend's statement, which
-# then spins on (#2717).
+# never ends: SYSDATE becomes the transaction's fixed localtimestamp (#2717).
 _REAL_SERVER_BREAK = _Need(
     "a break interrupts a real server's call; a Mirror backend's SYSDATE loop "
     'need not end',
@@ -7749,12 +7747,44 @@ class CallTimeoutIntegration(_ThrottleRetry, unittest.TestCase):
             except Exception:
                 pass  # dropped already, when the break went unanswered
 
-    @_requires(_REAL_SERVER_BREAK)
+    def test_a_call_timeout_cancels_the_mirror_backend_s_call(self):
+        # A 30-second sleep, which only the backend can stop: the Mirror
+        # cancels it on the break, answers it, and serves the next call at once.
+        # It used to leave the client to drop the connection, and the sleep ran
+        # on in PostgreSQL (#2717). DBMS_LOCK.SLEEP needs a grant on the beds,
+        # so this runs through the Mirror over PostgreSQL alone.
+        import time
+
+        from seerdb.common.exceptions import OperationalError
+
+        if os.environ.get('SEERDB_TEST_MIRROR') not in ('postgres', '1'):
+            self.skipTest("the Mirror over PostgreSQL's backend cancel (#2717)")
+        conn = _connect()
+        try:
+            conn.call_timeout = 1000
+            started = time.monotonic()
+            with self.assertRaises(OperationalError) as caught:
+                conn.cursor().execute('BEGIN DBMS_LOCK.SLEEP(30); END;')
+            self.assertIn('call timeout of 1000 ms', str(caught.exception))
+            conn.call_timeout = 0
+            cur = conn.cursor()
+            cur.execute('SELECT 1 FROM dual')
+            self.assertEqual(cur.fetchall(), [(1,)])
+            self.assertLess(time.monotonic() - started, 4.5)
+        finally:
+            conn.close()
+
     def test_a_call_timeout_ends_a_row_lock_wait(self):
         # An UPDATE waiting on another session's lock. Its ORA-01013 comes back
         # as the DML's status, which 9i's dialect reported as itself rather
         # than as the timeout. The holder rolls back after 6 seconds whatever
-        # happens, so the wait ends on its own.
+        # happens, so the wait ends on its own. Through the Mirror over
+        # PostgreSQL the break cancels the backend's waiting statement (#2717).
+        if os.environ.get('SEERDB_TEST_MIRROR') == 'passthrough':
+            self.skipTest(
+                'the passthrough has no cancel hook: the break reaches no '
+                'upstream call, which waits on (#2717)'
+            )
         import threading
         import time
 
@@ -7781,6 +7811,10 @@ class CallTimeoutIntegration(_ThrottleRetry, unittest.TestCase):
             with self.assertRaises(OperationalError) as caught:
                 waiter.cursor().execute(f'UPDATE {table} SET n = 3')
             self.assertLess(time.monotonic() - started, 4.5)
+            if os.environ.get('SEERDB_TEST_MIRROR') in ('postgres', '1'):
+                # The Mirror answers the break, having cancelled the wait, where
+                # it once left the client to drop the connection (#2717).
+                self.assertIn('call timeout of 1000 ms', str(caught.exception))
             if 'call timeout of 1000 ms' in str(caught.exception):
                 waiter.call_timeout = 0
                 waiter.rollback()

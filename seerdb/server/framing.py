@@ -25,8 +25,13 @@ version 315 (large SDU, #155), ``len(ub4) + type + flags + hdr-cksum(ub2)``.
 
 from __future__ import annotations
 
+import _socket
+import logging
+import select
 import socket
+import ssl
 import struct
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -41,6 +46,7 @@ from seerdb.common.tns_consts import (
     TNS_DATA,
     TNS_DATA_FLAGS_END_OF_RESPONSE,
     TNS_DATA_FLAGS_MORE,
+    TNS_MARKER,
     TTI_END_OF_RESPONSE,
     TTI_TOKEN,
 )
@@ -49,7 +55,9 @@ if TYPE_CHECKING:
     from seerdb.common.ano_session import AnoChannel
 
 # Re-exported for the server modules that frame at the default SDU.
-__all__ = ['DEFAULT_SDU', 'PacketStream']
+__all__ = ['DEFAULT_SDU', 'BreakWatch', 'PacketStream']
+
+logger = logging.getLogger(__name__)
 
 _HEADER_LEGACY = struct.Struct('>HhBBh')  # size, cksum, type, flags, hdr-cksum
 _HEADER_LARGE = struct.Struct('>IBBh')  # size, type, flags, hdr-cksum
@@ -114,6 +122,18 @@ class PacketStream:
         # is asked when the reply goes out, after the backend ran the call, so a
         # change the call itself made is reported on that call's reply.
         self.reply_prefix: Callable[[], bytes] | None = None
+        # The call being answered, as the break watcher sees it (#2717): whether
+        # one is, whether its reply has begun to go out, and whether a break
+        # cancelled it before it did, which drops the rest of its reply. Guarded
+        # by the lock, as the watcher's thread reads and sets them.
+        self._call_lock = threading.Lock()
+        self._in_call = False
+        self._reply_started = False
+        self._discard_reply = False
+        # Held while a packet is read. The watcher looks at the read-ahead and
+        # the socket under it: a read between the two would leave a gap in what
+        # it parses, and a payload byte could pass for a MARKER's header.
+        self._read_lock = threading.Lock()
 
     def allow_session_messages(self) -> None:
         """Raise the message limit to a logged-in session's. A transport that
@@ -204,6 +224,10 @@ class PacketStream:
         """
         if within is not None:
             return self._read_packet_within(within)
+        with self._read_lock:
+            return self._read_packet()
+
+    def _read_packet(self) -> tuple[int, bytes] | None:
         body = bytearray()
         while True:
             if not self._fill(8):
@@ -255,6 +279,14 @@ class PacketStream:
         (handshake replies) are small and go out whole.
         """
         if packet_type == TNS_DATA:
+            with self._call_lock:
+                if self._discard_reply:
+                    # The client broke the call, which then failed: what it
+                    # answers is not sent, as a real server sends none. The
+                    # break's reset and ORA-01013 are the answer (#2717).
+                    return
+                if self._in_call:
+                    self._reply_started = True
             if self.reply_prefix is not None:
                 body = self.reply_prefix() + body
             if self.response_token is not None:
@@ -278,6 +310,82 @@ class PacketStream:
         packet, rest = encode_packet(packet_type, body, self.sdu, self.large)
         self._sock.sendall(packet)
         assert rest is None, 'non-DATA packets do not fragment'
+
+    def begin_call(self) -> None:
+        """A call is being answered: a break may cancel it until its reply
+        begins (#2717)."""
+        with self._call_lock:
+            self._in_call = True
+            self._reply_started = False
+            self._discard_reply = False
+
+    def end_call(self) -> None:
+        """The call is answered, or cancelled: the next reply goes out."""
+        with self._call_lock:
+            self._in_call = False
+            self._discard_reply = False
+
+    def interrupt_call(self) -> bool:
+        """Drop the reply of the call being answered, as a break cancelled it,
+        when none of it has gone out yet. False when there is no call, or its
+        reply has begun: the break is then answered after it, as before."""
+        with self._call_lock:
+            if not self._in_call or self._reply_started:
+                return False
+            self._discard_reply = True
+            return True
+
+    def can_watch(self) -> bool:
+        """Whether :meth:`break_pending` can see the client: a socket's. A
+        WebSocket's messages are assembled before this framer sees them."""
+        return isinstance(self._sock, socket.socket)
+
+    def break_pending(self, timeout: float) -> bool | None:
+        """Wait up to ``timeout`` seconds for the client to send something,
+        without reading it. True when it sent a break (a ``MARKER``), or hung
+        up; None when it sent something else, or something this framer cannot
+        read before the call is done -- TLS records, whose headers are
+        encrypted, so over TCPS only a hang-up counts; False when it sent
+        nothing."""
+        sock = self._sock
+        try:
+            readable, _w, _x = select.select([sock], [], [], timeout)
+        except (OSError, ValueError):
+            return False  # the socket is closed: the session is ending
+        if not readable:
+            return False
+        # The read-ahead and the peek are taken together, with no read between
+        # them; while the session reads (a message's continuation), skip a look.
+        if not self._read_lock.acquire(blocking=False):
+            return None
+        try:
+            # The socket's own bytes, past TLS, and left in it to be read.
+            raw = _socket.socket.recv(
+                sock, 65536, socket.MSG_PEEK | socket.MSG_DONTWAIT
+            )
+            ahead = bytes(self._acc)
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True  # reset by the client
+        finally:
+            self._read_lock.release()
+        if not raw:
+            return True
+        if isinstance(sock, ssl.SSLSocket):
+            return None
+        # A MARKER's header is in plain text under native encryption too, which
+        # covers DATA payloads only. What was read ahead of the call comes first.
+        data = ahead + raw
+        pos = 0
+        while pos + 8 <= len(data):
+            if data[pos + 4] == TNS_MARKER:
+                return True
+            size = int.from_bytes(data[pos : pos + (4 if self.large else 2)], 'big')
+            if size < 8:
+                break
+            pos += size
+        return None
 
     def _write_data(self, body: bytes) -> None:
         # Continuation packets are sized SDU-37 (the client reads that exact size
@@ -365,3 +473,87 @@ def listen_socket(host: str, port: int, backlog: int) -> socket.socket:
         host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )[0]
     return socket.create_server((host, port), family=family, backlog=backlog)
+
+
+class BreakWatch:
+    """Cancels a backend's call when the client breaks it (#2717).
+
+    The session runs a call on its own thread and reads nothing from the client
+    until the backend returns. A client's break -- its ``cancel()``, or the
+    break a call timeout sends -- then waited in the socket while the backend
+    ran on, and a statement that never ended ran for good. One watcher thread a
+    session, armed for the length of each call, peeks for it: on a break or a
+    hang-up before the call's reply has begun, it cancels the backend's call and
+    has the stream drop that reply. The session then reads the break as it
+    always has and answers it with the reset and ORA-01013, as a real server
+    does. Without a backend ``cancel`` hook, or over a WebSocket, it does
+    nothing.
+    """
+
+    # How often an armed watcher looks again while the client sends something
+    # that is no break, rather than spin on a socket that stays readable.
+    POLL = 0.1
+
+    def __init__(self, stream: PacketStream, cancel: Callable[[], None] | None) -> None:
+        self._stream = stream
+        self._cancel = cancel
+        self._enabled = cancel is not None and stream.can_watch()
+        self._cond = threading.Condition()
+        self._armed = False
+        self._closed = False
+        self._thread: threading.Thread | None = None
+
+    def arm(self) -> None:
+        """A call is about to run."""
+        if not self._enabled:
+            return
+        self._stream.begin_call()
+        with self._cond:
+            self._armed = True
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name='mirror-break-watch', daemon=True
+                )
+                self._thread.start()
+            self._cond.notify()
+
+    def disarm(self) -> None:
+        """The call is answered; the session reads on."""
+        if not self._enabled:
+            return
+        with self._cond:
+            self._armed = False
+        self._stream.end_call()
+
+    def close(self) -> None:
+        """The session is over: the thread ends."""
+        with self._cond:
+            self._closed = True
+            self._armed = False
+            self._cond.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._armed and not self._closed:
+                    self._cond.wait()
+                if self._closed:
+                    return
+            pending = self._stream.break_pending(self.POLL)
+            if pending is None:
+                with self._cond:
+                    self._cond.wait(self.POLL)
+                continue
+            if not pending:
+                continue
+            if self._stream.interrupt_call():
+                cancel = self._cancel
+                try:
+                    if cancel is not None:
+                        cancel()
+                except Exception as exc:  # noqa: BLE001 -- the session carries on
+                    logger.warning('cancelling the backend call failed: %s', exc)
+            # One cancel a call: wait for the next.
+            with self._cond:
+                while self._armed and not self._closed:
+                    self._cond.wait()
