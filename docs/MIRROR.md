@@ -1346,6 +1346,12 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   10-15 04:00. Lifting this means storing the UTC time in Oracle's form
   wherever a value is built
   ([#2600](https://github.com/seerdb/seerdb/issues/2600)).
+- **`SYSDATE`, `SYSTIMESTAMP` and `CURRENT_TIMESTAMP` in PL/SQL** read the
+  clock each time they are evaluated, as Oracle's PL/SQL does, so a
+  `WHILE SYSDATE < t` loop ends. In SQL they are the statement's start, once
+  per statement, as in Oracle. A query inside a block, though, reads the clock
+  again on every row, where Oracle gives it one time for the statement
+  ([#2717](https://github.com/seerdb/seerdb/issues/2717)).
 - **`MEDIAN`** works as an aggregate, exact over a `NUMBER` and a `DATE`. As an
   analytic function (`MEDIAN(x) OVER (PARTITION BY ...)`) it is refused, since
   PostgreSQL has no exact median it can window.

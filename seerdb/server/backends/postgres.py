@@ -1514,12 +1514,19 @@ _HELPER_FUNCTIONS_DDL = (
     "regexp_replace($2, 'FF(?![1-9])', 'US', 'gi'))::timestamp $$;"
     # SYSTIMESTAMP / CURRENT_TIMESTAMP are TIMESTAMP WITH TIME ZONE values, the
     # first at the database's offset, the second at the session's; a plain
-    # timestamptz is TIMESTAMP WITH LOCAL TIME ZONE here (#1208).
+    # timestamptz is TIMESTAMP WITH LOCAL TIME ZONE here (#1208). Each of the
+    # instant it is given: the statement's start in SQL, the clock in PL/SQL, as
+    # Oracle reads them (_TIME_SOURCE, #2717); without one, the statement's.
+    f'CREATE OR REPLACE FUNCTION ora_systimestamp(timestamptz) RETURNS {_TSTZ_TYPE} '
+    f'LANGUAGE sql STABLE AS $$ SELECT ROW($1, 0)::{_TSTZ_TYPE} $$;'
     f'CREATE OR REPLACE FUNCTION ora_systimestamp() RETURNS {_TSTZ_TYPE} '
-    f'LANGUAGE sql STABLE AS $$ SELECT ROW(now(), 0)::{_TSTZ_TYPE} $$;'
+    'LANGUAGE sql STABLE AS $$ SELECT ora_systimestamp(statement_timestamp()) $$;'
+    'CREATE OR REPLACE FUNCTION ora_current_timestamp(timestamptz) '
+    f'RETURNS {_TSTZ_TYPE} LANGUAGE sql STABLE AS $$ SELECT '
+    f'ROW($1, extract(timezone FROM $1)::integer)::{_TSTZ_TYPE} $$;'
     f'CREATE OR REPLACE FUNCTION ora_current_timestamp() RETURNS {_TSTZ_TYPE} '
-    'LANGUAGE sql STABLE AS $$ SELECT '
-    f'ROW(now(), extract(timezone FROM now())::integer)::{_TSTZ_TYPE} $$;'
+    'LANGUAGE sql STABLE AS $$ '
+    'SELECT ora_current_timestamp(statement_timestamp()) $$;'
     # A WITH TIME ZONE value is its instant where a timestamptz is wanted -- in
     # arithmetic, a comparison, an LTZ column -- and its own wall-clock time where
     # a TIMESTAMP is, as Oracle converts it (#1208).
@@ -9013,6 +9020,24 @@ def _rowid_of_dual(sql: str) -> str:
     return _unmask_quoted(_ROWID_ITEM.sub(_DUAL_ROWID, masked), contents)
 
 
+# The instant SYSDATE, SYSTIMESTAMP and CURRENT_TIMESTAMP read (#2717). Oracle's
+# SQL reads the time once per statement, and its PL/SQL reads the clock each
+# time one is evaluated: `WHILE SYSDATE < t LOOP` ends. They were the
+# transaction's start (`localtimestamp`, `now()`), so that loop ran for good,
+# and two statements in one transaction read the same time. The statement's
+# start in SQL, then, and the clock in a text that is PL/SQL or PL/pgSQL -- a
+# block, a DO, a routine's or a trigger's definition -- where an embedded
+# multi-row query does read it again on every row (docs/MIRROR.md).
+_STATEMENT_TIME = 'statement_timestamp()'
+_CLOCK_TIME = 'clock_timestamp()'
+_TIME_SOURCE: ContextVar[str] = ContextVar('_TIME_SOURCE', default=_STATEMENT_TIME)
+_PROCEDURAL_TEXT = re.compile(
+    r'\s*(?:DO\b|DECLARE\b|BEGIN\b|CREATE\s+(?:OR\s+REPLACE\s+)?'
+    r'(?:EDITIONABLE\s+|NONEDITIONABLE\s+)?'
+    r'(?:FUNCTION|PROCEDURE|TRIGGER|PACKAGE|TYPE\s+BODY)\b)',
+    re.IGNORECASE,
+)
+
 _IDIOM_REWRITES: list[
     tuple[str, re.Pattern[str], str | Callable[[re.Match[str]], str]]
 ] = [
@@ -9176,7 +9201,7 @@ _IDIOM_REWRITES: list[
     (
         'systimestamp',
         re.compile(r'\bsystimestamp\b', re.IGNORECASE),
-        'ora_systimestamp()',
+        lambda _m: f'ora_systimestamp({_TIME_SOURCE.get()})',
     ),
     # DBMS_DEBUG_JDWP.CURRENT_SESSION_ID / _SERIAL are called without parentheses
     # in Oracle, which PostgreSQL would read as a column (#1355).
@@ -9193,7 +9218,7 @@ _IDIOM_REWRITES: list[
     (
         'current-timestamp',
         re.compile(r'\bcurrent_timestamp\b(?:\s*\(\s*\d+\s*\))?', re.IGNORECASE),
-        'ora_current_timestamp()',
+        lambda _m: f'ora_current_timestamp({_TIME_SOURCE.get()})',
     ),
     (
         'dbtimezone',
@@ -9210,11 +9235,12 @@ _IDIOM_REWRITES: list[
         ),
         r'AS timestamptz\1',
     ),
-    # SYSDATE is a DATE, so SYSDATE - d is a number of days (#1611).
+    # SYSDATE is a DATE, so SYSDATE - d is a number of days (#1611), of the
+    # instant Oracle reads (_TIME_SOURCE, #2717) at a second's precision.
     (
         'sysdate',
         re.compile(r'\bsysdate\b', re.IGNORECASE),
-        f'localtimestamp(0)::{_DATE_TYPE}',
+        lambda _m: f'({_TIME_SOURCE.get()})::timestamp(0)::{_DATE_TYPE}',
     ),
     # SESSIONTIMEZONE → the zone as ALTER SESSION spelled it, or, before any was
     # set, the session's current offset in Oracle's `+hh:mm` form: the zone a
@@ -12902,6 +12928,16 @@ def _past_the_gap(sql: str) -> str:
 
 
 def _rewritten_idioms(sql: str) -> str:
+    token = _TIME_SOURCE.set(
+        _CLOCK_TIME if _PROCEDURAL_TEXT.match(sql) else _STATEMENT_TIME
+    )
+    try:
+        return _rewritten_idiom_text(sql)
+    finally:
+        _TIME_SOURCE.reset(token)
+
+
+def _rewritten_idiom_text(sql: str) -> str:
     sql = _ruled('to-nchar', _to_nchar_as_to_char(sql), sql)
     sql = _ruled('bc-literal', _bc_literals(sql), sql)
     sql = _ruled('date-type', _mirror_date_type(sql), sql)

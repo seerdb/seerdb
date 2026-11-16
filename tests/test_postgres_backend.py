@@ -5590,7 +5590,7 @@ def test_a_profiled_mirror_records_each_statement_over_postgresql(
     assert (query['calls'], query['rows_out']) == (2, 2)
     assert query['backend']['statements_per_call'] >= 1
     assert query['backend']['database_ms'] > 0
-    assert 'localtimestamp' in query['translated']
+    assert 'statement_timestamp()' in query['translated']
     insert = statements['INSERT INTO T_PROF1881 VALUES(?)']
     assert (insert['kinds'], insert['rows_in']) == ({'executemany': 1}, 3)
     assert statements['SELECT * FROM NO_SUCH_TABLE_1881']['errors'] == {'ORA-00942': 1}
@@ -6173,8 +6173,9 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # sys.ora_intervalym_text (#2621), and the two state functions of MAX and
     # MIN of a WITH TIME ZONE value: sys.ora_tstz_larger and smaller (#2660),
     # and JSON_VALUE's lenient context item, three sys.ora_json_or_null, and
-    # JSON_QUERY's result by its input, two sys.ora_json_query_out (#2679).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 394
+    # JSON_QUERY's result by its input, two sys.ora_json_query_out (#2679),
+    # and SYSTIMESTAMP's and CURRENT_TIMESTAMP's at a given instant (#2717).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 396
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -6229,8 +6230,37 @@ def test_xmlelement_takes_its_name_after_name() -> None:
     ) == ('SELECT XMLELEMENT(NAME "A", XMLELEMENT(NAME "B", 2)) FROM dual')
 
 
+def test_sql_reads_the_statement_s_time_plsql_the_clock() -> None:
+    # Oracle's SQL reads SYSDATE once per statement, its PL/SQL each time it is
+    # evaluated: a `WHILE SYSDATE < t` loop ends. They were the transaction's
+    # start, so the loop ran for good (#2717).
+    assert _translate_idioms('SELECT SYSTIMESTAMP, CURRENT_TIMESTAMP FROM dual') == (
+        'SELECT ora_systimestamp(statement_timestamp()), '
+        'ora_current_timestamp(statement_timestamp()) FROM dual'
+    )
+    for text in (
+        'DO $$ BEGIN WHILE SYSDATE < t LOOP NULL; END LOOP; END $$',
+        'DECLARE t DATE := SYSDATE; BEGIN NULL; END;',
+        'BEGIN :x := SYSTIMESTAMP; END;',
+        'CREATE OR REPLACE PROCEDURE p AS BEGIN x := SYSDATE; END;',
+        'create function f return date as begin return sysdate; end;',
+        'CREATE OR REPLACE TRIGGER t BEFORE INSERT ON x FOR EACH ROW '
+        'BEGIN :new.d := SYSDATE; END;',
+    ):
+        out = _translate_idioms(text)
+        assert 'clock_timestamp()' in out and 'statement_timestamp' not in out, out
+    # A view or a table's default is SQL: the time of the statement using it.
+    for text in (
+        'CREATE VIEW v AS SELECT SYSDATE d FROM dual',
+        'CREATE TABLE t (d DATE DEFAULT SYSDATE)',
+    ):
+        assert 'statement_timestamp()' in _translate_idioms(text)
+
+
 def test_translate_idioms_functions_and_literals() -> None:
-    assert _translate_idioms('SELECT SYSDATE') == 'SELECT localtimestamp(0)::ora_date'
+    assert _translate_idioms('SELECT SYSDATE') == (
+        'SELECT (statement_timestamp())::timestamp(0)::ora_date'
+    )
     # HEXTORAW / RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as
     # real PostgreSQL functions (_HELPER_FUNCTIONS_DDL), so their call sites
     # resolve directly and pass through the idiom translation unchanged — just
@@ -16422,8 +16452,8 @@ def test_idiom_rewrites_leave_quoted_text_alone() -> None:
     )
     assert out == (
         "SELECT 'VARCHAR2', 'it''s NVARCHAR2', \"MINUS\" FROM t -- don't\n"
-        "WHERE c = CAST(x AS varchar(5)) EXCEPT SELECT 'sysdate', localtimestamp(0)::ora_date "
-        'FROM dual'
+        "WHERE c = CAST(x AS varchar(5)) EXCEPT SELECT 'sysdate', "
+        '(statement_timestamp())::timestamp(0)::ora_date FROM dual'
     )
     # A rule that reads into a literal still sees it: a negative INTERVAL.
     assert _translate_idioms("SELECT INTERVAL '-1 2:00:00' DAY TO SECOND") == (
