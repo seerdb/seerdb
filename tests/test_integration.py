@@ -188,13 +188,18 @@ _8I_UNSUPPORTED = (
     ('pipeline', 'the pipeline test uses array DML, unsupported on Oracle 8i'),
     ('batcherror', 'executemany (array DML) is not supported on Oracle 8i'),
     ('error_offset', 'the 8i error reply carries no offset (#719)'),
+    # 8i reads objects and collections (SeerODBC #168); these tests' SQL needs
+    # what 8.1.7 lacks.
     (
-        'collection_of_objects',
-        'object types are not supported on Oracle 8i (9i: #2258)',
+        'lob_attribute',
+        "8.1.7's SQL has no TO_CLOB / TO_BLOB, and 8i serves no LOB object's calls",
     ),
-    ('lob_attribute', 'object types are not supported on Oracle 8i (9i: #2258)'),
-    ('large_object_image', 'object types are not supported on Oracle 8i (9i: #2258)'),
-    ('nested_attribute', 'object types are not supported on Oracle 8i (9i: #2258)'),
+    ('large_object_image', "8.1.7's SQL has no TO_CLOB / TO_BLOB"),
+    (
+        'collection_value_from_a_one_element_constructor',
+        "8.1.7 takes no N'' literal into a VARCHAR2 element (ORA-12704)",
+    ),
+    ('collection_value_of_bfile_or_xmltype', 'Oracle 8i has no XMLType'),
     (
         'collection_of_collections',
         'object types are not supported on Oracle 8i (9i: #2258)',
@@ -203,7 +208,6 @@ _8I_UNSUPPORTED = (
         'local_time_zone_attribute',
         'object types are not supported on Oracle 8i (9i: #2258)',
     ),
-    ('collection_value', 'object types are not supported on Oracle 8i (9i: #2258)'),
     ('cache_evicts', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
     ('reuses_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
     ('forgets_the_cached_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
