@@ -7212,6 +7212,28 @@ VARCHAR2(10))` and `seerdb_va9` a `VARRAY(5) OF NUMBER`:
 9i's native form (§19.18) carries the same image in fixed-width fields
 (`_O9I_OBJECT_CELL`).
 
+**Binding an object or a collection** (SeerODBC #172), measured with ojdbc14
+on 9.2.0.4. It binds `seerdb_pt9(7, 'seven')` and a VARRAY into an INSERT,
+NULLs of both, and an object IN and OUT through a block:
+- **The descriptor** has a scalar's layout (§19.3) with the type's OID and
+  version filled in: `6d 01 00 00`, the size, `00 00`, the OID (`01 10 10` and
+  16 bytes), the version (`01 01`), charset 31 (`01 1f`), form `00`. The size is
+  the image's length (`01 10` for the object above); a NULL and an OUT bind are
+  declared at `04 7f ff ff ff`.
+- **The value** is the frame of the row cell above, without the type block.
+  ojdbc14 sends the type-OID, object-OID, snapshot and version fields empty
+  (`00 00 00 00`), then the image's length, flags `01 01` and the image. A NULL
+  is `00 00 00 00 00 01 01`.
+- **The image's header gives its length in the long form,** `84 01 fe 00 00 00
+  10`, where the server's replies use the short one.
+- **In a block**, the prompt marks each bind IN (`0x20`) or OUT (`0x10`). The
+  IN values follow in an RXD of their own, and an OUT object comes back in the
+  row cell's form, type block included.
+- **seerdb sends its 12c frame instead,** with the type's OID in the
+  type-OID field, and 9.2.0.4 takes it. A NULL object sent as a bare NULL
+  (`00`) left the server waiting for the frame.
+- **REF binds are not measured.**
+
 ### 19.18 Oracle 9i native OALL8 — the 64-bit thick request form (#716, #790)
 
 9i can speak the same OALL8 (`0x5e`) as 8i, but a native 9.2 OCI client marshals
