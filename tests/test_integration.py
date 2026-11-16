@@ -5827,6 +5827,13 @@ class BindIntegration(_IntegrationBase):
         self.cur.execute("BEGIN :v := N'nat \u00fcn\u00ee \u4e2d'; END;", [Var])
         self.assertEqual(Var.getvalue(), 'nat ünî 中')
 
+    def test_out_bind_text_past_ascii(self):
+        # A VARCHAR2 OUT bind's text past ASCII reads as a fetched value's does:
+        # on 8i it comes back in WE8ISO8859P1, which was read as UTF-8 (U+FFFD).
+        Var = self.cur.var(seerdb.DB_TYPE_VARCHAR, 20)
+        self.cur.execute("BEGIN :v := 'caf' || 'é'; END;", [Var])
+        self.assertEqual(Var.getvalue(), 'café')
+
     @_requires(_ASSOC_ARRAY_BIND)
     def test_array_binds_in_and_out(self):
         # Numbers in, strings in and out with one the block adds, and a NULL

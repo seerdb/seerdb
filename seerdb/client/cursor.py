@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
+import contextlib
 import re
+from collections.abc import Iterator
 from typing import Any
 
 from seerdb.client._conn_logic import plsql_inline_limit, temp_lobs_available
@@ -1009,10 +1011,30 @@ def _assign_out_binds(Bind, Result, Connection=None) -> list:
     Rows = Result[4]
     if not Rows or not isinstance(Rows[0], dict) or 'out_positions' not in Rows[0]:
         return []
+    with _bind_text_charset(Connection):
+        return _assign_out_values(Bind, Rows[0], Connection)
+
+
+@contextlib.contextmanager
+def _bind_text_charset(Connection) -> Iterator[None]:
+    # 8i returns an OUT bind's text, a RETURNING's included, in the charset its
+    # descriptor declares, WE8ISO8859P1, as it returns a row's: decoded as
+    # UTF-8, every character past ASCII came back as U+FFFD.
+    from seerdb.client.dialect import O8iDialect
+    from seerdb.common.types import reset_decode_8i, set_decode_8i
+
+    Token = set_decode_8i(isinstance(getattr(Connection, '_dialect', None), O8iDialect))
+    try:
+        yield
+    finally:
+        reset_decode_8i(Token)
+
+
+def _assign_out_values(Bind: list, Record: dict, Connection) -> list:
+    # Each OUT value of a block's record onto its Var (_assign_out_binds).
     from seerdb.common.lob import LOB
     from seerdb.common.types import decode_value
 
-    Record = Rows[0]
     RefCursors = []
     for Pos, Value in zip(Record['out_positions'], Record['out_values']):
         if Pos >= len(Bind):
@@ -1141,6 +1163,12 @@ def _assign_return_binds(Bind, Result, Connection=None) -> None:
     Records = [R for R in Rows or () if isinstance(R, dict) and 'return_positions' in R]
     if not Records:
         return
+    with _bind_text_charset(Connection):
+        _assign_return_values(Bind, Records, Connection)
+
+
+def _assign_return_values(Bind: list, Records: list, Connection) -> None:
+    # Each returned value of the records onto its Var (_assign_return_binds).
     from seerdb.common.tns import _PREFETCHED_IMAGE_TYPES
     from seerdb.common.types import decode_value
 
