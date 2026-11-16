@@ -326,6 +326,19 @@ def _lob_outs(bind: list, out_positions: list[int]) -> dict[int, tuple[int, int]
     return lobs
 
 
+def _object_outs(bind: list, out_positions: list[int]) -> frozenset[int]:
+    # The OUT binds a 9i block returns an object or collection for (SeerODBC
+    # #172): each object Var's index among the OUT values.
+    from seerdb.common.dbobject import DbObject, DbObjectType
+
+    return frozenset(
+        i
+        for i, pos in enumerate(out_positions)
+        if isinstance(bind[pos], DbObject)
+        or isinstance(getattr(_block_var(bind[pos]), 'dbtype', None), DbObjectType)
+    )
+
+
 def _cursor_marker(cursor_id: int, columns: list, rows: list) -> dict:
     # A cursor 9i already read, in the marker a 10g+ REF CURSOR leaves, with its
     # rows, so the cursor wraps them where 10g+ fetches by id (#2246, #2254).
@@ -342,9 +355,14 @@ def _block_input(value: object) -> object:
     # byte ojdbc14 sends (#2246); a NULL there is a bind the server cannot use.
     # A temporary LOB's is its locator, the marker itself (SeerODBC #169).
     from seerdb.common.datatypes import Var
+    from seerdb.common.dbobject import DbObjectType
 
     if _is_cursor_var(value):
         return b'\x00'
+    if isinstance(value, Var) and isinstance(value.dbtype, DbObjectType):
+        # An object's Var goes whole, so a NULL one is the object's NULL frame:
+        # a bare NULL left 9i waiting for the frame (SeerODBC #172).
+        return value
     return value._value if isinstance(value, Var) else value
 
 
@@ -383,6 +401,7 @@ class Fv2Dialect:
                 CAP_ARRAY_DML,
                 CAP_LOB_OBJECT,
                 CAP_TEMP_LOB,
+                CAP_OBJECT_BIND,
             }
         )
 
@@ -640,7 +659,10 @@ class Fv2Dialect:
             packet, end_of_fetch_ok=False, with_offset=True
         )
         (out_values, row_count, err_code) = decode_fv2_block_out(
-            packet, len(out_positions), _lob_outs(bind, out_positions)
+            packet,
+            len(out_positions),
+            _lob_outs(bind, out_positions),
+            _object_outs(bind, out_positions),
         )
         yield Send(encode_o7_close(0, cursor))
         yield RECV  # close STA

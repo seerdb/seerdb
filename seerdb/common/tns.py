@@ -14832,6 +14832,30 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
             # DATE / RAW / INTERVAL); keep the historical value
         return _o7_oac(Type, MaxSize, Csfrm, Charset)
 
+    from seerdb.common.dbobject import DbObject, DbObjectType
+
+    Held = Value.getvalue(0) if isinstance(Value, Var) else Value
+    if isinstance(Held, DbObject) or (
+        isinstance(Value, Var) and isinstance(Value.dbtype, DbObjectType)
+    ):
+        # An object or collection (SeerODBC #172), declared as ojdbc14 declares
+        # one to 9.2: type 109 at its image's length -- the most there is for
+        # a NULL or an OUT one -- with the type's OID and version, charset 31
+        # and form 0.
+        if isinstance(Held, DbObject):
+            Typ = Held._dbtype
+            Size = len(encode_object_image(Held))
+        else:
+            Typ = cast(Var, Value).dbtype
+            Size = 0
+        return _o7_oac(
+            TNS_TYPE_ADT,
+            Size or 0x7FFFFFFF,
+            0,
+            31,
+            Toid=Typ.oid,
+            Version=Typ.version,
+        )
     if isinstance(Value, TempLob):
         # A temporary LOB bound by its locator (SeerODBC #169), declared as
         # ojdbc14 declares one to 9.2: its type at 3876, under the 4000 past
@@ -18069,7 +18093,10 @@ _FV2_OUT_UNASSIGNED = bytes.fromhex('ff020c21')
 
 
 def decode_fv2_block_out(
-    Data: bytes, NumOut: int, Lobs: Mapping[int, tuple[int, int]] | None = None
+    Data: bytes,
+    NumOut: int,
+    Lobs: Mapping[int, tuple[int, int]] | None = None,
+    Objects: frozenset[int] = frozenset(),
 ) -> tuple[list, int, int]:
     # Parse a 9i PL/SQL block reply that returns OUT / IN OUT values (#102,
     # PROTOCOL §19.7). After any bind prompt is stripped, the reply is an
@@ -18105,6 +18132,14 @@ def decode_fv2_block_out(
             if i in Lobs:
                 (LobCell, Rest) = _O7_LOB_CELL_FROM_THIN(Rest)
                 OutValues.append(_pre10_lob_out(*Lobs[i], LobCell))
+                continue
+            if i in Objects:
+                # An object or collection: a row's object cell (PROTOCOL.md
+                # 19.17c), its image for the cursor to build against the Var's
+                # type, then the indicator (SeerODBC #172).
+                (Image, Rest) = _read_object_column(Rest, {})
+                (_, Rest) = _O7_EMPTY_CELL_FROM_THIN(Rest)
+                OutValues.append(Image)
                 continue
             # A value and its indicator, as in a row (`_O7_CELL`): -1 for NULL.
             (Cell, Rest) = _O7_CELL_FROM_THIN(Rest)
