@@ -319,8 +319,8 @@ to every supported server — from Oracle **8i (8.1.7) through 26ai**:
 | 23ai | ✅ supported | fast-auth login at field version 24; JSON / OSON, native `BOOLEAN`, `VECTOR` (dense + sparse), column annotations |
 | 21c | ✅ supported | |
 | 19c · 18c · 12c | ✅ supported | same 12c+ wire protocol as 21c |
-| 11g (11.2) | ✅ supported | primary reference tier |
-| 10g (10.2) | ✅ supported | |
+| 11g (11.2) | ✅ supported | primary reference tier; OCI 11.2's native form is an experimental opt-in (`oall8=True`) — see the matrix note |
+| 10g (10.2) | ✅ supported | OCI 11.2's native form is an experimental opt-in (`oall8=True`) — see the matrix note |
 | 9i (9.2) | ✅ common surface | the legacy field-version-2 (`TTI_ALL7`) dialect — see the matrix note; the native `OALL8` dialect is an experimental opt-in (`oall8=True`) |
 | 8i (8.1.7) | ✅ common surface | the 9.2-era `OALL8` dialect; the oldest and most limited tier — see the matrix note. 8.1.7 is the floor (Oracle 8.0 is unsupported) |
 
@@ -431,7 +431,8 @@ native BFILE reads, CLOB / BLOB OUT binds and `RETURNING` (their value is the
 text or bytes, as a fetched LOB's is: 8i serves no LOB object calls, and makes
 no temporary LOB, so an IN OUT LOB Var holding text and a block value past
 32512 bytes are refused), LONG / LONG RAW, ROWID / UROWID, and transactions — sync and
-async. 8i has no `SYS_REFCURSOR`: declare a package's `REF CURSOR` type. On top of the 9i gaps above it predates
+async. It keeps no cursor cache, so a repeated statement is parsed again, and
+runs no array DML: `executemany()` is refused. 8i has no `SYS_REFCURSOR`: declare a package's `REF CURSOR` type. On top of the 9i gaps above it predates
 `TIMESTAMP` and `INTERVAL` (only `DATE`), the AL16UTF16 national charset
 (`WE8ISO8859P1` only), and returns a single row for `CONNECT BY LEVEL`. Oracle
 **8.0** (pre-8i) is out of scope — 8.1.7 is the floor.
