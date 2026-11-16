@@ -13294,6 +13294,15 @@ class RefBindIntegration(_IntegrationBase):
         self.assertEqual(ref.type_name, self.TYPE)
         # Bind into an INSERT, then DEREF the stored REF back to the object.
         self.cur.execute(f'INSERT INTO {self.REFS} (id, r) VALUES (:1, :2)', [100, ref])
+        if _conn_is_8i(self.conn):
+            # 8.1.7's SQL takes no attribute of a DEREF (ORA-00923): read it from
+            # the object.
+            self.cur.execute(f'SELECT id, DEREF(r) FROM {self.REFS} WHERE id = 100')
+            (rid, obj) = self.cur.fetchone()
+            self.assertEqual((rid, obj.NAME), (100, 'Alice'))
+            self.cur.execute('SELECT DEREF(:1) FROM dual', [ref])
+            self.assertEqual(self.cur.fetchone()[0].NAME, 'Alice')
+            return
         self.cur.execute(f'SELECT id, DEREF(r).name FROM {self.REFS} WHERE id = 100')
         self.assertEqual(self.cur.fetchone(), (100, 'Alice'))
         # Bind into DEREF directly.
@@ -16538,8 +16547,16 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await cur.execute(f'SELECT REF(p) FROM {PEOPLE} p WHERE p.id = 1')
             ref = (await cur.fetchone())[0]
             await cur.execute(f'INSERT INTO {REFS} (id, r) VALUES (:1, :2)', [100, ref])
-            await cur.execute(f'SELECT id, DEREF(r).name FROM {REFS} WHERE id = 100')
-            self.assertEqual(await cur.fetchone(), (100, 'Alice'))
+            if _conn_is_8i(Conn):
+                # 8.1.7's SQL takes no attribute of a DEREF (ORA-00923).
+                await cur.execute(f'SELECT id, DEREF(r) FROM {REFS} WHERE id = 100')
+                (rid, obj) = await cur.fetchone()
+                self.assertEqual((rid, obj.NAME), (100, 'Alice'))
+            else:
+                await cur.execute(
+                    f'SELECT id, DEREF(r).name FROM {REFS} WHERE id = 100'
+                )
+                self.assertEqual(await cur.fetchone(), (100, 'Alice'))
         finally:
             cur = Conn.cursor()
             for s in drops:

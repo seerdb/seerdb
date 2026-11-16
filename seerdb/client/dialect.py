@@ -164,6 +164,7 @@ from seerdb.common.tns_consts import (
     TNS_TYPE_BFILE,
     TNS_TYPE_BLOB,
     TNS_TYPE_CLOB,
+    TNS_TYPE_REF,
     TNS_TYPE_REFCURSOR,
     TTI_DCB,
     TTI_FOB,
@@ -1188,10 +1189,18 @@ class Oall8Dialect:
 
     def capabilities(self) -> frozenset[str]:
         # 8i does query / DML / PL/SQL / LOB and drives its own COMMIT / ROLLBACK
-        # (no modern TTI_COMMIT); no array DML. It binds objects and collections
-        # as OCI 9.2 does (SeerODBC #172).
+        # (no modern TTI_COMMIT); no array DML. It binds objects, collections
+        # and REFs as OCI 9.2 does (SeerODBC #172).
         return frozenset(
-            {CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_OWN_TXN, CAP_OBJECT_BIND}
+            {
+                CAP_QUERY,
+                CAP_DML,
+                CAP_BLOCK,
+                CAP_LOB,
+                CAP_OWN_TXN,
+                CAP_OBJECT_BIND,
+                CAP_REF_BIND,
+            }
         )
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
@@ -1424,11 +1433,14 @@ class O8iDialect(Oall8Dialect):
         # 8i describes SQL's BITAND as type 29, which no client fetches: its
         # sqlplus is refused with ORA-00932, and the fetch seerdb sent was an
         # ORA-00600 [kpodfl1] in the server process (#2584). A type with no
-        # DbType is one seerdb cannot read either.
+        # DbType is one seerdb cannot read either, but for a REF, which has
+        # none on any tier: 8.1.7 sends one as OCI 9.2 defines it, its bytes
+        # (SeerODBC #168).
         return [
             col
             for col in columns
-            if dbtype_for_oracle_type(col.get('data_type') or 0, col.get('csfrm') or 1)
+            if col.get('data_type') != TNS_TYPE_REF
+            and dbtype_for_oracle_type(col.get('data_type') or 0, col.get('csfrm') or 1)
             is None
         ]
 
@@ -1536,6 +1548,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 CAP_LOB_OBJECT,
                 CAP_TEMP_LOB,
                 CAP_OBJECT_BIND,
+                CAP_REF_BIND,
             }
         )
 
