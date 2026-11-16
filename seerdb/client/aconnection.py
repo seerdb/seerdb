@@ -99,7 +99,12 @@ from seerdb.common.exceptions import (
     Truncated,
     connection_closed,
 )
-from seerdb.common.sqltext import is_plsql, is_reusable_dml, statement_head
+from seerdb.common.sqltext import (
+    is_plsql,
+    is_query,
+    is_reusable_dml,
+    statement_head,
+)
 from seerdb.common.tns import (
     _DTY_8I,
     FLUSH_OUT_BINDS,
@@ -1610,11 +1615,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             if ParseOnly and dialect_parses(self._dialect):
                 # Parsed in the dialect's own form (a pooled 11g session's).
                 return await self._drive(self._dialect.parse(Query))
-            if (
-                scrollable
-                and statement_head(Query).startswith('SELECT')
-                and dialect_scrolls(self._dialect)
-            ):
+            if scrollable and is_query(Query) and dialect_scrolls(self._dialect):
                 # Opened scrollable in the dialect's own form, its cursor kept
                 # open for scroll_fetch (a pooled 11g session's, #2466).
                 return await self._drive(
@@ -1642,7 +1643,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 refuse_pre10_batch(
                     self._dialect, Head, None if Native else ReturnBinds, BatchErrors
                 )
-            if Head.startswith('SELECT'):
+            if is_query(Head):
                 return await self._drain_cursor(
                     await self._drive(
                         self._dialect.execute_query(Query, Bind, self.fetch)
@@ -1677,7 +1678,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             if self.autocommit and pre10_dml_applied(Result, BatchErrors):
                 await self.commit()
             return Result
-        if Head.startswith('SELECT'):
+        if is_query(Head):
             Type = 'select'
         elif Head.startswith('BEGIN') or Head.startswith('DECLARE'):
             # Anonymous PL/SQL block: dedicated 'block' exec option set, not the
@@ -3253,7 +3254,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             Bind = Rows[0] if Rows else []
             Batch = Rows[1:]
         Head = statement_head(Op.statement)
-        if Head.startswith('SELECT'):
+        if is_query(Head):
             Type = 'select'
         elif Head.startswith('BEGIN') or Head.startswith('DECLARE'):
             Type = 'block'

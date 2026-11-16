@@ -1423,13 +1423,14 @@ def refuse_pre10_batch(Dialect, Head: str, ReturnBinds, BatchErrors: bool) -> No
     refused: an array RETURNING, and a batch of a query or a PL/SQL block.
     """
     from seerdb.client.dialect import CAP_ARRAY_DML
+    from seerdb.common.sqltext import is_plsql, is_query
 
     Tier = 'Oracle ' + _pre10_tier_name_for(Dialect)
     if CAP_ARRAY_DML not in Dialect.capabilities():
         raise NotSupportedError(f'executemany (array DML) is not supported on {Tier}')
     if ReturnBinds:
         raise NotSupportedError(f'an array DML RETURNING is not supported on {Tier}')
-    if Head.startswith(('SELECT', 'BEGIN', 'DECLARE')):
+    if is_query(Head) or is_plsql(Head):
         raise NotSupportedError(
             f'executemany of a query or PL/SQL block is not supported on {Tier}'
         )

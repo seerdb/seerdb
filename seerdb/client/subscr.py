@@ -392,9 +392,9 @@ class Subscription:
         # Only a query registers; anything else with the registration in its
         # execute draws ORA-03137 from the server, so it is refused here, as
         # python-oracledb refuses it.
-        from seerdb.common.sqltext import statement_head
+        from seerdb.common.sqltext import is_query
 
-        if not statement_head(statement).startswith(('SELECT', 'WITH')):
+        if not is_query(statement):
             raise ProgrammingError('registerquery takes a query')
         Conn = self.connection
         Cursor = Conn.cursor()

@@ -339,6 +339,23 @@ def statement_head(SQL: str) -> str:
     return ''
 
 
+def is_query(SQL: str) -> bool:
+    """Whether a statement is a query: its first word, past comments and any
+    opening parentheses, is ``SELECT`` or ``WITH`` (#2731).
+
+    A subquery factoring clause (``WITH w AS (...) SELECT ...``, ``WITH
+    FUNCTION ...``) and a parenthesised query (``(SELECT ...) UNION ...``) are
+    queries to the server as much as a plain ``SELECT``, and their rows are
+    fetched the same way. Taken for DML they were refused (ORA-00900) or ran
+    with no rows to fetch.
+    """
+    for T in sql_tokens(SQL):
+        if T.kind in ('space', 'comment') or SQL[T.start : T.end] == '(':
+            continue
+        return T.kind == 'word' and SQL[T.start : T.end].upper() in ('SELECT', 'WITH')
+    return False
+
+
 def is_plsql(SQL: str) -> bool:
     # PL/SQL blocks start with BEGIN or DECLARE after stripping leading
     # whitespace and SQL comments. Anonymous blocks, packaged calls

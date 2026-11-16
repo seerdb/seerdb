@@ -712,6 +712,8 @@ _END_TO_END = _Need(
     end_to_end=True,
 )
 _IMPLICIT_RESULTS = _Need('DBMS_SQL.RETURN_RESULT is 12c+', min_server=12)
+_SUBQUERY_FACTORING = _Need('a WITH clause is 9i and later', not_8i=True)
+_WITH_FUNCTION = _Need('a function in a WITH clause is 12c and later', min_server=12)
 _PRE12_VECTOR_REFUSAL = _Need('a 12.1+ session binds a VECTOR', below_fv=_FV)
 _CURSOR_CACHE = _Need(
     'cursor cache is disabled on 12c+ (re-parse each execute)', below_fv=_FV
@@ -3407,6 +3409,33 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT n, s FROM {self.TABLE}')
         (n, text) = self.cur.fetchone()
         self.assertEqual((float(n), text), (1.5, 'a'))
+
+    @_requires(_SUBQUERY_FACTORING)
+    def test_a_query_may_start_with_a_with_clause(self):
+        # A query whose first word is WITH is a query, its rows fetched as a
+        # SELECT's (#2731). Read off the first word as DML, 12c and later
+        # refused it (ORA-00900) and 10g and 11g ran it with no rows to fetch.
+        self.cur.execute('WITH w AS (SELECT :1 n FROM dual) SELECT n FROM w', [5])
+        self.assertEqual(self.cur.fetchall(), [(5,)])
+        self.cur.execute('/* c */ with w as (select 1 n from dual) select n from w')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
+    def test_a_query_may_start_with_a_parenthesis(self):
+        # A parenthesised query is a query too (#2731).
+        self.cur.execute('(SELECT 1 n FROM dual) UNION ALL (SELECT 2 FROM dual)')
+        self.assertEqual(sorted(self.cur.fetchall()), [(1,), (2,)])
+        self.cur.execute('  ( ( select 3 n from dual ) )')
+        self.assertEqual(self.cur.fetchall(), [(3,)])
+
+    @_requires(_WITH_FUNCTION, _postgres_cannot('run a function in a WITH clause'))
+    def test_a_query_may_start_with_a_with_function(self):
+        # A WITH clause may declare a PL/SQL function, its `;`s inside the
+        # query (#2731).
+        self.cur.execute(
+            'WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 7; END; '
+            'SELECT f() n FROM dual'
+        )
+        self.assertEqual(self.cur.fetchall(), [(7,)])
 
     @_requires(_BINARY_FLOAT)
     def test_the_conversion_functions(self):
@@ -13846,6 +13875,27 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             await Cur.execute(f'SELECT n FROM {Table}')
             self.assertEqual(float((await Cur.fetchone())[0]), 2.5)
             await self._drop_async(Cur, Table)
+        finally:
+            await Conn.close()
+
+    @_requires(_SUBQUERY_FACTORING)
+    async def test_a_query_may_start_with_a_with_clause(self):
+        # Async twin of CursorIntegration's (#2731).
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await Cur.execute('WITH w AS (SELECT :1 n FROM dual) SELECT n FROM w', [5])
+            self.assertEqual(await Cur.fetchall(), [(5,)])
+        finally:
+            await Conn.close()
+
+    async def test_a_query_may_start_with_a_parenthesis(self):
+        # Async twin of CursorIntegration's (#2731).
+        Conn = await seerdb.connect_async(**self._kwargs())
+        try:
+            Cur = Conn.cursor()
+            await Cur.execute('(SELECT 1 n FROM dual) UNION ALL (SELECT 2 FROM dual)')
+            self.assertEqual(sorted(await Cur.fetchall()), [(1,), (2,)])
         finally:
             await Conn.close()
 

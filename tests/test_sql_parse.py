@@ -24,11 +24,40 @@ from seerdb.common.sqltext import (
     canonical_bind_key,
     extract_bind_names,
     is_plsql,
+    is_query,
     is_reusable_dml,
     sql_tokens,
     statement_head,
     strip_non_bind_text,
 )
+
+
+class TestIsQuery(unittest.TestCase):
+    # A query is one whose first word, past comments and opening parentheses,
+    # is SELECT or WITH (#2731).
+    def test_select_with_and_a_parenthesis_are_queries(self):
+        for sql in (
+            'select 1 from dual',
+            'WITH w AS (SELECT 1 FROM dual) SELECT * FROM w',
+            '/* c */ -- d\n with w as (select 1 from dual) select * from w',
+            'WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; SELECT f() FROM dual',
+            '(SELECT 1 FROM dual) UNION ALL (SELECT 2 FROM dual)',
+            ' ( /* c */ ( select 1 from dual ) )',
+        ):
+            self.assertTrue(is_query(sql), sql)
+
+    def test_the_rest_are_not(self):
+        for sql in (
+            'insert into t select 1 from dual',
+            'BEGIN NULL; END;',
+            'DECLARE x NUMBER; BEGIN NULL; END;',
+            "update t set s = 'with'",
+            '"WITH"',
+            '( insert into t values (1) )',
+            '',
+            '/* select */',
+        ):
+            self.assertFalse(is_query(sql), sql)
 
 
 class TestStatementHead(unittest.TestCase):
