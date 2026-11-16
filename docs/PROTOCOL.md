@@ -6273,9 +6273,32 @@ differences matters:
 The reference client sends 64-byte chunks.
 
 seerdb binds a plain `str` or `bytes` this way in a 9i block, declared at 32767
-once it is past 4000 / 2000 bytes, and refuses one past 32512 bytes up front
-(#2637). On 8i, whose descriptor is sized to the value (§19.11), the same block
-takes it as it is.
+once it is past 4000 / 2000 bytes (#2637). On 8i, whose descriptor is sized to
+the value (§19.11), the same block takes it as it is.
+
+**Past 32512 bytes, a temporary LOB** (SeerODBC #169). ojdbc14 does it on
+9.2.0.4 with `CLOB.createTemporary`, a write, and the CLOB bound into the
+statement; seerdb does the same for a block's value past 32512 bytes, and for
+a CLOB / BLOB Var holding a value, and refuses one only on 8i, which makes no
+temporary LOB here.
+- **CREATE_TEMP** is the LOBOPS head (§19.5) with an empty 86-byte locator
+  (`00 54` and zeros) as its source, the session duration (10) in the
+  destination length, the charset form and the LOB type (112 / 113) in the two
+  short offsets, and the charset, amount and null-LOB pointers set. After the
+  locator come the charset, `01 1f` for WE8ISO8859P1, and the duration again
+  as the amount. The LOB is made in the database's charset, its national one
+  for an NCLOB, as on the native form (#2537).
+- **Its reply** is the RPA with the new locator (a ub2 length, 84, and the
+  body), then the status. The text is then written with §19.5's calls.
+- **The bind** is the LOB's type at 3876 (`0f 24`), under the 4000 past which a
+  statement's bind is LONG-class and read after the others, with charset 31
+  and form 1. An NCLOB's charset is AL16UTF16; with 31 the server answered
+  PLS-553.
+- **The value** is a ub4 length, 86, then the locator as a DALC, in 64-byte
+  chunks: `01 56 fe 40 <64 bytes> 16 <22 bytes> 00`. It goes in a statement's
+  RXD and in a block's, as other values do.
+- **ojdbc14 frees it** with FREE_TEMP (op `0x0111`) when told to; seerdb frees
+  no temporary LOB on any tier, so one lasts until the session ends.
 
 ### 19.4 Errors, ROWID, and unsupported types (#102)
 

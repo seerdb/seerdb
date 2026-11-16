@@ -151,6 +151,7 @@ from seerdb.common.tns import (
     prefixed_locator,
 )
 from seerdb.common.tns_consts import (
+    AL32UTF8_CHARSET,
     FIELD_VERSION_11_2,
     ISO_LATIN_1_CHARSET,
     ORA_NO_DATA_FOUND,
@@ -316,7 +317,7 @@ def _lob_outs(bind: list, out_positions: list[int]) -> dict[int, tuple[int, int]
 
     lobs = {}
     for i, pos in enumerate(out_positions):
-        value = bind[pos]
+        value = _block_var(bind[pos])
         if isinstance(value, Var) and value.dbtype.tns_type in (
             TNS_TYPE_CLOB,
             TNS_TYPE_BLOB,
@@ -339,6 +340,7 @@ def _cursor_marker(cursor_id: int, columns: list, rows: list) -> dict:
 def _block_input(value: object) -> object:
     # A block bind's IN value. A REF CURSOR's is an empty cursor slot, the one
     # byte ojdbc14 sends (#2246); a NULL there is a bind the server cannot use.
+    # A temporary LOB's is its locator, the marker itself (SeerODBC #169).
     from seerdb.common.datatypes import Var
 
     if _is_cursor_var(value):
@@ -346,18 +348,62 @@ def _block_input(value: object) -> object:
     return value._value if isinstance(value, Var) else value
 
 
+def _block_var(value: object) -> object:
+    # The Var a block bind writes an OUT value back to: the bind itself, or
+    # the one a temporary LOB's marker carries (SeerODBC #169); None for a
+    # plain value.
+    from seerdb.common.datatypes import TempLob, Var
+
+    if isinstance(value, TempLob):
+        return value.var if isinstance(value.var, Var) else None
+    return value if isinstance(value, Var) else None
+
+
 class Fv2Dialect:
     """Oracle 9i (TTC field version 2) — the four-call TTI_ALL7 dialect (#102,
     PROTOCOL.md §19). Sans-io: driven by ``OracleConnect._drive`` (sync) or
     ``AsyncOracleConnect._drive`` (async)."""
 
+    # The database's charset and its national one, from the login's TTI_PRO: a
+    # temporary LOB is made in the one its type has (SeerODBC #169).
+    _db_charset: int | None = None
+    _db_ncharset: int | None = None
+
     def capabilities(self) -> frozenset[str]:
         # 9i does query / DML / PL/SQL blocks / LOB, and array DML over
         # TTI_ALL7 (#2245). It uses the modern commit path, so it does NOT
-        # advertise CAP_OWN_TXN.
+        # advertise CAP_OWN_TXN. It makes temporary LOBs, as ojdbc14 does
+        # (SeerODBC #169).
         return frozenset(
-            {CAP_QUERY, CAP_DML, CAP_BLOCK, CAP_LOB, CAP_ARRAY_DML, CAP_LOB_OBJECT}
+            {
+                CAP_QUERY,
+                CAP_DML,
+                CAP_BLOCK,
+                CAP_LOB,
+                CAP_ARRAY_DML,
+                CAP_LOB_OBJECT,
+                CAP_TEMP_LOB,
+            }
         )
+
+    def create_temp_lob(self, is_blob: bool, csfrm: int = 1):
+        # A temporary CLOB, NCLOB (csfrm 2) or BLOB of the session's duration,
+        # as ojdbc14 makes one on 9.2.0.4 (SeerODBC #169), in the database's
+        # charset -- its national one for an NCLOB -- as 9i's native form makes
+        # one (#2537). Returns the bare locator.
+        from seerdb.common.tns import decode_o7_create_temp, encode_o7_create_temp
+
+        charset = self._db_ncharset if csfrm == 2 else self._db_charset
+        yield Send(
+            encode_o7_create_temp(
+                0, is_blob, 0 if is_blob else csfrm, charset or AL32UTF8_CHARSET
+            )
+        )
+        resp = yield RECV
+        if resp is False:
+            raise connection_closed('9i CREATE_TEMP')
+        fv2_raise_for_error(resp[1])
+        return decode_o7_create_temp(resp[1])
 
     # Whether a fetch keeps its LOB cells as LOB objects -- the connection's
     # fetch_lobs, set before each statement -- rather than reading their content
@@ -560,7 +606,7 @@ class Fv2Dialect:
         input_values = [
             _block_input(b) for b in bind if not isinstance(b, Var) or b.has_value
         ]
-        out_positions = [i for i, b in enumerate(bind) if isinstance(b, Var)]
+        out_positions = [i for i, b in enumerate(bind) if _block_var(b) is not None]
         cursor = yield from self._shared_cursor()
         yield Send(encode_o7_block(0, sql, bind, Cursor=cursor))
         resp = yield RECV
