@@ -9871,6 +9871,25 @@ class LOBObjectIntegration(_IntegrationBase):
         self.assertEqual(empty_clob.read(), '')
         self.assertEqual(empty_blob.read(), b'')
 
+    def test_a_lob_call_in_a_subquery_is_a_lob(self):
+        # Through a derived table or a CTE, by star or by name, a LOB call is
+        # still a LOB (#2694).
+        for sql in (
+            "SELECT * FROM (SELECT TO_CLOB('some value') c, EMPTY_BLOB() b FROM dual)",
+            "SELECT s.c, s.b FROM (SELECT TO_CLOB('some value') c, EMPTY_BLOB() b "
+            'FROM dual) s',
+            "WITH w AS (SELECT TO_CLOB('some value') c, EMPTY_BLOB() b FROM dual) "
+            'SELECT c, b FROM w',
+        ):
+            with self.subTest(sql=sql):
+                self.cur.execute(sql)
+                self.assertEqual(
+                    [d[1] for d in self.cur.description],
+                    [seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_BLOB],
+                )
+                clob, blob = self.cur.fetchone()
+                self.assertEqual((clob.read(), blob.read()), ('some value', b''))
+
     def test_a_fetched_clob_is_a_lob_object(self):
         lob = self._fetch_lob()
         self.assertTrue(hasattr(lob, 'read'), f'expected a LOB, got {type(lob)}')
@@ -18956,6 +18975,20 @@ class JsonTableIntegration(_IntegrationBase):
                 seerdb.DB_TYPE_VARCHAR,
             ],
         )
+
+    def test_a_clob_column_is_a_lob(self):
+        # A CLOB column, its value text or FORMAT JSON, is a LOB, as a CLOB
+        # column of a table is (#2694).
+        self.cur.execute(
+            f"SELECT * FROM JSON_TABLE('{self.DOC}', '$' COLUMNS (name CLOB PATH "
+            "'$.name', o CLOB FORMAT JSON PATH '$.o'))"
+        )
+        self.assertEqual(
+            [d[1] for d in self.cur.description],
+            [seerdb.DB_TYPE_CLOB, seerdb.DB_TYPE_CLOB],
+        )
+        (name, o) = self.cur.fetchone()
+        self.assertEqual((name.read(), o.read()), ('x', '{"z":1}'))
 
     def test_an_implied_path_reads_the_key_as_written(self):
         self.assertEqual(self._table("""'{"id":2}', '$' COLUMNS (id)"""), [('2',)])

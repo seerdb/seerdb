@@ -1350,6 +1350,46 @@ def test_a_whole_lob_call_item_is_a_lob_column() -> None:
     assert _computed_column_types("INSERT INTO t VALUES (to_clob('a'))") == {}
 
 
+def test_a_lob_call_keeps_its_type_through_a_subquery() -> None:
+    # A source item's type reaches a column with no table origin that names
+    # it, by name or by star, through a derived table, a LATERAL subquery (as
+    # JSON_TABLE's translation writes one) and a CTE, nested too (#2694).
+    from seerdb.common.tns_consts import TNS_TYPE_BLOB, TNS_TYPE_CLOB
+
+    lob = "(SELECT to_clob('x') c, empty_blob() b, 1 n FROM dual)"
+    every = {0, 1, 2}
+    assert _computed_column_types(f'SELECT * FROM {lob}', ['c', 'b', 'n'], every) == {
+        0: TNS_TYPE_CLOB,
+        1: TNS_TYPE_BLOB,
+    }
+    assert _computed_column_types(
+        f'SELECT s.b, c AS d, n FROM {lob} s', ['b', 'd', 'n'], every
+    ) == {0: TNS_TYPE_BLOB, 1: TNS_TYPE_CLOB}
+    assert _computed_column_types(
+        f'WITH w AS {lob}, v (k) AS (SELECT c FROM w) SELECT * FROM v', ['k'], {0}
+    ) == {0: TNS_TYPE_CLOB}
+    assert _computed_column_types(
+        f'SELECT * FROM (SELECT * FROM {lob})', ['c', 'b', 'n'], every
+    ) == {0: TNS_TYPE_CLOB, 1: TNS_TYPE_BLOB}
+    assert _computed_column_types(
+        'SELECT * FROM t, LATERAL (SELECT TO_CLOB(a) AS a FROM JSON_TABLE(x, '
+        "'$' COLUMNS (a text PATH '$.a')) AS sys_jt)",
+        ['id', 'a'],
+        {1},
+    ) == {1: TNS_TYPE_CLOB}
+    # A table's own column, a traced one, keeps its describe.
+    assert _computed_column_types(f'SELECT t.c FROM t, {lob} s', ['c'], set()) == {}
+    # An expression over the column, a name that two sources give with other
+    # types, and a column nothing says is untraced map nothing.
+    assert _computed_column_types(f'SELECT upper(c) c FROM {lob}', ['c'], {0}) == {}
+    assert _computed_column_types(
+        f"SELECT * FROM {lob} a, (SELECT 'y' c FROM dual) z",
+        ['c', 'b', 'n', 'c'],
+        {0, 1, 2, 3},
+    ) == {1: TNS_TYPE_BLOB}
+    assert _computed_column_types(f'SELECT c FROM {lob}') == {}
+
+
 def test_declared_columns_record_what_postgresql_keeps_less_of() -> None:
     # What sys.ora_columns records from a DDL (#1386): a RAW(n)'s length, None for
     # a type it records nothing for, no constraint as a column, and a MODIFY that

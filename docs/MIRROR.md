@@ -1295,11 +1295,9 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
 - **`JSON_QUERY … PRETTY`** returns the compact text: PostgreSQL's pretty
   form isn't Oracle's, so the clause is not kept
   ([#2679](https://github.com/seerdb/seerdb/issues/2679)).
-- **A `JSON_TABLE` column** differs from 23ai in three places
+- **A `JSON_TABLE` column** differs from 23ai in two places
   ([#2679](https://github.com/seerdb/seerdb/issues/2679)):
   - a BOOLEAN column over a JSON number is TRUE or FALSE, where 23ai gives NULL;
-  - a CLOB column is described as VARCHAR2, as any CLOB coming out of a subquery
-    is ([#2694](https://github.com/seerdb/seerdb/issues/2694));
   - sibling `NESTED` columns' rows come in the other order. They are the same
     rows, and neither side orders them without an ORDER BY.
 - **A `JSON_EXISTS … PASSING` text value compared with a JSON number** is
