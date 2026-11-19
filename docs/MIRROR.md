@@ -692,8 +692,10 @@ PostgreSQL 19 with the newest extensions, before CI's image moves to it.
 | `JSON_TABLE` as 23ai answers it: Oracle's column types, an implied path read as the column is written, no row path, `NESTED [PATH]`, `FOR ORDINALITY`, `EXISTS`, `FORMAT JSON` in Oracle's compact form, a column's and the table's `ON ERROR` / `ON EMPTY`, and invalid JSON as no rows | PostgreSQL 17 | refused with ORA-03001 |
 | `RETURNING OLD col` / `NEW col` (23ai) in a DML statement or a PL/SQL block | PostgreSQL 18 | refused with ORA-03001 |
 | `ALTER TABLE … DISABLE CONSTRAINT` / `ENABLE CONSTRAINT` of a foreign key, and `MODIFY CONSTRAINT … DISABLE \| ENABLE`: the constraint shows as `DISABLED` / `NOT VALIDATED`, and `ENABLE` checks the rows (an orphan is ORA-02298) | PostgreSQL 18 | refused with ORA-03001 |
+| A CHECK created `DISABLE` in `CREATE TABLE` or `ALTER TABLE … ADD`: it shows as `DISABLED` / `NOT VALIDATED` | PostgreSQL 18 | refused with ORA-03001 |
 | `IGNORE NULLS` in `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE`, inside the call or behind it | PostgreSQL 19 | refused with ORA-03001; `RESPECT NULLS`, the default, is accepted everywhere |
 | The JSON path methods `upper()` and `lower()`, in `JSON_VALUE`, `JSON_QUERY` and `JSON_EXISTS` | PostgreSQL 19 | refused with ORA-40442, as a path 23ai cannot parse is |
+| `DISABLE` / `ENABLE` of a CHECK constraint, in either spelling: `ENABLE` checks the rows (a row that breaks it is ORA-02293) | PostgreSQL 19 | refused with ORA-03001 |
 
 ### Which role to connect as
 
@@ -1319,11 +1321,14 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   `.number()`, `.string()`, `.date()`, `.timestamp()`, `.boolean()`,
   `.double()`, `.size()` and `.type()` work, from PostgreSQL 17
   ([#2679](https://github.com/seerdb/seerdb/issues/2679)).
-- **Only a foreign key can be disabled**, and only from PostgreSQL 18
-  (*By PostgreSQL version*). `DISABLE` / `ENABLE` of a CHECK, NOT NULL,
-  PRIMARY KEY or UNIQUE constraint, `ENABLE NOVALIDATE`, and `CASCADE` or
-  `KEEP INDEX` on either are refused with ORA-03001: PostgreSQL can't switch
-  those off and on ([#2663](https://github.com/seerdb/seerdb/issues/2663)).
+- **Only a foreign key and a CHECK can be disabled**, a foreign key from
+  PostgreSQL 18 and a CHECK from 19 (*By PostgreSQL version*). `DISABLE` /
+  `ENABLE` of a NOT NULL, PRIMARY KEY or UNIQUE constraint, `ENABLE
+  NOVALIDATE`, and `CASCADE` or `KEEP INDEX` on either are refused with
+  ORA-03001: PostgreSQL can't switch those off and on
+  ([#2663](https://github.com/seerdb/seerdb/issues/2663)). A CHECK declared
+  `ENABLE NOVALIDATE` or `DISABLE VALIDATE` is refused too
+  ([#2681](https://github.com/seerdb/seerdb/issues/2681)).
 - **Fractional seconds** stop at six digits; a `TIMESTAMP(9)` is a
   `TIMESTAMP(6)`.
 - **A WITH TIME ZONE value keeps no region.** It keeps its instant and its
