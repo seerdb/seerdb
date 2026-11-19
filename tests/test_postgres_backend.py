@@ -41,6 +41,7 @@ from seerdb.server.backends.postgres import (  # noqa: E402
     _NO_OP,
     _REF_SELECT,
     _ROUTINE_MARK,
+    _SERVER_VERSION,
     OraInterval,
     PostgresBackend,
     _backend_error,
@@ -13072,6 +13073,29 @@ def test_json_constructor_values_keep_their_type() -> None:
                 array.array('f', [1, 2]),
                 SparseVector(4, [1], array.array('d', [2.5])),
             ]
+    finally:
+        backend.rollback()
+        backend.close()
+
+
+def test_a_json_array_of_a_query_over_no_rows_is_empty() -> None:
+    # JSON_ARRAY(SELECT ...) over no rows is [] on 23ai, and PostgreSQL's
+    # json_array() is NULL there before 19 (#2740): below 19 it is wrapped.
+    sql = 'select json_array(select n from t where 1 = 0) from dual'
+    assert _translate_json_constructor_values(sql) == (
+        "select COALESCE(json_array(select n from t where 1 = 0), '[]') from dual"
+    )
+    token = _SERVER_VERSION.set(190000)
+    try:
+        assert _translate_json_constructor_values(sql) == sql
+    finally:
+        _SERVER_VERSION.reset(token)
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        assert backend.execute(
+            'SELECT JSON_ARRAY(SELECT 1 FROM dual WHERE 1 = 0), '
+            'JSON_ARRAY(SELECT 1 FROM dual) FROM dual'
+        ).rows == [([], [1])]
     finally:
         backend.rollback()
         backend.close()

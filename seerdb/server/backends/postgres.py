@@ -10140,7 +10140,8 @@ def _translate_json_constructor_values(sql: str) -> str:
     with to_jsonb, so a timestamp, a RAW or a vector would come back a string or
     a bare object where Oracle's keeps its type. A literal, a bind and NULL go
     as they are -- untyped, nothing could resolve the function for them -- as
-    does a value written FORMAT JSON, already JSON."""
+    does a value written FORMAT JSON, already JSON. A JSON_ARRAY of a query
+    over no rows is an empty array, as Oracle's is (#2740)."""
     if 'json_' not in sql.lower():
         return sql
 
@@ -10151,7 +10152,11 @@ def _translate_json_constructor_values(sql: str) -> str:
         if name.upper() == 'JSON_ARRAY' and inner[0].lstrip().upper().startswith(
             'SELECT'
         ):
-            return None
+            if _SERVER_VERSION.get() >= 190000:
+                return None
+            # floor: PG19 -- below 19, json_array() of a query over no rows
+            # is NULL, where Oracle's is [] (#2740, #2682).
+            return f"COALESCE({name}({','.join(inner)}), '[]')"
         out = [
             _json_constructor_value(arg, name.upper() == 'JSON_OBJECT') for arg in inner
         ]
