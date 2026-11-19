@@ -8556,6 +8556,65 @@ def _check_conditions(sql: str) -> tuple[str, list[tuple[str, str]]] | None:
     return (table, found) if found else None
 
 
+def _check_state(sql: str, server_version: int) -> str:
+    """A CHECK's state in a CREATE TABLE or ALTER TABLE ... ADD, the words
+    behind its condition, as PostgreSQL takes it (#2681): ENABLE [VALIDATE] is
+    the default and goes; DISABLE [NOVALIDATE] creates it NOT ENFORCED, from
+    PostgreSQL 18. ENABLE NOVALIDATE and DISABLE VALIDATE, and DISABLE before
+    18, are refused (docs/MIRROR.md, *By PostgreSQL version*)."""
+    if not _CONSTRAINT_DDL.match(sql):
+        return sql
+    upper = sql.upper()
+    if 'CHECK' not in upper or 'ABLE' not in upper:
+        return sql
+    tokens = [
+        token for token in sql_tokens(sql) if token.kind not in ('space', 'comment')
+    ]
+
+    def text(k: int) -> str:
+        return sql[tokens[k].start : tokens[k].end].upper() if k < len(tokens) else ''
+
+    edits: list[tuple[int, int, str]] = []
+    for k in range(len(tokens) - 1):
+        if not (text(k) == 'CHECK' and text(k + 1) == '('):
+            continue
+        depth = 0
+        for close in range(k + 1, len(tokens)):
+            depth += (text(close) == '(') - (text(close) == ')')
+            if depth == 0:
+                break
+        else:
+            continue
+        state = text(close + 1)
+        if state not in ('ENABLE', 'DISABLE'):
+            continue
+        last = close + 1
+        check = text(last + 1)
+        if check in ('VALIDATE', 'NOVALIDATE'):
+            last += 1
+        else:
+            check = 'VALIDATE' if state == 'ENABLE' else 'NOVALIDATE'
+        if (state, check) == ('ENABLE', 'NOVALIDATE'):
+            raise UnsupportedFeature(
+                'ENABLE NOVALIDATE of a CHECK constraint: PostgreSQL checks '
+                "a constraint's rows as it creates it"
+            )
+        if (state, check) == ('DISABLE', 'VALIDATE'):
+            raise UnsupportedFeature('DISABLE VALIDATE of a CHECK constraint')
+        replacement = ''
+        if state == 'DISABLE':
+            # floor: PG18 -- this refusal goes when 18 is the minimum (#2682).
+            if server_version < 180000:
+                raise UnsupportedFeature(
+                    'a CHECK constraint created DISABLE needs PostgreSQL 18 or later'
+                )
+            replacement = 'NOT ENFORCED'
+        edits.append((tokens[close + 1].start, tokens[last].end, replacement))
+    for start, end, replacement in reversed(edits):
+        sql = f'{sql[:start]}{replacement}{sql[end:]}'
+    return sql
+
+
 def _translate_ddl(sql: str) -> str:
     """Rewrite an Oracle ``CREATE TABLE`` / object ``CREATE TYPE`` to PostgreSQL:
     map the column/attribute types and drop the clauses PostgreSQL has no equal
@@ -16860,6 +16919,7 @@ _ENFORCE_AGAIN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _ORA_CANNOT_VALIDATE_PARENT_KEYS = 2298
+_ORA_CANNOT_VALIDATE_CHECK = 2293
 _ORA_CANNOT_ENABLE_NO_SUCH = 2430
 _ORA_CANNOT_DISABLE_NO_SUCH = 2431
 # A constraint's kind, as a DISABLE's refusal names it.
@@ -16899,6 +16959,19 @@ def _backend_error(
         return BackendError(
             f'cannot validate ({schema}.{name}) - parent keys not found',
             ora_code=_ORA_CANNOT_VALIDATE_PARENT_KEYS,
+        )
+    if (
+        code == ORA_CHECK_CONSTRAINT_VIOLATED
+        and translated is not None
+        and _ENFORCE_AGAIN.match(translated)
+    ):
+        # ENABLE of a CHECK some row breaks (#2681), 23ai's ORA-02293.
+        diag = getattr(exc, 'diag', None)
+        schema = (getattr(diag, 'schema_name', None) or '').upper()
+        name = (getattr(diag, 'constraint_name', None) or '').upper()
+        return BackendError(
+            f'cannot validate ({schema}.{name}) - check constraint violated',
+            ora_code=_ORA_CANNOT_VALIDATE_CHECK,
         )
     if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and _names_a_sequence(exc, original):
         code = _ORA_SEQUENCE_DOES_NOT_EXIST
@@ -20597,6 +20670,11 @@ class PostgresBackend:
         sql = _ruled('index-expressions', _parenthesized_index_keys(sql), sql)
         sql = _ruled('constraint-names', self._named_constraints(sql), sql)
         checks = _check_conditions(sql)
+        sql = _ruled(
+            'check-state',
+            _check_state(sql, self._conn.info.server_version),
+            sql,
+        )
         sql = _ruled('ddl', _translate_ddl(sql), sql)
         sql = _ruled('trigger-ddl', self._created_trigger(sql), sql)
         sql = _ruled('drop-trigger', self._dropped_trigger(sql), sql)
@@ -22788,13 +22866,13 @@ class PostgresBackend:
         # Oracle's DISABLE / ENABLE of a constraint (#2663). PostgreSQL 18
         # switches a foreign key off and on, ALTER CONSTRAINT ... NOT ENFORCED |
         # ENFORCED, and checks its rows as it goes back on, as ENABLE VALIDATE
-        # does. It has no way for any other kind, nor before 18, nor for ENABLE
-        # NOVALIDATE: those are refused (docs/MIRROR.md, *By PostgreSQL
-        # version* and *Known limits*).
+        # does; 19 a CHECK too (#2681). It has no way for any other kind, nor
+        # before those versions, nor for ENABLE NOVALIDATE: those are refused
+        # (docs/MIRROR.md, *By PostgreSQL version* and *Known limits*).
         if _KEY_STATE.match(sql):
             raise UnsupportedFeature(
                 'DISABLE or ENABLE of a PRIMARY KEY or UNIQUE constraint: '
-                'PostgreSQL switches only a foreign key off and on'
+                'PostgreSQL switches only a foreign key and a CHECK off and on'
             )
         found = _CONSTRAINT_STATE.match(sql)
         if found is None:
@@ -22847,10 +22925,20 @@ class PostgresBackend:
                     else _ORA_CANNOT_ENABLE_NO_SUCH
                 ),
             )
+        if row[0] == 'c':
+            # PostgreSQL 19 switches a CHECK as 18 does a foreign key (#2681).
+            # floor: PG19 -- this refusal goes when 19 is the minimum (#2682).
+            if self._conn.info.server_version < 190000:
+                raise UnsupportedFeature(
+                    'DISABLE or ENABLE of a CHECK constraint needs PostgreSQL 19 '
+                    'or later'
+                )
+            return f'{target} {"NOT ENFORCED" if disable else "ENFORCED"}'
         if row[0] != 'f':
             raise UnsupportedFeature(
                 f'DISABLE or ENABLE of a {_DISABLE_REFUSED_KINDS.get(row[0], row[0])} '
-                'constraint: PostgreSQL switches only a foreign key off and on'
+                'constraint: PostgreSQL switches only a foreign key and a CHECK '
+                'off and on'
             )
         # floor: PG18 -- this refusal goes when 18 is the minimum (#2682).
         if self._conn.info.server_version < 180000:
