@@ -10639,6 +10639,63 @@ def _translate_avg(sql: str) -> str:
     return ''.join(out)
 
 
+# The window functions that take Oracle's IGNORE NULLS / RESPECT NULLS (#2741).
+_NULL_TREATMENT_NAMES = frozenset(
+    {'LAG', 'LEAD', 'FIRST_VALUE', 'LAST_VALUE', 'NTH_VALUE'}
+)
+# The option as Oracle also writes it, inside the call after the first argument.
+_INNER_NULL_TREATMENT = re.compile(r'\s+(IGNORE|RESPECT)\s+NULLS\s*$', re.IGNORECASE)
+# What may stand between the call and its OVER: NTH_VALUE's FROM FIRST | LAST,
+# then the option.
+_OUTER_NULL_TREATMENT = re.compile(
+    r'(?:\s+FROM\s+(?P<from>FIRST|LAST)\b)?(?:\s+(?P<nulls>IGNORE|RESPECT)\s+NULLS\b)?'
+    r'(?=\s*OVER\b)',
+    re.IGNORECASE,
+)
+
+
+def _translate_null_treatment(sql: str) -> str:
+    """Oracle's IGNORE NULLS / RESPECT NULLS in LAG, LEAD, FIRST_VALUE,
+    LAST_VALUE and NTH_VALUE (#2741), behind the call as PostgreSQL 19 takes
+    it: Oracle also writes it inside, after the first argument.
+
+    RESPECT NULLS is the default on both sides, and NTH_VALUE's FROM FIRST
+    is Oracle's default and PostgreSQL's only behaviour, so below 19 the one
+    and always the other go. IGNORE NULLS below 19, and FROM LAST, are refused.
+    """
+    lowered = sql.lower()
+    # FROM FIRST | LAST is NTH_VALUE's alone.
+    if 'nulls' not in lowered and 'nth_value' not in lowered:
+        return sql
+    (out, pos) = ([], 0)
+    for call in _calls(sql, _NULL_TREATMENT_NAMES, '_$#."'):
+        if call.start < pos or not call.args:
+            continue  # inside a call already replaced, or left to fail
+        args = [_translate_null_treatment(sql[a:b]) for a, b in call.args]
+        inner = _INNER_NULL_TREATMENT.search(args[0])
+        nulls = inner.group(1).upper() if inner else None
+        if inner:
+            args[0] = args[0][: inner.start()]
+        outer = _OUTER_NULL_TREATMENT.match(sql, call.close_at + 1)
+        end = call.close_at + 1
+        if outer is not None and outer.end() > end:
+            end = outer.end()
+            if outer.group('from') and outer.group('from').upper() == 'LAST':
+                raise UnsupportedFeature('NTH_VALUE ... FROM LAST')
+            if outer.group('nulls'):
+                nulls = outer.group('nulls').upper()
+        elif not inner:
+            continue
+        if nulls == 'IGNORE' and _SERVER_VERSION.get() < 190000:
+            # floor: PG19 -- refused below 19 (#2741, #2682).
+            raise UnsupportedFeature('IGNORE NULLS needs PostgreSQL 19 or later')
+        option = f' {nulls} NULLS' if nulls and _SERVER_VERSION.get() >= 190000 else ''
+        out += [sql[pos : call.start], f'{call.name}({",".join(args)}){option}']
+        pos = end
+    out.append(sql[pos:])
+    return ''.join(out)
+
+
 # An Oracle identifier may carry `#` (and `$`) after its first character:
 # serial#, statistic#, obj#. PostgreSQL takes `$` but not `#` (#1249).
 _HASH_IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_$#]*')
@@ -13269,6 +13326,7 @@ def _rewritten_idiom_text(sql: str) -> str:
     sql = _ruled('nullif', _translate_nullif(sql), sql)
     sql = _ruled('median', _translate_median(sql), sql)
     sql = _ruled('avg', _translate_avg(sql), sql)
+    sql = _ruled('null-treatment', _translate_null_treatment(sql), sql)
     sql = _ruled('json-functions', _translate_json_functions(sql), sql)
     sql = _ruled(
         'json-constructor-values', _translate_json_constructor_values(sql), sql
