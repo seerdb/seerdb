@@ -18052,6 +18052,81 @@ def test_a_not_null_constraint_keeps_its_name_from_postgresql_18() -> None:
         backend.close()
 
 
+def test_ignore_nulls_in_a_window_function_from_postgresql_19() -> None:
+    # Oracle's IGNORE NULLS / RESPECT NULLS (#2741), inside the call or behind
+    # it, go behind it as PostgreSQL 19 takes them. RESPECT NULLS and
+    # NTH_VALUE's FROM FIRST are the defaults and go below 19; IGNORE NULLS
+    # below 19, and FROM LAST, are refused.
+    from seerdb.server.backend import UnsupportedFeature
+    from seerdb.server.backends.postgres import (
+        _SERVER_VERSION,
+        _translate_null_treatment,
+    )
+
+    token = _SERVER_VERSION.set(190000)
+    try:
+        assert _translate_null_treatment(
+            "select lag(v IGNORE NULLS, 2, 'z') over (order by n), "
+            'lead(v) respect nulls over (order by n), '
+            'nth_value(v, 2) from first ignore nulls over (order by n) from x'
+        ) == (
+            "select lag(v, 2, 'z') IGNORE NULLS over (order by n), "
+            'lead(v) RESPECT NULLS over (order by n), '
+            'nth_value(v, 2) IGNORE NULLS over (order by n) from x'
+        )
+        sql = "select lag('ignore nulls') over (order by n) from x"
+        assert _translate_null_treatment(sql) == sql
+    finally:
+        _SERVER_VERSION.reset(token)
+    token = _SERVER_VERSION.set(180000)
+    try:
+        assert _translate_null_treatment(
+            'select lead(v respect nulls) over (order by n), '
+            'nth_value(v, 2) from first over (order by n) from x'
+        ) == (
+            'select lead(v) over (order by n), nth_value(v, 2) over (order by n) from x'
+        )
+        with pytest.raises(UnsupportedFeature, match='IGNORE NULLS'):
+            _translate_null_treatment(
+                'select lag(v) ignore nulls over (order by n) from x'
+            )
+    finally:
+        _SERVER_VERSION.reset(token)
+    with pytest.raises(UnsupportedFeature, match='FROM LAST'):
+        _translate_null_treatment(
+            'select nth_value(v, 2) from last over (order by n) from x'
+        )
+    if _server_version_num() < 190000:
+        pytest.skip('IGNORE NULLS needs PostgreSQL 19')
+    # The answers 23ai gives (2026-11-19).
+    rows = (
+        "(SELECT 1 n, 'a' v FROM dual UNION ALL SELECT 2, NULL FROM dual "
+        "UNION ALL SELECT 3, 'c' FROM dual)"
+    )
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        for query in (
+            f'SELECT n, LAG(v IGNORE NULLS) OVER (ORDER BY n) FROM {rows} ORDER BY n',
+            f'SELECT n, LAG(v) IGNORE NULLS OVER (ORDER BY n) FROM {rows} ORDER BY n',
+        ):
+            assert [(int(n), v) for (n, v) in backend.execute(query).rows] == [
+                (1, None),
+                (2, 'a'),
+                (3, 'a'),
+            ]
+        assert [
+            v
+            for (_, v) in backend.execute(
+                'SELECT n, NTH_VALUE(v, 2) FROM FIRST IGNORE NULLS OVER (ORDER BY n '
+                'ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) '
+                f'FROM {rows} ORDER BY n'
+            ).rows
+        ] == ['c', 'c', 'c']
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_merge_into_a_view_from_postgresql_17() -> None:
     # MERGE into a simple view runs from PostgreSQL 17 (#2652); before it,
     # PostgreSQL refuses it (docs/MIRROR.md, *By PostgreSQL version*).

@@ -687,6 +687,7 @@ PostgreSQL 19 with the newest extensions, before CI's image moves to it.
 | `JSON_TABLE` as 23ai answers it: Oracle's column types, an implied path read as the column is written, no row path, `NESTED [PATH]`, `FOR ORDINALITY`, `EXISTS`, `FORMAT JSON` in Oracle's compact form, a column's and the table's `ON ERROR` / `ON EMPTY`, and invalid JSON as no rows | PostgreSQL 17 | refused with ORA-03001 |
 | `RETURNING OLD col` / `NEW col` (23ai) in a DML statement or a PL/SQL block | PostgreSQL 18 | refused with ORA-03001 |
 | `ALTER TABLE … DISABLE CONSTRAINT` / `ENABLE CONSTRAINT` of a foreign key, and `MODIFY CONSTRAINT … DISABLE \| ENABLE`: the constraint shows as `DISABLED` / `NOT VALIDATED`, and `ENABLE` checks the rows (an orphan is ORA-02298) | PostgreSQL 18 | refused with ORA-03001 |
+| `IGNORE NULLS` in `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE`, inside the call or behind it | PostgreSQL 19 | refused with ORA-03001; `RESPECT NULLS`, the default, is accepted everywhere |
 
 ### Which role to connect as
 
@@ -1359,6 +1360,11 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   12c and later) is a syntax error: PostgreSQL has no function local to a
   query. Create the function instead
   ([#2734](https://github.com/seerdb/seerdb/issues/2734)).
+- **`NTH_VALUE … FROM LAST`** is refused: PostgreSQL counts from the first row
+  of the frame only. `FROM FIRST`, the default, works. Over a frame of the
+  whole partition (`ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`),
+  reversing the window's `ORDER BY` gives the same row
+  ([#2741](https://github.com/seerdb/seerdb/issues/2741)).
 - **`MEDIAN`** works as an aggregate, exact over a `NUMBER` and a `DATE`. As an
   analytic function (`MEDIAN(x) OVER (PARTITION BY ...)`) it is refused, since
   PostgreSQL has no exact median it can window.
