@@ -190,6 +190,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_1_EXT_3,
     FIELD_VERSION_23_4,
     ISO_LATIN_1_CHARSET,
+    O8I_STATUS_FLAG_NO_TRANSACTION,
     ORA_ARRAY_DML_ERRORS,
     ORA_LOB_ALREADY_OPENED,
     ORA_LOB_NOT_OPENED,
@@ -16099,7 +16100,18 @@ def _o8i_status(Data: bytes) -> dict | None:
             raise Truncated('8i status: the RPA alone')
     if Rest[:1] != bytes([TTI_OER]):
         return None
-    return _O8I_STATUS_FROM_O8I(Rest)[0]
+    Status = _O8I_STATUS_FROM_O8I(Rest)[0]
+    # The session's transaction state for transaction_in_progress, as 10g's
+    # call status would say it: the flags' 0x40 is set while none is open.
+    StatusSink = _DECODE_CALL_STATUS.get()
+    if StatusSink is not None:
+        StatusSink[:] = [
+            0
+            if Status['flags'] & O8I_STATUS_FLAG_NO_TRANSACTION
+            else TNS_EOCS_FLAGS_TXN_IN_PROGRESS,
+            Status['code'],
+        ]
+    return Status
 
 
 def _o8i_status_or_none(Data: bytes) -> dict | None:
@@ -17619,6 +17631,15 @@ def _o9i_oall8_status_or_none(Terminal: bytes) -> dict | None:
         return None
 
 
+def _record_9i_call_status(Status: dict) -> None:
+    # A 9.2 native status's call status, as from 10g, for
+    # transaction_in_progress: its TXN_IN_PROGRESS bit says whether a
+    # transaction is open (PROTOCOL.md §19.12).
+    StatusSink = _DECODE_CALL_STATUS.get()
+    if StatusSink is not None:
+        StatusSink[:] = [Status['call_status'], Status['code']]
+
+
 def _o9i_oall8_status_fields(Terminal: bytes) -> dict | None:
     # The fields of a 9i OALL8 reply's status (_O9I_STATUS), past any RPA ahead of
     # it, or None when the terminal holds none. A status whose tail does not read
@@ -17638,6 +17659,7 @@ def _o9i_oall8_status_fields(Terminal: bytes) -> dict | None:
             if Message
             else None
         )
+        _record_9i_call_status(Status)
         return Status
     except (IndexError, DataError):
         pass
@@ -17645,6 +17667,7 @@ def _o9i_oall8_status_fields(Terminal: bytes) -> dict | None:
         (Status, _) = _O9I_STATUS_HEAD_FROM_O9I(Oer)
     except (IndexError, DataError) as Exc:
         raise Truncated('9i OALL8 status cut short') from Exc
+    _record_9i_call_status(Status)
     Code = Status['code']
     Message = None
     # The message naming the code: a batch-errors status (ORA-24381) lists the

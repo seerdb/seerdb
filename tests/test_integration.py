@@ -343,6 +343,14 @@ class _Target(NamedTuple):
     lob_out: bool = False
 
 
+def _conn_is_compact_9i(conn) -> bool:
+    # 9i's default compact form, whose replies say nothing of a transaction
+    # (PROTOCOL.md §19.12).
+    from seerdb.client.dialect import Fv2Dialect
+
+    return isinstance(getattr(conn, '_dialect', None), Fv2Dialect)
+
+
 def _dialect_binds_lob_outs(conn) -> bool:
     from seerdb.client.dialect import Fv2Dialect, O8iDialect
 
@@ -3980,7 +3988,9 @@ class CursorIntegration(_IntegrationBase):
     def test_transaction_in_progress_follows_the_server(self):
         # The TXN_IN_PROGRESS bit of each reply's call status (#2456): a DML
         # sets it, and a commit's or a rollback's bare status reply clears it.
-        # Before 10g seerdb doesn't read it, and says so.
+        # 8i says it with its status's no-transaction flag, and 9i's native
+        # form with the same call status; 9i's compact form says nothing, and
+        # seerdb says so (PROTOCOL.md §19.12).
         from seerdb.common.exceptions import DatabaseError
 
         with seerdb.connect(
@@ -3991,7 +4001,7 @@ class CursorIntegration(_IntegrationBase):
             service_name=_SERVICE,
             **_FV_KW,
         ) as conn:
-            if conn.field_version < FIELD_VERSION_10_2:
+            if _conn_is_compact_9i(conn):
                 with self.assertRaises(seerdb.NotSupportedError):
                     conn.transaction_in_progress
                 return
@@ -4015,6 +4025,14 @@ class CursorIntegration(_IntegrationBase):
                 cur.execute(f'SELECT n FROM {table}')
                 self.assertEqual(cur.fetchall(), [(1,)])
                 self.assertFalse(conn.transaction_in_progress)
+                if not os.environ.get('SEERDB_TEST_MIRROR'):
+                    # Oracle opens a transaction for a SELECT FOR UPDATE; the
+                    # Mirror doesn't say so yet, a gap of its own.
+                    cur.execute(f'SELECT n FROM {table} FOR UPDATE')
+                    self.assertEqual(cur.fetchall(), [(1,)])
+                    self.assertTrue(conn.transaction_in_progress)
+                    conn.rollback()
+                    self.assertFalse(conn.transaction_in_progress)
             finally:
                 cur.execute(f'DROP TABLE {table}')
 
@@ -14224,7 +14242,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         Kwargs = self._kwargs()
         Kwargs['autocommit'] = False
         async with await seerdb.connect_async(**Kwargs) as Conn:
-            if Conn.field_version < FIELD_VERSION_10_2:
+            if _conn_is_compact_9i(Conn):
                 with self.assertRaises(seerdb.NotSupportedError):
                     Conn.transaction_in_progress
                 return

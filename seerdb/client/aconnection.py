@@ -1395,7 +1395,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         to_send: object = None
         try:
             while True:
-                intent = gen.send(to_send)  # type: ignore[attr-defined]
+                # The dialect decodes its replies here, as the sync twin's does.
+                with recording_session_keywords(
+                    self._session_keywords, self._call_status
+                ):
+                    intent = gen.send(to_send)  # type: ignore[attr-defined]
                 if intent is RECV:
                     to_send = await self._next_data_packet()
                     if self._session_shutdown:

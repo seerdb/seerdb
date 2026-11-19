@@ -723,11 +723,16 @@ class _ConnectionLogic:
     def transaction_in_progress(self) -> bool:
         """Whether the session has a transaction open, as the server said in
         its last reply (the TXN_IN_PROGRESS bit of the call status, #2456).
-        Not available before Oracle 10g, whose replies seerdb doesn't read it
-        from."""
-        if self.field_version < FIELD_VERSION_10_2:
+        On 8i, the status's no-transaction flag says it, and on a 9i session
+        with ``oall8=True`` the native form's call status does (PROTOCOL.md
+        §19.12). 9i's default compact form carries neither, so there it is
+        not available."""
+        if self.field_version < FIELD_VERSION_10_2 and not isinstance(
+            self._dialect, (O8iDialect, Fv2Oall8Dialect)
+        ):
             raise NotSupportedError(
-                'transaction_in_progress is not available before Oracle 10g'
+                'transaction_in_progress is not available on Oracle 9i '
+                'without oall8=True'
             )
         return bool(
             self._call_status and self._call_status[0] & TNS_EOCS_FLAGS_TXN_IN_PROGRESS
