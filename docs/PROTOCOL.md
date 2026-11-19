@@ -6796,6 +6796,33 @@ ROWID/UROWID string binds straight back into `WHERE ROWID = :r`). Note:
 `ROWIDTOCHAR(ROWID)` on an IOT raises ORA-01410 on 8i, so the UROWID reference
 comes from the raw value, not that function.
 
+### 19.10a Oracle 8i describe-only (SeerODBC #353)
+
+OCI's `OCIStmtExecute(..., OCI_DESCRIBE_ONLY)` against 8.1.7, captured
+2026-11-20 with OCI 9.2, for
+`SELECT owner, object_name, created FROM all_objects WHERE rownum <= 2`:
+
+- **The call** is the OALL8 of §19.9 with the option word `0x00028001`
+  (`01 80 02 00`): PARSE `0x01`, the cursor statement's `0x8000` and DESCRIBE
+  `0x20000`, with no EXECUTE `0x20` and no FETCH `0x40`. The same query's
+  execute is `0x00008061`. A statement with binds adds `0x08`: `0x00028009`.
+  The rest is the execute's: prefetch rows 1, max long 0, the SQL text, and
+  al8i4 `[1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]`.
+- **On its own cursor.** OCI first opens one with function `0x02`
+  (`03 02 <seq> 01 00 00 00 00`). The reply is `08 01 00 00 00`, an RPA holding
+  the cursor (1), then `09`. The OALL8 then names that cursor, where the execute
+  sends 0. Afterwards OCI closes the cursor with OCCA (function 105,
+  `03 69 <seq> 01 01 00 00 00 01 00 00 00`), answered by `09`. Not measured:
+  whether 8.1.7 takes a describe-only OALL8 on cursor 0.
+- **The reply** is §19.10's describe, then the RPA (four `ub4`s: 0, 0, 1, 0) and
+  the status: rows 0, code 0, SQL type 3, the cursor. There is no row header,
+  no row and no ORA-01403. The execute has the same describe, then `06` and its
+  rows before the RPA.
+- **A bind marker** (`SELECT :1 + 1 AS n FROM dual`) sends its 25-byte bind
+  descriptor (§19.11) and no value. Unbound, the descriptor reads type 1, flag
+  `0x80`, size 0; bound as an `int`, type 2 (NUMBER), flag 0, size 22. Both
+  describe N as NUMBER, size 22.
+
 ### 19.11 Oracle 8i IN binds — the 9.2-era bind section (#359)
 
 Parameterized statements ride the same OALL8 (§19.9) with three header changes
@@ -6895,7 +6922,10 @@ ub2 cursor            the statement's cursor (256 = 00 01, #2285)
 ub2 position          the error's offset in the SQL text
 ub1 sql_type          the command code: 2 INSERT, 3 SELECT, 6 UPDATE, 7 DELETE,
                       12 DROP TABLE, 44 COMMIT, 45 ROLLBACK, 47 a PL/SQL block
-ub1 fatal, ub1 flags, ub1 cursor_options, ub1 upi_param
+ub1 fatal
+ub1 flags             0x40 while no transaction is open (below); 0x20 seen
+                      on the fetch after a SELECT FOR UPDATE, meaning unknown
+ub1 cursor_options, ub1 upi_param
 ub1 warnings          0x10 an UPDATE / DELETE without WHERE, 0x20 a compile
                       error; 0x01 with any
 rowid                 ub4 data object, ub2 file, a reserved byte, ub4 block,
@@ -6923,6 +6953,34 @@ status as whole only once every field has its bytes, the message too
 ride the OALL8 as ordinary statements (type `0`). Encoder: `encode_8i_oall8_dml`
 (over the shared `_encode_8i_oall8`); decoder: `decode_8i_dml_response`;
 statement classification: `o8i_stmt_type`.
+
+**Whether a transaction is open (SeerODBC #344).** Measured 2026-11-19 on 8.1.7
+and 9.2.0.4 with DML, a query, SELECT FOR UPDATE, COMMIT, ROLLBACK,
+`BEGIN COMMIT; END;`, DDL, an error inside an open transaction, and an INSERT
+under autocommit:
+
+- **8.1.7: bit `0x40` of the status's `flags` means no transaction is open.**
+  It is set after connect and after a query with nothing pending. DML and
+  SELECT FOR UPDATE clear it, and it stays clear on every reply until the
+  transaction ends: a query's, a fetch's ORA-01403, an error's. COMMIT,
+  ROLLBACK, `BEGIN COMMIT; END;` and DDL set it again, a DROP that ends a
+  pending DELETE included. Test the bit, not the byte: the fetch after a SELECT
+  FOR UPDATE showed `0x20`, and the ROLLBACK after it `0x60`. This is the
+  opposite sense of 10g's `TXN_IN_PROGRESS` (`0x02` of `call_status`, §5.2).
+- **9.2, native OALL8 form (§19.18):** the status opens with a `call_status`, as
+  from 10g, and `0x02` is `TXN_IN_PROGRESS`. It reads 2 after DML and SELECT FOR
+  UPDATE and stays set through later queries and an error. It reads 1 with
+  nothing pending and after DDL, and 5 on a COMMIT's, ROLLBACK's and
+  `BEGIN COMMIT; END;`'s status. `flags` stays 0 there, apart from that `0x20`.
+- **9.2, compact form (§19.2): none found.** `flags` is 0 throughout. The RPA
+  holds two values, a counter that rises with each call and a zero. A commit or
+  rollback (functions `0x0e` / `0x0f`) is answered by a bare `09`, with no status.
+
+The RPA's transaction id length was 0 in every reply, on both releases. Its last
+value also follows the state (8.1.7's fourth `ub4`, 9.2 native's fourth of five):
+0 with nothing pending, 1 once DML has run, 2 on the reply that ends a
+transaction. On 8.1.7 it also reads 2 on the first DDL after connect, so the
+status bit is the cleaner signal.
 
 ### 19.13 Oracle 8i anonymous PL/SQL blocks — IN binds (#361)
 
