@@ -310,13 +310,14 @@ jobs:
   # 23ai, its default, and once more 12.1, so the older release's dialect stays
   # covered (#1747).
   mirror-postgres:
-    name: Integration tests (Mirror over PostgreSQL, ${{ matrix.presents }}${{ matrix.setup == 'oldest' && ', oldest supported PostgreSQL' || '' }})
+    name: Integration tests (Mirror over PostgreSQL, ${{ matrix.presents }}${{ matrix.label && format(', {0}', matrix.label) || '' }})
     needs: changes
     if: needs.changes.outputs.mirror == 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    # Even a failure to build the oldest setup's image doesn't fail the run.
-    continue-on-error: ${{ matrix.setup == 'oldest' }}
+    # Even a failure to build the oldest or the next setup's image doesn't fail
+    # the run.
+    continue-on-error: ${{ matrix.setup != 'newest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -329,10 +330,20 @@ jobs:
           # job's summary instead.
           - presents: "23ai"
             setup: oldest
+            label: oldest supported PostgreSQL
             build_args: >-
               --build-arg PG_IMAGE=postgres:16.14-alpine3.24
               --build-arg PGVECTOR_VERSION=v0.8.0
               --build-arg PLPGSQL_CHECK_VERSION=v2.10.11
+          # The next PostgreSQL major, before CI's image moves to it: built
+          # from the same file with the newest extensions, and reported like
+          # the oldest setup, so it never fails the run. The stable 18 entries
+          # above stay the ones that gate.
+          - presents: "23ai"
+            setup: next
+            label: PostgreSQL 19
+            build_args: >-
+              --build-arg PG_IMAGE=postgres:19rc2-alpine3.24
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -374,17 +385,18 @@ jobs:
           SEERDB_TEST_MIRROR: "1"
           MIRROR_PRESENTS: ${{ matrix.presents }}
           SETUP: ${{ matrix.setup }}
+          LABEL: ${{ matrix.label }}
         run: |
           # A failing pytest must not hide behind `tee`'s status.
           set -o pipefail
-          # The oldest setup's failures are reported, not raised (#2668): each
-          # run keeps going, and the summary lists what failed.
-          oldest_failed=0
+          # The oldest and the next setup's failures are reported, not raised
+          # (#2668): each run keeps going, and the summary lists what failed.
+          setup_failed=0
           report() {
-            if [ "$SETUP" = "oldest" ] && [ "$1" -ne 0 ]; then
-              oldest_failed=1
+            if [ "$SETUP" != "newest" ] && [ "$1" -ne 0 ]; then
+              setup_failed=1
               {
-                echo "### $2: fails on the oldest supported PostgreSQL"
+                echo "### $2: fails on $LABEL"
                 echo '```'
                 grep -E '^(FAILED|ERROR) ' "$3" || tail -n 20 "$3"
                 echo '```'
@@ -421,8 +433,10 @@ jobs:
           kill "$MIRROR_PID" 2>/dev/null || true
           if [ "$status" -ne 0 ]; then echo "--- mirror log ---"; tail -n 200 mirror.log; fi
           report "$status" "tests/test_integration.py" integration.out || exit $?
-          if [ "$oldest_failed" -ne 0 ]; then
+          if [ "$setup_failed" -ne 0 ] && [ "$SETUP" = "oldest" ]; then
             echo "::warning title=Oldest supported PostgreSQL::tests fail on PostgreSQL 16.14; see the job summary, and docs/MIRROR.md *By PostgreSQL version*"
-          elif [ "$SETUP" = "oldest" ]; then
-            echo "Everything passes on the oldest supported PostgreSQL." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$setup_failed" -ne 0 ]; then
+            echo "::warning title=$LABEL::tests fail on $LABEL; see the job summary"
+          elif [ "$SETUP" != "newest" ]; then
+            echo "Everything passes on $LABEL." >> "$GITHUB_STEP_SUMMARY"
           fi

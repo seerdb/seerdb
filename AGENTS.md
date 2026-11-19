@@ -142,6 +142,9 @@ every supported version has.
 - **CI's image tracks the newest releases**, each pinned exactly
   (`examples/mirror-pg.Dockerfile`). Test a bump before moving the pin:
   plpgsql_check v2.10.12 crashed the server.
+- **A new PostgreSQL major gets a non-blocking CI leg first**, built from the
+  same file, while the stable one still gates. Its failures are reported in the
+  job's summary, like the oldest setup's. The pin moves once that leg is clean.
 - **A feature only a newer version has is installed only where the server has
   it.** Check the server's version at install, so the dictionary still installs
   on 16. A construct the oldest version can't parse must never reach the install
