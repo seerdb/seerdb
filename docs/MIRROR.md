@@ -243,6 +243,11 @@ would cost far more than anyone gains from it.
   has both modes, and the Mirror passes either through. In `JSON_EXISTS`, a
   strict path's structural error is the ON ERROR answer, as a lax path's
   errors are ([#2679](https://github.com/seerdb/seerdb/issues/2679)).
+- **JSON path methods past Oracle's.** From PostgreSQL 19, a path may use
+  `ltrim()`, `rtrim()`, `btrim()`, `initcap()`, `replace()` and
+  `split_part()`, which 23ai refuses with ORA-40442. Oracle's `upper()` and
+  `lower()` answer as 23ai's do
+  ([#2742](https://github.com/seerdb/seerdb/issues/2742)).
 - **JSON key order.** JSON objects are unordered, and two documents that differ
   only in key order are equal, by `JSON_EQUAL` on Oracle and by `=` here. A
   JSON column is stored as PostgreSQL's `jsonb`, which keeps its keys in its
@@ -688,6 +693,7 @@ PostgreSQL 19 with the newest extensions, before CI's image moves to it.
 | `RETURNING OLD col` / `NEW col` (23ai) in a DML statement or a PL/SQL block | PostgreSQL 18 | refused with ORA-03001 |
 | `ALTER TABLE … DISABLE CONSTRAINT` / `ENABLE CONSTRAINT` of a foreign key, and `MODIFY CONSTRAINT … DISABLE \| ENABLE`: the constraint shows as `DISABLED` / `NOT VALIDATED`, and `ENABLE` checks the rows (an orphan is ORA-02298) | PostgreSQL 18 | refused with ORA-03001 |
 | `IGNORE NULLS` in `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE`, inside the call or behind it | PostgreSQL 19 | refused with ORA-03001; `RESPECT NULLS`, the default, is accepted everywhere |
+| The JSON path methods `upper()` and `lower()`, in `JSON_VALUE`, `JSON_QUERY` and `JSON_EXISTS` | PostgreSQL 19 | refused with ORA-40442, as a path 23ai cannot parse is |
 
 ### Which role to connect as
 
@@ -1365,6 +1371,12 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   whole partition (`ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`),
   reversing the window's `ORDER BY` gives the same row
   ([#2741](https://github.com/seerdb/seerdb/issues/2741)).
+- **A JSON path that cannot be parsed** is ORA-40442, which is also 23ai's
+  code for most such paths. For a method it does not know, such as
+  `$.a.foo()`, 23ai gives ORA-40597 with the same text. `upper()` and
+  `lower()` on a number give NULL in `JSON_VALUE`, where 23ai turns the
+  number into text first: `'5'`
+  ([#2742](https://github.com/seerdb/seerdb/issues/2742)).
 - **`MEDIAN`** works as an aggregate, exact over a `NUMBER` and a `DATE`. As an
   analytic function (`MEDIAN(x) OVER (PARTITION BY ...)`) it is refused, since
   PostgreSQL has no exact median it can window.

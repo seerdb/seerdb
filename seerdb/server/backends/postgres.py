@@ -16717,6 +16717,10 @@ _NUMBER_CHARACTERS = frozenset('0123456789.+-eE')
 # invalid number (#2441).
 _INVALID_JSON = re.compile(r'invalid input syntax for type json\b')
 _ORA_JSON_SYNTAX_ERROR = 40441
+# A path PostgreSQL could not parse, a method it lacks among them: 23ai's
+# ORA-40442 (#2742), where the SQLSTATE alone reads as an invalid statement.
+_INVALID_JSON_PATH = re.compile(r'syntax error at .* of jsonpath input')
+_ORA_JSON_PATH_SYNTAX_ERROR = 40442
 
 
 # PL/SQL's SQLCODE and SQLERRM (#2429), as functions of the SQLSTATE and message
@@ -16737,6 +16741,7 @@ _PLSQL_ERROR_DDL = (
         for code, text in {
             **_ORA_MESSAGE,
             _ORA_JSON_SYNTAX_ERROR: 'JSON syntax error',
+            _ORA_JSON_PATH_SYNTAX_ERROR: 'JSON path expression syntax error',
         }.items()
     )
     + 'END $$;'
@@ -16760,6 +16765,8 @@ _PLSQL_ERROR_DDL = (
     f'THEN -{_ORA_CHILD_RECORD_FOUND} '
     "WHEN $1 = '22P02' AND $2 ~ '^invalid input syntax for type json' "
     f'THEN -{_ORA_JSON_SYNTAX_ERROR} '
+    "WHEN $1 = '42601' AND $2 ~ '^syntax error at .* of jsonpath input' "
+    f'THEN -{_ORA_JSON_PATH_SYNTAX_ERROR} '
     + ''.join(
         f"WHEN $1 = '{state}' THEN -{code} " for state, code in _SQLSTATE_TO_ORA.items()
     )
@@ -16952,6 +16959,12 @@ def _backend_error(
     if code == ORA_INVALID_NUMBER and _INVALID_JSON.match(_primary_message(exc)):
         return BackendError(
             'JSON syntax error', ora_code=_ORA_JSON_SYNTAX_ERROR, error_offset=offset
+        )
+    if getattr(exc, 'sqlstate', None) == '42601' and _INVALID_JSON_PATH.match(
+        _primary_message(exc)
+    ):
+        return BackendError(
+            'JSON path expression syntax error', ora_code=_ORA_JSON_PATH_SYNTAX_ERROR
         )
     missing = _MISSING_RELATION.match(_primary_message(exc))
     if code == ORA_TABLE_OR_VIEW_DOES_NOT_EXIST and missing is not None:

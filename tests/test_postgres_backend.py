@@ -18127,6 +18127,45 @@ def test_ignore_nulls_in_a_window_function_from_postgresql_19() -> None:
         backend.close()
 
 
+def test_json_path_upper_and_lower_from_postgresql_19() -> None:
+    # A path PostgreSQL cannot parse is 23ai's ORA-40442 (#2742), where it
+    # was ORA-00900. PostgreSQL 19's jsonpath has upper() and lower(), as
+    # 23ai's has; before 19 a path using them is that ORA-40442.
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        refused_paths = ['$.a.trim()']
+        if _server_version_num() < 190000:
+            refused_paths.append('$.a.upper()')
+        for path in refused_paths:
+            with pytest.raises(BackendError) as refused:
+                backend.execute(
+                    'SELECT 1 FROM dual WHERE JSON_EXISTS(\'{"a":"Ab"}\', '
+                    f"'{path}')"
+                )
+            assert refused.value.ora_code == 40442
+            assert 'JSON path expression syntax error' in str(refused.value)
+            backend.rollback()
+        if _server_version_num() < 190000:
+            pytest.skip('upper() and lower() in a JSON path need PostgreSQL 19')
+        # The answers 23ai gives (2026-11-19).
+        assert backend.execute(
+            'SELECT JSON_VALUE(\'{"a":"Ab"}\', \'$.a.lower()\'), '
+            'JSON_QUERY(\'{"a":"Ab"}\', \'$.a.upper()\') FROM dual'
+        ).rows == [('ab', '"AB"')]
+        assert (
+            backend.execute(
+                'SELECT COUNT(*) FROM dual WHERE '
+                'JSON_EXISTS(\'{"a":"Ab"}\', \'$?(@.a.upper() == "AB")\')'
+            ).rows[0][0]
+            == 1
+        )
+    finally:
+        backend.rollback()
+        backend.close()
+
+
 def test_merge_into_a_view_from_postgresql_17() -> None:
     # MERGE into a simple view runs from PostgreSQL 17 (#2652); before it,
     # PostgreSQL refuses it (docs/MIRROR.md, *By PostgreSQL version*).
