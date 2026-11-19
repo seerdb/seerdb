@@ -7297,8 +7297,19 @@ NULLs of both, and an object IN and OUT through a block, in the OALL8 form of
   on 9i's native form OCI 11.2's to 10g and 11g, `00 6f 00 00 00 d0 07 00 00`, 9
   zero bytes, the OID's length and the OID, version `01 00`, 8 zero bytes. The
   value is the REF's bytes as a value.
-- **No NULL REF.** An OCIRef never filled in, bound with a NULL indicator, was
-  ORA-00600 [kokeermd1] on both servers. seerdb binds no NULL REF: a `None`
+- **A pure-OUT REF**, measured with `declare x ref <t> := :1; begin :2 := x;
+  end;`, :1 and :2 both `SQLT_REF`, has the IN REF's descriptor. OCI bound :2
+  as an OCIRef from `OCIObjectNew`, never filled, with a NULL indicator. Its
+  value is `04 00 02 00 00`, the same on both servers: 4 bytes, an empty
+  OCIRef's image. That is a ub2 body length of 2 and a body of `00 00`, where a
+  filled REF has `00 28` and a body starting `02 09`.
+- **The OUT REF comes back** in the IOV reply (`20 10` for IN, OUT), after the
+  `07`, as the REF's bytes as a value (`2a` + 42 bytes). The status `08` follows
+  directly, with no indicator and no return code, as in an object's OUT cell
+  and unlike 8i's REF row cell. Here it was the REF bound IN, byte for byte.
+- **No NULL REF.** An OCIRef never filled in, bound IN with a NULL indicator,
+  was ORA-00600 [kokeermd1] on both servers. The same OCIRef bound pure OUT is
+  accepted. seerdb binds no NULL REF: a `None`
   names no type.
 
 **Associative arrays in the OALL8 form** (SeerODBC #172), measured with OCI 9.2
