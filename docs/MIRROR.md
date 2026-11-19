@@ -643,8 +643,8 @@ Both modes translate the same SQL and PL/SQL; only who may do what differs.
 
 ### What the database needs
 
-- **PostgreSQL 16 or later**, tested on the newest (18). What an older one
-  lacks is listed under *By PostgreSQL version* below.
+- **PostgreSQL 16 or later**, tested on 18, and on 19 without gating. What an
+  older one lacks is listed under *By PostgreSQL version* below.
 - **[orafce](https://github.com/orafce/orafce)** 4.17 or later, which supplies
   Oracle's built-in functions (`NVL`, `DECODE`, `TO_CHAR`, `ADD_MONTHS`, ...)
   and `UTL_RAW`. It is a requirement: without it, much ordinary Oracle SQL
@@ -675,7 +675,8 @@ and extensions offer, rather than keeping to what every supported version has.
 CI tests the newest version (#2652). What an older one lacks is listed here and
 not worked around. A non-blocking CI leg on the oldest supported setup reports
 what it lacks (#2668). That setup is PostgreSQL 16.14 with orafce 4.17.1,
-pgvector 0.8.0 and plpgsql_check 2.10.11.
+pgvector 0.8.0 and plpgsql_check 2.10.11. Another non-blocking leg runs
+PostgreSQL 19 with the newest extensions, before CI's image moves to it.
 
 | feature | needs | before that |
 |---|---|---|
