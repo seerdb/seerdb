@@ -9104,6 +9104,17 @@ _PROCEDURAL_TEXT = re.compile(
     re.IGNORECASE,
 )
 
+
+# An alias's AS, right before a word (#2733).
+_AS_BEFORE = re.compile(r'\bAS\s*$', re.IGNORECASE)
+
+
+def _date_of(instant: str) -> str:
+    """A DATE of an instant: its time at the session's zone, cut to the second,
+    as SYSDATE and CURRENT_DATE give it (#2733)."""
+    return f"date_trunc('second', ({instant})::timestamp)::{_DATE_TYPE}"
+
+
 _IDIOM_REWRITES: list[
     tuple[str, re.Pattern[str], str | Callable[[re.Match[str]], str]]
 ] = [
@@ -9302,11 +9313,26 @@ _IDIOM_REWRITES: list[
         r'AS timestamptz\1',
     ),
     # SYSDATE is a DATE, so SYSDATE - d is a number of days (#1611), of the
-    # instant Oracle reads (_TIME_SOURCE, #2717) at a second's precision.
+    # instant Oracle reads (_TIME_SOURCE, #2717), cut to the second: a
+    # timestamp(0) rounds, and put SYSDATE up to half a second ahead (#2733).
     (
         'sysdate',
         re.compile(r'\bsysdate\b', re.IGNORECASE),
-        lambda _m: f'({_TIME_SOURCE.get()})::timestamp(0)::{_DATE_TYPE}',
+        lambda _m: _date_of(_TIME_SOURCE.get()),
+    ),
+    # CURRENT_DATE is the same DATE, at the session's zone, which is the zone the
+    # timestamptz is read in here. Passed through, it was PostgreSQL's own
+    # current_date, the date alone at midnight (#2733). After a dot or AS it is
+    # a name -- `:now AS current_date`, python-oracledb's test_dataframe_1050 --
+    # and is left alone.
+    (
+        'current-date',
+        re.compile(r'(?<![.\w$#])current_date\b', re.IGNORECASE),
+        lambda m: (
+            m.group(0)
+            if _AS_BEFORE.search(m.string, 0, m.start())
+            else _date_of(_TIME_SOURCE.get())
+        ),
     ),
     # SESSIONTIMEZONE → the zone as ALTER SESSION spelled it, or, before any was
     # set, the session's current offset in Oracle's `+hh:mm` form: the zone a

@@ -6298,9 +6298,42 @@ def test_sql_reads_the_statement_s_time_plsql_the_clock() -> None:
         assert 'statement_timestamp()' in _translate_idioms(text)
 
 
+def test_current_date_is_the_session_s_date_and_time() -> None:
+    # Oracle's CURRENT_DATE is a DATE of the session zone's date and time, to
+    # the second. Passed through, it was PostgreSQL's current_date: the date
+    # alone, at midnight (#2733). It reads the time as SYSDATE does, the
+    # statement's in SQL and the clock in PL/SQL (#2717).
+    from seerdb.common.tns_consts import TNS_TYPE_DATE
+
+    assert _translate_idioms('SELECT CURRENT_DATE FROM dual') == (
+        "SELECT date_trunc('second', (statement_timestamp())::timestamp)::ora_date "
+        'FROM dual'
+    )
+    assert 'clock_timestamp()' in _translate_idioms('BEGIN :d := current_date; END;')
+    # After a dot or AS, a name: python-oracledb's test_dataframe_1050 has
+    # `:now as current_date`.
+    for sql in ('SELECT t.current_date FROM t', 'SELECT :now as current_date FROM t'):
+        assert _translate_idioms(sql) == sql
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        for zone in ('-05:00', '+05:00'):
+            backend.execute(f"ALTER SESSION SET TIME_ZONE = '{zone}'")
+            result = backend.execute(
+                'SELECT CURRENT_DATE, CAST(CURRENT_TIMESTAMP AS TIMESTAMP) FROM dual'
+            )
+            assert result.columns[0].data_type == TNS_TYPE_DATE
+            ((date, wall),) = result.rows
+            # The same statement's instant, at the session's zone, cut (not
+            # rounded) to the second.
+            assert isinstance(date, datetime.datetime), date
+            assert date == wall.replace(microsecond=0), (zone, date, wall)
+    finally:
+        backend.close()
+
+
 def test_translate_idioms_functions_and_literals() -> None:
     assert _translate_idioms('SELECT SYSDATE') == (
-        'SELECT (statement_timestamp())::timestamp(0)::ora_date'
+        "SELECT date_trunc('second', (statement_timestamp())::timestamp)::ora_date"
     )
     # HEXTORAW / RAWTOHEX, EMPTY_CLOB / EMPTY_BLOB and FROM_TZ are installed as
     # real PostgreSQL functions (_HELPER_FUNCTIONS_DDL), so their call sites
@@ -16517,7 +16550,7 @@ def test_idiom_rewrites_leave_quoted_text_alone() -> None:
     assert out == (
         "SELECT 'VARCHAR2', 'it''s NVARCHAR2', \"MINUS\" FROM t -- don't\n"
         "WHERE c = CAST(x AS varchar(5)) EXCEPT SELECT 'sysdate', "
-        '(statement_timestamp())::timestamp(0)::ora_date FROM dual'
+        "date_trunc('second', (statement_timestamp())::timestamp)::ora_date FROM dual"
     )
     # A rule that reads into a literal still sees it: a negative INTERVAL.
     assert _translate_idioms("SELECT INTERVAL '-1 2:00:00' DAY TO SECOND") == (
