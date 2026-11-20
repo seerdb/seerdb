@@ -8921,6 +8921,16 @@ _ADD_CONSTRAINT_ITEM = re.compile(
 )
 # A MODIFY item's trailing NOT NULL / NULL.
 _TRAILING_NULLITY = re.compile(r'(?:^|\s)(NOT\s+NULL|NULL)\s*$', re.IGNORECASE)
+# A MODIFY item's NOT NULL state words, ENABLE [VALIDATE] or VALIDATE: what a
+# NOT NULL is anyway (#2752).
+_NULLITY_STATE = re.compile(
+    r'(\bNULL)\s+(?:ENABLE(?:\s+VALIDATE)?|VALIDATE)\s*$', re.IGNORECASE
+)
+# A MODIFY item's NOT NULL given a name: `c CONSTRAINT nn NOT NULL` (#2752).
+_NAMED_NOT_NULL = re.compile(
+    r'(?:^|\s)CONSTRAINT\s+("[^"]+"|[A-Za-z_][\w$#]*)\s+(?=NOT\s+NULL\s*$)',
+    re.IGNORECASE,
+)
 
 
 def _translate_alter_columns(sql: str) -> str | None:
@@ -8984,6 +8994,12 @@ def _translate_alter_columns(sql: str) -> str | None:
 def _modify_actions(table: str, column: str, rest: str) -> list[str] | None:
     # One MODIFY item's ALTER COLUMN actions (#1414): its type, default and
     # nullity, each where given; None for a part this does not model.
+    rest = _NULLITY_STATE.sub(r'\1', rest)
+    named = _NAMED_NOT_NULL.search(rest)
+    constraint = None
+    if named is not None:
+        constraint = named.group(1)
+        rest = f'{rest[: named.start()]} {rest[named.end() :]}'.strip()
     nullity = None
     default = None
     at = re.search(r'\bDEFAULT\b', rest, re.IGNORECASE)
@@ -9014,7 +9030,11 @@ def _modify_actions(table: str, column: str, rest: str) -> list[str] | None:
             actions.append(f'ADD {_raw_length_check(table, column, int(raw.group(1)))}')
     if default is not None:
         actions.append(f'ALTER COLUMN {column} SET DEFAULT {default}')
-    if nullity is not None:
+    if constraint is not None and _SERVER_VERSION.get() >= 180000:
+        # A NOT NULL has a name, and a catalog row, from 18 on (#2752).
+        actions.append(f'ADD CONSTRAINT {constraint} NOT NULL {column}')
+    elif nullity is not None:
+        # floor: PG18 -- below 18 a NOT NULL has no name to keep (#2752, #2682).
         verb = 'SET' if nullity.startswith('NOT') else 'DROP'
         actions.append(f'ALTER COLUMN {column} {verb} NOT NULL')
     return actions
@@ -16839,6 +16859,31 @@ class _UniqueViolation(BackendError):
         )
 
 
+# ORA-02296: a NOT NULL added over rows that are NULL there (#2752). PostgreSQL's
+# 23502 says the column "contains null values"; an INSERT's says "violates".
+_ORA_CANNOT_ENABLE_NULLS_FOUND = 2296
+_NULLS_FOUND = re.compile(r'^column ".*" of relation ".*" contains null values$')
+_ALTER_TABLE_STATEMENT = re.compile(r'\s*ALTER\s+TABLE\b', re.IGNORECASE)
+_NOT_NULL_NAME = re.compile(
+    r'\bCONSTRAINT\s+("[^"]+"|[A-Za-z_][\w$#]*)\s+NOT\s+NULL\b', re.IGNORECASE
+)
+
+
+def _nulls_found(exc: Exception, original: str) -> BackendError:
+    # 21c: `cannot enable (PYO.) - null values found` for an unnamed NOT NULL,
+    # the constraint's name after the dot for a named one.
+    named = _NOT_NULL_NAME.search(original)
+    name = ''
+    if named is not None:
+        name = named.group(1)
+        name = name[1:-1] if name.startswith('"') else name.upper()
+    schema = (getattr(getattr(exc, 'diag', None), 'schema_name', None) or '').upper()
+    return BackendError(
+        f'cannot enable ({schema}.{name}) - null values found',
+        ora_code=_ORA_CANNOT_ENABLE_NULLS_FOUND,
+    )
+
+
 # ORA-01407: an UPDATE's NOT NULL violation, where an INSERT's is ORA-01400.
 _ORA_CANNOT_UPDATE_TO_NULL = 1407
 _UPDATE_STATEMENT = re.compile(r'\s*UPDATE\b', re.IGNORECASE)
@@ -17118,6 +17163,13 @@ def _backend_error(
     offset = _missing_object_offset(exc, original)
     if offset is None:
         offset = _error_offset(exc, original, translated)
+    if (
+        getattr(exc, 'sqlstate', None) == '23502'
+        and _NULLS_FOUND.search(_primary_message(exc))
+        and original is not None
+        and _ALTER_TABLE_STATEMENT.match(original)
+    ):
+        return _nulls_found(exc, original)
     if getattr(exc, 'sqlstate', None) == '23502' and getattr(
         getattr(exc, 'diag', None), 'column_name', None
     ):
