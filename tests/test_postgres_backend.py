@@ -15806,8 +15806,73 @@ def test_oracle_alter_table_column_forms_translate() -> None:
         'ALTER TABLE t DROP COLUMN e, DROP COLUMN "F"'
     )
     # Not modelled: runs as written, to fail honestly.
-    named = 'ALTER TABLE t MODIFY (a CONSTRAINT a_nn NOT NULL)'
-    assert _translate_ddl(named) == named
+    checked = 'ALTER TABLE t MODIFY (a CHECK (a > 0))'
+    assert _translate_ddl(checked) == checked
+
+
+def test_a_named_not_null_in_modify() -> None:
+    # `MODIFY c CONSTRAINT nn NOT NULL`, either spelling, with or without
+    # ENABLE VALIDATE: a named NOT NULL from PostgreSQL 18, which keeps one in
+    # its catalog; below, the NOT NULL alone. It ran as written and was a
+    # syntax error (#2752).
+    from seerdb.server.backends.postgres import _SERVER_VERSION
+
+    for version, expected in (
+        (180000, 'ALTER TABLE t ADD CONSTRAINT a_nn NOT NULL a'),
+        (160000, 'ALTER TABLE t ALTER COLUMN a SET NOT NULL'),
+    ):
+        token = _SERVER_VERSION.set(version)
+        try:
+            for sql in (
+                'ALTER TABLE t MODIFY (a CONSTRAINT a_nn NOT NULL)',
+                'ALTER TABLE t MODIFY a CONSTRAINT a_nn NOT NULL',
+                'alter table t modify (a constraint a_nn not null enable validate)',
+            ):
+                assert (
+                    _translate_ddl(sql)
+                    .replace('not null', 'NOT NULL')
+                    .replace('add constraint', 'ADD CONSTRAINT')
+                    == expected
+                ), (version, sql)
+            # ENABLE [VALIDATE] is what an unnamed NOT NULL is anyway.
+            assert _translate_ddl('ALTER TABLE t MODIFY a NOT NULL ENABLE') == (
+                'ALTER TABLE t ALTER COLUMN a SET NOT NULL'
+            )
+        finally:
+            _SERVER_VERSION.reset(token)
+
+
+def test_a_not_null_over_null_rows_is_ora_02296() -> None:
+    # 21c: `cannot enable (PYO.) - null values found`, the constraint's name
+    # after the dot when it has one. It was ORA-01400, an INSERT's (#2752).
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.execute('CREATE TABLE nn2752 (a NUMBER, b NUMBER)')
+        backend.execute('INSERT INTO nn2752 VALUES (NULL, NULL)')
+        backend.commit()
+        for statement, name in (
+            ('ALTER TABLE nn2752 MODIFY a NOT NULL', ''),
+            ('ALTER TABLE nn2752 MODIFY (b CONSTRAINT nn2752_b NOT NULL)', 'NN2752_B'),
+        ):
+            with pytest.raises(BackendError) as raised:
+                backend.execute(statement)
+            assert raised.value.ora_code == 2296, statement
+            assert str(raised.value).endswith(f'.{name}) - null values found')
+            backend.rollback()
+        backend.execute('UPDATE nn2752 SET b = 1')
+        backend.execute('ALTER TABLE nn2752 MODIFY b CONSTRAINT nn2752_b NOT NULL')
+        with pytest.raises(BackendError) as raised:
+            backend.execute('INSERT INTO nn2752 VALUES (1, NULL)')
+        assert raised.value.ora_code == 1400
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE nn2752')
+        except Exception:
+            backend.rollback()
+        backend.close()
 
 
 def test_oracle_alter_table_column_forms_run() -> None:

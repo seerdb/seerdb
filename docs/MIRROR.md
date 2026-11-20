@@ -685,7 +685,7 @@ PostgreSQL 19 with the newest extensions, before CI's image moves to it.
 
 | feature | needs | before that |
 |---|---|---|
-| A NOT NULL constraint keeps its name: `CONSTRAINT nn NOT NULL` shows as `NN` in `USER_CONSTRAINTS`, and `ALTER TABLE … DROP CONSTRAINT nn` drops it | PostgreSQL 18 | listed under a made-up name (`<oid>_<oid>_<n>_not_null`); `DROP CONSTRAINT` is refused with ORA-00942 |
+| A NOT NULL constraint keeps its name: `CONSTRAINT nn NOT NULL`, in `CREATE TABLE` or `ALTER TABLE … MODIFY`, shows as `NN` in `USER_CONSTRAINTS`, and `ALTER TABLE … DROP CONSTRAINT nn` drops it | PostgreSQL 18 | listed under a made-up name (`<oid>_<oid>_<n>_not_null`); `DROP CONSTRAINT` is refused with ORA-00942 |
 | `MERGE INTO` a view | PostgreSQL 17 | refused: "cannot execute MERGE on relation" |
 | `JSON_VALUE`, with `RETURNING`, `ERROR \| NULL \| DEFAULT … ON ERROR \| ON EMPTY` and a path's item methods (`.number()`, `.date()`, …), as 23ai answers it | PostgreSQL 17 | refused with ORA-03001 |
 | `JSON_QUERY` as 23ai answers it: VARCHAR2 text in Oracle's compact form for a text input, JSON for a JSON input, `RETURNING`, `WITH [CONDITIONAL \| UNCONDITIONAL] [ARRAY] WRAPPER`, `ERROR \| NULL \| EMPTY [ARRAY \| OBJECT] ON ERROR \| ON EMPTY` | PostgreSQL 17 | `JSON_QUERY(x, path)` alone gives the path's first value as JSON; any clause is refused with ORA-03001 |
