@@ -2019,9 +2019,11 @@ that is the whole reply (`17 <ub4 call_status> <ub2 sequence>`). Measured on 10g
 11g and 23ai: an INSERT or UPDATE sets the bit, and the commit's or rollback's
 status clears it. The last reply's error code is kept too: after ORA-00028,
 ORA-01012, ORA-01089, ORA-01092, ORA-02396, ORA-03113, ORA-03114 or ORA-03135 the
-session is gone, and `is_healthy()` says False without a round trip. seerdb
-doesn't read the bit from the 8i and 9i replies, so there the attribute is
-refused rather than guessed.
+session is gone, and `is_healthy()` says False without a round trip. Before
+10g (§19.12): on 8i the status's no-transaction flag (`0x40`) is read as the
+bit's opposite, and on a 9i session with `oall8=True` the native form's call
+status is read as from 10g. 9i's compact form says nothing of a transaction,
+so there the attribute is refused rather than guessed.
 
 **Server side: the transaction bit is not optional (#889).** A client reads
 `TXN_IN_PROGRESS` (`0x02`) to decide whether releasing a connection to a pool,

@@ -2171,7 +2171,13 @@ class OracleConnect(_ConnectionLogic):
         to_send: object = None
         try:
             while True:
-                intent = gen.send(to_send)  # type: ignore[attr-defined]
+                # The dialect decodes its replies here: the call status they
+                # record is what transaction_in_progress reads (8i and 9i's
+                # native form, PROTOCOL.md §19.12).
+                with recording_session_keywords(
+                    self._session_keywords, self._call_status
+                ):
+                    intent = gen.send(to_send)  # type: ignore[attr-defined]
                 if intent is RECV:
                     to_send = self._next_data_packet()
                     if self._session_shutdown:

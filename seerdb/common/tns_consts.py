@@ -187,6 +187,10 @@ RCAP_TTC_SESSION_STATE_OPS = 0x10
 # A server that never sets it tells every client there is nothing to roll back,
 # so the transaction (and its locks) outlive the connection (#889).
 TNS_EOCS_FLAGS_TXN_IN_PROGRESS = 0x02
+# Oracle 8i's status has no call status. Its `flags` byte carries the same state
+# the other way round: this bit is set while NO transaction is open (PROTOCOL.md
+# §19.12, measured on 8.1.7).
+O8I_STATUS_FLAG_NO_TRANSACTION = 0x40
 
 # The OER's warn-flags byte (the last of the six single-byte fields after the
 # error position). Bit 0x20 says the call CREATED a PL/SQL object that compiled

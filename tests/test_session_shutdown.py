@@ -55,6 +55,7 @@ def _bare(data):
     Conn._session_shutdown = False
     Conn.conn_state = CONN_STATE_AUTHENTICATED
     Conn._call_status = [1]
+    Conn._session_keywords = {}
     Conn._call_timeout = 0
     Conn._call_in_progress = False
     return Conn
