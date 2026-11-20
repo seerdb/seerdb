@@ -2563,6 +2563,33 @@ _HELPER_FUNCTIONS_DDL = (
         'LANGUAGE sql IMMUTABLE AS $$ SELECT $2 $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json_query_out(text, jsonb) RETURNS varchar '
         'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_json_serialize($2) $$;'
+        # A JSON constructor's result with no RETURNING (#2744): 23ai's default,
+        # VARCHAR2(4000), so its compact text, and an error past 4000 bytes
+        # rather than a document cut short. Of the constructor's json, not
+        # jsonb, which would sort an object's keys where Oracle keeps them as
+        # written; an extended value goes through sys.ora_json_serialize, so
+        # after it. A name of its own, not an overload of that one: a literal,
+        # of no type yet, would find the two ambiguous.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_compact(j json) RETURNS text '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE json_typeof(j) '
+        "WHEN 'object' THEN CASE WHEN (SELECT count(*) FROM json_object_keys(j)) = 1 "
+        "AND (SELECT k FROM json_object_keys(j) k) ~ '^[$](number|oracle|interval|rawhex)' "
+        # 23ai writes a TIMESTAMP's fraction only when it has one.
+        'THEN regexp_replace(sys.ora_json_serialize(j::jsonb), '
+        """'^("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})[.]0{6}"$', '\\1"') """
+        "ELSE '{' || coalesce((SELECT string_agg(to_json(k)::text || ':' || "
+        "sys.ora_json_compact(v), ',' ORDER BY n) FROM json_each(j) "
+        "WITH ORDINALITY AS e(k, v, n)), '') || '}' END "
+        "WHEN 'array' THEN '[' || coalesce((SELECT string_agg(sys.ora_json_compact(v), "
+        "',' ORDER BY n) FROM json_array_elements(j) WITH ORDINALITY AS a(v, n)), '') "
+        # A number as 23ai writes it: no trailing zeros, no exponent.
+        "|| ']' WHEN 'number' THEN trim_scale(j::text::numeric)::text "
+        'ELSE j::jsonb::text END $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_text(j json) RETURNS varchar '
+        'LANGUAGE plpgsql IMMUTABLE AS $$ DECLARE t text := sys.ora_json_compact(j); '
+        "BEGIN IF octet_length(t) > 4000 THEN RAISE EXCEPTION USING ERRCODE = 'P0001', "
+        "MESSAGE = 'ORA-40478: output value too large (maximum: 4000)'; END IF; "
+        'RETURN t; END $$;'
     )
     + (
         # A BOOLEAN stored into a NUMBER column (#1705): 23ai converts it, TRUE to 1
@@ -10200,28 +10227,76 @@ def _translate_json_constructor_values(sql: str) -> str:
     a bare object where Oracle's keeps its type. A literal, a bind and NULL go
     as they are -- untyped, nothing could resolve the function for them -- as
     does a value written FORMAT JSON, already JSON. A JSON_ARRAY of a query
-    over no rows is an empty array, as Oracle's is (#2740)."""
+    over no rows is an empty array, as Oracle's is (#2740).
+
+    Without a RETURNING clause, Oracle's constructor gives VARCHAR2 text, in
+    its compact form, where PostgreSQL's gives json (#2744). So it is written
+    out with sys.ora_json_text -- except as a value of
+    another constructor, where Oracle takes it as JSON, and it stays JSON
+    (`nested`)."""
     if 'json_' not in sql.lower():
         return sql
+    return _json_constructors(sql, nested=False)
 
+
+def _json_constructors(sql: str, nested: bool) -> str:
     def call(name: str, args: list[str]) -> str | None:
-        if not args or (len(args) == 1 and args[0].strip() in ('', '*')):
+        upper = name.upper()
+        if len(args) == 1 and args[0].strip() == '*':
             return None
-        inner = [_translate_json_constructor_values(a) for a in args]
-        if name.upper() == 'JSON_ARRAY' and inner[0].lstrip().upper().startswith(
-            'SELECT'
+        args = [] if len(args) == 1 and not args[0].strip() else args
+        # Every call is replaced, unchanged or not, so that the calls inside
+        # it are visited here, as values, and not again as outermost ones.
+        inner = [_json_constructors(a, nested=True) for a in args]
+        if upper in ('JSON_ARRAYAGG', 'JSON_OBJECTAGG') or (
+            upper == 'JSON_ARRAY'
+            and inner
+            and inner[0].lstrip().upper().startswith('SELECT')
         ):
-            if _SERVER_VERSION.get() >= 190000:
-                return None
+            values = inner
+        else:
+            values = [_json_constructor_value(a, upper == 'JSON_OBJECT') for a in inner]
+        returning = bool(args) and _json_returning(args[-1])
+        text = not nested and not returning
+        # json, whose object keeps its keys in order: PostgreSQL makes it jsonb,
+        # sorting them, when a value is jsonb, as an extended one is (#2744).
+        own = '' if returning else f'{" " if values else ""}RETURNING json'
+        built = f'{name}({",".join(values)}{own})'
+        if (
+            upper == 'JSON_ARRAY'
+            and inner
+            and inner[0].lstrip().upper().startswith('SELECT')
+            and _SERVER_VERSION.get() < 190000
+        ):
             # floor: PG19 -- below 19, json_array() of a query over no rows
             # is NULL, where Oracle's is [] (#2740, #2682).
-            return f"COALESCE({name}({','.join(inner)}), '[]')"
-        out = [
-            _json_constructor_value(arg, name.upper() == 'JSON_OBJECT') for arg in inner
-        ]
-        return f'{name}({",".join(out)})'
+            built = f"COALESCE({built}, '[]')"
+        return f'sys.ora_json_text({built})::varchar(4000)' if text else built
 
-    return _rewrite_calls(sql, frozenset({'JSON_OBJECT', 'JSON_ARRAY'}), call, '_$#."')
+    return _rewrite_calls(
+        sql,
+        frozenset({'JSON_OBJECT', 'JSON_ARRAY', 'JSON_OBJECTAGG', 'JSON_ARRAYAGG'}),
+        call,
+        '_$#."',
+    )
+
+
+_JSON_CONSTRUCTOR_CALL = re.compile(
+    r'JSON_(?:OBJECT|ARRAY)(?:AGG)?\s*\(', re.IGNORECASE
+)
+
+
+def _json_returning(arg: str) -> bool:
+    # Whether a constructor's last argument has its own RETURNING clause, at
+    # its top level (#2744).
+    depth = 0
+    for token in sql_tokens(arg):
+        text = arg[token.start : token.end]
+        if token.kind == 'other' and text in '()':
+            depth += 1 if text == '(' else -1
+        elif not depth and token.kind == 'word' and text.upper() == 'RETURNING':
+            return True
+    return False
 
 
 def _json_constructor_value(arg: str, keyed: bool) -> str:
@@ -10268,6 +10343,9 @@ def _json_constructor_value(arg: str, keyed: bool) -> str:
         or bare[0].isdigit()
         or bare[:2].upper() in ("N'", "Q'")
         or arg[end:].lstrip().upper().startswith('FORMAT')
+        # A constructor is JSON already, its keys in order; as jsonb they
+        # would be sorted (#2744).
+        or _JSON_CONSTRUCTOR_CALL.match(bare)
     ):
         return arg
     lead = value[: len(value) - len(value.lstrip())]

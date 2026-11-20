@@ -6215,8 +6215,10 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # MIN of a WITH TIME ZONE value: sys.ora_tstz_larger and smaller (#2660),
     # and JSON_VALUE's lenient context item, three sys.ora_json_or_null, and
     # JSON_QUERY's result by its input, two sys.ora_json_query_out (#2679),
-    # and SYSTIMESTAMP's and CURRENT_TIMESTAMP's at a given instant (#2717).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 396
+    # and SYSTIMESTAMP's and CURRENT_TIMESTAMP's at a given instant (#2717),
+    # and a JSON constructor's text: sys.ora_json_compact and sys.ora_json_text
+    # (#2744).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 398
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -13053,8 +13055,9 @@ def test_json_constructor_values_keep_their_type() -> None:
         "select json_object('a' : :1, 'b' : c FORMAT JSON, KEY 'k' VALUE d, "
         "'n' : NULL ABSENT ON NULL), json_array(e, 'x', 3 returning json) from t"
     ) == (
-        "select json_object('a' : :1, 'b' : c FORMAT JSON, KEY 'k' VALUE "
-        "sys.ora_json_scalar(d), 'n' : NULL ABSENT ON NULL), "
+        "select sys.ora_json_text(json_object('a' : :1, 'b' : c FORMAT JSON, "
+        "KEY 'k' VALUE sys.ora_json_scalar(d), 'n' : NULL ABSENT ON NULL "
+        'RETURNING json))::varchar(4000), '
         "json_array(sys.ora_json_scalar(e), 'x', 3 returning json) from t"
     )
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
@@ -13081,13 +13084,18 @@ def test_json_constructor_values_keep_their_type() -> None:
 def test_a_json_array_of_a_query_over_no_rows_is_empty() -> None:
     # JSON_ARRAY(SELECT ...) over no rows is [] on 23ai, and PostgreSQL's
     # json_array() is NULL there before 19 (#2740): below 19 it is wrapped.
+    # Text, as a constructor with no RETURNING is (#2744).
     sql = 'select json_array(select n from t where 1 = 0) from dual'
     assert _translate_json_constructor_values(sql) == (
-        "select COALESCE(json_array(select n from t where 1 = 0), '[]') from dual"
+        'select sys.ora_json_text(COALESCE(json_array(select n from t where 1 = 0 '
+        "RETURNING json), '[]'))::varchar(4000) from dual"
     )
     token = _SERVER_VERSION.set(190000)
     try:
-        assert _translate_json_constructor_values(sql) == sql
+        assert _translate_json_constructor_values(sql) == (
+            'select sys.ora_json_text(json_array(select n from t where 1 = 0 '
+            'RETURNING json))::varchar(4000) from dual'
+        )
     finally:
         _SERVER_VERSION.reset(token)
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
@@ -13095,9 +13103,75 @@ def test_a_json_array_of_a_query_over_no_rows_is_empty() -> None:
         assert backend.execute(
             'SELECT JSON_ARRAY(SELECT 1 FROM dual WHERE 1 = 0), '
             'JSON_ARRAY(SELECT 1 FROM dual) FROM dual'
-        ).rows == [([], [1])]
+        ).rows == [('[]', '[1]')]
     finally:
         backend.rollback()
+        backend.close()
+
+
+def test_a_json_constructor_without_returning_gives_text() -> None:
+    # 23ai: a constructor with no RETURNING gives VARCHAR2(4000), in Oracle's
+    # compact form; the Mirror gave JSON, so a client got a list or a dict
+    # where Oracle hands it text (#2744). Inside another constructor it is
+    # JSON, nested, and an object keeps its keys in the order written.
+    from seerdb.common.tns_consts import TNS_TYPE_VARCHAR
+    from seerdb.server.backend import BackendError
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        for expression, text in (
+            ('json_array(1, 2)', '[1,2]'),
+            ("json_object('a' : 1)", '{"a":1}'),
+            ('json_array(SELECT 1 FROM dual)', '[1]'),
+            ('json_object()', '{}'),
+            # Numbers and datetimes as 23ai writes them.
+            (
+                'json_array(1.50, -0.50, 1e2, 1.0, 1e-5, 1.5e30)',
+                '[1.5,-0.5,100,1,0.00001,1500000000000000000000000000000]',
+            ),
+            (
+                "json_array(TIMESTAMP '2024-01-02 03:04:05', "
+                "TIMESTAMP '2024-01-02 03:04:05.25', DATE '2024-01-02')",
+                '["2024-01-02T03:04:05","2024-01-02T03:04:05.250000",'
+                '"2024-01-02T00:00:00"]',
+            ),
+            (
+                "json_object('b' : 1, 'a' : json_array(1, NULL, 2), "
+                "'c' : json_object('z' : 'q', 'y' : 2))",
+                '{"b":1,"a":[1,2],"c":{"z":"q","y":2}}',
+            ),
+        ):
+            result = backend.execute(f'SELECT {expression} FROM dual')
+            assert result.rows == [(text,)], expression
+            column = result.columns[0]
+            assert (column.data_type, column.data_length) == (TNS_TYPE_VARCHAR, 4000)
+        (row,) = backend.execute(
+            "SELECT json_arrayagg(json_object('n' : level)) FROM dual "
+            'CONNECT BY level <= 2'
+        ).rows
+        assert row == ('[{"n":1},{"n":2}]',)
+        # An explicit RETURNING is kept.
+        (row,) = backend.execute('SELECT json_array(1 RETURNING JSON) FROM dual').rows
+        assert row == ([1],)
+        # Past VARCHAR2(4000), an error, not a document cut short.
+        with pytest.raises(BackendError) as raised:
+            backend.execute("SELECT json_array(rpad('x', 4000, 'x')) FROM dual")
+        assert raised.value.ora_code == 40478
+        # The text goes into a JSON column, and JSON_VALUE reads it.
+        backend.execute('CREATE TABLE j2744 (j JSON)')
+        backend.execute("INSERT INTO j2744 SELECT json_object('k' : 1) FROM dual")
+        assert backend.execute('SELECT j FROM j2744').rows == [({'k': 1},)]
+        if _server_version_num() >= 170000:  # JSON_VALUE needs 17
+            (row,) = backend.execute(
+                "SELECT json_value(json_object('a' : 5), '$.a') FROM dual"
+            ).rows
+            assert row == ('5',)
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE j2744')
+        except Exception:
+            backend.rollback()
         backend.close()
 
 
