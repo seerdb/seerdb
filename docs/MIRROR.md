@@ -686,6 +686,7 @@ PostgreSQL 19 with the newest extensions, before CI's image moves to it.
 | feature | needs | before that |
 |---|---|---|
 | A NOT NULL constraint keeps its name: `CONSTRAINT nn NOT NULL`, in `CREATE TABLE` or `ALTER TABLE … MODIFY`, shows as `NN` in `USER_CONSTRAINTS`, and `ALTER TABLE … DROP CONSTRAINT nn` drops it | PostgreSQL 18 | listed under a made-up name (`<oid>_<oid>_<n>_not_null`); `DROP CONSTRAINT` is refused with ORA-00942 |
+| A NOT NULL added `[ENABLE] NOVALIDATE` in `ALTER TABLE … MODIFY`: the rows there are not checked, it shows as `ENABLED` / `NOT VALIDATED` and its column as nullable, and `MODIFY CONSTRAINT nn [ENABLE] VALIDATE` checks them (a NULL is ORA-02293) | PostgreSQL 18 | refused with ORA-03001 |
 | `MERGE INTO` a view | PostgreSQL 17 | refused: "cannot execute MERGE on relation" |
 | `JSON_VALUE`, with `RETURNING`, `ERROR \| NULL \| DEFAULT … ON ERROR \| ON EMPTY` and a path's item methods (`.number()`, `.date()`, …), as 23ai answers it | PostgreSQL 17 | refused with ORA-03001 |
 | `JSON_QUERY` as 23ai answers it: VARCHAR2 text in Oracle's compact form for a text input, JSON for a JSON input, `RETURNING`, `WITH [CONDITIONAL \| UNCONDITIONAL] [ARRAY] WRAPPER`, `ERROR \| NULL \| EMPTY [ARRAY \| OBJECT] ON ERROR \| ON EMPTY` | PostgreSQL 17 | `JSON_QUERY(x, path)` alone gives the path's first value as JSON; any clause is refused with ORA-03001 |
@@ -1322,13 +1323,17 @@ The PostgreSQL backend does not reproduce all of Oracle. The main limits:
   `.double()`, `.size()` and `.type()` work, from PostgreSQL 17
   ([#2679](https://github.com/seerdb/seerdb/issues/2679)).
 - **Only a foreign key and a CHECK can be disabled**, a foreign key from
-  PostgreSQL 18 and a CHECK from 19 (*By PostgreSQL version*). `DISABLE` /
-  `ENABLE` of a NOT NULL, PRIMARY KEY or UNIQUE constraint, `ENABLE
-  NOVALIDATE`, and `CASCADE` or `KEEP INDEX` on either are refused with
-  ORA-03001: PostgreSQL can't switch those off and on
-  ([#2663](https://github.com/seerdb/seerdb/issues/2663)). A CHECK declared
+  PostgreSQL 18 and a CHECK from 19 (*By PostgreSQL version*). `DISABLE` of a
+  NOT NULL, `DISABLE` / `ENABLE` of a PRIMARY KEY or UNIQUE constraint,
+  `ENABLE NOVALIDATE` of an existing constraint, and `CASCADE` or `KEEP INDEX`
+  on either are refused with ORA-03001: PostgreSQL can't switch those off and
+  on ([#2663](https://github.com/seerdb/seerdb/issues/2663)). A CHECK declared
   `ENABLE NOVALIDATE` or `DISABLE VALIDATE` is refused too
   ([#2681](https://github.com/seerdb/seerdb/issues/2681)).
+- **A NOT NULL added `NOVALIDATE`** checks the whole row a later UPDATE writes.
+  An UPDATE of another column of a row that was already NULL there is refused
+  with ORA-01407, where Oracle checks only new values and lets it through
+  ([#2752](https://github.com/seerdb/seerdb/issues/2752)).
 - **Fractional seconds** stop at six digits; a `TIMESTAMP(9)` is a
   `TIMESTAMP(6)`.
 - **A WITH TIME ZONE value keeps no region.** It keeps its instant and its
