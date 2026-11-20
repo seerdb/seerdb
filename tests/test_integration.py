@@ -4025,14 +4025,12 @@ class CursorIntegration(_IntegrationBase):
                 cur.execute(f'SELECT n FROM {table}')
                 self.assertEqual(cur.fetchall(), [(1,)])
                 self.assertFalse(conn.transaction_in_progress)
-                if not os.environ.get('SEERDB_TEST_MIRROR'):
-                    # Oracle opens a transaction for a SELECT FOR UPDATE; the
-                    # Mirror doesn't say so yet, a gap of its own.
-                    cur.execute(f'SELECT n FROM {table} FOR UPDATE')
-                    self.assertEqual(cur.fetchall(), [(1,)])
-                    self.assertTrue(conn.transaction_in_progress)
-                    conn.rollback()
-                    self.assertFalse(conn.transaction_in_progress)
+                # A SELECT FOR UPDATE opens a transaction too (#2751).
+                cur.execute(f'SELECT n FROM {table} FOR UPDATE')
+                self.assertEqual(cur.fetchall(), [(1,)])
+                self.assertTrue(conn.transaction_in_progress)
+                conn.rollback()
+                self.assertFalse(conn.transaction_in_progress)
             finally:
                 cur.execute(f'DROP TABLE {table}')
 

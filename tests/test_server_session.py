@@ -1734,6 +1734,53 @@ def test_a_query_leaves_the_transaction_flag_alone() -> None:
         _ENCODE_TXN_IN_PROGRESS.reset(token)
 
 
+@pytest.mark.parametrize(
+    'sql',
+    [
+        'SELECT n FROM t FOR UPDATE',
+        'select n from t where n = :1 for update of n nowait',
+        '-- lock\nSELECT n FROM t FOR /* rows */ UPDATE SKIP LOCKED',
+        'WITH w AS (SELECT 1 x FROM dual) SELECT n FROM t, w FOR UPDATE WAIT 5',
+    ],
+)
+def test_a_select_for_update_opens_a_transaction(sql: str) -> None:
+    # Its row locks last until the transaction ends, and Oracle sets the bit
+    # after one (#2751). Clear, a client that trusts it skips its rollback on
+    # release and the locks outlive the connection's use (#889).
+    from seerdb.common.tns import _ENCODE_TXN_IN_PROGRESS
+    from seerdb.server.session import _mark_transaction
+
+    token = _ENCODE_TXN_IN_PROGRESS.set(False)
+    try:
+        _mark_transaction(sql, autocommit=False)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is True
+        _mark_transaction(sql, autocommit=True)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is False
+    finally:
+        _ENCODE_TXN_IN_PROGRESS.reset(token)
+
+
+@pytest.mark.parametrize(
+    'sql',
+    [
+        "SELECT 'for update' FROM dual",
+        'SELECT 1 FROM dual -- for update',
+        'SELECT "FOR" FROM t',
+        'SELECT n FROM t ORDER BY n',
+    ],
+)
+def test_for_update_in_text_takes_no_locks(sql: str) -> None:
+    from seerdb.common.tns import _ENCODE_TXN_IN_PROGRESS
+    from seerdb.server.session import _mark_transaction
+
+    token = _ENCODE_TXN_IN_PROGRESS.set(False)
+    try:
+        _mark_transaction(sql, autocommit=False)
+        assert _ENCODE_TXN_IN_PROGRESS.get() is False
+    finally:
+        _ENCODE_TXN_IN_PROGRESS.reset(token)
+
+
 def test_bind_vars_wraps_block_binds_with_type_and_size() -> None:
     from seerdb.common.tns import ExecRequest
     from seerdb.common.tns_consts import (

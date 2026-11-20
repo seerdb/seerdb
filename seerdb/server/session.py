@@ -55,9 +55,11 @@ from seerdb.common.sqltext import (
     altered_current_schema,
     altered_edition,
     is_plsql,
+    is_query,
     is_reusable_dml,
     placeholder_count,
     plsql_bind_directions,
+    sql_tokens,
 )
 from seerdb.common.tns import (
     _CSFRM_DB,
@@ -2284,13 +2286,35 @@ def _mark_transaction(sql: str, autocommit: bool) -> None:
     unrelated features.
 
     DML and PL/SQL open a transaction; autocommit closes it again straight away,
-    as does an explicit commit / rollback. DDL commits implicitly. A query
-    changes nothing, so it leaves the flag alone.
+    as does an explicit commit / rollback. DDL commits implicitly. So does a
+    SELECT FOR UPDATE: its row locks last until the transaction ends, and Oracle
+    sets the bit after one (#2751). Any other query changes nothing, so it
+    leaves the flag alone.
     """
     if autocommit:
         _ENCODE_TXN_IN_PROGRESS.set(False)
-    elif is_reusable_dml(sql) or is_plsql(sql):
+    elif is_reusable_dml(sql) or is_plsql(sql) or _locks_rows(sql):
         _ENCODE_TXN_IN_PROGRESS.set(True)
+
+
+def _locks_rows(sql: str) -> bool:
+    """Whether a query has a FOR UPDATE clause, and so takes row locks (#2751).
+
+    Read off the statement's words, so a FOR UPDATE inside a string literal, a
+    comment or a quoted identifier does not count."""
+    if not is_query(sql):
+        return False
+    words = (
+        sql[t.start : t.end].upper()
+        for t in sql_tokens(sql)
+        if t.kind not in ('space', 'comment')
+    )
+    previous = ''
+    for word in words:
+        if previous == 'FOR' and word == 'UPDATE':
+            return True
+        previous = word
+    return False
 
 
 # An ALTER SESSION that sets an NLS parameter (#2020).
@@ -5087,6 +5111,9 @@ def _answer_reexecute(
         # (#873). The sibling func-4 path has carried its rows since #854; this
         # is the same for func 78.
         result = backend.execute(sql, request.bind_rows[0] if request.bind_rows else ())
+        if not request.autocommit:
+            # A re-executed SELECT FOR UPDATE locks its rows again (#2751).
+            _mark_transaction(sql, autocommit=False)
     except BackendError as err:
         logger.info('re-execute refused: %s', err.ora_message)
         stream.write_packet(
@@ -5194,6 +5221,9 @@ def _answer_reexecute_binds(
         return []
     try:
         result = backend.execute(sql, rows[0] if rows else [])
+        if not request.autocommit:
+            # A re-executed SELECT FOR UPDATE locks its rows again (#2751).
+            _mark_transaction(sql, autocommit=False)
     except BackendError as err:
         logger.info('re-execute refused: %s', err.ora_message)
         stream.write_packet(
