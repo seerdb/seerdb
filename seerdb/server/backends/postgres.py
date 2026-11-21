@@ -7518,28 +7518,87 @@ def _tds_scalar(pg_name: str, typmod: int) -> tuple[_TdsLeaf, str]:
 _ALTER_SESSION_SCHEMA = re.compile(
     r'\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*"?(\w+)"?\s*$', re.IGNORECASE
 )
-# ALTER SESSION SET TIME_ZONE -- which a 12.1+ client also sends at login, pinned
-# to its own UTC offset. PostgreSQL's own spelling of an offset is POSIX and
-# INVERTS the sign (`SET TIME ZONE '+05:30'` runs the session at -05:30), so an
-# offset is set as an explicit POSIX spec instead. The zone is also kept as
-# Oracle spelled it, which is what SESSIONTIMEZONE reports back. The pattern
-# admits no quote, so the zone is safe to inline as a literal.
+# ALTER SESSION SET TIME_ZONE -- which a client also sends at login. PostgreSQL's
+# own spelling of an offset is POSIX and INVERTS the sign (`SET TIME ZONE
+# '+05:30'` runs the session at -05:30), so an offset is set as an explicit POSIX
+# spec instead. The zone is also kept as Oracle spells it, which is what
+# SESSIONTIMEZONE reports back. A quoted value admits no quote, so it is safe to
+# inline as a literal; an unquoted one is a single word (#2763).
 _ALTER_SESSION_TIME_ZONE = re.compile(
-    r"\s*ALTER\s+SESSION\s+SET\s+TIME_ZONE\s*=\s*'([^']+)'\s*;?\s*$", re.IGNORECASE
+    r"\s*ALTER\s+SESSION\s+SET\s+TIME_ZONE\s*=\s*(?:'([^']*)'|(\w+))\s*;?\s*$",
+    re.IGNORECASE,
 )
-_TZ_OFFSET = re.compile(r'([+-])(\d{1,2}):(\d{2})$')
+_TZ_OFFSET = re.compile(r'([+-]?)(\d{1,2}):(\d{2})')
+_ORA_LITERAL_FORMAT = 1861
+_ORA_TZ_HOUR = 1874
+_ORA_TZ_MINUTE = 1875
+_ORA_TZ_REGION = 1882
+_ORA_INVALID_ALTER_SESSION_OPTION = 2248
+# LOCAL: the zone the login set (alter_session keeps it), else the server's own.
+_TIME_ZONE_LOCAL = (
+    "DO $$ BEGIN PERFORM set_config('TimeZone', coalesce(nullif("
+    "current_setting('seerdb.login_posix', true), ''), "
+    "(SELECT reset_val FROM pg_settings WHERE name = 'TimeZone')), false); "
+    "PERFORM set_config('seerdb.time_zone', "
+    "coalesce(current_setting('seerdb.login_time_zone', true), ''), false); END $$"
+)
+# What the login set, kept for LOCAL.
+_KEEP_LOGIN_TIME_ZONE = (
+    "DO $$ BEGIN PERFORM set_config('seerdb.login_time_zone', "
+    "coalesce(current_setting('seerdb.time_zone', true), ''), false); "
+    "PERFORM set_config('seerdb.login_posix', current_setting('TimeZone'), false); "
+    'END $$'
+)
 
 
-def _translate_time_zone(zone: str) -> str:
-    zone = zone.strip()
-    m = _TZ_OFFSET.match(zone)
+def _oracle_region(name: str) -> str | None:
+    # A region as Oracle spells it, matched in any case: V$TIMEZONE_NAMES' list.
+    from seerdb.common._tzregions import TZ_REGIONS
+
+    wanted = name.lower()
+    for region in TZ_REGIONS.values():
+        if region.lower() == wanted:
+            return region
+    return None
+
+
+def _translate_time_zone(zone: str | None, word: str | None = None) -> str:
+    """The PostgreSQL for ``ALTER SESSION SET TIME_ZONE`` = a quoted *zone* or an
+    unquoted *word*, refused with Oracle's errors as 23ai refuses it (#2763)."""
+    if word is not None:
+        if word.upper() == 'LOCAL':
+            return _TIME_ZONE_LOCAL
+        if word.upper() == 'DBTIMEZONE':
+            return _translate_time_zone(_DB_TIME_ZONE_NAME)
+        raise BackendError(
+            'invalid option for ALTER SESSION',
+            ora_code=_ORA_INVALID_ALTER_SESSION_OPTION,
+        )
+    zone = (zone or '').strip()
+    m = _TZ_OFFSET.fullmatch(zone)
     if m:
-        sign, hh, mm = m.group(1), int(m.group(2)), m.group(3)
-        zone = f'{sign}{hh:02d}:{mm}'
+        sign, hh, mm = m.group(1) or '+', int(m.group(2)), int(m.group(3))
+        if hh > 15:
+            raise BackendError(
+                'time zone hour must be between -15 and 15', ora_code=_ORA_TZ_HOUR
+            )
+        if mm > 59 or (hh == 15 and mm and sign == '+'):
+            raise BackendError(
+                'time zone minute must be between -59 and 59', ora_code=_ORA_TZ_MINUTE
+            )
+        zone = f'{sign}{hh:02d}:{mm:02d}'
         flipped = '-' if sign == '+' else '+'
-        posix = f'<{zone}>{flipped}{hh:02d}:{mm}'
+        posix = f'<{zone}>{flipped}{hh:02d}:{mm:02d}'
+    elif zone[:1] in ('+', '-') or zone[:1].isdigit():
+        raise BackendError(
+            'literal does not match format string', ora_code=_ORA_LITERAL_FORMAT
+        )
     else:
-        posix = zone  # a region name, e.g. Europe/Moscow, means the same in both
+        region = _oracle_region(zone)
+        if region is None:
+            raise BackendError('time zone region not found', ora_code=_ORA_TZ_REGION)
+        # A region name, e.g. Europe/Moscow, means the same in both.
+        zone = posix = region
     # A DO block, not a SELECT: ALTER SESSION is not a query, and answering it
     # with a row failed the reference thin client (#1153).
     return (
@@ -8225,7 +8284,7 @@ def _translate_admin(sql: str) -> str:
         return f'SET search_path TO {m.group(1).lower()}, {_SEARCH_PATH_TAIL}'
     m = _ALTER_SESSION_TIME_ZONE.match(sql)
     if m:
-        return _translate_time_zone(m.group(1))
+        return _translate_time_zone(m.group(1), m.group(2))
     m = _ALTER_SESSION_NLS_DATE_FORMAT.match(sql)
     if m:
         return _nls_date_format_settings(m.group(1).replace("''", "'"))
@@ -27961,6 +28020,10 @@ class PostgresBackend:
                 return
             statement = rest
         self._at_once(_translate_admin(statement))
+        if _ALTER_SESSION_TIME_ZONE.match(statement):
+            # The zone the login set is what ALTER SESSION SET TIME_ZONE = LOCAL
+            # returns to (#2763).
+            self._at_once(_KEEP_LOGIN_TIME_ZONE)
 
     @_while_connected
     def refuse_implicit_results(self) -> None:

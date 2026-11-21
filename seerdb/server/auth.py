@@ -666,6 +666,27 @@ def parse_auth_response_oci(payload: bytes) -> tuple[bytes, bytes, bytes]:
     return user, sesskey, password
 
 
+def parse_auth_alter_session_oci(payload: bytes) -> str | None:
+    """The ``ALTER SESSION`` statement an OCI login AUTH carries, or ``None``.
+
+    The sqlplus / thick-OCI counterpart of :func:`parse_auth_alter_session`.
+    OCI sets the session time zone this way on every release from 9.2, in its
+    native pair, ``ALTER SESSION SET TIME_ZONE='+01:00'`` plus a NUL (#2763).
+
+    Never raises: a malformed value must not fail an otherwise good login.
+    """
+    try:
+        pairs = decode_auth_oci(payload)['pairs']
+    except Exception:  # noqa: BLE001 - a login must not fail over this
+        return None
+    for pair in pairs:
+        if (pair.get('key') or b'') == b'AUTH_ALTER_SESSION':
+            value = bytes(pair.get('value') or b'')
+            statement = value.rstrip(b'\x00').decode('utf-8', 'replace').strip()
+            return statement or None
+    return None
+
+
 def _group_app_context(pairs: list) -> list[tuple[str, str, str]]:
     """Application-context entries from the auth message's key/value pairs.
 
