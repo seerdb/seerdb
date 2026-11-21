@@ -170,6 +170,24 @@ class Native11AuthTest(unittest.TestCase):
             (b"ALTER SESSION SET TIME_ZONE='Europe/Moscow'\x00", 1),
         )
 
+    def test_the_mirror_reads_the_time_zone_an_oci_login_sets(self):
+        # The Mirror's half (#2763): the statement out of the OCI AUTH, for its
+        # backend to run; a body without one, or not an AUTH at all, gives None.
+        from seerdb.server.auth import parse_auth_alter_session_oci
+
+        Challenge = make_challenge(b'pyo123', salt=token_bytes(10))
+        Auth = _auth_from(encode_challenge_oci(Challenge)[10:])
+        with mock.patch.dict(os.environ, {'ORA_SDTZ': 'Europe/Moscow'}):
+            (Message, _) = encode_auth_oci11(
+                {'seq': 4, 'auth': Auth, 'env': _env()}, []
+            )
+        self.assertEqual(
+            parse_auth_alter_session_oci(Message),
+            "ALTER SESSION SET TIME_ZONE='Europe/Moscow'",
+        )
+        self.assertIsNone(parse_auth_alter_session_oci(b''))
+        self.assertIsNone(parse_auth_alter_session_oci(b'\x03\x73\x01garbage'))
+
     def test_a_pooled_session_asks_for_a_new_one(self):
         # As the converted AUTH: a pooled session's purity defaults to NEW, and a
         # connection class goes out as given.

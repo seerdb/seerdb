@@ -3227,6 +3227,80 @@ def test_translate_admin_sets_the_session_time_zone_without_inverting_it() -> No
     assert _translate_admin("ALTER SESSION SET NLS_SORT='BINARY'") == _NO_OP
 
 
+@pytest.mark.parametrize(
+    ('value', 'code'),
+    [
+        # As 23ai refuses them, measured 2026-11-21 (#2763).
+        ("'Nowhere/X'", 1882),
+        ("''", 1882),
+        ("'LOCAL'", 1882),
+        ("'DBTIMEZONE'", 1882),
+        ("'+16:00'", 1874),
+        ("'-16:00'", 1874),
+        ("'+05:61'", 1875),
+        ("'+15:30'", 1875),
+        ("'+5'", 1861),
+        ('SESSIONTIMEZONE', 2248),
+        ('foo', 2248),
+    ],
+)
+def test_a_time_zone_oracle_refuses_is_refused_with_its_error(
+    value: str, code: int
+) -> None:
+    from seerdb.server.backend import BackendError
+
+    with pytest.raises(BackendError) as raised:
+        _translate_admin(f'ALTER SESSION SET TIME_ZONE = {value}')
+    assert raised.value.ora_code == code
+
+
+def test_a_time_zone_is_kept_as_oracle_spells_it() -> None:
+    # 23ai: an offset's sign is optional and its hour two digits; a region is
+    # matched in any case and stored as Oracle names it; -15:59 and +15:00 are
+    # the bounds. DBTIMEZONE is the database's zone (#2763).
+    def zone(statement: str) -> str:
+        return (
+            _translate_admin(statement).split("'seerdb.time_zone', '")[1].split("'")[0]
+        )
+
+    assert zone("ALTER SESSION SET TIME_ZONE = '5:00'") == '+05:00'
+    assert zone("ALTER SESSION SET TIME_ZONE = ' europe/moscow'") == 'Europe/Moscow'
+    assert zone("ALTER SESSION SET TIME_ZONE = '-15:59'") == '-15:59'
+    assert zone("ALTER SESSION SET TIME_ZONE = '+15:00'") == '+15:00'
+    assert zone('alter session set time_zone = dbtimezone;') == '+00:00'
+    assert 'seerdb.login_posix' in _translate_admin(
+        'ALTER SESSION SET TIME_ZONE = LOCAL'
+    )
+
+
+def test_local_returns_to_the_zone_the_login_set() -> None:
+    # As on 23ai (#2763): LOCAL is the zone the login's ALTER SESSION set, after
+    # an offset or a region; DBTIMEZONE the database's. Read back through
+    # SESSIONTIMEZONE and the clock's own offset.
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    try:
+        backend.authenticate('PYO')
+        backend.open_session({})
+        backend.alter_session("ALTER SESSION SET TIME_ZONE='Europe/Moscow'")
+
+        def zones() -> tuple:
+            return backend.execute(
+                "SELECT sessiontimezone, to_char(current_timestamp, 'TZH:TZM') "
+                'FROM dual'
+            ).rows[0]
+
+        for moved in ("'-05:00'", "'Europe/London'"):
+            backend.execute(f'ALTER SESSION SET TIME_ZONE = {moved}')
+            backend.execute('ALTER SESSION SET TIME_ZONE = LOCAL')
+            assert zones() == ('Europe/Moscow', '+03:00')
+        backend.execute('ALTER SESSION SET TIME_ZONE = DBTIMEZONE')
+        assert zones() == ('+00:00', '+00:00')
+        backend.execute("ALTER SESSION SET TIME_ZONE = '5:00'")
+        assert zones() == ('+05:00', '+05:00')
+    finally:
+        backend.close()
+
+
 def test_sessiontimezone_reads_the_zone_the_session_was_given() -> None:
     # The Oracle spelling ALTER SESSION stored, or before any was set the
     # session's own offset in Oracle's `+hh:mm` form.
@@ -5732,9 +5806,14 @@ def test_date_and_timestamp_columns() -> None:
     assert date_value == datetime.datetime(2020, 12, 31, 0, 0)
     # TIMESTAMP keeps the microseconds.
     assert ts_value == datetime.datetime(2024, 1, 15, 13, 30, 45, 123456)
-    # LTZ is naive: the instant 07:00Z in the database zone, UTC.
+    # LTZ is naive: the instant 07:00Z, which arrives in the database zone, UTC,
+    # and is read as the session's wall clock (#2762). The session runs at the
+    # client's UTC offset at login.
     assert tz_type is seerdb.DB_TYPE_TIMESTAMP_LTZ
-    assert tz_value == datetime.datetime(2024, 6, 1, 7, 0, 0)
+    login_offset = (
+        datetime.datetime.now().astimezone().utcoffset() or datetime.timedelta(0)
+    )
+    assert tz_value == datetime.datetime(2024, 6, 1, 7, 0, 0) + login_offset
 
 
 def test_interval_day_to_second_column() -> None:

@@ -21295,8 +21295,9 @@ def _encode_temporal(Value: datetime.date | BcDate, DataType: int) -> bytes:
         # 11 bytes always: DATE prefix + 4 BE nanosecond bytes (zero when the
         # value has no sub-second part), keeping the column a fixed width.
         #
-        # TIMESTAMP WITH LOCAL TIME ZONE is the SAME shape: it is normalised to
-        # the session zone and carries no explicit offset, which is why its
+        # TIMESTAMP WITH LOCAL TIME ZONE is the SAME shape: it is the wall clock
+        # in the database's zone (DBTIMEZONE), as 23ai sends it, and carries no
+        # explicit offset (#2762, #2763), which is why its
         # describe length is 11 like a plain TIMESTAMP and unlike TZ's 13. Left
         # out of this branch it fell through to the DATE form below and silently
         # dropped the fractional seconds -- 22:30:02.5 came back 22:30:02, with
