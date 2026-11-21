@@ -2470,6 +2470,10 @@ _HELPER_FUNCTIONS_DDL = (
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_json($1::text) $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json(jsonb) RETURNS jsonb '
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+        # A constructor's RETURNING JSON gives json, which keeps its keys in
+        # the order written (#2754).
+        'CREATE OR REPLACE FUNCTION sys.ora_json(json) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb $$;'
         # JSON_VALUE's context item when no ERROR ON ERROR is given (#2679):
         # invalid JSON is NULL, as 23ai's default NULL ON ERROR makes it.
         # PL/pgSQL, not SQL: PostgreSQL 18 plans a SQL function's statement
@@ -2493,6 +2497,8 @@ _HELPER_FUNCTIONS_DDL = (
         'LANGUAGE sql IMMUTABLE AS $$ SELECT $1 $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(jsonb) RETURNS jsonb '
         'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_or_null(json) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb $$;'
         # A text value stored into a JSON column (#2441): 23ai converts a
         # VARCHAR2, a CLOB or any text expression, where PostgreSQL converts only
         # an untyped literal, through jsonb's input, and refused the rest. These
@@ -2519,6 +2525,21 @@ _HELPER_FUNCTIONS_DDL = (
         'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(timestamp) RETURNS jsonb '
         "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('$oracleTimestamp', "
         """to_char($1, 'YYYY-MM-DD"T"HH24:MI:SS.US')) $$;"""
+        # A WITH TIME ZONE value as 23ai writes it (#2754): its wall clock with
+        # six fractional digits, then its offset, or Z for none. A WITH LOCAL
+        # TIME ZONE one, a timestamptz here, at the session's zone.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_zoned(timestamp, integer) RETURNS jsonb '
+        "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('$oracleTimestampTZ', "
+        """to_char($1, 'YYYY-MM-DD"T"HH24:MI:SS.US') || CASE WHEN $2 = 0 THEN 'Z' """
+        "ELSE CASE WHEN $2 < 0 THEN '-' ELSE '+' END || "
+        "lpad(div(abs($2), 3600)::text, 2, '0') || ':' || "
+        "lpad(div(abs($2) % 3600, 60)::text, 2, '0') END) $$;"
+        f'CREATE OR REPLACE FUNCTION sys.ora_json_scalar({_TSTZ_TYPE}) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT '
+        f'sys.ora_json_zoned({_TSTZ_WALL}, ($1).off) $$;'
+        'CREATE OR REPLACE FUNCTION sys.ora_json_scalar(timestamptz) RETURNS jsonb '
+        'LANGUAGE sql STABLE STRICT AS $$ SELECT '
+        'sys.ora_json_zoned($1::timestamp, extract(timezone FROM $1)::integer) $$;'
         f'CREATE OR REPLACE FUNCTION sys.ora_json_scalar({_DATE_TYPE}) RETURNS jsonb '
         "LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT jsonb_build_object('$oracleDate', "
         """to_char($1, 'YYYY-MM-DD"T"HH24:MI:SS')) $$;"""
@@ -2563,6 +2584,9 @@ _HELPER_FUNCTIONS_DDL = (
         'LANGUAGE sql IMMUTABLE AS $$ SELECT $2 $$;'
         'CREATE OR REPLACE FUNCTION sys.ora_json_query_out(text, jsonb) RETURNS varchar '
         'LANGUAGE sql IMMUTABLE AS $$ SELECT sys.ora_json_serialize($2) $$;'
+        # A constructor's RETURNING JSON, json here, is JSON too (#2754).
+        'CREATE OR REPLACE FUNCTION sys.ora_json_query_out(json, jsonb) RETURNS jsonb '
+        'LANGUAGE sql IMMUTABLE AS $$ SELECT $2 $$;'
         # A JSON constructor's result with no RETURNING (#2744): 23ai's default,
         # VARCHAR2(4000), so its compact text, and an error past 4000 bytes
         # rather than a document cut short. Of the constructor's json, not
@@ -2590,6 +2614,18 @@ _HELPER_FUNCTIONS_DDL = (
         "BEGIN IF octet_length(t) > 4000 THEN RAISE EXCEPTION USING ERRCODE = 'P0001', "
         "MESSAGE = 'ORA-40478: output value too large (maximum: 4000)'; END IF; "
         'RETURN t; END $$;'
+        # JSON_SERIALIZE(x) (#2754): a constructor's json in the order its keys
+        # were written, as 23ai serializes one; JSON text, or jsonb, as its
+        # value. After sys.ora_json_compact and sys.ora_json_serialize, which
+        # the bodies call.
+        'CREATE OR REPLACE FUNCTION sys.ora_json_out(json) RETURNS text '
+        'LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT sys.ora_json_compact($1) $$;'
+        + ''.join(
+            f'CREATE OR REPLACE FUNCTION sys.ora_json_out({source}) RETURNS text '
+            'LANGUAGE sql IMMUTABLE STRICT AS $$ '
+            'SELECT sys.ora_json_serialize(sys.ora_json($1)) $$;'
+            for source in ('jsonb', 'text', 'character')
+        )
     )
     + (
         # A BOOLEAN stored into a NUMBER column (#1705): 23ai converts it, TRUE to 1
@@ -5047,10 +5083,11 @@ def _from_extended(value: object) -> object:
             if key == '$oracleTimestamp':
                 return datetime.datetime.fromisoformat(item)
             if key == '$oracleTimestampTZ':
-                # The instant, naive in UTC, as a client decodes OSON's.
+                # With its offset, which OSON keeps beside the instant as 23ai
+                # writes it (#2754); one written without is UTC.
                 when = datetime.datetime.fromisoformat(item.replace('Z', '+00:00'))
-                if when.tzinfo is not None:
-                    when = when.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=datetime.timezone.utc)
                 return when
             if key in ('$numberFloat', '$numberDouble'):
                 return float(item)
@@ -10026,7 +10063,16 @@ def _json_table_columns(
 
 
 _JSON_EXTENDED = re.compile(r'\s+EXTENDED\s*$', re.IGNORECASE)
-_JSON_RETURNING = re.compile(r'\s+RETURNING\b.*$', re.IGNORECASE | re.DOTALL)
+
+
+def _without_returning(argument: str) -> str:
+    # An argument up to its own RETURNING clause. Only one outside the
+    # parentheses: a constructor inside, JSON_ARRAY(x RETURNING JSON), keeps
+    # its own (#2754).
+    for position, word in _top_level_words(argument)[0]:
+        if word == 'RETURNING':
+            return argument[:position].strip()
+    return argument.strip()
 
 
 def _translate_json_functions(sql: str) -> str:
@@ -10046,8 +10092,8 @@ def _translate_json_functions(sql: str) -> str:
         if upper == 'JSON_SCALAR' and len(inner) == 1:
             return f'sys.ora_json_scalar({inner[0].strip()})'
         if upper == 'JSON_SERIALIZE' and len(inner) == 1:
-            value = _JSON_RETURNING.sub('', inner[0]).strip()
-            return f'sys.ora_json_serialize(sys.ora_json({value}))'
+            value = _without_returning(inner[0])
+            return f'sys.ora_json_out({value})'
         if upper == 'JSON_VALUE' and len(inner) == 2:
             if _SERVER_VERSION.get() < 170000:
                 # floor: PG17 -- refused below 17 (#2679, #2682).
@@ -10073,7 +10119,7 @@ def _translate_json_functions(sql: str) -> str:
             # PASSING's commas split the call's arguments: they are one clause.
             return _json_exists(inner[0], ','.join(inner[1:]))
         if upper == 'JSON_QUERY' and len(inner) >= 2:
-            path = _JSON_RETURNING.sub('', inner[1]).strip().split()[0]
+            path = _without_returning(inner[1]).split()[0]
             return (
                 f'jsonb_path_query_first(sys.ora_json({inner[0].strip()}), '
                 f'CAST({path} AS jsonpath))'
