@@ -75,14 +75,22 @@ def test_the_upstream_session_opens_at_the_clients_version(
     # The upstream answers the client as it would directly: it maps the 23ai
     # types and refuses implicit results below 12.1. A client below 11.2 is
     # relayed at 11.2, which 23ai serves (#2430).
+    import types
+
     opened: dict = {}
-    monkeypatch.setattr(seerdb, 'connect', lambda **kwargs: opened.update(kwargs))
+    session = types.SimpleNamespace()
+    monkeypatch.setattr(
+        seerdb, 'connect', lambda **kwargs: opened.update(kwargs) or session
+    )
     backend = OraclePassthroughBackend(
         host='db', port=1521, service='S', credentials={'PYO': 'pyo123'}
     )
     backend.authenticate('PYO')
     backend.open_session({} if spoken is None else {'field_version': spoken})
     assert opened.get('field_version') == upstream
+    # LTZ values are relayed as they arrive; the Mirror's client shifts them
+    # into its own session's zone (#2762).
+    assert session._ltz_shift is False
 
 
 def test_a_character_bind_is_declared_with_its_buffer():

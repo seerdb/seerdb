@@ -504,6 +504,43 @@ def decode_fv2_lob(data_type: int, content: bytes, charset: int) -> str | bytes:
     return content or b''
 
 
+class DbZoneDatetime(datetime.datetime):
+    """A TIMESTAMP WITH LOCAL TIME ZONE as it arrives: the wall clock in the
+    database's zone (DBTIMEZONE), naive.
+
+    The client turns it into the session's wall clock before handing it out, as
+    OCI does (#2762), and the passthrough Mirror's upstream sessions into a plain
+    datetime unshifted. A value that escapes either step is still a datetime.
+    """
+
+    @classmethod
+    def of(cls, value: object) -> object:
+        # A decoded LTZ value, marked; a date before year 1 (BcDate) stays as is.
+        if type(value) is datetime.datetime:
+            return cls(
+                value.year,
+                value.month,
+                value.day,
+                value.hour,
+                value.minute,
+                value.second,
+                value.microsecond,
+            )
+        return value
+
+    def plain(self) -> datetime.datetime:
+        # The same wall clock as an ordinary datetime.
+        return datetime.datetime(
+            self.year,
+            self.month,
+            self.day,
+            self.hour,
+            self.minute,
+            self.second,
+            self.microsecond,
+        )
+
+
 def decode_value(Column: dict, Data: bytes | list | None) -> object:
     # Dispatcher: pick the right decoder based on the column's TNS data type.
     # Unknown types are returned as raw bytes so callers can still see them.
@@ -531,11 +568,12 @@ def decode_value(Column: dict, Data: bytes | list | None) -> object:
         return decode_string(Data, _string_charset(Column))
     if DataType == TNS_TYPE_LONGRAW:
         return bytes(Data)
+    if DataType == TNS_TYPE_TIMESTAMPLTZ:
+        return DbZoneDatetime.of(decode_date(Data))
     if DataType in (
         TNS_TYPE_DATE,
         TNS_TYPE_TIMESTAMP,
         TNS_TYPE_TIMESTAMPTZ,
-        TNS_TYPE_TIMESTAMPLTZ,
     ):
         return decode_date(Data)
     if DataType == TNS_TYPE_BFLOAT:

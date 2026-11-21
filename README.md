@@ -470,6 +470,17 @@ type handler converts the value seerdb fetched, so the same holds through one: a
 string column too, where python-oracledb hands back a `float`. A `TIMESTAMP WITH
 TIME ZONE` fetched as `str` keeps its offset, as seerdb's datetime for it does.
 
+A **`TIMESTAMP WITH LOCAL TIME ZONE`** value is fetched as the session's wall
+clock, as OCI (python-oracledb's thick mode, sqlplus) hands it out: the server
+sends it in the database's zone, and seerdb shifts it to `SESSIONTIMEZONE`, a
+region's daylight saving time following the date. The same goes for an OUT or
+RETURNING bind, an object's attribute and a collection's element. A value bound
+IN is the instant in the database's zone, unshifted, as with OCI.
+python-oracledb's thin mode returns the database's wall clock. The two zones are
+read with one query the first time a session meets such a value, and again after
+an `ALTER SESSION SET TIME_ZONE` the session runs; a zone a logon trigger or
+PL/SQL changes goes unseen until then.
+
 A **CLOB / BLOB** an output type handler wants as `str` / `bytes` is read
 through the LOB it arrives as, where python-oracledb has the server redefine the
 column and send it inline. The values are the same; it costs a read per LOB. A

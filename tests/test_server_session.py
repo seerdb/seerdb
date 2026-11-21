@@ -805,12 +805,14 @@ def test_mark_value_binds_leaves_nulls_and_other_types_alone() -> None:
         TNS_TYPE_TIMESTAMP,
         TNS_TYPE_TIMESTAMPLTZ,
     )
+    from seerdb.common.types import DbZoneDatetime
     from seerdb.server import BinaryDoubleValue, BinaryFloatValue, BindVar, LtzValue
     from seerdb.server.session import _mark_value_binds
 
     value = datetime.datetime(2026, 9, 25, 13, 45, 6)
     null = BindVar(value=None, tns_type=TNS_TYPE_TIMESTAMPLTZ, max_size=11)
-    row = [value, value, None, null]
+    # An LTZ bind decodes as the client's mark for a database-zone value (#2762).
+    row = [DbZoneDatetime.of(value), value, None, null]
     request = ExecRequest(
         'insert into t values (:1, :2, :3, :4)',
         0,

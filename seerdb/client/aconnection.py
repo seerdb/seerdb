@@ -2273,6 +2273,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         finally:
             await Cur.close()
 
+    async def _ltz_load(self) -> None:
+        # The zones LTZ values are shifted between, read once (#2762).
+        from seerdb.client._conn_logic import _LTZ_ZONES_SQL
+
+        self._ltz_set_zones(self._rows(await self.execute(_LTZ_ZONES_SQL)))
+
     async def _describe_object_type(
         self, schema: str | None, name: str | None
     ) -> 'DbObjectType | None':

@@ -20,6 +20,7 @@ an image in it and stamps the types it describes with it
 import asyncio
 import unittest
 
+from seerdb.client._conn_logic import _ConnectionLogic
 from seerdb.client.acursor import AsyncCursor
 from seerdb.client.cursor import _resolve_objects
 from seerdb.common.dbobject import DbObjectType, ObjectImage
@@ -64,7 +65,7 @@ _UTF_8 = (
 )
 
 
-class _Conn:
+class _Conn(_ConnectionLogic):
     def __init__(self, server_charset):
         self._server_charset = server_charset
         self._types = dict((t.name, t) for t in _types(server_charset))

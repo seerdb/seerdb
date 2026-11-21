@@ -127,6 +127,8 @@ class Cursor(_CursorLogic):
             _resolve_parameters(operation, parameters), self._connection
         )
         Bind = self._resolve_cursor_binds(Bind)
+        # An ALTER SESSION may set the session's zone (#2762).
+        self._connection._ltz_note_statement(operation)
         Bind = self._promote_large_lob_binds(operation, Bind)
         Bind = _with_object_bind_lobs(
             Bind,
@@ -401,6 +403,8 @@ class Cursor(_CursorLogic):
         # DML RETURNING ... INTO: write the returned value list onto each Var.
         _assign_return_binds(Bind, Result, self._connection)
         _resolve_return_bind_lobs(self._connection, Bind)
+        # The LTZ values OUT and RETURNING binds filled, in the session's zone.
+        _resolve_out_bind_ltz(self._connection, Bind)
 
         # Implicit result sets (#121): queue any DBMS_SQL.RETURN_RESULT cursors
         # for nextset() to fetch on demand.
@@ -1627,7 +1631,38 @@ def _resolve_objects(Connection, Row: list) -> list:
                 Attrs = decode_object_image(Val.image, Layout, Charset)
                 Out[I] = DbObject(Val.type_name, Attrs, dbtype=Typ)
             Out[I] = _object_with_lobs(Out[I], Connection)
-    return Out
+    return _resolve_ltz(Connection, Out)
+
+
+def _resolve_ltz(Connection, Row: list) -> list:
+    # A fetched row's TIMESTAMP WITH LOCAL TIME ZONE values -- columns, object
+    # attributes, collection elements -- as the session's wall clock, as OCI
+    # hands them out (#2762). The zones are read the first time one appears.
+    from seerdb.common.dbobject import DbObject
+    from seerdb.common.types import DbZoneDatetime
+
+    if Connection is None or not any(
+        isinstance(V, (DbZoneDatetime, DbObject)) for V in Row
+    ):
+        return Row
+    if not Connection._ltz_present(Row):
+        return Row
+    if Connection._ltz_needs_zones():
+        Connection._ltz_load()
+    return Connection._ltz_value(Row)
+
+
+def _resolve_out_bind_ltz(Connection, Bind) -> None:
+    # The same for the values OUT binds filled.
+    if Connection is None:
+        return
+    Vars = [V for V in Connection._ltz_vars(Bind) if Connection._ltz_present(V._value)]
+    if not Vars:
+        return
+    if Connection._ltz_needs_zones():
+        Connection._ltz_load()
+    for V in Vars:
+        V._value = Connection._ltz_value(V._value)
 
 
 def _bind_temp_lobs(Bind: list, Connection: object = None) -> list:

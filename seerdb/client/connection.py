@@ -3263,6 +3263,12 @@ class OracleConnect(_ConnectionLogic):
             'max_elements': int(Upper) if Upper else 0,
         }
 
+    def _ltz_load(self) -> None:
+        # The zones LTZ values are shifted between, read once (#2762).
+        from seerdb.client._conn_logic import _LTZ_ZONES_SQL
+
+        self._ltz_set_zones(self._rows(self.execute(_LTZ_ZONES_SQL)))
+
     def _current_schema_owner(self) -> str | None:
         # The schema a type name that named no owner resolves in.
         Rows = self._rows(self.execute(_CURRENT_SCHEMA_SQL))

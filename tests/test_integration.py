@@ -4520,12 +4520,62 @@ class CursorIntegration(_IntegrationBase):
             self.assertEqual(caught.exception.code, code)
 
     @_requires(_LTZ)
+    def test_an_ltz_value_is_read_as_the_session_s_wall_clock(self):
+        # As OCI hands it out (#2762): fetched and OUT, an LTZ value is the
+        # session's wall clock, DST following the date in a region; bound IN,
+        # it is the instant in the database zone, unshifted. After an ALTER
+        # SESSION the new zone applies. Measured with OCI 23.26 on 23ai. London,
+        # because 9.2's small time-zone file has no Europe/Berlin (ORA-01882).
+        july = "TIMESTAMP '2024-07-01 10:00:00.25 +00:00'"
+        january = "TIMESTAMP '2024-01-15 10:00:00 +00:00'"
+
+        def ltz(literal):
+            return f'CAST({literal} AS TIMESTAMP WITH LOCAL TIME ZONE)'
+
+        self.cur.execute("ALTER SESSION SET TIME_ZONE = 'Europe/London'")
+        self.cur.execute(f'SELECT {ltz(july)}, {ltz(january)} FROM dual')
+        self.assertEqual(
+            self.cur.fetchone(),
+            (
+                datetime.datetime(2024, 7, 1, 11, 0, 0, 250000),
+                datetime.datetime(2024, 1, 15, 10, 0),
+            ),
+        )
+        out = self.cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+        self.cur.execute(f'begin :o := {ltz(july)}; end;', {'o': out})
+        self.assertEqual(
+            out.getvalue(), datetime.datetime(2024, 7, 1, 11, 0, 0, 250000)
+        )
+        # Bound IN, 12:00 is read in the database zone: 12:00 UTC at +00:00,
+        # 20:00 UTC on 9.2 at -08:00.
+        self.cur.execute('SELECT dbtimezone FROM dual')
+        database = _tz_offset(self.cur.fetchone()[0])
+        if database is None:
+            self.skipTest('a named database time zone')
+        bound = self.cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+        bound.setvalue(0, datetime.datetime(2024, 7, 1, 12, 0))
+        self.cur.execute(
+            'SELECT to_char(sys_extract_utc(CAST(:b AS TIMESTAMP WITH TIME ZONE)), '
+            "'YYYY-MM-DD HH24:MI:SS') FROM dual",
+            {'b': bound},
+        )
+        utc = datetime.datetime(2024, 7, 1, 12, 0) - database
+        self.assertEqual(self.cur.fetchone(), (f'{utc:%Y-%m-%d %H:%M:%S}',))
+        self.cur.execute("ALTER SESSION SET TIME_ZONE = '-05:00'")
+        self.cur.execute(f'SELECT {ltz(july)} FROM dual')
+        self.assertEqual(
+            self.cur.fetchone(), (datetime.datetime(2024, 7, 1, 5, 0, 0, 250000),)
+        )
+
+    @_requires(_LTZ)
     def test_timestamp_with_local_time_zone(self):
         # TIMESTAMP WITH LOCAL TIME ZONE (#1208), as measured on 9i to 23ai: a value
-        # bound as LTZ is the instant in the database zone and round-trips as it
-        # is; a TIMESTAMP bound into one is read in the session zone and comes
-        # back in the database's; a precision truncates; a CAST does the same
-        # conversions; SYSTIMESTAMP / CURRENT_TIMESTAMP are WITH TIME ZONE.
+        # bound as LTZ is the instant in the database zone; a TIMESTAMP bound into
+        # one is read in the session zone; a precision truncates; a CAST does the
+        # same conversions; SYSTIMESTAMP / CURRENT_TIMESTAMP are WITH TIME ZONE.
+        # Fetched, an LTZ value is the session's wall clock, as OCI hands it out
+        # (#2762): the one bound as LTZ moves by the zones' difference, and the
+        # TIMESTAMP comes back as it was bound.
         self.cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
         (session, database) = (_tz_offset(z) for z in self.cur.fetchone())
         if session is None or database is None:
@@ -4533,7 +4583,7 @@ class CursorIntegration(_IntegrationBase):
         (session, zone) = _session_zone_apart_from(database)
         self.cur.execute(f"ALTER SESSION SET TIME_ZONE = '{zone}'")
         value = _LTZ_VALUE
-        local = value - session + database
+        fetched = value - database + session
         self.cur.execute(_LTZ_TABLE_DDL.format(self.TABLE))
         for k, kind in (
             (1, seerdb.DB_TYPE_TIMESTAMP_LTZ),
@@ -4550,13 +4600,13 @@ class CursorIntegration(_IntegrationBase):
         self.assertEqual(
             self.cur.fetchall(),
             [
-                (1, value, value.replace(microsecond=123000)),
-                (2, local, local.replace(microsecond=123000)),
+                (1, fetched, fetched.replace(microsecond=123000)),
+                (2, value, value.replace(microsecond=123000)),
             ],
         )
         for kind, expected in (
-            (seerdb.DB_TYPE_TIMESTAMP_LTZ, value),
-            (seerdb.DB_TYPE_TIMESTAMP, local),
+            (seerdb.DB_TYPE_TIMESTAMP_LTZ, fetched),
+            (seerdb.DB_TYPE_TIMESTAMP, value),
         ):
             self.cur.setinputsizes(kind)
             self.cur.execute(
@@ -4647,7 +4697,11 @@ class CursorIntegration(_IntegrationBase):
         var = self.cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
         var.setvalue(0, value.replace(microsecond=0))
         self.cur.execute('begin :value := :value + 5.25; end;', {'value': var})
-        self.assertEqual(var.getvalue(), datetime.datetime(2022, 5, 15, 18, 0, 0))
+        # The OUT value is the session's wall clock, as OCI hands it out (#2762).
+        self.assertEqual(
+            var.getvalue(),
+            datetime.datetime(2022, 5, 15, 18, 0, 0) - database + session,
+        )
 
     @_requires(_LTZ, _TRUNC_TIMESTAMP)
     def test_a_midnight_ltz_bind_matches_a_truncated_ltz_column(self):
@@ -13296,6 +13350,13 @@ class ObjectLocalTimeZoneAttributeIntegration(_IntegrationBase):
         import datetime
 
         given = datetime.datetime(2026, 9, 27, 13, 14, 15)
+        # Bound, the attribute is the instant in the database zone; read back, the
+        # session's wall clock, as OCI does both (#2762).
+        self.cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
+        (session, database) = (_tz_offset(z) for z in self.cur.fetchone())
+        if session is None or database is None:
+            self.skipTest('a named time zone')
+        read = given - database + session
         typ = self.conn.gettype(self.TYPE)
         self.assertEqual(typ.attrs[1]['type_name'], 'TIMESTAMP WITH LOCAL TZ')
         out = self.cur.var(typ)
@@ -13304,10 +13365,10 @@ class ObjectLocalTimeZoneAttributeIntegration(_IntegrationBase):
             [typ.newobject({'ID': 1, 'TS': given}), out],
         )
         (returned,) = out.getvalue()
-        self.assertEqual(returned.TS.replace(tzinfo=None), given)
+        self.assertEqual(returned.TS.replace(tzinfo=None), read)
         self.cur.execute(f'SELECT o FROM {self.TABLE}')
         (fetched,) = self.cur.fetchone()
-        self.assertEqual(fetched.TS.replace(tzinfo=None), given)
+        self.assertEqual(fetched.TS.replace(tzinfo=None), read)
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
@@ -14511,6 +14572,25 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     self.assertEqual(caught.exception.code, code)
 
     @_requires(_LTZ)
+    async def test_an_ltz_value_is_read_as_the_session_s_wall_clock(self):
+        # Async twin of CursorIntegration's (#2762).
+        july = "TIMESTAMP '2024-07-01 10:00:00.25 +00:00'"
+        ltz = f'CAST({july} AS TIMESTAMP WITH LOCAL TIME ZONE)'
+        async with await seerdb.connect_async(**self._kwargs()) as Conn:
+            async with Conn.cursor() as Cur:
+                await Cur.execute("ALTER SESSION SET TIME_ZONE = 'Europe/London'")
+                await Cur.execute(f'SELECT {ltz} FROM dual')
+                self.assertEqual(
+                    await Cur.fetchone(),
+                    (datetime.datetime(2024, 7, 1, 11, 0, 0, 250000),),
+                )
+                out = Cur.var(seerdb.DB_TYPE_TIMESTAMP_LTZ)
+                await Cur.execute(f'begin :o := {ltz}; end;', {'o': out})
+                self.assertEqual(
+                    out.getvalue(), datetime.datetime(2024, 7, 1, 11, 0, 0, 250000)
+                )
+
+    @_requires(_LTZ)
     async def test_timestamp_with_local_time_zone(self):
         # Async twin of CursorIntegration's.
         Table = 'PYO_ASYNC_LTZ'
@@ -14524,7 +14604,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             (session, zone) = _session_zone_apart_from(database)
             await Cur.execute(f"ALTER SESSION SET TIME_ZONE = '{zone}'")
             value = _LTZ_VALUE
-            local = value - session + database
+            fetched = value - database + session
             await self._drop_async(Cur, Table)
             await Cur.execute(_LTZ_TABLE_DDL.format(Table))
             for k, kind in (
@@ -14542,13 +14622,13 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
             self.assertEqual(
                 await Cur.fetchall(),
                 [
-                    (1, value, value.replace(microsecond=123000)),
-                    (2, local, local.replace(microsecond=123000)),
+                    (1, fetched, fetched.replace(microsecond=123000)),
+                    (2, value, value.replace(microsecond=123000)),
                 ],
             )
             for kind, expected in (
-                (seerdb.DB_TYPE_TIMESTAMP_LTZ, value),
-                (seerdb.DB_TYPE_TIMESTAMP, local),
+                (seerdb.DB_TYPE_TIMESTAMP_LTZ, fetched),
+                (seerdb.DB_TYPE_TIMESTAMP, value),
             ):
                 Cur.setinputsizes(kind)
                 await Cur.execute(
@@ -14676,7 +14756,8 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 var.setvalue(0, value.replace(microsecond=0))
                 await Cur.execute('begin :value := :value + 5.25; end;', {'value': var})
                 self.assertEqual(
-                    var.getvalue(), datetime.datetime(2022, 5, 15, 18, 0, 0)
+                    var.getvalue(),
+                    datetime.datetime(2022, 5, 15, 18, 0, 0) - database + session,
                 )
 
     async def test_a_var_read_only_as_input_beside_an_out_var(self):
@@ -15077,7 +15158,15 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     )
                     await Cur.execute(f'SELECT o FROM {Table}')
                     (Fetched,) = await Cur.fetchone()
-                    self.assertEqual(Fetched.TS.replace(tzinfo=None), Given)
+                    # Read back as the session's wall clock (#2762).
+                    await Cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
+                    Zones = [_tz_offset(z) for z in await Cur.fetchone()]
+                    if None in Zones:
+                        self.skipTest('a named time zone')
+                    (Session, Database) = Zones
+                    self.assertEqual(
+                        Fetched.TS.replace(tzinfo=None), Given - Database + Session
+                    )
                 finally:
                     for Stmt in Drops:
                         try:
