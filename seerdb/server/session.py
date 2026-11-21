@@ -256,6 +256,7 @@ from seerdb.common.tns_consts import (
     TTI_ROLLBACK,
     TTI_STA,
 )
+from seerdb.common.types import DbZoneDatetime
 from seerdb.server import lockout, stats
 from seerdb.server.auth import (
     AuthWalk,
@@ -4037,10 +4038,11 @@ def _answer_lobops(
 # type the client declared: the value type the decoder gives, and the marker
 # that says which type it was.
 _MARKED_BINDS: dict[int, tuple[type, Callable[..., object]]] = {
-    # A TIMESTAMP WITH LOCAL TIME ZONE bind decodes to the same naive datetime
-    # a TIMESTAMP bind does, but Oracle reads the two in different zones
-    # (#1222).
-    TNS_TYPE_TIMESTAMPLTZ: (datetime.datetime, LtzValue.of),
+    # A TIMESTAMP WITH LOCAL TIME ZONE bind decodes to the wall clock a
+    # TIMESTAMP bind does, but Oracle reads the two in different zones
+    # (#1222). The decoder gives it as a DbZoneDatetime, the client's mark for
+    # a value in the database's zone (#2762).
+    TNS_TYPE_TIMESTAMPLTZ: (DbZoneDatetime, LtzValue.of),
     # A DATE bind decodes to the datetime a TIMESTAMP bind without a fraction
     # does, but Oracle types the bind and every expression over it by the
     # declared type: the difference of two is a NUMBER of days (#2593).

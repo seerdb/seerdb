@@ -365,6 +365,10 @@ class OraclePassthroughBackend:
             **self._client_identity,
             **extra,
         )
+        # The values go on to the Mirror's own client, which shifts a TIMESTAMP
+        # WITH LOCAL TIME ZONE into its session's zone itself (#2762): relay them
+        # as they arrive.
+        self._conn._ltz_shift = False
 
     def set_client_identity(self, identity: dict) -> None:
         """The session identity the client declared, for the upstream connect.

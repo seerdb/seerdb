@@ -21,7 +21,10 @@ the pure methods here.
 
 from __future__ import annotations
 
+import datetime
+import re
 import socket
+import zoneinfo
 from typing import TYPE_CHECKING, TypeGuard
 
 from seerdb.client.dialect import (
@@ -169,6 +172,46 @@ _O7_XA_NAMES: list[tuple[bytes, bytes]] = [
     (b'AUTH_INTERNALNAME\x00', b'seerdb'),
     (b'AUTH_EXTERNALNAME\x00', b'seerdb_1'),
 ]
+
+
+# The two zones a TIMESTAMP WITH LOCAL TIME ZONE value is shifted between (#2762):
+# it arrives in DBTIMEZONE and is handed out in SESSIONTIMEZONE, as OCI does.
+_LTZ_ZONES_SQL = 'SELECT DBTIMEZONE, SESSIONTIMEZONE FROM DUAL'
+# A statement that may change the session's zone, after which it is read again.
+_SETS_TIME_ZONE = re.compile(r'\bALTER\s+SESSION\b.*\bTIME_ZONE\b', re.I | re.S)
+_ZONE_OFFSET = re.compile(r'([+-]?)(\d{1,2}):(\d{2})')
+
+
+def _zone_tzinfo(Name: object) -> datetime.tzinfo | None:
+    """The tzinfo of a zone as SESSIONTIMEZONE or DBTIMEZONE reports it.
+
+    An offset is fixed; a region goes through ``zoneinfo``, so DST follows the
+    date. 9.2 pads a region with a trailing space. None for a name the tz
+    database lacks: the value then stays unshifted.
+    """
+    Zone = (Name if isinstance(Name, str) else '').strip()
+    Offset = _ZONE_OFFSET.fullmatch(Zone)
+    if Offset:
+        Minutes = int(Offset.group(2)) * 60 + int(Offset.group(3))
+        Sign = -1 if Offset.group(1) == '-' else 1
+        return datetime.timezone(datetime.timedelta(minutes=Sign * Minutes))
+    if not Zone:
+        return None
+    try:
+        return zoneinfo.ZoneInfo(Zone)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        pass
+    # Oracle reports a region in the case the session set it; the tz database
+    # is case-sensitive.
+    from seerdb.common._tzregions import TZ_REGIONS
+
+    for Region in TZ_REGIONS.values():
+        if Region.lower() == Zone.lower():
+            try:
+                return zoneinfo.ZoneInfo(Region)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+                return None
+    return None
 
 
 class _ConnectionLogic:
@@ -1247,6 +1290,85 @@ class _ConnectionLogic:
         from seerdb.client.connection import Xid
 
         return Xid(format_id, global_transaction_id, branch_qualifier)
+
+    # --- TIMESTAMP WITH LOCAL TIME ZONE, as OCI hands it out (#2762) -------
+    # Whether this session's LTZ values are shifted into the session's zone. The
+    # passthrough Mirror's upstream sessions don't: their clients shift.
+    _ltz_shift: bool = True
+    # (DBTIMEZONE, SESSIONTIMEZONE) as tzinfos, read once and again after the
+    # session's zone may have changed; None until then.
+    _ltz_zones: tuple[datetime.tzinfo | None, datetime.tzinfo | None] | None = None
+
+    def _ltz_needs_zones(self) -> bool:
+        return self._ltz_shift and self._ltz_zones is None
+
+    def _ltz_set_zones(self, Rows: list) -> None:
+        (Db, Session) = Rows[0] if Rows else (None, None)
+        self._ltz_zones = (_zone_tzinfo(Db), _zone_tzinfo(Session))
+
+    def _ltz_note_statement(self, Sql: object) -> None:
+        # An ALTER SESSION that sets the zone: read the zones again when next
+        # needed. A logon trigger or PL/SQL that changes it goes unseen.
+        if self._ltz_zones is not None and isinstance(Sql, str):
+            if _SETS_TIME_ZONE.search(Sql):
+                self._ltz_zones = None
+
+    def _ltz_value(self, Value: object) -> object:
+        """*Value* with every LTZ value in it as the session's wall clock.
+
+        Rows (lists, tuples), objects and collections are walked; an object is
+        updated in place. The zones must have been read, unless shifting is off.
+        """
+        from seerdb.common.dbobject import DbObject
+        from seerdb.common.types import DbZoneDatetime
+
+        if isinstance(Value, DbZoneDatetime):
+            Plain = Value.plain()
+            if not self._ltz_shift or self._ltz_zones is None:
+                return Plain
+            (Db, Session) = self._ltz_zones
+            if Db is None or Session is None:
+                return Plain
+            try:
+                return Plain.replace(tzinfo=Db).astimezone(Session).replace(tzinfo=None)
+            except OverflowError:
+                # Past year 9999 or before year 1 once shifted.
+                return Plain
+        if isinstance(Value, list):
+            return [self._ltz_value(V) for V in Value]
+        if isinstance(Value, tuple):
+            return tuple(self._ltz_value(V) for V in Value)
+        if isinstance(Value, DbObject):
+            if Value._is_collection:
+                Value._elements[:] = [self._ltz_value(V) for V in Value._elements]
+            else:
+                for Key, Attr in list(Value._attrs.items()):
+                    Value._attrs[Key] = self._ltz_value(Attr)
+        return Value
+
+    def _ltz_vars(self, Bind: object) -> list:
+        # The Vars of a bind whose values an OUT bind may have filled.
+        from seerdb.common.datatypes import Var
+
+        Values = Bind.values() if isinstance(Bind, dict) else Bind
+        if not isinstance(Values, (list, tuple)):
+            Values = list(Values) if hasattr(Values, '__iter__') else []
+        return [V for V in Values if isinstance(V, Var)]
+
+    def _ltz_present(self, Value: object) -> bool:
+        # Whether a row, a value or a Var's value holds an LTZ value to shift:
+        # top level, or anywhere in an object or a collection.
+        from seerdb.common.dbobject import DbObject
+        from seerdb.common.types import DbZoneDatetime
+
+        if isinstance(Value, DbZoneDatetime):
+            return True
+        if isinstance(Value, (list, tuple)):
+            return any(self._ltz_present(V) for V in Value)
+        if isinstance(Value, DbObject):
+            Inner = Value._elements if Value._is_collection else Value._attrs.values()
+            return any(self._ltz_present(V) for V in Inner)
+        return False
 
     def _rows(self, result: object) -> list:
         # The row block of an execute() result (execute is typed `object`); [] if

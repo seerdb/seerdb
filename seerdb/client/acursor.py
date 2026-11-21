@@ -98,6 +98,8 @@ class AsyncCursor(_CursorLogic):
             _resolve_parameters(operation, parameters), self._connection
         )
         Bind = self._resolve_cursor_binds(Bind)
+        # An ALTER SESSION may set the session's zone (#2762).
+        self._connection._ltz_note_statement(operation)
         Bind = await self._promote_large_lob_binds(operation, Bind)
         # A plain loop: an await inside a nested comprehension is a SyntaxError
         # before Python 3.12.
@@ -349,6 +351,15 @@ class AsyncCursor(_CursorLogic):
             Value._connection = self._connection
             if not KeepReturnLobs:
                 Bucket[Index] = await Value.aread()
+        # The LTZ values OUT and RETURNING binds filled, in the session's zone
+        # (#2762).
+        Conn = self._connection
+        LtzVars = [V for V in Conn._ltz_vars(Bind) if Conn._ltz_present(V._value)]
+        if LtzVars:
+            if Conn._ltz_needs_zones():
+                await Conn._ltz_load()
+            for V in LtzVars:
+                V._value = Conn._ltz_value(V._value)
 
         if ColMeta:
             # SELECT result set: clear lastrowid (see sync Cursor._run).
@@ -468,6 +479,12 @@ class AsyncCursor(_CursorLogic):
                         NewRow[I] = DbObject(Val.type_name, Attrs, dbtype=Typ)
                     NewRow[I] = _object_with_lobs(NewRow[I], self._connection)
             ResolvedRows.append(NewRow)
+        # TIMESTAMP WITH LOCAL TIME ZONE values, in the session's zone (#2762).
+        Conn = self._connection
+        if any(Conn._ltz_present(R) for R in ResolvedRows):
+            if Conn._ltz_needs_zones():
+                await Conn._ltz_load()
+            ResolvedRows = [Conn._ltz_value(R) for R in ResolvedRows]
         return ResolvedRows
 
     async def nextset(self) -> bool | None:

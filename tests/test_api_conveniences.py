@@ -10,6 +10,7 @@ import types
 import unittest
 
 import seerdb
+from seerdb.client._conn_logic import _ConnectionLogic
 from seerdb.client.connection import OracleConnect
 from seerdb.client.cursor import Cursor
 from seerdb.common.exceptions import InterfaceError, ProgrammingError
@@ -154,7 +155,7 @@ class TestScroll(unittest.TestCase):
             cur.scroll(mode='first')
 
 
-class _StubConn:
+class _StubConn(_ConnectionLogic):
     # Minimal stand-in for OracleConnect: _run only needs .sock (for
     # _check_open) and .execute returning a wire-shaped result tuple.
     sock = object()
