@@ -710,7 +710,7 @@ _OBJECT_BIND = _Need(
 )
 _ARRAY_DML_ROWCOUNTS = _Need('arraydmlrowcounts needs a 12.1+ server', min_fv=_FV)
 _TIME_ZONE_SYNC = _Need(
-    'client time-zone sync is 12c+ (AUTH_ALTER_SESSION)', min_fv=_FV
+    'a login sets the session time zone from 9.2 (AUTH_ALTER_SESSION)', not_8i=True
 )
 _TEMP_LOB = _Need(
     'a temporary LOB needs a 12c+ server (CREATE_TEMP), or the native form',
@@ -3381,11 +3381,11 @@ class CursorIntegration(_IntegrationBase):
 
     @_requires(_TIME_ZONE_SYNC)
     def test_session_timezone_synced_to_client(self):
-        # #307: on 12c+ the driver sends AUTH_ALTER_SESSION at login to pin the
-        # session time zone to the client's UTC offset (as oracledb / OCI /
-        # sqlplus do), so SESSIONTIMEZONE / CURRENT_TIMESTAMP reflect the client,
-        # not the server default. Gated to 12c+ (10g/11g's stricter auth parse
-        # rejects the extra pair; no oracledb reference to match there).
+        # #307: the driver sends AUTH_ALTER_SESSION at login to pin the session
+        # time zone to the client's UTC offset (as oracledb / OCI / sqlplus do),
+        # so SESSIONTIMEZONE / CURRENT_TIMESTAMP reflect the client, not the
+        # server default. From 9.2, as OCI sets it (#2761); 8i has no session
+        # time zone.
         off = datetime.datetime.now().astimezone().utcoffset() or datetime.timedelta(0)
         total = int(off.total_seconds())
         sign = '+' if total >= 0 else '-'

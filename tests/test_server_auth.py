@@ -925,9 +925,8 @@ def test_parse_auth_alter_session_finds_the_login_time_zone() -> None:
     assert statement.startswith("ALTER SESSION SET TIME_ZONE='")
 
 
-def test_parse_auth_alter_session_is_quiet_when_there_is_none() -> None:
-    # Before 12.1 the client sends no such pair, and a malformed body must not
-    # turn a good login into a failed one.
+def test_parse_auth_alter_session_reads_an_11g_login() -> None:
+    # An 11.2 login carries the pair too, as OCI sends it there (#2761).
     from seerdb.server.auth import parse_auth_alter_session
 
     challenge = make_challenge(b'pyo123')
@@ -943,7 +942,16 @@ def test_parse_auth_alter_session_is_quiet_when_there_is_none() -> None:
             'env': {'user': 'PYO', 'password': 'pyo123'},
         }
     )
-    assert parse_auth_alter_session(request) is None
+    statement = parse_auth_alter_session(request)
+    assert statement is not None
+    assert statement.startswith('ALTER SESSION SET TIME_ZONE=')
+
+
+def test_parse_auth_alter_session_is_quiet_when_there_is_none() -> None:
+    # A login without the pair, or a malformed body, must not turn a good login
+    # into a failed one.
+    from seerdb.server.auth import parse_auth_alter_session
+
     assert parse_auth_alter_session(b'') is None
     assert parse_auth_alter_session(b'\x03\x73\x01garbage') is None
 

@@ -8403,23 +8403,15 @@ def encode_dictionary_auth(Dictionary: dict) -> tuple[bytes, bytes]:
         HasUserPtr = False
         ModeInt = (Role * 32) | (Prelim * 128) | 1 | 256
         UserPrefixed = FieldVersion >= FIELD_VERSION_12_1
-        # Sync the session time zone to the client's UTC offset, the way oracledb
-        # / OCI / sqlplus do (AUTH_ALTER_SESSION). Without it the session runs at
-        # the server default, so CURRENT_TIMESTAMP / LOCALTIMESTAMP /
-        # SESSIONTIMEZONE and TIMESTAMP WITH LOCAL TIME ZONE reflect the server's
-        # zone, not the client's — a porting surprise (#307). Gated to 12c+: that
-        # is where oracledb (thin, 12.1+) operates and the phase-two AUTH accepts
-        # the extra pair; 10g / 11g have a stricter parse that desyncs on it, and
-        # no oracledb reference to match. The fv >= 23.1 EXT 1 fast-auth path already
-        # carries this via _auth_session_kvs.
-        if FieldVersion >= FIELD_VERSION_12_1:
-            SessionKvs = encode_kv(
-                b'AUTH_ALTER_SESSION', _alter_session_clause(Dictionary), 1
-            )
-            NumPairs = 2 + SpeedyKeyInd + 1 + ProxyInd + DrcpInd
-        else:
-            SessionKvs = b''
-            NumPairs = 2 + SpeedyKeyInd + ProxyInd + DrcpInd
+        # Set the session time zone (ORA_SDTZ, else the client's UTC offset) as
+        # OCI does on every release from 9.2 (AUTH_ALTER_SESSION). Without it the
+        # session runs at the server default, so CURRENT_TIMESTAMP /
+        # LOCALTIMESTAMP / SESSIONTIMEZONE and TIMESTAMP WITH LOCAL TIME ZONE
+        # reflect the server's zone, not the client's (#307). 10g and 11g take
+        # the same pair as 12.1 (#2761). The fv >= 23.1 EXT 1 fast-auth path
+        # carries it via _auth_session_kvs.
+        SessionKvs = encode_kv(_LOGIN_TIME_ZONE, _alter_session_clause(Dictionary), 1)
+        NumPairs = 2 + SpeedyKeyInd + 1 + ProxyInd + DrcpInd
 
     # The AUTH head (_AUTH_HEAD): the subtype and sequence, the has-user field
     # (fast-auth only) and four pointers, the user length and logon mode, the
@@ -18909,6 +18901,16 @@ def _o8i_info_pairs(Pairs: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes
     ]
 
 
+# The pair a login sets the session time zone with. OCI flags it 1, on every
+# release from 9.2; 8.1.7 has no session time zone, and OCI sends it none.
+_LOGIN_TIME_ZONE = b'AUTH_ALTER_SESSION'
+
+
+def _login_time_zone_pair() -> tuple[bytes, bytes]:
+    # The pre-10g logins' time-zone pair (#2761): ORA_SDTZ, else the OS offset.
+    return (_LOGIN_TIME_ZONE, _local_tz_clause())
+
+
 def _pre10_login(
     Subtype: int,
     Seq: int,
@@ -18943,7 +18945,7 @@ def _pre10_login(
                     'key': Key,
                     'value_length': len(Val),
                     'value': Val,
-                    'flags': 0,
+                    'flags': 1 if Key == _LOGIN_TIME_ZONE else 0,
                 }
                 for Key, Val in Pairs
             ],
@@ -18992,9 +18994,15 @@ def encode_o7_oauth(
     Seq: int, User: bytes, Mode: int, PwdField: bytes, Pairs: list[tuple[bytes, bytes]]
 ) -> bytes:
     # 9i's phase two: OAUTH (0x73) thin-coded, AUTH_PASSWORD -- O3LOGON's DES
-    # proof as 8i sends it, hex(DES blocks) + decimal pad count -- and the pairs.
+    # proof as 8i sends it, hex(DES blocks) + decimal pad count -- the pairs, and
+    # the session time zone, as OCI sets it on 9.2 (#2761).
     return _pre10_login(
-        TTI_AUTH, Seq, User, Mode, [(b'AUTH_PASSWORD', PwdField), *Pairs], O8i=False
+        TTI_AUTH,
+        Seq,
+        User,
+        Mode,
+        [(b'AUTH_PASSWORD', PwdField), *Pairs, _login_time_zone_pair()],
+        O8i=False,
     )
 
 
@@ -19081,7 +19089,7 @@ def _oall8_auth(
                     'key': Key,
                     'value_length': len(Value),
                     'value': Value,
-                    'flags': 0,
+                    'flags': 1 if Key == _LOGIN_TIME_ZONE else 0,
                 }
                 for (Key, Value) in Pairs
             ],
@@ -19100,13 +19108,18 @@ def encode_oall8_oauth_phase2(
     Seq: int, User: bytes, PwdField: bytes, Pairs: list[tuple[bytes, bytes]]
 ) -> bytes:
     # OAUTH (0x73) phase two: send AUTH_PASSWORD (hex(DES blocks) + decimal pad
-    # count) plus the informational pairs. Logon mode 0x101 marks phase two.
+    # count), the informational pairs and the session time zone (#2761). Logon
+    # mode 0x101 marks phase two.
     return _oall8_auth(
         TTI_AUTH,
         Seq,
         User,
         0x101,
-        [(b'AUTH_PASSWORD', PwdField), *_o8i_info_pairs(Pairs)],
+        [
+            (b'AUTH_PASSWORD', PwdField),
+            *_o8i_info_pairs(Pairs),
+            _login_time_zone_pair(),
+        ],
     )
 
 
@@ -19267,6 +19280,8 @@ def encode_auth_oci11(
         Out.append((b'AUTH_KPPL_CONN_CLASS', CClass.encode('utf-8'), 0))
     if Purity:
         Out.append((b'AUTH_KPPL_PURITY', str(Purity).encode('ascii'), 1))
+    # The session time zone, as OCI 11.2 sets it (#2761).
+    Out.append((_LOGIN_TIME_ZONE, _alter_session_clause(Dictionary), 1))
     Out += [(K, V, 0) for K, V in Pairs]
     Mode = (Env.get('role', 0) * 32) | (Env.get('prelim', 0) * 128) | 1 | 256
     return (_auth_call_oci(TTI_AUTH, Dictionary['seq'], User, Mode, Out), ConnKey)
