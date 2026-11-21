@@ -6217,8 +6217,11 @@ def test_helper_functions_ddl_defines_the_scalar_helpers() -> None:
     # JSON_QUERY's result by its input, two sys.ora_json_query_out (#2679),
     # and SYSTIMESTAMP's and CURRENT_TIMESTAMP's at a given instant (#2717),
     # and a JSON constructor's text: sys.ora_json_compact and sys.ora_json_text
-    # (#2744).
-    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 398
+    # (#2744), and a WITH TIME ZONE value in JSON: sys.ora_json_zoned and two
+    # sys.ora_json_scalar, with a constructor's RETURNING JSON taken by
+    # sys.ora_json, sys.ora_json_or_null and sys.ora_json_query_out, and
+    # JSON_SERIALIZE's four sys.ora_json_out (#2754).
+    assert _HELPER_FUNCTIONS_DDL.count('CREATE OR REPLACE FUNCTION') == 408
     # HEXTORAW / RAWTOHEX are orafce's (#800).
     assert 'FUNCTION hextoraw(' not in _HELPER_FUNCTIONS_DDL
     assert 'FUNCTION rawtohex(' not in _HELPER_FUNCTIONS_DDL
@@ -12514,11 +12517,14 @@ def test_json_columns_keep_osons_types_in_extended_form() -> None:
     back = _from_extended(extended)
     assert isinstance(back, dict)
     assert back['day'] == datetime.datetime(2022, 12, 5)  # a DATE, as OSON's
-    # A WITH TIME ZONE value comes back naive in UTC, as a client decodes
-    # OSON's (#1707).
-    assert back['tz'] == datetime.datetime(2022, 12, 7, 22, 59, 15)
-    assert {k: v for k, v in back.items() if k not in ('day', 'tz')} == {
-        k: v for k, v in doc.items() if k not in ('day', 'tz')
+    # A WITH TIME ZONE value comes back with its offset, which OSON keeps
+    # beside the instant (#2754).
+    zoned = _from_extended({'$oracleTimestampTZ': '2024-01-02T03:04:05.250000+05:30'})
+    assert isinstance(zoned, datetime.datetime)
+    assert zoned.utcoffset() == datetime.timedelta(hours=5, minutes=30)
+    assert back['tz'].utcoffset() == datetime.timedelta(0)
+    assert {k: v for k, v in back.items() if k != 'day'} == {
+        k: v for k, v in doc.items() if k != 'day'
     }
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
     try:
@@ -12636,7 +12642,9 @@ def test_oracles_sql_json_over_jsonb() -> None:
             'd': datetime.datetime(2022, 12, 5),
             'f': 38.75,
             'l': 9,
-            'z': datetime.datetime(2022, 12, 7, 22, 59, 15, 123400),
+            'z': datetime.datetime(
+                2022, 12, 7, 22, 59, 15, 123400, tzinfo=datetime.timezone.utc
+            ),
         }
         (ym,) = backend.execute(
             "SELECT JSON(JSON_SCALAR(TO_YMINTERVAL('8-04'))) FROM dual"
@@ -13205,6 +13213,73 @@ def test_a_json_constructor_without_returning_gives_text() -> None:
             backend.execute('DROP TABLE j2744')
         except Exception:
             backend.rollback()
+        backend.close()
+
+
+def test_a_zoned_timestamp_in_json_is_written_as_23ai_writes_it() -> None:
+    # A TIMESTAMP WITH TIME ZONE in a JSON constructor came out as the
+    # Mirror's composite, {"off":7200,"utc":...} (#2754). 23ai writes its wall
+    # clock with six fractional digits and its offset, Z for none, and a WITH
+    # LOCAL TIME ZONE one at the session's zone; as JSON it keeps the offset.
+    # JSON_SERIALIZE of a constructor's RETURNING JSON was a syntax error.
+    import datetime
+
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS), presents='23ai')
+    try:
+        backend.execute("ALTER SESSION SET TIME_ZONE = '+01:00'")
+        for expression, text in (
+            (
+                "json_array(TIMESTAMP '2024-01-02 03:04:05.25 +02:00')",
+                '["2024-01-02T03:04:05.250000+02:00"]',
+            ),
+            (
+                "json_object('a' : TIMESTAMP '2024-01-02 03:04:05 +00:00')",
+                '{"a":"2024-01-02T03:04:05.000000Z"}',
+            ),
+            (
+                "json_array(FROM_TZ(TIMESTAMP '2024-01-02 03:04:05.5', '-05:30'))",
+                '["2024-01-02T03:04:05.500000-05:30"]',
+            ),
+            (
+                "json_array(CAST(TIMESTAMP '2024-01-02 03:04:05 +02:00' "
+                'AS TIMESTAMP WITH LOCAL TIME ZONE))',
+                '["2024-01-02T02:04:05.000000+01:00"]',
+            ),
+            (
+                "json_serialize(json_scalar(TIMESTAMP '2024-01-02 03:04:05 +02:00'))",
+                '"2024-01-02T03:04:05.000000+02:00"',
+            ),
+            (
+                "json_serialize(json_array(TIMESTAMP '2024-01-02 03:04:05 +02:00' "
+                'RETURNING JSON))',
+                '["2024-01-02T03:04:05.000000+02:00"]',
+            ),
+            (
+                "json_serialize(json_object('b' : 1, 'a' : 2.50 RETURNING JSON))",
+                '{"b":1,"a":2.5}',
+            ),
+        ):
+            assert backend.execute(f'SELECT {expression} FROM dual').rows == [
+                (text,)
+            ], expression
+        plus_two = datetime.timezone(datetime.timedelta(hours=2))
+        (row,) = backend.execute(
+            "SELECT json_scalar(TIMESTAMP '2024-01-02 03:04:05.25 +02:00'), "
+            "json_array(TIMESTAMP '2024-01-02 03:04:05 +02:00' RETURNING JSON) "
+            'FROM dual'
+        ).rows
+        assert row == (
+            datetime.datetime(2024, 1, 2, 3, 4, 5, 250000, tzinfo=plus_two),
+            [datetime.datetime(2024, 1, 2, 3, 4, 5, tzinfo=plus_two)],
+        )
+        assert row[0].utcoffset() == datetime.timedelta(hours=2)
+        if _server_version_num() >= 170000:  # JSON_VALUE needs 17
+            (row,) = backend.execute(
+                "SELECT json_value(json_object('a' : 5 RETURNING JSON), '$.a') "
+                'FROM dual'
+            ).rows
+            assert row == ('5',)
+    finally:
         backend.close()
 
 
