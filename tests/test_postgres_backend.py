@@ -15982,6 +15982,85 @@ def test_a_not_null_over_null_rows_is_ora_02296() -> None:
         backend.close()
 
 
+def test_a_not_null_novalidate_translation() -> None:
+    # `MODIFY c [CONSTRAINT nn] NOT NULL [ENABLE] NOVALIDATE` is PostgreSQL
+    # 18's NOT VALID; before 18 it is refused (#2752).
+    from seerdb.server.backend import UnsupportedFeature
+    from seerdb.server.backends.postgres import _SERVER_VERSION
+
+    token = _SERVER_VERSION.set(180000)
+    try:
+        assert _translate_ddl('ALTER TABLE t MODIFY a NOT NULL ENABLE NOVALIDATE') == (
+            'ALTER TABLE t ADD NOT NULL a NOT VALID'
+        )
+        assert _translate_ddl(
+            'ALTER TABLE t MODIFY (a CONSTRAINT a_nn NOT NULL NOVALIDATE)'
+        ) == ('ALTER TABLE t ADD CONSTRAINT a_nn NOT NULL a NOT VALID')
+    finally:
+        _SERVER_VERSION.reset(token)
+    token = _SERVER_VERSION.set(160000)
+    try:
+        with pytest.raises(UnsupportedFeature, match='PostgreSQL 18'):
+            _translate_ddl('ALTER TABLE t MODIFY a NOT NULL NOVALIDATE')
+    finally:
+        _SERVER_VERSION.reset(token)
+
+
+def test_a_not_null_novalidate_checks_new_rows_only() -> None:
+    # 21c: a NOT NULL added NOVALIDATE over a NULL row is ENABLED / NOT
+    # VALIDATED, its column still nullable to the dictionary, new NULLs refused;
+    # VALIDATE over the NULL row is ORA-02293, and once it is gone, VALIDATED
+    # (#2752).
+    from seerdb.server.backend import BackendError
+
+    if _server_version_num() < 180000:
+        pytest.skip('a NOT NULL NOVALIDATE needs PostgreSQL 18')
+    backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))
+    states = (
+        'SELECT constraint_name, status, validated FROM user_constraints '
+        "WHERE table_name = 'NV2752' ORDER BY constraint_name"
+    )
+    nullable = (
+        "SELECT nullable FROM user_tab_columns WHERE table_name = 'NV2752' "
+        'ORDER BY column_id'
+    )
+    try:
+        backend.execute('CREATE TABLE nv2752 (a NUMBER, b NUMBER)')
+        backend.execute('INSERT INTO nv2752 VALUES (NULL, 1)')
+        backend.commit()
+        backend.execute(
+            'ALTER TABLE nv2752 MODIFY (a CONSTRAINT nv2752_a NOT NULL ENABLE NOVALIDATE)'
+        )
+        assert backend.execute(states).rows == [
+            ('NV2752_A', 'ENABLED', 'NOT VALIDATED')
+        ]
+        assert backend.execute(nullable).rows == [('Y',), ('Y',)]
+        with pytest.raises(BackendError) as raised:
+            backend.execute('INSERT INTO nv2752 VALUES (NULL, 2)')
+        assert raised.value.ora_code == 1400
+        backend.rollback()
+        for statement in (
+            'ALTER TABLE nv2752 MODIFY CONSTRAINT nv2752_a VALIDATE',
+            'ALTER TABLE nv2752 MODIFY CONSTRAINT nv2752_a ENABLE VALIDATE',
+        ):
+            with pytest.raises(BackendError) as raised:
+                backend.execute(statement)
+            assert raised.value.ora_code == 2293, statement
+            assert str(raised.value).endswith('.NV2752_A) - check constraint violated')
+            backend.rollback()
+        backend.execute('DELETE FROM nv2752')
+        backend.execute('ALTER TABLE nv2752 MODIFY CONSTRAINT nv2752_a VALIDATE')
+        assert backend.execute(states).rows == [('NV2752_A', 'ENABLED', 'VALIDATED')]
+        assert backend.execute(nullable).rows == [('N',), ('Y',)]
+    finally:
+        backend.rollback()
+        try:
+            backend.execute('DROP TABLE nv2752')
+        except Exception:
+            backend.rollback()
+        backend.close()
+
+
 def test_oracle_alter_table_column_forms_run() -> None:
     # The forms run, and the dictionary reads what they declared (#1414).
     backend = PostgresBackend(_CONNINFO, credentials=dict(_CREDS))

@@ -3615,7 +3615,13 @@ _ORACLE_DICTIONARY_DDL = (
     "WHEN o.data_type = 'VECTOR' THEN coalesce(o.data_length, 0) "
     'ELSE coalesce(c.character_maximum_length, 0) END)'
     '::information_schema.cardinal_number AS char_length, '
-    "CASE c.is_nullable WHEN 'YES' THEN 'Y' ELSE 'N' END AS nullable, "
+    # A NOT NULL added NOVALIDATE leaves the column nullable to the dictionary,
+    # as 21c lists it, though new NULLs are refused (#2752); PostgreSQL 18 marks
+    # its column NOT NULL all the same. On 16 no constraint is of type `n`.
+    "CASE WHEN c.is_nullable = 'YES' OR EXISTS (SELECT 1 FROM pg_constraint k "
+    "WHERE k.contype = 'n' AND NOT k.convalidated AND k.conrelid = "
+    "(quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass "
+    "AND k.conkey[1] = c.ordinal_position) THEN 'Y' ELSE 'N' END AS nullable, "
     'c.column_default AS data_default, '
     "CASE WHEN h.relid IS NULL THEN 'NO' ELSE 'YES' END AS hidden_column, "
     "'NO' AS virtual_column, 'NO' AS identity_column, NULL::text AS default_on_null, "
@@ -4104,8 +4110,9 @@ _ORACLE_DICTIONARY_DDL = (
     # A constraint DISABLE switched off (#2663): PostgreSQL 18 keeps it NOT
     # ENFORCED, and `enforced` says so. Before 18 the column is always YES.
     "CASE WHEN tc.enforced = 'NO' THEN 'DISABLED' ELSE 'ENABLED' END AS status, "
-    "CASE WHEN tc.enforced = 'NO' THEN 'NOT VALIDATED' ELSE 'VALIDATED' END "
-    'AS validated, '
+    # A NOT NULL added NOVALIDATE is ENABLED / NOT VALIDATED (#2752).
+    "CASE WHEN tc.enforced = 'NO' OR nn.convalidated IS FALSE THEN 'NOT VALIDATED' "
+    "ELSE 'VALIDATED' END AS validated, "
     # An unnamed constraint is named SYS_Cnnnnnnn (#2141), and a NOT NULL
     # keeps information_schema's made-up name: Oracle's GENERATED NAME both.
     # 16's made-up NOT NULL name, and 18's own for an unnamed one that the
@@ -4127,7 +4134,8 @@ _ORACLE_DICTIONARY_DDL = (
     # column; and one on a primary key's column, which Oracle does not list.
     # The casts behind a CASE: a condition's order is not the order
     # PostgreSQL evaluates it in, and `tnn_c_check` is no oid.
-    'LEFT JOIN LATERAL (SELECT a.attrelid, a.attnum, a.attname FROM pg_attribute a, '
+    'LEFT JOIN LATERAL (SELECT a.attrelid, a.attnum, a.attname, '
+    'true AS convalidated FROM pg_attribute a, '
     "(SELECT tc.constraint_type = 'CHECK' AND tc.constraint_name "
     "~ '^[0-9]+_[0-9]+_[0-9]+_not_null$' AS made_up) m "
     'WHERE m.made_up AND a.attrelid = CASE WHEN m.made_up THEN '
@@ -4137,7 +4145,8 @@ _ORACLE_DICTIONARY_DDL = (
     # PostgreSQL 18 keeps a NOT NULL as a constraint of its own, contype `n`,
     # which information_schema lists as a CHECK under its real name (#2652).
     # On 16 no constraint has that type, and this finds none.
-    'UNION ALL SELECT a.attrelid, a.attnum, a.attname FROM pg_constraint c '
+    'UNION ALL SELECT a.attrelid, a.attnum, a.attname, c.convalidated '
+    'FROM pg_constraint c '
     'JOIN pg_namespace cn ON cn.oid = c.connamespace '
     'JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1] '
     "WHERE tc.constraint_type = 'CHECK' AND c.contype = 'n' "
@@ -8926,6 +8935,11 @@ _TRAILING_NULLITY = re.compile(r'(?:^|\s)(NOT\s+NULL|NULL)\s*$', re.IGNORECASE)
 _NULLITY_STATE = re.compile(
     r'(\bNULL)\s+(?:ENABLE(?:\s+VALIDATE)?|VALIDATE)\s*$', re.IGNORECASE
 )
+# A NOT NULL's ENABLE NOVALIDATE or NOVALIDATE: new rows are checked, the rows
+# there are not (#2752).
+_NULLITY_NOVALIDATE = re.compile(
+    r'(\bNOT\s+NULL)\s+(?:ENABLE\s+)?NOVALIDATE\s*$', re.IGNORECASE
+)
 # A MODIFY item's NOT NULL given a name: `c CONSTRAINT nn NOT NULL` (#2752).
 _NAMED_NOT_NULL = re.compile(
     r'(?:^|\s)CONSTRAINT\s+("[^"]+"|[A-Za-z_][\w$#]*)\s+(?=NOT\s+NULL\s*$)',
@@ -8995,6 +9009,7 @@ def _modify_actions(table: str, column: str, rest: str) -> list[str] | None:
     # One MODIFY item's ALTER COLUMN actions (#1414): its type, default and
     # nullity, each where given; None for a part this does not model.
     rest = _NULLITY_STATE.sub(r'\1', rest)
+    (rest, novalidate) = _NULLITY_NOVALIDATE.subn(r'\1', rest)
     named = _NAMED_NOT_NULL.search(rest)
     constraint = None
     if named is not None:
@@ -9030,7 +9045,14 @@ def _modify_actions(table: str, column: str, rest: str) -> list[str] | None:
             actions.append(f'ADD {_raw_length_check(table, column, int(raw.group(1)))}')
     if default is not None:
         actions.append(f'ALTER COLUMN {column} SET DEFAULT {default}')
-    if constraint is not None and _SERVER_VERSION.get() >= 180000:
+    if novalidate:
+        # PostgreSQL 18 leaves a NOT NULL's existing rows unchecked: NOT VALID.
+        # floor: PG18 -- this refusal goes when 18 is the minimum (#2752, #2682).
+        if _SERVER_VERSION.get() < 180000:
+            raise UnsupportedFeature('NOT NULL NOVALIDATE needs PostgreSQL 18 or later')
+        named_as = '' if constraint is None else f'CONSTRAINT {constraint} '
+        actions.append(f'ADD {named_as}NOT NULL {column} NOT VALID')
+    elif constraint is not None and _SERVER_VERSION.get() >= 180000:
         # A NOT NULL has a name, and a catalog row, from 18 on (#2752).
         actions.append(f'ADD CONSTRAINT {constraint} NOT NULL {column}')
     elif nullity is not None:
@@ -16871,13 +16893,23 @@ _NOT_NULL_NAME = re.compile(
 
 def _nulls_found(exc: Exception, original: str) -> BackendError:
     # 21c: `cannot enable (PYO.) - null values found` for an unnamed NOT NULL,
-    # the constraint's name after the dot for a named one.
+    # the constraint's name after the dot for a named one. A NOVALIDATE one
+    # validated over them is a CHECK's `cannot validate (PYO.NN) - check
+    # constraint violated`, as 21c answers `MODIFY CONSTRAINT nn VALIDATE`.
+    validated = _CONSTRAINT_STATE.match(original)
     named = _NOT_NULL_NAME.search(original)
     name = ''
-    if named is not None:
+    if validated is not None:
+        name = validated.group('name') or validated.group('mname')
+    elif named is not None:
         name = named.group(1)
-        name = name[1:-1] if name.startswith('"') else name.upper()
+    name = name[1:-1] if name.startswith('"') else name.upper()
     schema = (getattr(getattr(exc, 'diag', None), 'schema_name', None) or '').upper()
+    if validated is not None:
+        return BackendError(
+            f'cannot validate ({schema}.{name}) - check constraint violated',
+            ora_code=_ORA_CANNOT_VALIDATE_CHECK,
+        )
     return BackendError(
         f'cannot enable ({schema}.{name}) - null values found',
         ora_code=_ORA_CANNOT_ENABLE_NULLS_FOUND,
@@ -17052,7 +17084,9 @@ _CONSTRAINT_STATE = re.compile(
     r'(?P<verb>DISABLE|ENABLE)(?:\s+(?P<check>VALIDATE|NOVALIDATE))?\s+CONSTRAINT\s+'
     r'(?P<name>"[^"]+"|[A-Za-z_][\w$#]*)'
     r'|MODIFY\s+CONSTRAINT\s+(?P<mname>"[^"]+"|[A-Za-z_][\w$#]*)\s+'
-    r'(?P<mverb>DISABLE|ENABLE)(?:\s+(?P<mcheck>VALIDATE|NOVALIDATE))?'
+    r'(?:(?P<mverb>DISABLE|ENABLE)(?:\s+(?P<mcheck>VALIDATE|NOVALIDATE))?'
+    # VALIDATE alone checks the rows and keeps the state (#2752).
+    r'|(?P<mvalidate>VALIDATE))'
     r')(?P<rest>[^;]*?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
@@ -23035,8 +23069,14 @@ class PostgresBackend:
             return sql
         table = found.group(1)
         name = found.group('name') or found.group('mname')
-        disable = (found.group('verb') or found.group('mverb')).upper() == 'DISABLE'
-        check = (found.group('check') or found.group('mcheck') or '').upper()
+        verb = (found.group('verb') or found.group('mverb') or '').upper()
+        disable = verb == 'DISABLE'
+        check = (
+            found.group('check')
+            or found.group('mcheck')
+            or found.group('mvalidate')
+            or ''
+        ).upper()
         if found.group('rest').strip():
             raise UnsupportedFeature(
                 f'{found.group("rest").strip().upper()} on DISABLE or ENABLE of a '
@@ -23080,6 +23120,16 @@ class PostgresBackend:
                     if disable
                     else _ORA_CANNOT_ENABLE_NO_SUCH
                 ),
+            )
+        if row[0] == 'n' and not disable:
+            # A NOT NULL, from PostgreSQL 18 a constraint of its own: ENABLE
+            # [VALIDATE] or VALIDATE checks a NOVALIDATE one's rows, and is
+            # nothing for one already checked (#2752). PostgreSQL cannot switch
+            # a NOT NULL off; DISABLE is refused below.
+            return f'ALTER TABLE {table} VALIDATE CONSTRAINT {name}'
+        if not verb:
+            raise UnsupportedFeature(
+                'VALIDATE alone of a constraint other than a NOT NULL'
             )
         if row[0] == 'c':
             # PostgreSQL 19 switches a CHECK as 18 does a foreign key (#2681).
