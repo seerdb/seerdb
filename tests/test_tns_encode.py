@@ -2166,6 +2166,10 @@ class TestTnsCommandEncoders(unittest.TestCase):
         self.assertEqual(encode_packet(Type, Data, Sdu), (Ret, None))
 
 
+# The thin login's time-zone pair at ORA_SDTZ=+01:00, flag 1 (#2761).
+_LOGIN_TZ_PAIR = b"\x01\x12\x12AUTH_ALTER_SESSION\x01%%ALTER SESSION SET TIME_ZONE='+01:00'\x00\x01\x01"
+
+
 class TestTnsCommandEncodersDict(unittest.TestCase):
     def test_tns_close_0(self):
         Dict = {'type': DictionaryType.close, 'seq': 7}
@@ -4334,7 +4338,11 @@ class TestTnsCommandEncodersDict(unittest.TestCase):
                 19,
             ]
         )
-        self.assertEqual(encode_dictionary_auth(Dict), (Ret, ConnKey))
+        # An 11.2 login sets the session time zone too, as OCI does (#2761): one
+        # more pair, counted in the head.
+        Ret = Ret[:11] + b'\x03' + Ret[12:] + _LOGIN_TZ_PAIR
+        with patch.dict(os.environ, {'ORA_SDTZ': '+01:00'}):
+            self.assertEqual(encode_dictionary_auth(Dict), (Ret, ConnKey))
 
     @patch('seerdb.common.crypto.token_bytes')
     def test_tns_auth_1(self, mock_token_bytes):
@@ -4658,7 +4666,11 @@ class TestTnsCommandEncodersDict(unittest.TestCase):
                 19,
             ]
         )
-        self.assertEqual(encode_dictionary_auth(Dict), (Ret, ConnKey))
+        # An 11.2 login sets the session time zone too, as OCI does (#2761): one
+        # more pair, counted in the head.
+        Ret = Ret[:11] + b'\x03' + Ret[12:] + _LOGIN_TZ_PAIR
+        with patch.dict(os.environ, {'ORA_SDTZ': '+01:00'}):
+            self.assertEqual(encode_dictionary_auth(Dict), (Ret, ConnKey))
 
     def test_tns_tran_0(self):
         Dict = {'type': DictionaryType.tran, 'req': 147, 'seq': 8}
@@ -6374,18 +6386,20 @@ class TestO3logonMessages(unittest.TestCase):
         self.assertEqual(encode_o7_osesskey(5, b'pyo', 1, pairs), sent)
 
     def test_the_oauth_carries_the_proof_and_the_pairs(self):
-        # Phase two: mode 0x101, AUTH_PASSWORD first, the pairs after; the user
-        # raw, as below 12.1.
+        # Phase two: mode 0x101, AUTH_PASSWORD first, the pairs after, then the
+        # session time zone with OCI's flag 1 (#2761); the user raw, as below 12.1.
         from seerdb.common.tns import encode_o7_oauth
 
-        sent = encode_o7_oauth(
-            6, b'pyo', 0x101, b'F18CC9AF1CE5A7E82', [(b'AUTH_ACL', b'8000')]
-        )
+        with patch.dict(os.environ, {'ORA_SDTZ': '+01:00'}):
+            sent = encode_o7_oauth(
+                6, b'pyo', 0x101, b'F18CC9AF1CE5A7E82', [(b'AUTH_ACL', b'8000')]
+            )
         self.assertEqual(
-            sent[:13], bytes.fromhex('037306010103020101010102010170796f')[:13]
+            sent[:13], bytes.fromhex('037306010103020101010103010170796f')[:13]
         )
         self.assertIn(b'\x0d\x0dAUTH_PASSWORD\x01\x11\x11F18CC9AF1CE5A7E82\x00', sent)
-        self.assertTrue(sent.endswith(b'\x08\x08AUTH_ACL\x01\x04\x048000\x00'))
+        self.assertIn(b'\x08\x08AUTH_ACL\x01\x04\x048000\x00', sent)
+        self.assertTrue(sent.endswith(_LOGIN_TZ_PAIR))
 
     def test_the_osesskey_reply_carries_the_session_key(self):
         # 9.2.0.4's reply in seerdb's own session: the RPA, one pair,

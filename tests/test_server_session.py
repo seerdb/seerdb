@@ -544,18 +544,15 @@ def _login_with(backend: _DualBackend, version: int) -> dict:
 
 @pytest.mark.parametrize('version', [6, 7, 8, 17])  # 11.2, 12.1, 12.2, 23ai
 def test_the_login_time_zone_reaches_the_backend(version: int) -> None:
-    # From 12.1 a client pins the session time zone to its own UTC offset in the
-    # login AUTH (AUTH_ALTER_SESSION); the Mirror hands that statement to the
-    # backend's alter_session hook. An 11.2 client sends none.
+    # A client pins the session time zone to its own UTC offset in the login
+    # AUTH (AUTH_ALTER_SESSION), at 11.2 too (#2761); the Mirror hands that
+    # statement to the backend's alter_session hook.
     backend = _AlterSessionBackend()
     result = _login_with(backend, version)
     assert result['row'] == ('X',)
-    if version < 7:
-        assert backend.statements == []
-    else:
-        (statement,) = backend.statements
-        assert statement.startswith("ALTER SESSION SET TIME_ZONE='")
-        assert not statement.endswith('\x00')
+    (statement,) = backend.statements
+    assert statement.startswith("ALTER SESSION SET TIME_ZONE='")
+    assert not statement.endswith('\x00')
 
 
 def test_a_refused_login_time_zone_does_not_fail_the_login() -> None:

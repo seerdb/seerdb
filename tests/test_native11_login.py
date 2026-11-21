@@ -160,6 +160,16 @@ class Native11AuthTest(unittest.TestCase):
             {P['key']: (P.get('value'), P['flags']) for P in Fields['pairs']},
         )
 
+    def test_the_login_sets_the_session_time_zone(self):
+        # As OCI 11.2 sets it (#2761): AUTH_ALTER_SESSION, flag 1, its value
+        # NUL-terminated.
+        with mock.patch.dict(os.environ, {'ORA_SDTZ': 'Europe/Moscow'}):
+            (_, Pairs) = self._pairs()
+        self.assertEqual(
+            Pairs[b'AUTH_ALTER_SESSION'],
+            (b"ALTER SESSION SET TIME_ZONE='Europe/Moscow'\x00", 1),
+        )
+
     def test_a_pooled_session_asks_for_a_new_one(self):
         # As the converted AUTH: a pooled session's purity defaults to NEW, and a
         # connection class goes out as given.
