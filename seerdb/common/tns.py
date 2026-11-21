@@ -8522,14 +8522,62 @@ def _packed_client_version(Version: str) -> int:
     return (Parts[0] << 24) | (Parts[1] << 20) | (Parts[2] << 12)
 
 
-def _local_tz_clause() -> bytes:
-    # "ALTER SESSION SET TIME_ZONE='±hh:mm'" + NUL, matching the reference client:
-    # the client pins the session time zone to its own UTC offset.
+_ORA_SDTZ_OFFSET = re.compile(r'([+-]?)(\d{1,2}):(\d{2})')
+
+
+def _os_offset() -> str:
+    # The OS's UTC offset now, quoted, as '±hh:mm': DST follows the date, and
+    # the region itself is never sent.
     Offset = datetime.datetime.now().astimezone().utcoffset() or datetime.timedelta(0)
     Total = int(Offset.total_seconds())
     Sign = '+' if Total >= 0 else '-'
     Hh, Mm = divmod(abs(Total) // 60, 60)
-    return f"ALTER SESSION SET TIME_ZONE='{Sign}{Hh:02d}:{Mm:02d}'\x00".encode('utf-8')
+    return f"'{Sign}{Hh:02d}:{Mm:02d}'"
+
+
+def _known_region(Name: str) -> bool:
+    # A region the server's V$TIMEZONE_NAMES lists, in any case: OCI checks the
+    # name against its own tz file.
+    from seerdb.common._tzregions import TZ_REGIONS
+
+    Wanted = Name.lower()
+    return any(Region.lower() == Wanted for Region in TZ_REGIONS.values())
+
+
+def _session_time_zone(Value: str | None) -> str:
+    """The TIME_ZONE a login sets for ``ORA_SDTZ`` = *Value*, as OCI does (#2760).
+
+    Measured with OCI 23.26: the value is trimmed. An offset from -15:59 to
+    +15:00 (sign optional, minutes below 60) and a known region, in any case, go
+    as written. ``DB_TZ`` (any case) is the database's zone: OCI sends it as a
+    number it already knows, and this client sends ``DBTIMEZONE`` for the server
+    to resolve. Everything else gives the OS offset: unset or empty, ``OS_TZ``,
+    and what OCI won't take (``LOCAL``, an unknown region, ``+16:00``,
+    ``+05:61``, ``+5``).
+    """
+    Zone = (Value or '').strip()
+    if Zone.upper() == 'DB_TZ':
+        return 'DBTIMEZONE'
+    Offset = _ORA_SDTZ_OFFSET.fullmatch(Zone)
+    if Offset:
+        Sign, Hours, Minutes = (
+            Offset.group(1),
+            int(Offset.group(2)),
+            int(Offset.group(3)),
+        )
+        Limit = 15 * 60 + (59 if Sign == '-' else 0)
+        if Minutes < 60 and Hours * 60 + Minutes <= Limit:
+            return f"'{Zone}'"
+    elif Zone and "'" not in Zone and _known_region(Zone):
+        return f"'{Zone}'"
+    return _os_offset()
+
+
+def _local_tz_clause() -> bytes:
+    # "ALTER SESSION SET TIME_ZONE=..." + NUL, as the reference client sends it:
+    # the session's zone is ORA_SDTZ, else the client's own UTC offset.
+    Zone = _session_time_zone(os.environ.get('ORA_SDTZ'))
+    return f'ALTER SESSION SET TIME_ZONE={Zone}\x00'.encode('utf-8')
 
 
 def _alter_session_clause(Dictionary: dict) -> bytes:

@@ -33,6 +33,7 @@ import ssl
 import tempfile
 import time
 import unittest
+import unittest.mock
 from decimal import Decimal
 from typing import Any, NamedTuple
 
@@ -3392,6 +3393,26 @@ class CursorIntegration(_IntegrationBase):
         expected = f'{sign}{hh:02d}:{mm:02d}'
         self.cur.execute('SELECT sessiontimezone FROM dual')
         self.assertEqual(self.cur.fetchone()[0].strip(), expected)
+
+    @_requires(_TIME_ZONE_SYNC)
+    def test_ora_sdtz_sets_the_session_time_zone(self):
+        # #2760: ORA_SDTZ is the session's zone, as OCI sends it: a region or an
+        # offset as written, and DB_TZ the database's own zone.
+        for value, expected in (
+            ('Europe/Moscow', 'Europe/Moscow'),
+            ('-03:30', '-03:30'),
+            ('DB_TZ', None),
+        ):
+            with self.subTest(ORA_SDTZ=value):
+                with unittest.mock.patch.dict(os.environ, {'ORA_SDTZ': value}):
+                    conn = _connect_with()
+                try:
+                    cur = conn.cursor()
+                    cur.execute('SELECT sessiontimezone, dbtimezone FROM dual')
+                    session, database = cur.fetchone()
+                    self.assertEqual(session.strip(), expected or database.strip())
+                finally:
+                    conn.close()
 
     def test_a_query_may_start_with_a_comment(self):
         # Whether a statement is a query is read off its first word, and a
