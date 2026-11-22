@@ -99,6 +99,21 @@ def test_sta_decodes_back_in_both_dialects() -> None:
         assert decode(wire, {'has_sequence': 1}) == (values, b'')
 
 
+def test_tpc_replies_decode_back_in_both_dialects() -> None:
+    context = {'app_value': 0, 'context_length': 3, 'context': b'ctx'}
+    state = {'state': 4}
+    for codec in CODECS:
+        for schema, values in (
+            (tns._TPC_CONTEXT_REPLY, context),
+            (tns._TPC_STATE_REPLY, state),
+        ):
+            wire = wire_schema.compile_encoder(schema, codec)(values)
+            assert wire_schema.compile_decoder(schema, codec)(wire + b'\x09') == (
+                values,
+                b'\x09',
+            )
+
+
 def test_a_92_sta_ends_at_the_call_status() -> None:
     # 9.2's, to a thin OALL8 session: no end-to-end sequence, which is 10g's
     # (#2768).

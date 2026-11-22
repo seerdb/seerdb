@@ -70,6 +70,24 @@ class TestDecode(unittest.TestCase):
         self.assertEqual(_decode_tpc_state(bytes.fromhex('080101')), 1)
         self.assertEqual(_decode_tpc_state(bytes.fromhex('080104')), 4)
 
+    def test_the_codec_leaves_the_status_behind_the_parameters(self):
+        from seerdb.common.tns import decode_tpc_context, decode_tpc_state
+
+        self.assertEqual(
+            decode_tpc_context(self._BEGIN), (self._CTX, bytes.fromhex('0901030104'))
+        )
+        self.assertEqual(
+            decode_tpc_state(bytes.fromhex('0801040901')), (4, bytes.fromhex('0901'))
+        )
+
+    def test_a_reply_without_parameters_is_a_status(self):
+        # A failure's reply: no RPA, so no context or state to read.
+        from seerdb.common.tns import decode_tpc_context, decode_tpc_state
+
+        status = bytes.fromhex('0901030104')
+        self.assertEqual(decode_tpc_context(status), (None, status))
+        self.assertEqual(decode_tpc_state(status), (None, status))
+
 
 if __name__ == '__main__':
     unittest.main()

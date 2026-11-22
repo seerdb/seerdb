@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar, cast
 
 if TYPE_CHECKING:
     from seerdb.common.ano_session import AnoChannel
@@ -291,7 +291,7 @@ def _tpc_error_info(Packet: bytes) -> tuple[int, str | None]:
     return decode_error_reply(Packet)
 
 
-def _raise_tpc_error(Packet: bytes) -> None:
+def _raise_tpc_error(Packet: bytes) -> NoReturn:
     # A TPC op that failed: raise the matching exception.
     from seerdb.common.exceptions import from_ora_code
 
@@ -320,20 +320,16 @@ def _check_tpc_reply(Packet: bytes) -> bytes:
 
 
 def _decode_tpc_context(Packet: bytes) -> bytes:
-    # TPC switch (begin) return parameters (#131): leads with the RPA token
-    # (TTI_RPA = TNS_MSG_TYPE_PARAMETER), then an application value (ub4), a
-    # context length (ub2), and the opaque transaction context bytes. RE'd from
-    # a live 21c tpc_begin capture; the context is replayed on prepare/commit.
-    from seerdb.common.tns import decode_ub4
+    # The transaction context a TPC switch (begin) returned (#131), replayed on
+    # prepare and commit; a reply without one is the failure it reports.
+    from seerdb.common.tns import decode_tpc_context
 
     if not Packet:
         raise OperationalError('empty TPC response')
-    if Packet[0] != TTI_RPA:
+    (Context, _) = decode_tpc_context(Packet)
+    if Context is None:
         _raise_tpc_error(Packet)
-    Rest = Packet[1:]
-    (_AppValue, Rest) = decode_ub4(Rest)
-    (CtxLen, Rest) = decode_ub4(Rest)  # context length (ub2)
-    return bytes(Rest[:CtxLen])
+    return Context
 
 
 def _decode_aq_enq(Packet: bytes) -> bytes:
@@ -566,14 +562,14 @@ def _decode_aq_array(Packet: bytes, queue, operation: int, props_list: list):
 
 
 def _decode_tpc_state(Packet: bytes) -> int:
-    # TPC change-state return (#131): the RPA token then a ub4 transaction state.
-    from seerdb.common.tns import decode_ub4
+    # The state a TPC change of state left the branch in (#131).
+    from seerdb.common.tns import decode_tpc_state
 
     if not Packet:
         raise OperationalError('empty TPC response')
-    if Packet[0] != TTI_RPA:
+    (State, _) = decode_tpc_state(Packet)
+    if State is None:
         _raise_tpc_error(Packet)
-    (State, _) = decode_ub4(Packet[1:])
     return State
 
 
