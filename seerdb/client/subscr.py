@@ -289,10 +289,9 @@ class Subscription:
     def _read(self, Emon: OracleConnect) -> None:
         # Reads the stream: TNS DATA packets, their bodies joined, the leading
         # OAC token, then a record per notification.
-        from seerdb.client.aq import MessageProperties
-        from seerdb.client.connection import _parse_aq_msg_props
         from seerdb.common.tns import (
             assemble_packet,
+            decode_aq_message_props,
             decode_error_reply,
             decode_notification,
         )
@@ -301,7 +300,7 @@ class Subscription:
         FV = Emon.field_version
 
         def skip(Rest: bytes) -> bytes:
-            return _parse_aq_msg_props(Rest, MessageProperties(), FV)
+            return decode_aq_message_props(Rest, FV)[1]
 
         (Raw, Stream, Started) = (b'', b'', False)
         Sock = Emon._sock
