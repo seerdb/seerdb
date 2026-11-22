@@ -61,7 +61,6 @@ from seerdb.common.tns_consts import (
     CCAP_TTC4,
     CCAP_TTC4_EXPLICIT_BOUNDARY,
     CONN_STATE_AUTHENTICATED,
-    FIELD_VERSION_9_2,
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
@@ -659,8 +658,9 @@ class _ConnectionLogic:
         # The field version the SERVER advertised, before negotiating down.
         # Some reply fields follow the server's own release, not the version
         # the session agreed on: a 20.1+ server ends every OER with a SQL type
-        # and a checksum even when a client negotiated 12.1 (#1145).
-        Caps = self._server_compile_caps
+        # and a checksum even when a client negotiated 12.1 (#1145). Every
+        # request reads it (_make_dict), before the server's caps are in too.
+        Caps = getattr(self, '_server_compile_caps', b'')
         if len(Caps) > CCAP_FIELD_VERSION:
             return Caps[CCAP_FIELD_VERSION]
         return self.field_version
@@ -1079,7 +1079,7 @@ class _ConnectionLogic:
             'field_version': self.field_version,
             'oall8': getattr(self, '_oall8', False),
             # A thin OALL8 session to 9.2 writes 9.2's OALL8 (#2768).
-            'thin92': getattr(self, '_thin92', False),
+            'server_field_version': self._server_field_version(),
             # The native 11g login (#2466) sends the OCI banner in its PRO.
             'oci_banner': getattr(self, '_native11', False),
             'max_string_size': max_string_size(self._server_runtime_caps),
@@ -1194,15 +1194,15 @@ class _ConnectionLogic:
     _thin92_lobs: object = None
 
     def _server_below_10_2(self) -> bool:
-        # Whether the SERVER predates 10.2, for what 9.2 itself lacks: the
-        # session's field version, except a thin OALL8 session's to 9.2, which
-        # runs at 10.2 (#2768).
-        return self.field_version < FIELD_VERSION_10_2 or self._thin92
+        # Whether the SERVER predates 10.2, for what 9.2 itself lacks: its own
+        # field version, which a thin OALL8 session to 9.2 runs above (#2768).
+        return self._server_field_version() < FIELD_VERSION_10_2
 
     def _tpc_field_version(self) -> int:
-        # The field version a transaction switch goes at: the server's own for a
-        # thin OALL8 session to 9.2, whose switch has no 10g fields (#2768).
-        return FIELD_VERSION_9_2 if self._thin92 else self.field_version
+        # The field version a transaction switch goes at: the server's own when
+        # it is below the session's, as a thin OALL8 session's to 9.2 is, whose
+        # switch has no 10g fields (#2768).
+        return min(self.field_version, self._server_field_version())
 
     def _lob_dialect(self):
         # The dialect that serves a LOB object's calls: the session's own, or a

@@ -92,10 +92,21 @@ def test_an_oci_sync_value_past_255_bytes_is_chunked() -> None:
 
 
 def test_sta_decodes_back_in_both_dialects() -> None:
-    values = {'call_status': 5, 'sequence': 0xFA2F}
+    values = {'call_status': 5, 'has_sequence': 1, 'sequence': 0xFA2F}
     for codec in CODECS:
         wire = wire_schema.compile_encoder(tns._STA, codec)(values)
-        assert wire_schema.compile_decoder(tns._STA, codec)(wire) == (values, b'')
+        decode = wire_schema.compile_decoder(tns._STA, codec)
+        assert decode(wire, {'has_sequence': 1}) == (values, b'')
+
+
+def test_a_92_sta_ends_at_the_call_status() -> None:
+    # 9.2's, to a thin OALL8 session: no end-to-end sequence, which is 10g's
+    # (#2768).
+    decode = wire_schema.compile_decoder(tns._STA, tns._THIN)
+    assert decode(bytes.fromhex('090105'), {'has_sequence': 0}) == (
+        {'call_status': 5, 'has_sequence': 0},
+        b'',
+    )
 
 
 def test_an_unknown_field_kind_is_refused() -> None:
@@ -267,6 +278,7 @@ def test_a_describe_column_decodes_back_in_both_dialects(version: int) -> None:
             thin = tns._encode_dcb_column(col, 3)
             given = {
                 'has_oaccolid': version >= FIELD_VERSION_12_2,
+                'has_position': 1,
                 'has_uds': version >= FIELD_VERSION_11_2,
                 'has_domain': version >= FIELD_VERSION_23_1,
                 'has_annotations': False,

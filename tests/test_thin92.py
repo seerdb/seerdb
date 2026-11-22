@@ -130,19 +130,19 @@ def test_the_execute_goes_from_the_define_count_to_the_sql():
         'def': [],
     }
 
-    def execute(thin92: bool) -> bytes:
+    def execute(server: int) -> bytes:
         return encode_dictionary_exec(
             {
                 'type': DictionaryType.exec,
                 'query': query,
                 'seq': 5,
                 'field_version': FIELD_VERSION_10_2,
-                'thin92': thin92,
+                'server_field_version': server,
             }
         )
 
     sql = b"SELECT 'x' FROM dual"
-    (thin92, tenth) = (execute(True), execute(False))
+    (thin92, tenth) = (execute(FIELD_VERSION_9_2), execute(FIELD_VERSION_10_2))
     # The same head; 10g's has the block before the SQL, 9.2's goes straight on.
     head = thin92.index(sql)
     assert thin92[:head] == tenth[:head]
