@@ -636,6 +636,43 @@ _DECODE_SERVER_FIELD_VERSION: contextvars.ContextVar[int | None] = (
     contextvars.ContextVar('decode_server_field_version', default=None)
 )
 
+
+# Set around a thin OALL8 session's compact-dialect calls (its LOB calls,
+# #2768): 9.2 then leads each short status with the call status, which the
+# compact readers skip.
+_O7_STATUS_LEADS = contextvars.ContextVar('o7_status_leads', default=False)
+
+
+def _o7_without_call_status(Status: bytes) -> bytes:
+    # A short status from its token, the call status a thin OALL8 session's
+    # leads it with taken out (#2768).
+    if _O7_STATUS_LEADS.get() and Status[:1] == bytes([TTI_OER]):
+        return Status[:1] + decode_ub4(Status[1:])[1]
+    return Status
+
+
+# Set while a thin OALL8 session to 9.2 encodes its requests (#2768): its bind
+# OACs carry no 0x10 in their cont flags (encode_token_raw).
+_ENCODE_THIN92 = contextvars.ContextVar('encode_thin92', default=False)
+
+
+def _decoding_thin92() -> bool:
+    """Whether the reply comes from 9.2 to a thin OALL8 session (#2768).
+
+    That session runs 10g's thin path at field version 10.2 against a server
+    that advertised 9.2's (2), the one case where the session's version is above
+    the server's. 9.2 answers that path in 10g's forms without what 10.1 added:
+    the status's end-to-end sequence, the describe column's position and the
+    describe's trailing flags.
+    """
+    Server = _DECODE_SERVER_FIELD_VERSION.get()
+    return (
+        Server is not None
+        and Server < FIELD_VERSION_10_2
+        and _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_10_2
+    )
+
+
 # Same idea for the *encode* side: the field version of the message currently
 # being built, set by encode_dictionary_exec and read by encode_token_raw to
 # pick the 11g vs 12c+ bind-OAC layout. Separate from the decode var so the two
@@ -1036,7 +1073,9 @@ def decode_packet(
             StatusSink = _DECODE_CALL_STATUS.get()
             if StatusSink is not None:
                 try:
-                    (Status, _) = _STA_FROM_THIN(Data)
+                    (Status, _) = (
+                        _STA_92_FROM_THIN if _decoding_thin92() else _STA_FROM_THIN
+                    )(Data)
                 except (IndexError, Truncated):
                     pass  # a short status leaves the last one recorded
                 else:
@@ -2522,6 +2561,8 @@ _O8I_STATUS: wire_schema.Schema = (
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
 # A commit's or rollback's whole thin reply, read for its call status (#2456).
 _STA_FROM_THIN = wire_schema.compile_decoder(_STA, _THIN)
+# 9.2's to a thin OALL8 session: the call status alone, `09 01 05` (#2768).
+_STA_92_FROM_THIN = wire_schema.compile_decoder(_STA[:2], _THIN)
 # The experimental 9i OALL8 describe (#792, #798): the OCI describe column
 # (_DCB_COLUMN) without the byte 10g+ OCI has before each column and the one
 # after it, behind the maximum row size, the column count and one byte (0x4b);
@@ -2699,6 +2740,11 @@ _OER_TAIL: wire_schema.Schema = (
     ('when', 'ext_20_1', (('n4', 'ext_sql_type'), ('n4', 'ext_checksum'))),
 )
 _OER_HEAD_FROM_THIN = wire_schema.compile_decoder(_OER_HEAD, _THIN)
+# 9.2's to a thin OALL8 session: the call status, then 9i's short status as it
+# is, with no end-to-end sequence and 9i's widths (#2768).
+_OER_HEAD_92_FROM_THIN = wire_schema.compile_decoder(
+    (_O7_STATUS_HEAD[0], ('n4', 'call_status'), *_O7_STATUS_HEAD[1:]), _THIN
+)
 _OER_TAIL_FROM_THIN = wire_schema.compile_decoder(_OER_TAIL, _THIN)
 _O7_RXH_FROM_THIN = wire_schema.compile_decoder(_O7_RXH, _THIN)
 _O7_RXH_THIN = wire_schema.compile_encoder(_O7_RXH, _THIN)
@@ -2849,6 +2895,11 @@ _DCB_COLUMN_THIN = wire_schema.compile_encoder(_DCB_COLUMN, _THIN)
 _DCB_COLUMN_OCI = wire_schema.compile_encoder(_DCB_COLUMN, _OCI)
 _DCB_COLUMN_FROM_OCI = wire_schema.compile_decoder(_DCB_COLUMN, _OCI)
 _DCB_COLUMN_FROM_THIN = wire_schema.compile_decoder(_DCB_COLUMN, _THIN)
+# 9.2's column to a thin OALL8 session: 10g's, ending at the type name (#2768).
+_DCB_COLUMN_92_FROM_THIN = wire_schema.compile_decoder(
+    tuple(_F for _F in _DCB_COLUMN if _F != ('only', 'thin', (('n4', 'position'),))),
+    _THIN,
+)
 _LONG_CELL_THIN = wire_schema.compile_encoder(_LONG_CELL, _THIN)
 _LONG_CELL_OCI = wire_schema.compile_encoder(_LONG_CELL, _OCI)
 _LONG_CELL_FROM_THIN = wire_schema.compile_decoder(_LONG_CELL, _THIN)
@@ -3031,6 +3082,9 @@ def _decode_describe_body(Rest: bytes) -> tuple[list, bytes]:
         (Col, Rest) = _decode_dcb_column(Rest)
         Columns.append(Col)
     Rest = _skip_bytes_with_length(Rest)  # current date
+    if _decoding_thin92():
+        # 9.2's describe ends at the date: the row header follows (#2768).
+        return (Columns, Rest)
     for _ in range(4):
         (_, Rest) = decode_ub4(Rest)  # dcbflag/dcbmdbz/dcbmnpr/dcbmxpr
     if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
@@ -3062,7 +3116,9 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
         'has_annotations': False,
         'has_vector': False,
     }
-    (Field, Rest) = _DCB_COLUMN_FROM_THIN(Rest, Given)
+    (Field, Rest) = (
+        _DCB_COLUMN_92_FROM_THIN if _decoding_thin92() else _DCB_COLUMN_FROM_THIN
+    )(Rest, Given)
     DataType = Field['data_type']
     Precision = Field['precision']
     DataScale = Field['scale']
@@ -7049,9 +7105,10 @@ def _read_refcursor_out(Rest: bytes, *, indicator: bool = True) -> tuple[dict, b
         (Col, Rest) = _decode_dcb_column(Rest)
         Columns.append(Col)
     Rest = _skip_bytes_with_length(Rest)  # current date
-    for _ in range(4):  # dcbflag / mdbz / mnpr / mxpr
+    # 9.2's describe ends at the date, as a query's does (#2768).
+    for _ in range(0 if _decoding_thin92() else 4):  # dcbflag / mdbz / mnpr / mxpr
         (_, Rest) = decode_ub4(Rest)
-    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
+    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2 and not _decoding_thin92():
         # dcbqcky (query-cache key) is an 11g addition; a 10g (field version 4)
         # nested-cursor describe ends after the four ub4 flags. Skipping a
         # phantom one here consumes the cursor id and desyncs the IOV decode of
@@ -7151,7 +7208,9 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
         'ext_12c': Wide,
         'ext_20_1': Wide and ServerFieldVersion >= FIELD_VERSION_20_1,
     }
-    (Head, Rest) = _OER_HEAD_FROM_THIN(Data, Given)
+    (Head, Rest) = (
+        _OER_HEAD_92_FROM_THIN if _decoding_thin92() else _OER_HEAD_FROM_THIN
+    )(Data, Given)
     (Tail, Rest) = _OER_TAIL_FROM_THIN(Rest, {**Given, **Head})
     # The "current row number" (`rows`) doubles as a DML's affected-row count on
     # 11g; 12c+ repeats it in the extended ub8 the tail skips. `position` is the
@@ -7671,7 +7730,11 @@ def _skip_rpa_tail_fields(Rest: bytes) -> bytes | None:
             if BinLen > 0:
                 (_, Rest) = decode_dalc(Rest)
             (_, Rest) = decode_ub4(Rest)  # keyword number
-        (RegLen, Rest) = decode_ub4(Rest)  # registration, raw bytes
+        # The registration, raw bytes: 10g's change notification, which 9.2
+        # predates and doesn't send (#2768).
+        RegLen = 0
+        if not _decoding_thin92():
+            (RegLen, Rest) = decode_ub4(Rest)
     except (IndexError, Truncated):
         return None
     # A query registered for change notification (#2460): the registration
@@ -7844,6 +7907,18 @@ def _decode_rxd_step(Data: bytes, Acc: tuple) -> tuple:
                 )
                 if Image is not None:
                     Row.append(LOB(DataType, Locator or b'', prefetched=Image))
+                    continue
+                if Locator is not None and _decoding_thin92():
+                    # 9.2's LOB calls carry the text in the column's charset,
+                    # an NCLOB's national (#2383, #2768): keep both on the LOB.
+                    Row.append(
+                        LOB(
+                            DataType,
+                            Locator,
+                            charset=Col.get('charset'),
+                            csfrm=Col.get('csfrm') or 1,
+                        )
+                    )
                     continue
                 Row.append(None if Locator is None else LOB(DataType, Locator))
                 continue
@@ -8253,6 +8328,16 @@ def encode_packet(
 def encode_dictionary(Dictionary: dict) -> bytes:
     # Auth dictionaries yield two values (data, conn_key); callers use
     # encode_dictionary_auth() directly for that, so this stays single-bytes.
+    # A thin OALL8 session to 9.2 writes its bind OACs as 9.2 converts them
+    # (#2768).
+    Token = _ENCODE_THIN92.set(bool(Dictionary.get('thin92')))
+    try:
+        return _encode_dictionary(Dictionary)
+    finally:
+        _ENCODE_THIN92.reset(Token)
+
+
+def _encode_dictionary(Dictionary: dict) -> bytes:
     match Dictionary['type']:
         case DictionaryType.chgpwd:
             return encode_dictionary_chgpwd(Dictionary)
@@ -10119,6 +10204,15 @@ def capability_arrays(
     Compile[CCAP_FIELD_VERSION] = field_version
     return bytes(Compile), _render_caps(_RUNTIME_CAPS[Base])
 
+
+# The capability vectors ojdbc6 11.2.0.3 sends 9.2.0.4, captured 2026-11-21
+# (#2768): 11.2's, except LOGON_TYPES 0 (no O5LOGON, which 9i refuses), the
+# last two compile bytes and the last runtime one. With them 9.2 serves the
+# thin OALL8 (function 0x5e) that 10g and 11g speak, in 9.2's own replies.
+_THIN92_COMPILE_CAPS = bytes.fromhex(
+    '06010000000101060101010101010029900307030001004f013704000000000c000006000381'
+)
+_THIN92_RUNTIME_CAPS = bytes.fromhex('02000000000001')
 
 # Oracle 9i (pre-10g) capability vectors, captured from the JDBC thin driver
 # (#90). Minimal by design: compile-cap index 17 = 0x03, everything else 0
@@ -14104,6 +14198,9 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
     CompileCaps, RuntimeCaps = capability_arrays(
         FieldVersion, oall8=Dictionary.get('oall8', False)
     )
+    if Dictionary.get('thin92_dty'):
+        # A thin OALL8 session to 9.2 (#2768): ojdbc6 11.2's caps to 9.2.0.4.
+        CompileCaps, RuntimeCaps = _THIN92_COMPILE_CAPS, _THIN92_RUNTIME_CAPS
     # End-of-response opt-in (#155/#132): when the server advertised EOR support
     # in its accept, set CCAP_TTC4's 0x20 bit so the server delimits every
     # response with the EOR (29) marker — the prerequisite for pipelining. Only
@@ -14525,6 +14622,10 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
     Cursor = Dictionary['query']['cursor']
     Query = Dictionary['query']['query'].encode('utf-8')
     QueryLen = len(Query)
+    if Dictionary.get('thin92') and QueryLen:
+        # 9.2 reads the SQL's length in characters, not the UTF-8 bytes that
+        # carry it, as over the compact form (_o7_sql_length, #2275, #2768).
+        QueryLen = _o7_sql_length(Dictionary['query']['query'])
     QueryFlag = 1 if QueryLen > 0 else 0
     Bind = Dictionary['query']['bind']
     BindLen = len(Bind)
@@ -14775,6 +14876,10 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
         Sql = _bytes_with_length(Query) if QueryLen else b''
         return Head + Middle + Sql + All8s + Tokens
 
+    if Dictionary.get('thin92'):
+        # 9.2 reads the SQL straight after the define count: the block below
+        # is 10g's, and 9.2 answers it ORA-03120, as ojdbc6's OALL8 shows (#2768).
+        return Head + Query + All8s + Tokens
     return Head + bytes([0, 0, 1]) + ServerVersion + Query + All8s + Tokens
 
 
@@ -17996,6 +18101,7 @@ def _o7_status(Data: bytes) -> dict | None:
     Rest = _skip_fv2_rpa(Data) if Data else b''
     if not Rest or Rest[0] != TTI_OER:
         return None
+    Rest = _o7_without_call_status(Rest)
     try:
         (Status, Rest) = _O7_STATUS_HEAD_FROM_THIN(Rest)
     except (IndexError, Truncated, DataError):
@@ -18032,6 +18138,7 @@ def _scan_fv2_message(Packet: bytes) -> tuple[int, str | None]:
     # A status the schema does not read whole: its code, and its message found
     # as the final DALC, the offset whose DALC consumes exactly the rest of the
     # packet -- the reading before #2284, kept for a reply that ends early.
+    Packet = _o7_without_call_status(Packet)
     (ErrCode, Rest) = decode_ub4(decode_ub4(Packet[1:])[1])
     Fallback = None
     for I in range(len(Rest)):
@@ -23234,6 +23341,12 @@ def encode_token_raw(
     # TNS_BIND_ARRAY (0x40) and the max-number-of-array-elements field carries
     # the array's declared capacity (0 for a scalar bind).
     FormOfUse = 2 if Charset == AL16UTF16_CHARSET else 1
+    if _ENCODE_THIN92.get() and Charset:
+        # A thin OALL8 session to 9.2: no 0x10 in the cont flags. With it, 9.2
+        # stores a bind's text unconverted and PL/SQL refuses the bind
+        # (PLS-00553); without it, as the compact form sends it, the declared
+        # AL32UTF8 is converted to the database's charset (#2768).
+        Flag &= ~0x10
     if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
         # 12c+ bind OAC (oracledb _write_column_metadata): a fixed flag byte
         # (TNS_BIND_USE_INDICATORS = 1), a ub8 cont-flag, OID + version, the

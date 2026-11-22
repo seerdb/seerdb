@@ -61,6 +61,7 @@ from seerdb.common.tns_consts import (
     CCAP_TTC4,
     CCAP_TTC4_EXPLICIT_BOUNDARY,
     CONN_STATE_AUTHENTICATED,
+    FIELD_VERSION_9_2,
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_23_1,
@@ -331,6 +332,17 @@ class _ConnectionLogic:
             return self._oall8_login_error(Packet)
         if isinstance(self._dialect, O8iDialect):
             return decode_8i_terminal_error(Packet)
+        if self._thin92_wanted():
+            # Asked with ojdbc6's caps, 9.2 leads the status with the call
+            # status (#2768); read as the compact one is, the code fell in the
+            # row count and a wrong password logged in.
+            from seerdb.common.tns import _O7_STATUS_LEADS
+
+            Token = _O7_STATUS_LEADS.set(True)
+            try:
+                return decode_fv2_oer_error(Packet)
+            finally:
+                _O7_STATUS_LEADS.reset(Token)
         return decode_fv2_oer_error(Packet)
 
     @staticmethod
@@ -927,7 +939,7 @@ class _ConnectionLogic:
             raise ValueError('application context namespace must be a non-empty string')
         # 8i and 9i accept the piggyback and ignore it, so a context set there
         # would silently never take effect (#1775).
-        if self.field_version < FIELD_VERSION_10_2:
+        if self._server_below_10_2():
             raise NotSupportedError('application context requires Oracle 10g or later')
 
     def set_app_context(self, namespace: str, **values: str) -> None:
@@ -1066,6 +1078,8 @@ class _ConnectionLogic:
             'seq': self._next_seq(),
             'field_version': self.field_version,
             'oall8': getattr(self, '_oall8', False),
+            # A thin OALL8 session to 9.2 writes 9.2's OALL8 (#2768).
+            'thin92': getattr(self, '_thin92', False),
             # The native 11g login (#2466) sends the OCI banner in its PRO.
             'oci_banner': getattr(self, '_native11', False),
             'max_string_size': max_string_size(self._server_runtime_caps),
@@ -1167,6 +1181,61 @@ class _ConnectionLogic:
     def _nego_cache_key(self) -> tuple[str, int, str]:
         # Identify the connection target for the negotiation cache (#438).
         return (self.host, self.port, self.service_name or self.sid or '')
+
+    # --- 9.2 over thin OALL8 (#2768) --------------------------------------
+    # With `thin_oall8=True` a 9.2 session logs in as the compact one does, then
+    # speaks 10g's thin path: ojdbc6 11.2 does so, and 9.2 answers it with the
+    # call status (transaction state) and binds PL/SQL index-by tables. The
+    # session runs at field version 10.2, so the client takes 10g's paths; the
+    # decoders tell 9.2's replies by the server's field version, which stays 2.
+    _thin_oall8: bool = False
+    _thin92: bool = False
+    # Its LOB calls go in 9.2's own LOBOPS, the compact dialect's (#2768).
+    _thin92_lobs: object = None
+
+    def _server_below_10_2(self) -> bool:
+        # Whether the SERVER predates 10.2, for what 9.2 itself lacks: the
+        # session's field version, except a thin OALL8 session's to 9.2, which
+        # runs at 10.2 (#2768).
+        return self.field_version < FIELD_VERSION_10_2 or self._thin92
+
+    def _tpc_field_version(self) -> int:
+        # The field version a transaction switch goes at: the server's own for a
+        # thin OALL8 session to 9.2, whose switch has no 10g fields (#2768).
+        return FIELD_VERSION_9_2 if self._thin92 else self.field_version
+
+    def _lob_dialect(self):
+        # The dialect that serves a LOB object's calls: the session's own, or a
+        # thin OALL8 session's compact one, which 9.2 answers with the call
+        # status in front of each status.
+        return self._dialect if self._dialect is not None else self._thin92_lobs
+
+    def _thin92_wanted(self) -> bool:
+        # Asked for, and the server is a 9.2 the compact dialect would serve.
+        from seerdb.client.dialect import Fv2Dialect
+
+        return (
+            self._thin_oall8
+            and self.field_version < FIELD_VERSION_10_2
+            and isinstance(self._dialect, Fv2Dialect)
+        )
+
+    def _dty_dict(self) -> dict:
+        # The DTY's dictionary: a thin OALL8 session to 9.2 sends 10g's type
+        # table with ojdbc6's caps.
+        Dictionary = self._make_dict(DictionaryType.dty)
+        if self._thin92_wanted():
+            Dictionary['field_version'] = FIELD_VERSION_10_2
+            Dictionary['thin92_dty'] = True
+        return Dictionary
+
+    def _thin92_begin(self) -> None:
+        # Logged in: from here a thin OALL8 session to 9.2 takes 10g's path.
+        if self._thin92_wanted():
+            self._thin92_lobs = self._dialect
+            self.field_version = FIELD_VERSION_10_2
+            self._dialect = None
+            self._thin92 = True
 
     def _select_dialect(self, is_8i: bool = False) -> None:
         # Pick the wire dialect once the negotiated version is final — the single
@@ -1405,7 +1474,7 @@ class _ConnectionLogic:
     def dialect_serves_lobs(self) -> bool:
         """Whether this session's pre-10g dialect serves a LOB object's calls
         itself -- 9i's LOBOPS form, persistent-LOB writes included (#2259)."""
-        return dialect_lob_objects(getattr(self, '_dialect', None))
+        return dialect_lob_objects(self._lob_dialect())
 
     def _raise_lobops_error(self, Packet: bytes) -> None:
         # Decode the OER trailing a content-free LOBOPS response and raise on a

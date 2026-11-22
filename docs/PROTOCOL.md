@@ -7460,6 +7460,39 @@ server identifies itself: the OCI-form banner is in its first TTI_PRO, and
 nothing earlier tells an 8i server from a 9i one. The default 9i path is
 byte-identical with or without this code.
 
+### 19.19 Oracle 9i over thin OALL8 — JDBC thin 11.2's form (#2768)
+
+JDBC thin 11.2 (ojdbc6 11.2.0.3) talks to 9.2.0.4 neither in the compact
+TTI_ALL7 form (§19) nor the native one (§19.18). It uses the thin OALL8
+(function `0x5e`) that 10g and 11g take. Captured 2026-11-21.
+
+The form is chosen by the client's DTY capabilities, which the client sends after
+the TTI_PRO has said 9.2. They are 11.2's except in three places:
+- LOGON_TYPES (byte 4) is `00`, since 9i refuses O5LOGON;
+- the last two compile bytes are `03 81`;
+- the last runtime byte is `01`.
+
+The login is the compact form's thin-coded OSESSKEY/OAUTH (`0x76`/`0x73`).
+
+9.2 answers in 10g's forms, without what 10.1 added:
+
+| part | 9.2's form |
+|---|---|
+| OALL8 request | 10g's head through the define count, then the SQL. There is no `00 00 01` + server-version block: with it, every call is refused ORA-03120. The SQL's length counts characters, as in §19 (#2275). |
+| OER | `04`, the call status, then 9i's short status as it is: no end-to-end sequence, 9i's widths. |
+| commit / rollback | `09` and the call status, with no sequence: `09 01 05`. |
+| describe | `10`, the preamble, then the body: max row size, count, `4b`, the columns, the describe date. There are no flag words after the date. |
+| describe column | 10g's thin column, ending at the type name: no position. |
+| RPA | the parameters, the transaction id, the session-state pairs. There is no registration. |
+| string bind OAC | no `0x10` in the cont flags. With it, 9.2 stores the text unconverted and PL/SQL refuses the bind (PLS-00553). Without it, the declared AL32UTF8 is converted to the database's charset. |
+| REF CURSOR OUT | the describe as a query's, then the cursor id, then the value's indicator. |
+
+**What 9.2 doesn't take in this form**, and what seerdb sends instead:
+- **LOB calls:** 9.2 refuses the 10g LOBOPS (ORA-22275), so they go in the compact form (§19.5), whose statuses now lead with the call status. A wrong password's refusal leads with it the same way.
+- **Transaction switches (TPC):** at 9.2's field version.
+- **TTI_PING, the application-context piggyback, scrollable cursors and changepassword:** refused or replaced as on the compact form.
+- **DML RETURNING:** runs as a PL/SQL block (#801). 9.2's native RETURNING with a too-small variable is ORA-00600 [17172], after which the transaction is unusable.
+
 ## 20. Oracle 23ai field version 24 — fast-auth + the fv24 framing (#89)
 
 Column **annotations** are only delivered when the client advertises a TTC

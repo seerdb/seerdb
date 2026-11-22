@@ -293,7 +293,7 @@ class Cursor(_CursorLogic):
         # the open's prefetch to prefetchrows so it stays mid-stream. Gated to
         # 10g+ (the OALL8 path); 9i (fv2) speaks the TTI_ALL7 dialect and falls
         # back to the buffered scroll (#161).
-        if self._scrollable and self._connection.field_version >= FIELD_VERSION_10_2:
+        if self._scrollable and not self._connection._server_below_10_2():
             Kw['scrollable'] = True
             # 0 is a real answer, not a missing one: it opens the cursor and
             # reads NOTHING, which is what binding it into a PL/SQL block needs
@@ -431,10 +431,7 @@ class Cursor(_CursorLogic):
             # count, not the total result set size; len(rows) is the answer
             # callers expect from cursor.rowcount.
             self._rowcount = len(self._rows)
-            if (
-                self._scrollable
-                and self._connection.field_version >= FIELD_VERSION_10_2
-            ):
+            if self._scrollable and not self._connection._server_below_10_2():
                 # Server-side scrollable open (#181): the cursor stays open and
                 # this Result holds only the first prefetched batch. Record the
                 # window so scroll()/fetchone can reposition + pull more lazily.

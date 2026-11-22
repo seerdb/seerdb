@@ -40,7 +40,6 @@ from seerdb.common.exceptions import (
 from seerdb.common.sqltext import is_plsql, returning_bind_positions
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
-    FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
     ORA_ARRAY_DML_ERRORS,
     ORA_NO_DATA_FOUND,
@@ -233,7 +232,7 @@ class AsyncCursor(_CursorLogic):
             Kw['ReturnBinds'] = ReturnBinds
         # Server-side scrollable open (#181), 10g+ only; 9i (fv2) falls back to
         # the buffered scroll (#161).
-        if self._scrollable and self._connection.field_version >= FIELD_VERSION_10_2:
+        if self._scrollable and not self._connection._server_below_10_2():
             Kw['scrollable'] = True
             # 0 is a real answer, not a missing one: it opens the cursor and
             # reads NOTHING, which is what binding it into a PL/SQL block needs
@@ -369,10 +368,7 @@ class AsyncCursor(_CursorLogic):
             self._plan_fetch()
             self._rows = await self._resolve_rows(Rows)
             self._rowcount = len(self._rows)
-            if (
-                self._scrollable
-                and self._connection.field_version >= FIELD_VERSION_10_2
-            ):
+            if self._scrollable and not self._connection._server_below_10_2():
                 # Server-side scroll window (#181), 10g+; 9i stays buffered (#161).
                 CursorId = (
                     Result[2] if len(Result) > 2 and isinstance(Result[2], int) else 0
