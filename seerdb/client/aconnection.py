@@ -249,6 +249,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         dsn: str | None = None,
         negotiation_cache: bool = False,
         oall8: bool = False,
+        thin_oall8: bool = False,
         xa: bool = False,
         access_token: object = None,
         externalauth: bool = False,
@@ -329,6 +330,10 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.negotiation_cache = negotiation_cache
         # Experimental 9i OALL8 opt-in (#716, #798).
         self._oall8 = oall8
+        # 9.2 over thin OALL8 (#2768), experimental; ignored on other tiers.
+        if thin_oall8 and oall8:
+            raise ProgrammingError('thin_oall8 and oall8 are two forms: choose one')
+        self._thin_oall8 = thin_oall8
         self._o3_oall8 = False
         # A pooled 11g session speaks the native form (#2466); set at the ACCEPT.
         self._native11 = False
@@ -1077,9 +1082,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 # 8i needs its own shorter DTY (§ _DTY_8I).
                                 Data = _DTY_8I
                             else:
-                                Data = encode_dictionary(
-                                    self._make_dict(DictionaryType.dty)
-                                )
+                                Data = encode_dictionary(self._dty_dict())
                             await self.send(TNS_DATA, Data)
                         case p if p == TTI_DTY:
                             if self._native11:
@@ -1158,6 +1161,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                                     int,
                                     await self._drive(self._dialect.server_version()),
                                 )
+                                self._thin92_begin()
                                 return 0
                             return await self._handle_rpa(Packet[1:])
                         case p if p == TTI_WRN:
@@ -1195,6 +1199,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                                     int,
                                     await self._drive(self._dialect.server_version()),
                                 )
+                                self._thin92_begin()
                                 return 0
                             raise DatabaseError('authentication failed')
                         case _:
@@ -1392,6 +1397,11 @@ class AsyncOracleConnect(_ConnectionLogic):
             Timer = asyncio.get_running_loop().call_later(
                 self._call_timeout / 1000.0, self._on_call_timeout
             )
+        # A thin OALL8 session to 9.2 drives the compact dialect for its LOB
+        # calls, whose statuses 9.2 leads with the call status (#2768).
+        from seerdb.common.tns import _O7_STATUS_LEADS
+
+        Leads = _O7_STATUS_LEADS.set(self._thin92)
         to_send: object = None
         try:
             while True:
@@ -1444,6 +1454,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 ) from exc
             raise
         finally:
+            _O7_STATUS_LEADS.reset(Leads)
             if Timer is not None:
                 Timer.cancel()
                 if self._break_deadline is not None:
@@ -1608,6 +1619,17 @@ class AsyncOracleConnect(_ConnectionLogic):
         if Batch is None:
             Batch = []
         Head = statement_head(Query)
+        if self._thin92 and ReturnBinds and not Batch:
+            # A thin OALL8 session to 9.2 runs RETURNING as a PL/SQL block, as
+            # the compact form does (#801): 9.2's native RETURNING takes a too
+            # small variable for an internal error (ORA-00600 [17172]), after
+            # which the transaction is unusable (#2768).
+            Wrapped, BlockBind = returning_block_request(Query, Bind)
+            try:
+                Raw = await self.execute(Wrapped, BlockBind)
+            except DatabaseError as Exc:
+                raise returning_block_error(Exc) from None
+            return returning_block_result(Raw, len(Bind))
         # A pre-10g dialect (9i / fv2 or 8i) runs as sans-io generators driven by
         # the async _drive; the connection is a thin orchestrator (#369). Neither
         # tier carries an autocommit bit, so commit is explicit.
@@ -2119,16 +2141,18 @@ class AsyncOracleConnect(_ConnectionLogic):
         the wire format we walk through. `prefixed` opts into the
         ub2-length-prefixed locator form required for temp LOBs (#91);
         `offset` / `amount` select a slice (#964)."""
-        if dialect_lob_objects(self._dialect):
+        if dialect_lob_objects(self._lob_dialect()):
             # 9i reads through its own LOBOPS form (#2259); see the sync twin.
             from seerdb.client.dialect import lob_object_charset
             from seerdb.common.types import decode_fv2_lob
 
-            Content = await self._drive(self._dialect.lob_read(Locator, offset, amount))
+            Content = await self._drive(
+                self._lob_dialect().lob_read(Locator, offset, amount)
+            )
             return decode_fv2_lob(
                 DataType,
                 cast(bytes, Content),
-                lob_object_charset(self._dialect, charset),
+                lob_object_charset(self._lob_dialect(), charset),
             )
         from seerdb.common.tns_consts import TNS_TYPE_CLOB
 
@@ -2615,19 +2639,19 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.common.tns import decode_lobops_locator
         from seerdb.common.tns_consts import TNS_LOB_OP_WRITE
 
-        if dialect_lob_objects(self._dialect):
+        if dialect_lob_objects(self._lob_dialect()):
             # In the charset the dialect reads the LOB's text in: UTF-16 on a
             # pooled 11g session (#2466), the 9i session's otherwise (#2383).
             from seerdb.client.dialect import lob_object_charset
             from seerdb.common.types import fv2_lob_payload
 
             (Bytes, Amount) = fv2_lob_payload(
-                Data, is_blob, lob_object_charset(self._dialect, charset)
+                Data, is_blob, lob_object_charset(self._lob_dialect(), charset)
             )
             (_, Updated) = cast(
                 tuple,
                 await self._drive(
-                    self._dialect.lob_operation(
+                    self._lob_dialect().lob_operation(
                         Locator, TNS_LOB_OP_WRITE, Amount, offset, Bytes
                     )
                 ),
@@ -2655,12 +2679,12 @@ class AsyncOracleConnect(_ConnectionLogic):
     ) -> tuple[int | None, bytes | None]:
         """Async port of the sync :meth:`lob_operation` (#964): one
         value-returning TTI_LOBOPS operation, returning its ``ub4``."""
-        if dialect_lob_objects(self._dialect):
+        if dialect_lob_objects(self._lob_dialect()):
             # 9i's own LOBOPS form (#2259).
             return cast(
                 'tuple[int | None, bytes | None]',
                 await self._drive(
-                    self._dialect.lob_operation(Locator, Operation, Amount)
+                    self._lob_dialect().lob_operation(Locator, Operation, Amount)
                 ),
             )
         if self.field_version < FIELD_VERSION_10_2:
@@ -2693,10 +2717,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         """Async port of the sync `bfile_read_native` (#46): FILE_OPEN ->
         READ -> FILE_CLOSE over TTI_LOBOPS, using the open-flagged locator the
         server returns from FILE_OPEN."""
-        if self._dialect is not None:
+        if self._lob_dialect() is not None:
             # 8i and 9i read a BFILE through their own LOBOPS forms; the fetch
             # leaves it a locator for this read (#1103).
-            return cast(bytes, await self._drive(self._dialect.bfile_read(Locator)))
+            return cast(
+                bytes, await self._drive(self._lob_dialect().bfile_read(Locator))
+            )
         from seerdb.common.tns_consts import (
             TNS_LOB_OP_FILE_CLOSE,
             TNS_LOB_OP_FILE_OPEN,
@@ -2848,7 +2874,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             # A pooled 11g session's own ping (#2466).
             await self._drive(self._dialect.ping())
             return
-        if self.field_version < FIELD_VERSION_10_2:
+        if self._server_below_10_2():
             # 9i lacks TTI_PING (func 147); use a trivial round trip (#168).
             await self.execute("SELECT 'X' FROM dual")
             return
@@ -2900,7 +2926,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 'connection: the server refuses a password change on a DRCP '
                 'session (ORA-56609)'
             )
-        if self.field_version < FIELD_VERSION_10_2:
+        if self._server_below_10_2():
             raise NotSupportedError(
                 'changepassword is not supported on Oracle 9i'
             )  # (#168)
@@ -2981,7 +3007,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             )
         Data = encode_tpc_change_state(
             self._next_seq(),
-            self.field_version,
+            self._tpc_field_version(),
             Operation,
             State,
             Branch,
@@ -3030,7 +3056,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             )
         Data = encode_tpc_switch(
             self._next_seq(),
-            self.field_version,
+            self._tpc_field_version(),
             TNS_TPC_TXN_START,
             xid,
             flags,
@@ -3050,7 +3076,7 @@ class AsyncOracleConnect(_ConnectionLogic):
             return
         Data = encode_tpc_switch(
             self._next_seq(),
-            self.field_version,
+            self._tpc_field_version(),
             TNS_TPC_TXN_DETACH,
             xid,
             flags,
@@ -3473,7 +3499,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         if self.field_version < FIELD_VERSION_12_1 and (
             payload_type is _JSON
             or self._dialect is not None
-            or self.field_version < FIELD_VERSION_10_2
+            or self._server_below_10_2()
         ):
             # A 10g or 11g thin session takes a RAW or an object queue (#2697,
             # #2702, #2708); a JSON payload and the native forms are measured

@@ -401,6 +401,18 @@ does, with these differences:
 It stays an opt-in: the client has to choose the dialect before the server
 identifies its version (#799).
 
+**Experimental: 9i over thin OALL8** (`connect(..., thin_oall8=True)`, also on
+`connect_async`; not with `oall8=True`). seerdb talks to 9.2 as JDBC thin 11.2
+does: it sends that driver's capabilities, logs in as the compact form does, and
+then speaks the thin OALL8 that 10g and 11g take. Over the 9.2 bed it passes the
+integration suite, with these differences from the default compact form:
+- **`connection.transaction_in_progress`** answers, from each reply's call status.
+- **It binds PL/SQL associative arrays** (`arrayvar`).
+- **`cursor.parse()`** parses without running the statement.
+- **It makes no temporary LOBs**, so a LOB Var, a CLOB or BLOB OUT bind and a REF
+  bind aren't supported there yet; the compact form binds all three.
+- **Validated on 9.2.0.4 only.** The other servers ignore the option.
+
 **Experimental: 11g's native form on a dedicated session** (the same
 `oall8=True`). A pooled 11g session always speaks OCI 11.2's native form, the
 only one 11g's pool serves (#2466); with the flag a dedicated 11g session does

@@ -39,6 +39,7 @@ from typing import Any, NamedTuple
 
 import seerdb
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_9_2,
     FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
@@ -342,6 +343,15 @@ class _Target(NamedTuple):
     # a LOB Var binds (temp_lobs), and on 8i and 9i's compact form, which bind
     # one by its locator (SeerODBC #167).
     lob_out: bool = False
+    # The session's own field version, where it differs from the server's: a
+    # thin OALL8 session to 9.2 runs at 10.2 (#2768). 0 when it is the same.
+    session_fv: int = 0
+
+
+def _sql_fv(conn) -> int:
+    # The field version a test's SQL may assume of the server: the session's,
+    # except that a thin OALL8 session to 9.2 runs at 10.2 against a 9.2 (#2768).
+    return FIELD_VERSION_9_2 if getattr(conn, '_thin92', False) else conn.field_version
 
 
 def _conn_is_compact_9i(conn) -> bool:
@@ -407,7 +417,9 @@ def _target_of(conn) -> _Target:
     from seerdb.client._conn_logic import temp_lobs_available
 
     return _Target(
-        conn.field_version,
+        # A thin OALL8 session to 9.2 runs at 10.2 but its server is 9.2, and
+        # that is what SQL a test may send (#2768).
+        _sql_fv(conn),
         _conn_is_8i(conn),
         conn.server_version >> 24,
         os.environ.get('SEERDB_TEST_MIRROR', ''),
@@ -439,6 +451,7 @@ def _target_of(conn) -> _Target:
         or bool(getattr(conn, '_native11', False))
         or _dialect_binds_refs(conn),
         temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
+        conn.field_version,
     )
 
 
@@ -496,9 +509,16 @@ class _Need(NamedTuple):
     ref_binds: bool = False
     # Whether a CLOB or BLOB comes back from an OUT bind.
     lob_out: bool = False
+    # Whether the field versions name what the session's form does (a parse, a
+    # native RETURNING) rather than what SQL its server runs (#2768).
+    protocol: bool = False
 
     def missing(self, target: _Target) -> bool:
-        fv = target.field_version
+        fv = (
+            target.session_fv
+            if self.protocol and target.session_fv
+            else target.field_version
+        )
         if self.temp_lobs and not target.temp_lobs:
             return True
         if self.rows_returning and target.wrapped_returning:
@@ -641,7 +661,7 @@ _CHANGE_PASSWORD = _Need(
     min_fv=_FV,
     password_change=True,
 )
-_PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV)
+_PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV, protocol=True)
 _ARRAY_DML = _Need('executemany (array DML) is not supported on Oracle 8i', not_8i=True)
 _FV2_EXECUTE_PATH = _Need('fv2 (9i) uses a separate execute path', min_fv=_FV)
 _PROXY_AUTH = _Need('proxy authentication needs a 10g+ server', min_fv=_FV)
@@ -654,7 +674,7 @@ _BLOCK_IOV = _Need(
     'the 8i block reply carries no IOV directions (9i: #2264)', not_8i=True
 )
 _PRE10_PARSE_REFUSAL = _Need(
-    '10g+ sends a real parse; this is the pre-10g refusal', below_fv=_FV
+    '10g+ sends a real parse; this is the pre-10g refusal', below_fv=_FV, protocol=True
 )
 _PRE10_RETURNING = _Need(
     'RETURNING ... INTO takes the native path from 10g', below_fv=_FV
@@ -799,6 +819,10 @@ _FV_KW: dict[str, Any] = {'field_version': _FIELD_VERSION} if _FIELD_VERSION els
 # every other server ignores the option.
 if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
     _FV_KW['oall8'] = True
+# Run the suite over 9.2's thin OALL8 form (#2768): ojdbc6's caps, then 10g's
+# thin path; every other server ignores the option.
+if os.environ.get('SEERDB_TEST_THIN_OALL8', '') not in ('', '0'):
+    _FV_KW['thin_oall8'] = True
 # Run the suite over pooled sessions, as DRCP serves them (#2466): on 11g that
 # is the native form. The server's pool must be started.
 if os.environ.get('SEERDB_TEST_SERVER_TYPE'):
@@ -1196,7 +1220,7 @@ class _IntegrationBase(_ThrottleRetry, unittest.TestCase):
                 self.conn.close()
                 self.skipTest(Reason)
             return
-        if self.conn.field_version >= FIELD_VERSION_10_2:
+        if _sql_fv(self.conn) >= FIELD_VERSION_10_2:
             return
         Reason = _fv2_skip_reason(self._testMethodName)
         if Reason is None and _conn_is_8i(self.conn):
@@ -3135,7 +3159,7 @@ class TypesIntegration(_IntegrationBase):
             [42],
         )
         self.assertEqual(self.cur.fetchone(), (42, 'n='))
-        if self.conn.field_version >= FIELD_VERSION_10_2:
+        if _sql_fv(self.conn) >= FIELD_VERSION_10_2:
             self.cur.execute(
                 'SELECT CAST(1.5 AS BINARY_DOUBLE), CAST(2.5 AS BINARY_FLOAT) FROM dual'
             )
@@ -3948,7 +3972,7 @@ class CursorIntegration(_IntegrationBase):
         from seerdb.common.exceptions import DatabaseError, NotSupportedError
         from seerdb.common.tns_consts import FIELD_VERSION_10_2
 
-        if self.conn.field_version < FIELD_VERSION_10_2:
+        if _sql_fv(self.conn) < FIELD_VERSION_10_2:
             with self.assertRaises(NotSupportedError):
                 self.conn.set_app_context('CLIENTCONTEXT', ATTR1='VALUE1')
             return
@@ -5144,7 +5168,7 @@ class CursorIntegration(_IntegrationBase):
                 f'INSERT INTO {self.TABLE} (id, v) VALUES (1, :1) RETURNING v INTO :2',
                 ['a value far longer than two characters', small],
             )
-        if self.conn.field_version < FIELD_VERSION_10_2:
+        if _sql_fv(self.conn) < FIELD_VERSION_10_2:
             # Pre-10g runs RETURNING as a PL/SQL block (#801), where the INTO
             # target is an ordinary OUT bind — so the *server* catches it, and
             # says so in its own words. Reported either way, which is the point.
@@ -8655,7 +8679,7 @@ class ErrorAndRowcountIntegration(_IntegrationBase):
         # is told ORA-00900, a syntax error (#1127).
         # Before 10g the same error is ORA-01401, "inserted value too large for
         # column" (measured on 8i and 9i).
-        expected = 1401 if self.conn.field_version < FIELD_VERSION_10_2 else 12899
+        expected = 1401 if _sql_fv(self.conn) < FIELD_VERSION_10_2 else 12899
         self.cur.execute(f'CREATE TABLE {self.TABLE} (v VARCHAR2(3))')
         with self.assertRaises(seerdb.DatabaseError) as ctx:
             self.cur.execute(f"INSERT INTO {self.TABLE} VALUES ('abcd')")
@@ -9090,7 +9114,7 @@ class VarValueIntegration(_IntegrationBase):
     def test_a_binary_double_takes_a_decimal(self):
         from seerdb.common.tns_consts import FIELD_VERSION_10_2
 
-        if self.conn.field_version < FIELD_VERSION_10_2:
+        if _sql_fv(self.conn) < FIELD_VERSION_10_2:
             self.skipTest('BINARY_DOUBLE is 10g+')
         for Value, Expected in ((Decimal('1.25'), 1.25), (True, 1.0), (12, 12.0)):
             with self.subTest(value=Value):
@@ -13726,7 +13750,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         if Reason is None:
             return
         Conn = await seerdb.connect_async(**self._kwargs())
-        Fv = Conn.field_version
+        Fv = _sql_fv(Conn)
         await Conn.close()
         if Fv < FIELD_VERSION_10_2:
             self.skipTest(Reason)
@@ -14149,7 +14173,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         from seerdb.common.tns_consts import FIELD_VERSION_10_2
 
         async with await seerdb.connect_async(**self._kwargs()) as Conn:
-            if Conn.field_version < FIELD_VERSION_10_2:
+            if _sql_fv(Conn) < FIELD_VERSION_10_2:
                 with self.assertRaises(NotSupportedError):
                     Conn.set_app_context('CLIENTCONTEXT', ATTR1='VALUE1')
                 return
