@@ -20018,13 +20018,56 @@ def encode_oci11_tpc_change_state(
     )
 
 
+# A two-phase commit call's return parameters (#131), one message in both
+# dialects: a switch (begin, resume) returns an application value and the
+# transaction context, which a later prepare or commit replays; a change of
+# state returns the state the branch is left in. A failure sends no
+# parameters, only its status.
+_TPC_CONTEXT_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n4', 'app_value'),
+    ('n2', 'context_length'),
+    ('bytes', 'context', 'context_length'),
+)
+_TPC_STATE_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n4', 'state'),
+)
+_TPC_CONTEXT_REPLY_THIN = wire_schema.compile_encoder(_TPC_CONTEXT_REPLY, _THIN)
+_TPC_CONTEXT_REPLY_OCI = wire_schema.compile_encoder(_TPC_CONTEXT_REPLY, _OCI)
+_TPC_CONTEXT_REPLY_FROM_THIN = wire_schema.compile_decoder(_TPC_CONTEXT_REPLY, _THIN)
+_TPC_CONTEXT_REPLY_FROM_OCI = wire_schema.compile_decoder(_TPC_CONTEXT_REPLY, _OCI)
+_TPC_STATE_REPLY_THIN = wire_schema.compile_encoder(_TPC_STATE_REPLY, _THIN)
+_TPC_STATE_REPLY_OCI = wire_schema.compile_encoder(_TPC_STATE_REPLY, _OCI)
+_TPC_STATE_REPLY_FROM_THIN = wire_schema.compile_decoder(_TPC_STATE_REPLY, _THIN)
+_TPC_STATE_REPLY_FROM_OCI = wire_schema.compile_decoder(_TPC_STATE_REPLY, _OCI)
+
+
+def decode_tpc_context(Data: bytes) -> tuple[bytes | None, bytes]:
+    """The context a thin switch returned, and what follows it; (None, Data)
+    for a reply that is a status alone, a failure's."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, Data)
+    (Values, Rest) = _TPC_CONTEXT_REPLY_FROM_THIN(Data)
+    return (Values['context'], Rest)
+
+
+def decode_tpc_state(Data: bytes) -> tuple[int | None, bytes]:
+    """The state a thin change of state left the branch in, and what follows
+    it; (None, Data) for a reply that is a status alone."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, Data)
+    (Values, Rest) = _TPC_STATE_REPLY_FROM_THIN(Data)
+    return (Values['state'], Rest)
+
+
 def decode_oci11_tpc_context(Data: bytes) -> tuple[bytes | None, bytes]:
     """The context a switch returned, and the status behind it; (None, Data)
     for a reply that is a status alone, a failure's."""
     if Data[:1] != bytes([TTI_RPA]):
         return (None, Data)
-    Length = int.from_bytes(Data[5:7], 'little')
-    return (bytes(Data[7 : 7 + Length]), Data[7 + Length :])
+    (Values, Rest) = _TPC_CONTEXT_REPLY_FROM_OCI(Data)
+    return (Values['context'], Rest)
 
 
 def decode_oci11_tpc_state(Data: bytes) -> tuple[int | None, bytes]:
@@ -20032,7 +20075,8 @@ def decode_oci11_tpc_state(Data: bytes) -> tuple[int | None, bytes]:
     it; (None, Data) for a reply that is a status alone."""
     if Data[:1] != bytes([TTI_RPA]):
         return (None, Data)
-    return (int.from_bytes(Data[1:5], 'little'), Data[5:])
+    (Values, Rest) = _TPC_STATE_REPLY_FROM_OCI(Data)
+    return (Values['state'], Rest)
 
 
 # An application context's change (func 154, #1775), as OCI 11.2's
