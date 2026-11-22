@@ -39,7 +39,6 @@ from typing import Any, NamedTuple
 
 import seerdb
 from seerdb.common.tns_consts import (
-    FIELD_VERSION_9_2,
     FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
@@ -349,9 +348,9 @@ class _Target(NamedTuple):
 
 
 def _sql_fv(conn) -> int:
-    # The field version a test's SQL may assume of the server: the session's,
-    # except that a thin OALL8 session to 9.2 runs at 10.2 against a 9.2 (#2768).
-    return FIELD_VERSION_9_2 if getattr(conn, '_thin92', False) else conn.field_version
+    # The field version a test's SQL may assume of the server: the server's
+    # own, which a thin OALL8 session to 9.2 runs above (#2768).
+    return min(conn.field_version, conn._server_field_version())
 
 
 def _conn_is_compact_9i(conn) -> bool:
