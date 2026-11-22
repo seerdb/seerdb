@@ -9,7 +9,12 @@
 import unittest
 
 from seerdb.client.aq import DeqOptions, EnqOptions, MessageProperties, Queue
-from seerdb.client.connection import _aq_error_info, _decode_aq_deq, _decode_aq_enq
+from seerdb.client.connection import (
+    _aq_error_info,
+    _decode_aq_array,
+    _decode_aq_deq,
+    _decode_aq_enq,
+)
 from seerdb.common.tns import (
     _DECODE_FIELD_VERSION,
     _DECODE_SERVER_FIELD_VERSION,
@@ -150,6 +155,134 @@ class TestDecode(unittest.TestCase):
         self.assertEqual(m.payload, b'hello-aq')
         self.assertEqual(m.expiration, -1)
         self.assertEqual(m.msgid.hex(), '549035f5cedc7af1e063c000a8c07e8f')
+
+    def _props(self, **extra) -> dict:
+        values = {
+            'priority': 2,
+            'delay': 0,
+            'expiration': -1,
+            'correlation_length': 4,
+            'correlation': b'corr',
+            'num_attempts': 1,
+            'exceptionq_length': 0,
+            'state': 0,
+            'has_enq_time': 0,
+            'enq_txn_id_length': 0,
+            'num_extensions': 1,
+            'extensions_byte': 0x16,
+            'extensions': [
+                {'text_length': 0, 'binary_length': 1, 'binary': b'x', 'keyword': 0x40}
+            ],
+            'user_properties': 0,
+            'csn': 0,
+            'dsn': 0,
+            'flags': 0,
+            'has_shard': 1,
+            'shard': 0,
+        }
+        values.update(extra)
+        return values
+
+    def _image(self, payload: bytes) -> bytes:
+        from seerdb.common.tns import _AQ_PAYLOAD_IMAGE_THIN
+
+        image = bytes(4) + payload
+        return _AQ_PAYLOAD_IMAGE_THIN(
+            {
+                'toid_length': 0,
+                'oid_length': 0,
+                'snapshot_length': 0,
+                'version': 1,
+                'image_length': len(image),
+                'flags': 0,
+                'image': image,
+            }
+        )
+
+    def test_decode_array_deq(self):
+        # Two messages: one with its properties (and an extension) and a
+        # payload, one with neither.
+        from seerdb.common.tns import (
+            _AQ_ARRAY_COUNT_THIN,
+            _AQ_ARRAY_HEAD_THIN,
+            _AQ_ARRAY_TAIL_THIN,
+        )
+        from seerdb.common.tns_consts import TNS_AQ_ARRAY_DEQ
+
+        def tail(msgid: bytes) -> bytes:
+            return _AQ_ARRAY_TAIL_THIN(
+                {
+                    'msgid_length': len(msgid),
+                    'msgid': msgid,
+                    'extensions_length': 0,
+                    'ack': 0,
+                }
+            )
+
+        first = self._props(has_props=1, props_byte=0, num_recipients=0, has_payload=1)
+        second = {'has_props': 0, 'num_recipients': 0, 'has_payload': 0}
+        reply = (
+            _AQ_ARRAY_COUNT_THIN({'num_iters': 2})
+            + _AQ_ARRAY_HEAD_THIN(first)
+            + self._image(b'one')
+            + tail(bytes(range(16)))
+            + _AQ_ARRAY_HEAD_THIN(second)
+            + tail(bytes(range(16, 32)))
+        )
+        (m1, m2) = _decode_aq_array(reply, _FakeQueue(), TNS_AQ_ARRAY_DEQ, [])
+        self.assertEqual((m1.priority, m1.expiration, m1.correlation), (2, -1, 'corr'))
+        self.assertEqual((m1.payload, m1.msgid), (b'one', bytes(range(16))))
+        self.assertEqual(
+            (m2.priority, m2.payload, m2.msgid), (0, None, bytes(range(16, 32)))
+        )
+
+    def test_decode_array_enq_msgids(self):
+        # An array enqueue's ids come back concatenated, one per message sent.
+        from seerdb.common.tns import (
+            _AQ_ARRAY_COUNT_THIN,
+            _AQ_ARRAY_HEAD_THIN,
+            _AQ_ARRAY_TAIL_THIN,
+        )
+        from seerdb.common.tns_consts import TNS_AQ_ARRAY_ENQ
+
+        ids = bytes(range(32))
+        reply = (
+            _AQ_ARRAY_COUNT_THIN({'num_iters': 1})
+            + _AQ_ARRAY_HEAD_THIN(
+                {'has_props': 0, 'num_recipients': 0, 'has_payload': 0}
+            )
+            + _AQ_ARRAY_TAIL_THIN(
+                {
+                    'msgid_length': len(ids),
+                    'msgid': ids,
+                    'extensions_length': 0,
+                    'ack': 0,
+                }
+            )
+        )
+        sent = [MessageProperties(), MessageProperties()]
+        self.assertIs(
+            _decode_aq_array(reply, _FakeQueue(), TNS_AQ_ARRAY_ENQ, sent), sent
+        )
+        self.assertEqual([p.msgid for p in sent], [ids[:16], ids[16:]])
+
+    def test_a_dequeue_with_no_message(self):
+        self.assertIsNone(_decode_aq_deq(bytes([TTI_RPA, 0]), _FakeQueue()))
+
+    def test_the_shard_id_is_21cs(self):
+        # Behind the flags from 21c on; a 19c reply ends at them.
+        from seerdb.common.tns import _AQ_MSG_PROPS_THIN, decode_aq_message_props
+        from seerdb.common.tns_consts import (
+            FIELD_VERSION_19_1_EXT_1,
+            FIELD_VERSION_21_1,
+        )
+
+        with_shard = _AQ_MSG_PROPS_THIN(self._props(shard=7)) + b'\x09'
+        (props, rest) = decode_aq_message_props(with_shard, FIELD_VERSION_21_1)
+        self.assertEqual((props['shard'], rest), (7, b'\x09'))
+        without = _AQ_MSG_PROPS_THIN(self._props(has_shard=0)) + b'\x09'
+        (props, rest) = decode_aq_message_props(without, FIELD_VERSION_19_1_EXT_1)
+        self.assertEqual(('shard' in props, rest), (False, b'\x09'))
 
     def test_decode_enq_msgid(self):
         # RPA + 16-byte msgid

@@ -23012,6 +23012,166 @@ def _aq_write_payload(Queue, Props) -> bytes:
     return bytes(Payload)
 
 
+# An AQ string as the replies carry one (#128): a count, then, when it is not
+# zero, the bytes with their own length.
+def _aq_string(name: str) -> wire_schema.Schema:
+    return (('n4', f'{name}_length'), ('when', f'{name}_length', (('value', name),)))
+
+
+# A message's properties, as a dequeue, an array operation and a notification
+# return them (#128), python-oracledb's AqBaseMessage order. The enqueue time
+# is there when its flag is set. The extensions are each a text, a binary
+# value and a keyword, behind a byte python-oracledb passes over (0x16 in a
+# live 21c dequeue). The shard id is 21c's.
+_AQ_MSG_PROPS: wire_schema.Schema = (
+    ('n4', 'priority'),
+    ('n4', 'delay'),
+    ('n4', 'expiration'),
+    *_aq_string('correlation'),
+    ('n4', 'num_attempts'),
+    *_aq_string('exceptionq'),
+    ('n4', 'state'),
+    ('n4', 'has_enq_time'),
+    ('when', 'has_enq_time', (('value', 'enq_time'),)),
+    *_aq_string('enq_txn_id'),
+    ('n4', 'num_extensions'),
+    (
+        'when',
+        'num_extensions',
+        (
+            ('u8', 'extensions_byte'),
+            (
+                'each',
+                'extensions',
+                'num_extensions',
+                (*_aq_string('text'), *_aq_string('binary'), ('n4', 'keyword')),
+            ),
+        ),
+    ),
+    ('n4', 'user_properties'),
+    ('n4', 'csn'),
+    ('n4', 'dsn'),
+    ('n4', 'flags'),
+    ('when', 'has_shard', (('n4', 'shard'),)),
+)
+_AQ_MSG_PROPS_THIN = wire_schema.compile_encoder(_AQ_MSG_PROPS, _THIN)
+_AQ_MSG_PROPS_FROM_THIN = wire_schema.compile_decoder(_AQ_MSG_PROPS, _THIN)
+
+# A RAW or JSON queue's payload: the type's, the object's and the snapshot's
+# ids (empty for these), a version, the image's length and flags, then the
+# image, whose first four bytes are a header.
+_AQ_PAYLOAD_IMAGE: wire_schema.Schema = (
+    *_aq_string('toid'),
+    *_aq_string('oid'),
+    *_aq_string('snapshot'),
+    ('n2', 'version'),
+    ('n4', 'image_length'),
+    ('n2', 'flags'),
+    ('when', 'image_length', (('value', 'image'),)),
+)
+_AQ_PAYLOAD_IMAGE_THIN = wire_schema.compile_encoder(_AQ_PAYLOAD_IMAGE, _THIN)
+_AQ_PAYLOAD_IMAGE_FROM_THIN = wire_schema.compile_decoder(_AQ_PAYLOAD_IMAGE, _THIN)
+
+# An enqueue's return: the message id the server gave it.
+_AQ_ENQ_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('bytes', 'msgid', TNS_AQ_MESSAGE_ID_LENGTH),
+)
+_AQ_ENQ_REPLY_THIN = wire_schema.compile_encoder(_AQ_ENQ_REPLY, _THIN)
+_AQ_ENQ_REPLY_FROM_THIN = wire_schema.compile_decoder(_AQ_ENQ_REPLY, _THIN)
+
+# A dequeue's return: whether a message came, then its properties and
+# recipients; the payload, then its message id.
+_AQ_DEQ_HEAD: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n4', 'num_bytes'),
+    ('when', 'num_bytes', (*_AQ_MSG_PROPS, ('n4', 'num_recipients'))),
+)
+_AQ_DEQ_HEAD_THIN = wire_schema.compile_encoder(_AQ_DEQ_HEAD, _THIN)
+_AQ_DEQ_HEAD_FROM_THIN = wire_schema.compile_decoder(_AQ_DEQ_HEAD, _THIN)
+
+# An array operation's return: the count of messages, then each one's
+# properties (when present, behind a byte python-oracledb passes over), its
+# recipients, the payload (when present), and its message ids -- an array
+# enqueue's are every message's, concatenated -- with the extensions' length
+# and the output acknowledgement.
+_AQ_ARRAY_COUNT: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n4', 'num_iters'),
+)
+_AQ_ARRAY_COUNT_THIN = wire_schema.compile_encoder(_AQ_ARRAY_COUNT, _THIN)
+_AQ_ARRAY_COUNT_FROM_THIN = wire_schema.compile_decoder(_AQ_ARRAY_COUNT, _THIN)
+_AQ_ARRAY_HEAD: wire_schema.Schema = (
+    ('n2', 'has_props'),
+    ('when', 'has_props', (('u8', 'props_byte'), *_AQ_MSG_PROPS)),
+    ('n4', 'num_recipients'),
+    ('n2', 'has_payload'),
+)
+_AQ_ARRAY_HEAD_THIN = wire_schema.compile_encoder(_AQ_ARRAY_HEAD, _THIN)
+_AQ_ARRAY_HEAD_FROM_THIN = wire_schema.compile_decoder(_AQ_ARRAY_HEAD, _THIN)
+_AQ_ARRAY_TAIL: wire_schema.Schema = (
+    *_aq_string('msgid'),
+    ('n2', 'extensions_length'),
+    ('n2', 'ack'),
+)
+_AQ_ARRAY_TAIL_THIN = wire_schema.compile_encoder(_AQ_ARRAY_TAIL, _THIN)
+_AQ_ARRAY_TAIL_FROM_THIN = wire_schema.compile_decoder(_AQ_ARRAY_TAIL, _THIN)
+
+
+def decode_aq_message_props(Data: bytes, FieldVersion: int) -> tuple[dict, bytes]:
+    """A message's properties (#128), and what follows them."""
+    return _AQ_MSG_PROPS_FROM_THIN(
+        Data, {'has_shard': FieldVersion >= FIELD_VERSION_21_1}
+    )
+
+
+def decode_aq_payload(Data: bytes, IsObject: bool) -> tuple[object, bytes]:
+    """A message's payload (#128): an object queue's object image, as a column
+    of that type reads, or a RAW or JSON queue's image past its header; None
+    for none. The caller makes the object or the JSON value of it."""
+    if IsObject:
+        return _read_object_column(Data, {})
+    (Values, Rest) = _AQ_PAYLOAD_IMAGE_FROM_THIN(Data)
+    if not Values['image_length']:
+        return (None, Rest)
+    return (Values['image'][4 : Values['image_length']], Rest)
+
+
+def decode_aq_enq_reply(Data: bytes) -> bytes:
+    """The message id an enqueue's return gave the message (#128)."""
+    return _AQ_ENQ_REPLY_FROM_THIN(Data)[0]['msgid']
+
+
+def decode_aq_deq_reply(Data: bytes, FieldVersion: int, IsObject: bool) -> dict | None:
+    """A dequeue's return (#128): the message's properties, with its
+    ``payload`` (as decode_aq_payload reads it) and ``msgid``; None when no
+    message came."""
+    Given = {'has_shard': FieldVersion >= FIELD_VERSION_21_1}
+    (Message, Rest) = _AQ_DEQ_HEAD_FROM_THIN(Data, Given)
+    if not Message['num_bytes']:
+        return None
+    (Message['payload'], Rest) = decode_aq_payload(Rest, IsObject)
+    Message['msgid'] = bytes(Rest[:TNS_AQ_MESSAGE_ID_LENGTH])
+    return Message
+
+
+def decode_aq_array_reply(Data: bytes, FieldVersion: int, IsObject: bool) -> list[dict]:
+    """An array enqueue's or dequeue's return (#128): per message, its
+    properties when they came (``has_props``), its ``payload`` when it came
+    (``has_payload``), and its ``msgid``."""
+    Given = {'has_shard': FieldVersion >= FIELD_VERSION_21_1}
+    (Count, Rest) = _AQ_ARRAY_COUNT_FROM_THIN(Data)
+    Out = []
+    for _ in range(Count['num_iters']):
+        (Message, Rest) = _AQ_ARRAY_HEAD_FROM_THIN(Rest, Given)
+        if Message['has_payload']:
+            (Message['payload'], Rest) = decode_aq_payload(Rest, IsObject)
+        (Tail, Rest) = _AQ_ARRAY_TAIL_FROM_THIN(Rest)
+        Message['msgid'] = Tail.get('msgid', b'')
+        Out.append(Message)
+    return Out
+
+
 def encode_aq_enq(Seq: int, FieldVersion: int, Queue, Props) -> bytes:
     # AQ enqueue (TNS_FUNC_AQ_ENQ): the layout of python-oracledb's AqEnqMessage.
     QName = Queue.name.encode('utf-8')

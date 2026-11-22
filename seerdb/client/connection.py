@@ -119,7 +119,6 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_9_2,
     FIELD_VERSION_10_2,
     FIELD_VERSION_12_1,
-    FIELD_VERSION_21_1,
     FIELD_VERSION_23_1_EXT_1,
     FIELD_VERSION_23_4,
     MAX_SEQ_NUM,
@@ -333,15 +332,14 @@ def _decode_tpc_context(Packet: bytes) -> bytes:
 
 
 def _decode_aq_enq(Packet: bytes) -> bytes:
-    # AQ enqueue return: the RPA token then the 16-byte message id (the trailing
-    # ub2 extensions length is ignored). #128.
-    from seerdb.common.tns_consts import TNS_AQ_MESSAGE_ID_LENGTH
+    # The message id an AQ enqueue's return gave the message (#128).
+    from seerdb.common.tns import decode_aq_enq_reply
 
     if not Packet:
         raise OperationalError('empty AQ enqueue response')
     if Packet[0] != TTI_RPA:
         _aq_raise(Packet)
-    return bytes(Packet[1 : 1 + TNS_AQ_MESSAGE_ID_LENGTH])
+    return decode_aq_enq_reply(Packet)
 
 
 import re as _re
@@ -384,43 +382,20 @@ def _aq_raise(Packet: bytes) -> None:
     raise DatabaseError(f'unexpected AQ response 0x{Packet[:1].hex()}')
 
 
-def _aq_str(Rest: bytes) -> tuple:
-    # read_bytes_with_length / read_str_with_length: a ub4 count, then (if
-    # non-zero) the chunked data. Empty/null normalised to b"".
-    from seerdb.common.tns import _read_str_with_length
-
-    (Value, Rest) = _read_str_with_length(Rest)
-    return (b'' if isinstance(Value, list) else bytes(Value), Rest)
-
-
-def _aq_raw(Rest: bytes) -> tuple:
-    # read_raw_bytes_and_length / read_bytes(): a single length byte then the
-    # data (0xFE = chunked). Used for the enqueue-time date and the payload image.
-    from seerdb.common.tns import decode_dalc
-
-    (Value, Rest) = decode_dalc(Rest)
-    return (b'' if isinstance(Value, list) else bytes(Value), Rest)
-
-
-def _decode_aq_payload(Rest: bytes, queue):
-    # Read the message payload (#128). For RAW the image is a length-prefixed
-    # blob whose first 4 bytes are a header; for an object queue it's a packed
-    # DbObject; for JSON it's OSON. Returns (payload, remaining_bytes).
-    from seerdb.common.tns import decode_ub4
-
+def _aq_payload(Payload, queue):
+    # A message's payload as the codec read it (#128), made what the queue
+    # holds: an object of its type, a JSON value, or RAW bytes.
     if queue.payload_type is not None:
+        if Payload is None:
+            return None
         from seerdb.common.dbobject import (
             DbObject,
             decode_collection_keyed,
             decode_object_image,
         )
-        from seerdb.common.tns import _read_object_column
         from seerdb.common.tns_consts import AL32UTF8_CHARSET
 
-        (Img, Rest) = _read_object_column(Rest, {})
-        if Img is None:
-            return (None, Rest)
-        Img = cast(Any, Img)  # the decoded object image (has .image)
+        Img = cast(Any, Payload)  # the decoded object image (has .image)
         from seerdb.client.cursor import _object_with_lobs
 
         Typ = queue.payload_type
@@ -429,39 +404,40 @@ def _decode_aq_payload(Rest: bytes, queue):
             (Elements, Keys) = decode_collection_keyed(
                 Img.image, Typ.element or {}, AL32UTF8_CHARSET
             )
-            return (
-                _object_with_lobs(
-                    DbObject(Typ.name, elements=Elements, dbtype=Typ, keys=Keys),
-                    Conn,
-                ),
-                Rest,
+            return _object_with_lobs(
+                DbObject(Typ.name, elements=Elements, dbtype=Typ, keys=Keys), Conn
             )
         Attrs = decode_object_image(Img.image, Typ.attrs, AL32UTF8_CHARSET)
-        return (_object_with_lobs(DbObject(Typ.name, Attrs, dbtype=Typ), Conn), Rest)
-    (_toid, Rest) = _aq_str(Rest)
-    (_oid, Rest) = _aq_str(Rest)
-    (_snapshot, Rest) = _aq_str(Rest)
-    (_version, Rest) = decode_ub4(Rest)  # skip_ub2 version no
-    (image_length, Rest) = decode_ub4(Rest)
-    (_flags, Rest) = decode_ub4(Rest)  # skip_ub2 flags
-    if image_length > 0:
-        (Image, Rest) = _aq_raw(Rest)
-        Payload = bytes(Image[4:image_length])
-        if queue.is_json:
-            from seerdb.common.oson import decode_oson
+        return _object_with_lobs(DbObject(Typ.name, Attrs, dbtype=Typ), Conn)
+    if Payload is None:
+        return None if queue.is_json else b''
+    if queue.is_json:
+        from seerdb.common.oson import decode_oson
 
-            return (decode_oson(Payload), Rest)
-        return (Payload, Rest)
-    return (None if queue.is_json else b'', Rest)
+        return decode_oson(bytes(Payload))
+    return bytes(Payload)
+
+
+def _aq_message_props(Props, Values: dict):
+    # The properties the codec read (#128), onto a MessageProperties.
+    Props.priority = Values['priority']
+    Props.delay = Values['delay']
+    Props.expiration = Values['expiration']
+    Props.correlation = Values.get('correlation', b'').decode('utf-8') or None
+    Props.num_attempts = Values['num_attempts']
+    Props.exceptionq = Values.get('exceptionq', b'').decode('utf-8') or None
+    Props.state = Values['state']
+    Props.enq_txn_id = Values.get('enq_txn_id', b'')
+    return Props
 
 
 def _decode_aq_deq(Packet: bytes, queue):
-    # AQ dequeue return parameters (#128): RPA token then, when a message is
-    # present, the message properties, recipients, payload, and 16-byte msgid.
-    # An empty queue comes back as ORA-25228 (no messages) -> None. RE'd from a
-    # live 21c capture; mirrors python-oracledb AqDeqMessage.
+    # AQ dequeue return parameters (#128): when a message is present, its
+    # properties, recipients, payload, and 16-byte msgid. An empty queue comes
+    # back as ORA-25228 (no messages) -> None. RE'd from a live 21c capture;
+    # mirrors python-oracledb AqDeqMessage.
     from seerdb.client.aq import MessageProperties
-    from seerdb.common.tns import decode_ub4
+    from seerdb.common.tns import decode_aq_deq_reply
 
     if not Packet:
         return None
@@ -472,52 +448,15 @@ def _decode_aq_deq(Packet: bytes, queue):
         ):  # no message available
             return None
         _aq_raise(Packet)
-    Rest = Packet[1:]
-    (NumBytes, Rest) = decode_ub4(Rest)
-    if NumBytes == 0:
+    Message = decode_aq_deq_reply(
+        Packet, queue._connection.field_version, queue.payload_type is not None
+    )
+    if Message is None:
         return None
-    Props = MessageProperties()
-    Rest = _parse_aq_msg_props(Rest, Props, queue._connection.field_version)
-    (_NumRecipients, Rest) = decode_ub4(Rest)
-    (Props.payload, Rest) = _decode_aq_payload(Rest, queue)
-    Props.msgid = bytes(Rest[:16])
+    Props = _aq_message_props(MessageProperties(), Message)
+    Props.payload = _aq_payload(Message['payload'], queue)
+    Props.msgid = Message['msgid']
     return Props
-
-
-def _parse_aq_msg_props(Rest: bytes, Props, field_version: int) -> bytes:
-    # The message-property fields shared by single dequeue and the array path
-    # (#128): priority/delay/expiration, correlation, attempts, exception queue,
-    # state, enqueue date, txn id, the keyword extensions, and the trailing
-    # user-property/cscn/dscn/flags (+ shard at fv >= 21.1).
-    from seerdb.common.tns import decode_ub4
-
-    (Props.priority, Rest) = decode_ub4(Rest)
-    (Props.delay, Rest) = decode_ub4(Rest)
-    (Props.expiration, Rest) = decode_ub4(Rest)
-    (Corr, Rest) = _aq_str(Rest)
-    Props.correlation = Corr.decode('utf-8') if Corr else None
-    (Props.num_attempts, Rest) = decode_ub4(Rest)
-    (ExQ, Rest) = _aq_str(Rest)
-    Props.exceptionq = ExQ.decode('utf-8') if ExQ else None
-    (Props.state, Rest) = decode_ub4(Rest)
-    (DateFlag, Rest) = decode_ub4(Rest)  # enqueue time
-    if DateFlag > 0:
-        (_DateBytes, Rest) = _aq_raw(Rest)
-    (Props.enq_txn_id, Rest) = _aq_str(Rest)
-    (NumExt, Rest) = decode_ub4(Rest)  # extensions
-    if NumExt > 0:
-        Rest = Rest[1:]  # skip_ub1
-        for _ in range(NumExt):
-            (_Text, Rest) = _aq_str(Rest)
-            (_Bin, Rest) = _aq_str(Rest)
-            (_Keyword, Rest) = decode_ub4(Rest)
-    (_UserProps, Rest) = decode_ub4(Rest)
-    (_Csn, Rest) = decode_ub4(Rest)
-    (_Dsn, Rest) = decode_ub4(Rest)
-    (_Flags, Rest) = decode_ub4(Rest)
-    if field_version >= FIELD_VERSION_21_1:
-        (_Shard, Rest) = decode_ub4(Rest)
-    return Rest
 
 
 def _decode_aq_array(Packet: bytes, queue, operation: int, props_list: list):
@@ -526,7 +465,7 @@ def _decode_aq_array(Packet: bytes, queue, operation: int, props_list: list):
     # dequeue it carries num_iters messages (properties + payload + msgid). An
     # empty queue comes back as ORA-25228 -> []. Mirrors AqArrayMessage.
     from seerdb.client.aq import MessageProperties
-    from seerdb.common.tns import decode_ub4
+    from seerdb.common.tns import decode_aq_array_reply
     from seerdb.common.tns_consts import TNS_AQ_ARRAY_ENQ
 
     if not Packet:
@@ -535,28 +474,21 @@ def _decode_aq_array(Packet: bytes, queue, operation: int, props_list: list):
         if _aq_oer_code(Packet) in (ORA_DEQUEUE_TIMEOUT, ORA_LISTEN_TIMEOUT):
             return []
         _aq_raise(Packet)
-    Rest = Packet[1:]
-    FV = queue._connection.field_version
-    (NumIters, Rest) = decode_ub4(Rest)
     Out = []
-    for I in range(NumIters):
+    for Message in decode_aq_array_reply(
+        Packet, queue._connection.field_version, queue.payload_type is not None
+    ):
         Props = MessageProperties()
-        (Flag, Rest) = decode_ub4(Rest)  # ub2 props-present
-        if Flag > 0:
-            Rest = Rest[1:]  # skip_ub1
-            Rest = _parse_aq_msg_props(Rest, Props, FV)
-        (_NumRecipients, Rest) = decode_ub4(Rest)
-        (PayFlag, Rest) = decode_ub4(Rest)  # ub2 payload-present
-        if PayFlag > 0:
-            (Props.payload, Rest) = _decode_aq_payload(Rest, queue)
-        (MsgId, Rest) = _aq_str(Rest)
+        if Message['has_props']:
+            _aq_message_props(Props, Message)
+        if Message['has_payload']:
+            Props.payload = _aq_payload(Message['payload'], queue)
+        MsgId = Message['msgid']
         if operation == TNS_AQ_ARRAY_ENQ:
             for J, P in enumerate(props_list):
                 P.msgid = bytes(MsgId[J * 16 : (J + 1) * 16])
         else:
             Props.msgid = bytes(MsgId)
-        (ExtLen, Rest) = decode_ub4(Rest)  # ub2 extensions length
-        (_Ack, Rest) = decode_ub4(Rest)  # ub2 output ack
         Out.append(Props)
     return props_list if operation == TNS_AQ_ARRAY_ENQ else Out
 
