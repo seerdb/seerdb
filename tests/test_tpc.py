@@ -5,15 +5,24 @@
 # change-state request encoders, and the response decoders. The full
 # begin/prepare/commit/rollback flow is covered live on 21c/23ai.
 
+import itertools
 import unittest
 
 from seerdb.client.connection import Xid, _decode_tpc_context, _decode_tpc_state
 from seerdb.common.tns import (
+    _DECODE_FIELD_VERSION,
     _ENCODE_FIELD_VERSION,
+    _TPC_CHANGE_STATE_FROM_THIN,
+    _TPC_SWITCH_FROM_THIN,
     encode_tpc_change_state,
     encode_tpc_switch,
 )
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_9_2,
+    FIELD_VERSION_10_2,
+    FIELD_VERSION_11_2,
+    FIELD_VERSION_12_1,
+    FIELD_VERSION_23_4,
     TNS_FUNC_TPC_TXN_CHANGE_STATE,
     TNS_FUNC_TPC_TXN_SWITCH,
     TNS_TPC_TXN_PREPARE,
@@ -166,3 +175,77 @@ class TestRecoverAndForget(unittest.TestCase):
             with self.subTest(cls=cls.__name__):
                 with self.assertRaisesRegex(NotSupportedError, 'thick mode'):
                     self._conn(cls).tpc_forget(Xid(1, b'g', b'b'))
+
+
+class TestTheCallsReadBack(unittest.TestCase):
+    # Both calls, read back by their schema's decoder (_TPC_SWITCH,
+    # _TPC_CHANGE_STATE, #2773) at the field version they were written for.
+    VERSIONS = (
+        FIELD_VERSION_9_2,
+        FIELD_VERSION_10_2,
+        FIELD_VERSION_11_2,
+        FIELD_VERSION_12_1,
+        FIELD_VERSION_23_4,
+    )
+
+    def _read(self, decode, data, fv):
+        token = _DECODE_FIELD_VERSION.set(fv)
+        try:
+            return decode(
+                data,
+                {
+                    'has_names': fv >= FIELD_VERSION_11_2,
+                    'has_flags': fv >= FIELD_VERSION_10_2,
+                },
+            )
+        finally:
+            _DECODE_FIELD_VERSION.reset(token)
+
+    def test_a_switch(self):
+        xid = Xid(0x1234, b'gtrid', b'bqual')
+        for fv, context in itertools.product(self.VERSIONS, (None, b'ctx' * 12)):
+            with self.subTest(fv=fv, context=context):
+                data = encode_tpc_switch(
+                    5, fv, TNS_TPC_TXN_START, xid, 1, 60, context, 7
+                )
+                fields, rest = self._read(_TPC_SWITCH_FROM_THIN, data, fv)
+                self.assertEqual(rest, b'')
+                self.assertEqual(
+                    (fields['operation'], fields['flags'], fields['timeout']),
+                    (TNS_TPC_TXN_START, 1, 60),
+                )
+                self.assertEqual(fields['format_id'], 0x1234)
+                self.assertEqual(fields['xid'][:10], b'gtridbqual')
+                self.assertEqual(fields['context'], context or b'')
+                self.assertEqual(fields['app_value'], 7)
+
+    def test_a_switch_names_only_from_11g(self):
+        # 10.2 and 9.2 have no field for the names, so none are sent there.
+        xid = Xid(1, b'g', b'b')
+        for fv in self.VERSIONS:
+            with self.subTest(fv=fv):
+                data = encode_tpc_switch(
+                    5, fv, TNS_TPC_TXN_START, xid, 1, 0, None, 0, b'INAME', b'ENAME'
+                )
+                fields, rest = self._read(_TPC_SWITCH_FROM_THIN, data, fv)
+                self.assertEqual(rest, b'')
+                if fv >= FIELD_VERSION_11_2:
+                    names = (fields['internal_name'], fields['external_name'])
+                    self.assertEqual(names, (b'INAME', b'ENAME'))
+                else:
+                    self.assertNotIn(b'INAME', data)
+
+    def test_a_change_of_state(self):
+        xid = Xid(9, b'g1', b'b1')
+        for fv in self.VERSIONS:
+            with self.subTest(fv=fv):
+                data = encode_tpc_change_state(
+                    6, fv, TNS_TPC_TXN_PREPARE, 0, xid, 2, b'ctx'
+                )
+                fields, rest = self._read(_TPC_CHANGE_STATE_FROM_THIN, data, fv)
+                self.assertEqual(rest, b'')
+                self.assertEqual(fields['operation'], TNS_TPC_TXN_PREPARE)
+                self.assertEqual(fields['context'], b'ctx')
+                self.assertEqual(
+                    fields.get('flags'), 2 if fv >= FIELD_VERSION_10_2 else None
+                )

@@ -9561,21 +9561,6 @@ def _tpc_xid_bytes(Xid) -> tuple | None:
     return (FormatId, bytes(Gtrid), bytes(Bqual), XidBytes)
 
 
-def _tpc_xid_descriptor(Parts) -> bytes:
-    # The format-id / gtrid-len / bqual-len / xid-pointer block shared by both
-    # TPC messages (after the operation + context-pointer block).
-    if Parts is not None:
-        (FormatId, Gtrid, Bqual, XidBytes) = Parts
-        return (
-            encode_sb4(FormatId)
-            + encode_sb4(len(Gtrid))
-            + encode_sb4(len(Bqual))
-            + bytes([1])
-            + encode_sb4(len(XidBytes))
-        )
-    return encode_sb4(0) + encode_sb4(0) + encode_sb4(0) + bytes([0]) + encode_sb4(0)
-
-
 def encode_tpc_switch(
     Seq: int,
     FieldVersion: int,
@@ -9589,68 +9574,48 @@ def encode_tpc_switch(
     ExternalName: bytes | None = None,
 ) -> bytes:
     # TPC start (tpc_begin) / detach (tpc_end). Mirrors oracledb
-    # TransactionSwitchMessage._write_message (#131).
-    Parts = _tpc_xid_bytes(Xid)
-    Out = _fun_header(TNS_FUNC_TPC_TXN_SWITCH, Seq, FieldVersion)
-    Out += encode_sb4(Operation)
-    if Context is not None:
-        Out += bytes([1]) + encode_sb4(len(Context))
-    else:
-        Out += bytes([0]) + encode_sb4(0)
-    Out += _tpc_xid_descriptor(Parts)
-    Out += encode_sb4(Flags) + encode_sb4(Timeout)
-    Out += bytes([1, 1, 1])  # ptrs: app value, return context, len
-    # The internal and external names are 11g's: 10.2 and 9.2 have neither
-    # field (#2691, PROTOCOL.md §28, measured against JDBC thin 11.2).
-    if FieldVersion >= FIELD_VERSION_11_2:
-        Out += (
-            bytes([1]) + encode_sb4(len(InternalName))
-            if InternalName
-            else bytes([0]) + encode_sb4(0)
-        )
-        Out += (
-            bytes([1]) + encode_sb4(len(ExternalName))
-            if ExternalName
-            else bytes([0]) + encode_sb4(0)
-        )
-    if Context is not None:
-        Out += Context
-    if Parts is not None:
-        Out += Parts[3]
-    Out += encode_sb4(AppValue)
-    if InternalName:
-        Out += InternalName
-    if ExternalName:
-        Out += ExternalName
-    return Out
+    # TransactionSwitchMessage._write_message (#131); the message is
+    # _TPC_SWITCH. The names are 11g's: 10.2 and 9.2 have no field for them,
+    # so none are sent there (#2691). The token goes by `FieldVersion`.
+    Fields = {
+        **_tpc_fields(Seq, Operation, Xid, Context),
+        **_tpc_names(InternalName, ExternalName),
+        'token_number': 0,
+        'flags': Flags,
+        'timeout': Timeout,
+        'app_value_present': True,
+        'return_context_present': True,
+        'return_length_present': True,
+        'has_names': FieldVersion >= FIELD_VERSION_11_2,
+        'app_value': AppValue,
+    }
+    Token = _ENCODE_FIELD_VERSION.set(FieldVersion)
+    try:
+        return _TPC_SWITCH_THIN(Fields)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
 
 
 def parse_tpc_switch(body: bytes, field_version: int) -> tuple[int, int, int, bytes]:
-    """Decode a client TPC switch call (TTI_FUN 103) — the inverse of
-    :func:`encode_tpc_switch` for the shape a sessionless begin / resume / suspend
-    sends. Returns ``(operation, flags, timeout, transaction_id)``: operation is
-    START (0x01) or DETACH (0x02), flags carry NEW vs RESUME, and the id is the
-    xid's gtrid (empty for a suspend, which sends no xid)."""
-    rest = body[3:]  # TTI_FUN, func, seq
-    if field_version >= FIELD_VERSION_23_1_EXT_1:
-        _, rest = decode_ub4(rest)  # the fv24 token number
-    operation, rest = decode_ub4(rest)
-    rest = rest[1:]  # context pointer flag
-    _ctx_len, rest = decode_ub4(rest)
-    _format_id, rest = decode_ub4(rest)
-    gtrid_len, rest = decode_ub4(rest)
-    _bqual_len, rest = decode_ub4(rest)
-    has_xid, rest = rest[0], rest[1:]
-    xidbytes_len, rest = decode_ub4(rest)
-    flags, rest = decode_ub4(rest)
-    timeout, rest = decode_ub4(rest)
-    rest = rest[3:]  # app-value / return-context / length pointers
-    rest = rest[1:]
-    _iname_len, rest = decode_ub4(rest)  # internal name
-    rest = rest[1:]
-    _ename_len, rest = decode_ub4(rest)  # external name
-    xid = rest[:xidbytes_len] if has_xid else b''
-    return operation, flags, timeout, xid[:gtrid_len]
+    """Decode a client TPC switch call (TTI_FUN 103, _TPC_SWITCH) — the inverse
+    of :func:`encode_tpc_switch` for the shape a sessionless begin / resume /
+    suspend sends. Returns ``(operation, flags, timeout, transaction_id)``:
+    operation is START (0x01) or DETACH (0x02), flags carry NEW vs RESUME, and
+    the id is the xid's gtrid (empty for a suspend, which sends no xid)."""
+    Token = _DECODE_FIELD_VERSION.set(field_version)
+    try:
+        Fields, _ = _TPC_SWITCH_FROM_THIN(
+            body, {'has_names': field_version >= FIELD_VERSION_11_2}
+        )
+    finally:
+        _DECODE_FIELD_VERSION.reset(Token)
+    xid = Fields['xid'] if Fields['xid_present'] else b''
+    return (
+        Fields['operation'],
+        Fields['flags'],
+        Fields['timeout'],
+        xid[: Fields['gtrid_length']],
+    )
 
 
 def encode_tpc_change_state(
@@ -9663,26 +9628,23 @@ def encode_tpc_change_state(
     Context: bytes | None,
 ) -> bytes:
     # TPC prepare / commit / rollback / forget. Mirrors oracledb
-    # TransactionChangeStateMessage._write_message (#131).
-    Parts = _tpc_xid_bytes(Xid)
-    Out = _fun_header(TNS_FUNC_TPC_TXN_CHANGE_STATE, Seq, FieldVersion)
-    Out += encode_sb4(Operation)
-    if Context is not None:
-        Out += bytes([1]) + encode_sb4(len(Context))
-    else:
-        Out += bytes([0]) + encode_sb4(0)
-    Out += _tpc_xid_descriptor(Parts)
-    Out += encode_sb4(0)  # timeout
-    Out += encode_sb4(State)
-    Out += bytes([1])  # ptr (out state)
-    # 9.2's change of state has no flags (#2691, PROTOCOL.md §28).
-    if FieldVersion >= FIELD_VERSION_10_2:
-        Out += encode_sb4(Flags)
-    if Context is not None:
-        Out += Context
-    if Parts is not None:
-        Out += Parts[3]
-    return Out
+    # TransactionChangeStateMessage._write_message (#131); the message is
+    # _TPC_CHANGE_STATE. 9.2's has no flags (#2691). The token goes by
+    # `FieldVersion`.
+    Fields = {
+        **_tpc_fields(Seq, Operation, Xid, Context),
+        'token_number': 0,
+        'timeout': 0,
+        'state': State,
+        'out_state_present': True,
+        'has_flags': FieldVersion >= FIELD_VERSION_10_2,
+        'flags': Flags,
+    }
+    Token = _ENCODE_FIELD_VERSION.set(FieldVersion)
+    try:
+        return _TPC_CHANGE_STATE_THIN(Fields)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
 
 
 # Subscriptions (#2460), as python-oracledb 26.1 thin sends them, measured
@@ -20619,13 +20581,20 @@ def encode_oci11_close_cursors(Seq: int, Cursors: list[int]) -> bytes:
     )
 
 
-# Two-phase commit (#131) as OCI 11.2 sends it to 10g and 11g: thin's two
-# functions at OCI's widths. Thin's operation is a ub8 here; the pointers are 8
-# bytes; the context the server returned rides ahead of the 128-byte XID. 11g's
-# switch has the internal and external names' two pointers and lengths, which
-# 10g's lacks; 11g's change of state has a ub8 operation and flags, and four
-# bytes no field is known for behind the state, all narrower on 10g.
-_OCI11_TPC_SWITCH: wire_schema.Schema = (
+# Two-phase commit (#131): the switch (begin, resume, detach) and the change of
+# state (prepare, commit, roll back, forget), one schema each for thin and for
+# OCI 11.2's form to 10g and 11g, which has thin's fields at OCI's widths. The
+# operation is a ub8 in OCI's wide form; the pointers are 8 bytes; the context
+# the server returned rides ahead of the 128-byte XID. Measured against JDBC
+# thin 11.2 on 10.2 and 9.2 (#2691, PROTOCOL.md §28) and OCI 11.2 on 10g and
+# 11g:
+# - the switch's internal and external names are 11g's, not 10.2's or 9.2's
+#   (`has_names`). Thin sends their bytes behind the app value; seerdb sends
+#   none, and OCI's zero pointers and lengths are 32 bytes;
+# - OCI writes four bytes no field is known for behind the switch's timeout,
+#   and behind a wide change of state's state;
+# - 9.2's change of state has no flags (`has_flags`).
+_TPC_SWITCH: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TNS_FUNC_TPC_TXN_SWITCH])),
     ('u8', 'seq'),
     ('token', 'token_number'),
@@ -20639,17 +20608,33 @@ _OCI11_TPC_SWITCH: wire_schema.Schema = (
     ('n4', 'xid_length'),
     ('n4', 'flags'),
     ('n4', 'timeout'),
-    ('pad', 4),
+    ('only', 'oci', (('pad', 4),)),
     ('ptr', 'app_value_present'),
     ('ptr', 'return_context_present'),
     ('ptr', 'return_length_present'),
-    ('when', 'has_names', (('pad', 32),)),
+    (
+        'when',
+        'has_names',
+        (
+            ('ptr', 'internal_name_present'),
+            ('wn4', 'internal_name_length'),
+            ('ptr', 'external_name_present'),
+            ('wn4', 'external_name_length'),
+        ),
+    ),
     ('bytes', 'context', 'context_length'),
     ('bytes', 'xid', 'xid_length'),
     ('n4', 'app_value'),
+    (
+        'when',
+        'has_names',
+        (
+            ('bytes', 'internal_name', 'internal_name_length'),
+            ('bytes', 'external_name', 'external_name_length'),
+        ),
+    ),
 )
-_OCI11_TPC_SWITCH_OCI_WIDE = wire_schema.compile_encoder(_OCI11_TPC_SWITCH, _OCI_WIDE)
-_OCI11_TPC_CHANGE_STATE: wire_schema.Schema = (
+_TPC_CHANGE_STATE: wire_schema.Schema = (
     ('const', bytes([TTI_FUN, TNS_FUNC_TPC_TXN_CHANGE_STATE])),
     ('u8', 'seq'),
     ('token', 'token_number'),
@@ -20663,25 +20648,27 @@ _OCI11_TPC_CHANGE_STATE: wire_schema.Schema = (
     ('n4', 'xid_length'),
     ('n4', 'timeout'),
     ('n4', 'state'),
-    ('when', 'wide', (('pad', 4),)),
+    ('only', 'oci', (('when', 'wide', (('pad', 4),)),)),
     ('ptr', 'out_state_present'),
-    ('wn4', 'flags'),
+    ('when', 'has_flags', (('wn4', 'flags'),)),
     ('bytes', 'context', 'context_length'),
     ('bytes', 'xid', 'xid_length'),
 )
-_OCI11_TPC_CHANGE_STATE_OCI_WIDE = wire_schema.compile_encoder(
-    _OCI11_TPC_CHANGE_STATE, _OCI_WIDE
-)
-_OCI11_TPC_CHANGE_STATE_OCI = wire_schema.compile_encoder(_OCI11_TPC_CHANGE_STATE, _OCI)
+_TPC_SWITCH_THIN = wire_schema.compile_encoder(_TPC_SWITCH, _THIN)
+_TPC_SWITCH_FROM_THIN = wire_schema.compile_decoder(_TPC_SWITCH, _THIN)
+_TPC_SWITCH_OCI_WIDE = wire_schema.compile_encoder(_TPC_SWITCH, _OCI_WIDE)
+_TPC_CHANGE_STATE_THIN = wire_schema.compile_encoder(_TPC_CHANGE_STATE, _THIN)
+_TPC_CHANGE_STATE_FROM_THIN = wire_schema.compile_decoder(_TPC_CHANGE_STATE, _THIN)
+_TPC_CHANGE_STATE_OCI_WIDE = wire_schema.compile_encoder(_TPC_CHANGE_STATE, _OCI_WIDE)
+_TPC_CHANGE_STATE_OCI = wire_schema.compile_encoder(_TPC_CHANGE_STATE, _OCI)
 
 
-def _oci11_tpc_fields(Seq: int, Operation: int, Xid, Context: bytes | None) -> dict:
-    # What the two functions share.
+def _tpc_fields(Seq: int, Operation: int, Xid, Context: bytes | None) -> dict:
+    # What the two calls share, in both dialects.
     Parts = _tpc_xid_bytes(Xid)
     (FormatId, Gtrid, Bqual, XidBytes) = Parts or (0, b'', b'', b'')
     return {
         'seq': Seq,
-        'token_number': None,
         'operation': Operation,
         'context_present': Context is not None,
         'context_length': len(Context or b''),
@@ -20695,6 +20682,23 @@ def _oci11_tpc_fields(Seq: int, Operation: int, Xid, Context: bytes | None) -> d
     }
 
 
+def _tpc_names(InternalName: bytes | None, ExternalName: bytes | None) -> dict:
+    # A switch's internal and external names, sent from 11.2 on.
+    return {
+        'internal_name_present': bool(InternalName),
+        'internal_name_length': len(InternalName or b''),
+        'internal_name': InternalName or b'',
+        'external_name_present': bool(ExternalName),
+        'external_name_length': len(ExternalName or b''),
+        'external_name': ExternalName or b'',
+    }
+
+
+def _oci11_tpc_fields(Seq: int, Operation: int, Xid, Context: bytes | None) -> dict:
+    # What the two functions share in OCI, which sends no token.
+    return {**_tpc_fields(Seq, Operation, Xid, Context), 'token_number': None}
+
+
 def encode_oci11_tpc_switch(
     Seq: int,
     Operation: int,
@@ -20706,9 +20710,10 @@ def encode_oci11_tpc_switch(
 ) -> bytes:
     """Start, resume or detach a global transaction branch on a native 10g or
     11g session."""
-    return _OCI11_TPC_SWITCH_OCI_WIDE(
+    return _TPC_SWITCH_OCI_WIDE(
         {
             **_oci11_tpc_fields(Seq, Operation, Xid, Context),
+            **_tpc_names(None, None),
             'flags': Flags,
             'timeout': Timeout,
             'app_value_present': True,
@@ -20730,7 +20735,7 @@ def encode_oci11_tpc_change_state(
 ) -> bytes:
     """Prepare, commit or roll back a branch on a native 10g or 11g session."""
     Wide = FieldVersion >= FIELD_VERSION_11_2
-    Encode = _OCI11_TPC_CHANGE_STATE_OCI_WIDE if Wide else _OCI11_TPC_CHANGE_STATE_OCI
+    Encode = _TPC_CHANGE_STATE_OCI_WIDE if Wide else _TPC_CHANGE_STATE_OCI
     return Encode(
         {
             **_oci11_tpc_fields(Seq, Operation, Xid, Context),
@@ -20738,6 +20743,7 @@ def encode_oci11_tpc_change_state(
             'state': State,
             'wide': Wide,
             'out_state_present': True,
+            'has_flags': True,
             'flags': 0,
         }
     )
