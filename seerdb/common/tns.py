@@ -23386,61 +23386,51 @@ def _encode_ref_bind_value(Ref: 'DbRef') -> bytes:
 _AQ_JSON_DESCRIPTOR = bytes.fromhex('012800260004610800000001000000000000')
 
 
-def _encode_sb4i(Val: int) -> bytes:
-    # Signed ub4: non-negative via encode_sb4; negative as 0x80|width then the
-    # big-endian magnitude (e.g. expiration -1 -> 81 01). Mirrors write_sb4.
-    if Val >= 0:
-        return encode_sb4(Val)
-    Mag = (-Val).to_bytes(4, 'big').lstrip(b'\x00') or b'\x00'
-    return bytes([0x80 | len(Mag)]) + Mag
-
-
-def _aq_value_with_length(Value) -> bytes:
-    # write_value_with_length: None -> ub4 0; else write_bytes_with_two_lengths.
+def _aq_string_values(Name: str, Value) -> dict:
+    # An AQ string's fields (_aq_string): its count, and its bytes when it has
+    # any. None and an empty value are both a bare zero count.
     if Value is None:
-        return encode_sb4(0)
+        return {f'{Name}_length': 0}
     if isinstance(Value, str):
         Value = Value.encode('utf-8')
-    return _obj_two_lengths(bytes(Value))
+    return {f'{Name}_length': len(Value), Name: bytes(Value)}
 
 
-def _aq_kv_pair(Text, Binary, Keyword: int) -> bytes:
-    # write_keyword_value_pair: the text value, the binary value, then the ub2
-    # keyword (each value length-prefixed; None -> ub4 0).
-    return (
-        _aq_value_with_length(Text)
-        + _aq_value_with_length(Binary)
-        + encode_sb4(Keyword)
-    )
-
-
-def _aq_write_msg_props(Props, FieldVersion: int) -> bytes:
-    # write_msg_props (aq_base): priority/delay/expiration, correlation,
-    # attempts, exception queue, state, enqueue time, txn id, then the four
-    # fixed agent/extension keyword-value pairs, user-property/cscn/dscn/flags,
-    # and (at fv >= 21.1) a shard id -- the layout python-oracledb sends.
-    Out = encode_sb4(Props.priority)
-    Out += encode_sb4(Props.delay)
-    Out += _encode_sb4i(Props.expiration)
-    Out += _aq_value_with_length(Props.correlation)
-    Out += encode_sb4(0)  # number of attempts
-    Out += _aq_value_with_length(Props.exceptionq)
-    Out += encode_sb4(Props.state)
-    Out += encode_sb4(0)  # enqueue time length
-    Out += _aq_value_with_length(Props.enq_txn_id)
-    Out += encode_sb4(4)  # number of extensions
-    Out += bytes([0x0E])  # unknown extra byte
-    Out += _aq_kv_pair(None, None, TNS_AQ_EXT_KEYWORD_AGENT_NAME)
-    Out += _aq_kv_pair(None, None, TNS_AQ_EXT_KEYWORD_AGENT_ADDRESS)
-    Out += _aq_kv_pair(None, b'\x00', TNS_AQ_EXT_KEYWORD_AGENT_PROTOCOL)
-    Out += _aq_kv_pair(None, None, TNS_AQ_EXT_KEYWORD_ORIGINAL_MSGID)
-    Out += encode_sb4(0)  # user property
-    Out += encode_sb4(0)  # cscn
-    Out += encode_sb4(0)  # dscn
-    Out += encode_sb4(0)  # flags
-    if FieldVersion >= FIELD_VERSION_21_1:
-        Out += encode_sb4(0xFFFFFFFF)  # shard id
-    return Out
+def _aq_msg_props_values(Props, FieldVersion: int) -> dict:
+    # A message's properties as a request carries them (_AQ_MSG_PROPS), the
+    # values python-oracledb's write_msg_props gives: no attempts and no
+    # enqueue time; four extensions behind the byte 0x0E -- the agent's name,
+    # address and protocol (a single zero byte), and the original message id;
+    # and from 21.1 no shard.
+    Extensions = [
+        {'text_length': 0, **_aq_string_values('binary', Binary), 'keyword': Keyword}
+        for (Binary, Keyword) in (
+            (None, TNS_AQ_EXT_KEYWORD_AGENT_NAME),
+            (None, TNS_AQ_EXT_KEYWORD_AGENT_ADDRESS),
+            (b'\x00', TNS_AQ_EXT_KEYWORD_AGENT_PROTOCOL),
+            (None, TNS_AQ_EXT_KEYWORD_ORIGINAL_MSGID),
+        )
+    ]
+    return {
+        'priority': Props.priority,
+        'delay': Props.delay,
+        'expiration': Props.expiration,
+        **_aq_string_values('correlation', Props.correlation),
+        'num_attempts': 0,
+        **_aq_string_values('exceptionq', Props.exceptionq),
+        'state': Props.state,
+        'has_enq_time': 0,
+        **_aq_string_values('enq_txn_id', Props.enq_txn_id),
+        'num_extensions': len(Extensions),
+        'extensions_byte': 0x0E,
+        'extensions': Extensions,
+        'user_properties': 0,
+        'csn': 0,
+        'dsn': 0,
+        'flags': 0,
+        'has_shard': FieldVersion >= FIELD_VERSION_21_1,
+        'shard': 0xFFFFFFFF,
+    }
 
 
 def _aq_write_payload(Queue, Props) -> bytes:
@@ -23579,6 +23569,245 @@ _AQ_ARRAY_TAIL_THIN = wire_schema.compile_encoder(_AQ_ARRAY_TAIL, _THIN)
 _AQ_ARRAY_TAIL_FROM_THIN = wire_schema.compile_decoder(_AQ_ARRAY_TAIL, _THIN)
 
 
+# A string in a request's data section, whose length a field before it gave:
+# 11g reads it as it stands, and a length byte in front of the queue name made
+# it read the payload a byte off, ORA-00600 [kpoaqeq: payload] (#2697); JDBC
+# thin 11.2 writes the dequeue's consumer, correlation and condition so too
+# (#2700). From 12.1 each is a value.
+def _aq_text(name: str) -> wire_schema.Schema:
+    return (
+        ('when', 'texts_bare', (('bytes', name, f'{name}_length'),)),
+        ('when', 'texts_counted', (('value', name),)),
+    )
+
+
+# The requests (#128), after their function header, the layouts of
+# python-oracledb's AqEnqMessage, AqDeqMessage and AqArrayMessage. Each pointer
+# says whether its value is in the data section that follows; the payload, an
+# object image, OSON in its descriptor or RAW bytes, follows the enqueue's.
+_AQ_ENQ: wire_schema.Schema = (
+    ('ptr', 'queue_name_present'),
+    ('n4', 'queue_name_length'),
+    *_AQ_MSG_PROPS,
+    ('ptr', 'recipients_present'),
+    ('n4', 'recipients_length'),
+    ('n4', 'visibility'),
+    ('ptr', 'relative_msgid_present'),
+    ('n4', 'relative_msgid_length'),
+    ('n4', 'sequence_deviation'),
+    ('ptr', 'toid_present'),
+    ('n4', 'toid_length'),
+    ('n4', 'message_version'),
+    ('ptr', 'payload_present'),
+    ('ptr', 'raw_payload_present'),
+    ('n4', 'raw_payload_length'),
+    ('ptr', 'msgid_present'),
+    ('n4', 'msgid_length'),
+    ('n4', 'enq_flags'),
+    ('ptr', 'extensions_1_present'),
+    ('n4', 'extensions_1_count'),
+    ('ptr', 'extensions_2_present'),
+    ('n4', 'extensions_2_count'),
+    ('ptr', 'source_seq_present'),
+    ('n4', 'source_seq_length'),
+    ('ptr', 'max_seq_present'),
+    ('n4', 'max_seq_length'),
+    ('u8', 'output_ack_length'),
+    ('ptr', 'sender_correlation_present'),
+    ('n4', 'sender_correlation_length'),
+    ('ptr', 'sender_name_present'),
+    ('n4', 'sender_name_length'),
+    ('ptr', 'sender_address_present'),
+    ('n4', 'sender_address_length'),
+    ('ptr', 'sender_charset_present'),
+    ('ptr', 'sender_ncharset_present'),
+    ('when', 'has_json_flag', (('ptr', 'json_payload'),)),
+    *_aq_text('queue_name'),
+    ('bytes', 'payload_toid', 16),
+)
+_AQ_ENQ_THIN = wire_schema.compile_encoder(_AQ_ENQ, _THIN)
+_AQ_ENQ_FROM_THIN = wire_schema.compile_decoder(_AQ_ENQ, _THIN)
+_AQ_DEQ: wire_schema.Schema = (
+    ('ptr', 'queue_name_present'),
+    ('n4', 'queue_name_length'),
+    ('ptr', 'props_present'),
+    ('ptr', 'props_length_present'),
+    ('ptr', 'recipients_present'),
+    ('ptr', 'recipients_length_present'),
+    ('ptr', 'consumer_present'),
+    ('n4', 'consumer_length'),
+    ('n4', 'mode'),
+    ('n4', 'navigation'),
+    ('n4', 'visibility'),
+    ('n4', 'wait'),
+    ('ptr', 'msgid_present'),
+    ('n4', 'msgid_length'),
+    ('ptr', 'correlation_present'),
+    ('n4', 'correlation_length'),
+    ('ptr', 'toid_present'),
+    ('n4', 'toid_length'),
+    ('n4', 'message_version'),
+    ('ptr', 'payload_present'),
+    ('ptr', 'out_msgid_present'),
+    ('n4', 'out_msgid_length'),
+    ('n4', 'deq_flags'),
+    ('ptr', 'condition_present'),
+    ('n4', 'condition_length'),
+    ('ptr', 'extensions_present'),
+    ('n4', 'extensions_count'),
+    ('when', 'has_json_flag', (('ptr', 'json_payload'),)),
+    ('when', 'has_shard', (('n4', 'shard'),)),
+    *_aq_text('queue_name'),
+    ('when', 'consumer_present', _aq_text('consumer')),
+    ('when', 'msgid_present', (('bytes', 'msgid', TNS_AQ_MESSAGE_ID_LENGTH),)),
+    ('when', 'correlation_present', _aq_text('correlation')),
+    ('bytes', 'payload_toid', 16),
+    ('when', 'condition_present', _aq_text('condition')),
+)
+_AQ_DEQ_THIN = wire_schema.compile_encoder(_AQ_DEQ, _THIN)
+_AQ_DEQ_FROM_THIN = wire_schema.compile_decoder(_AQ_DEQ, _THIN)
+# An array operation: its input (a dequeue's count of messages), its flags,
+# output and operation, the shard from 21.1 and an enqueue's count. A
+# dequeue's messages follow, each the queue, placeholder properties and the
+# dequeue options; an enqueue's follow in a row header and a row per message,
+# each with its payload after it, and a STATUS byte.
+_AQ_ARRAY_DEQ_ITEM: wire_schema.Schema = (
+    *_aq_string('queue_name'),
+    *_AQ_MSG_PROPS,
+    ('n4', 'num_recipients'),
+    *_aq_string('consumer'),
+    ('n4', 'mode'),
+    ('n4', 'navigation'),
+    ('n4', 'visibility'),
+    ('n4', 'wait'),
+    *_aq_string('msgid'),
+    *_aq_string('deq_correlation'),
+    *_aq_string('condition'),
+    ('n4', 'num_deq_extensions'),
+    ('n4', 'relative_msgid'),
+    ('n4', 'sequence_deviation'),
+    *_aq_string('payload_toid'),
+    ('n4', 'message_version'),
+    ('n4', 'payload_length'),
+    ('n4', 'raw_payload_length'),
+    ('n4', 'reserved'),
+    ('n4', 'deq_flags'),
+    ('n4', 'extensions_length'),
+    ('n4', 'source_seq_length'),
+)
+_AQ_ARRAY_CALL: wire_schema.Schema = (
+    ('ptr', 'input_present'),
+    ('n4', 'input_length'),
+    ('n4', 'array_flags'),
+    ('ptr', 'output_present'),
+    ('ptr', 'output_length_present'),
+    ('n4', 'operation'),
+    ('ptr', 'num_iters_present'),
+    ('when', 'has_shard', (('n4', 'shard'),)),
+    ('when', 'is_enq', (('n4', 'num_iters'),)),
+    ('each', 'messages', 'input_length', _AQ_ARRAY_DEQ_ITEM),
+)
+_AQ_ARRAY_CALL_THIN = wire_schema.compile_encoder(_AQ_ARRAY_CALL, _THIN)
+_AQ_ARRAY_CALL_FROM_THIN = wire_schema.compile_decoder(_AQ_ARRAY_CALL, _THIN)
+_AQ_ARRAY_ENQ_HEAD: wire_schema.Schema = (
+    ('n4', 'relative_msgid_length'),
+    ('const', bytes([TTI_RXH])),
+    *_aq_string('queue_name'),
+    ('bytes', 'payload_toid', 16),
+    ('n4', 'message_version'),
+    ('n4', 'enq_flags'),
+)
+_AQ_ARRAY_ENQ_HEAD_THIN = wire_schema.compile_encoder(_AQ_ARRAY_ENQ_HEAD, _THIN)
+_AQ_ARRAY_ENQ_HEAD_FROM_THIN = wire_schema.compile_decoder(_AQ_ARRAY_ENQ_HEAD, _THIN)
+_AQ_ARRAY_ENQ_ITEM: wire_schema.Schema = (
+    ('const', bytes([TTI_RXD])),
+    ('n4', 'aqi_flags'),
+    *_AQ_MSG_PROPS,
+    ('n4', 'num_recipients'),
+    ('n4', 'visibility'),
+    ('n4', 'relative_msgid'),
+    ('n4', 'sequence_deviation'),
+    ('when', 'has_raw_length', (('n4', 'raw_payload_length'),)),
+)
+_AQ_ARRAY_ENQ_ITEM_THIN = wire_schema.compile_encoder(_AQ_ARRAY_ENQ_ITEM, _THIN)
+_AQ_ARRAY_ENQ_ITEM_FROM_THIN = wire_schema.compile_decoder(_AQ_ARRAY_ENQ_ITEM, _THIN)
+
+# The fields every enqueue, dequeue and array dequeue item writes the same.
+_AQ_ENQ_FIXED = {
+    'queue_name_present': True,
+    'relative_msgid_present': False,
+    'relative_msgid_length': 0,
+    'sequence_deviation': 0,
+    'toid_present': True,
+    'toid_length': 16,
+    'message_version': TNS_AQ_MESSAGE_VERSION,
+    'msgid_present': True,
+    'msgid_length': TNS_AQ_MESSAGE_ID_LENGTH,
+    'extensions_1_present': False,
+    'extensions_1_count': 0,
+    'extensions_2_present': False,
+    'extensions_2_count': 0,
+    'source_seq_present': False,
+    'source_seq_length': 0,
+    'max_seq_present': False,
+    'max_seq_length': 0,
+    'output_ack_length': 0,
+    'sender_correlation_present': False,
+    'sender_correlation_length': 0,
+    'sender_name_present': False,
+    'sender_name_length': 0,
+    'sender_address_present': False,
+    'sender_address_length': 0,
+    'sender_charset_present': False,
+    'sender_ncharset_present': False,
+}
+_AQ_DEQ_FIXED = {
+    'queue_name_present': True,
+    'props_present': True,
+    'props_length_present': True,
+    'recipients_present': True,
+    'recipients_length_present': True,
+    'toid_present': True,
+    'toid_length': 16,
+    'message_version': TNS_AQ_MESSAGE_VERSION,
+    'payload_present': True,
+    'out_msgid_present': True,
+    'out_msgid_length': TNS_AQ_MESSAGE_ID_LENGTH,
+    'extensions_present': False,
+    'extensions_count': 0,
+    'json_payload': False,
+    'shard': -1,
+}
+_AQ_ARRAY_DEQ_FIXED = {
+    'num_recipients': 0,
+    'num_deq_extensions': 0,
+    'relative_msgid': 0,
+    'sequence_deviation': 0,
+    'message_version': TNS_AQ_MESSAGE_VERSION,
+    'payload_length': 0,
+    'raw_payload_length': 0,
+    'reserved': 0,
+    'extensions_length': 0,
+    'source_seq_length': 0,
+}
+
+
+def _aq_texts(FieldVersion: int) -> dict:
+    # Which form a request's data-section strings take (_aq_text).
+    Bare = FieldVersion < FIELD_VERSION_12_1
+    return {'texts_bare': Bare, 'texts_counted': not Bare}
+
+
+def _aq_delivery_flags(Mode: int, Either: bool) -> int:
+    # The KPD flags of a delivery mode: buffered messages, and for a dequeue
+    # either kind.
+    if Mode == TNS_AQ_MSG_BUFFERED:
+        return TNS_KPD_AQ_BUFMSG
+    if Either and Mode == TNS_AQ_MSG_PERSISTENT_OR_BUFFERED:
+        return TNS_KPD_AQ_EITHER
+    return 0
+
+
 def decode_aq_message_props(Data: bytes, FieldVersion: int) -> tuple[dict, bytes]:
     """A message's properties (#128), and what follows them."""
     return _AQ_MSG_PROPS_FROM_THIN(
@@ -23633,209 +23862,160 @@ def decode_aq_array_reply(Data: bytes, FieldVersion: int, IsObject: bool) -> lis
     return Out
 
 
+def _aq_present(Name: str, Value: bytes | None) -> dict:
+    # A dequeue option's pointer, its length, and its bytes when it is set.
+    if Value is None:
+        return {f'{Name}_present': False, f'{Name}_length': 0}
+    return {f'{Name}_present': True, f'{Name}_length': len(Value), Name: Value}
+
+
+def _aq_text_option(Value: str | None) -> bytes | None:
+    # A dequeue option's string, None when it is not set or empty.
+    return Value.encode('utf-8') if Value else None
+
+
 def encode_aq_enq(Seq: int, FieldVersion: int, Queue, Props) -> bytes:
-    # AQ enqueue (TNS_FUNC_AQ_ENQ): the layout of python-oracledb's AqEnqMessage.
+    """An enqueue (TNS_FUNC_AQ_ENQ, #128): _AQ_ENQ after the function header,
+    then the payload."""
     QName = Queue.name.encode('utf-8')
-    Out = _fun_header(TNS_FUNC_AQ_ENQ, Seq, FieldVersion)
-    Out += bytes([1]) + encode_sb4(len(QName))  # queue name ptr + len
-    Out += _aq_write_msg_props(Props, FieldVersion)
-    if Props.recipients is None:
-        Out += bytes([0]) + encode_sb4(0)  # recipients ptr + count
-    else:
-        Out += bytes([1]) + encode_sb4(3 * len(Props.recipients))
-    Out += encode_sb4(Queue.enqoptions.visibility)
-    Out += bytes([0]) + encode_sb4(0)  # relative message id ptr+len
-    Out += encode_sb4(0)  # sequence deviation
-    Out += bytes([1]) + encode_sb4(16)  # payload TOID ptr + len
-    Out += encode_sb4(TNS_AQ_MESSAGE_VERSION)  # message version (ub2)
-    if Queue.is_json:
-        Out += bytes([0, 0]) + encode_sb4(0)  # payload 0, RAW 0, RAW len 0
-    elif Queue.payload_type is not None:
-        Out += bytes([1, 0]) + encode_sb4(0)  # payload 1, RAW 0, RAW len 0
-    else:
-        RawLen = len(Props.payload) if Props.payload is not None else 0
-        Out += bytes([0, 1]) + encode_sb4(RawLen)  # payload 0, RAW 1, RAW len
-    Out += bytes([1]) + encode_sb4(TNS_AQ_MESSAGE_ID_LENGTH)  # return msgid ptr+len
-    EnqFlags = (
-        TNS_KPD_AQ_BUFMSG
-        if Queue.enqoptions.delivery_mode == TNS_AQ_MSG_BUFFERED
-        else 0
+    Object = Queue.payload_type is not None
+    Raw = not Queue.is_json and not Object
+    Recipients = Props.recipients
+    Values = {
+        **_AQ_ENQ_FIXED,
+        **_aq_msg_props_values(Props, FieldVersion),
+        **_aq_texts(FieldVersion),
+        'queue_name_length': len(QName),
+        'queue_name': QName,
+        'recipients_present': Recipients is not None,
+        'recipients_length': 0 if Recipients is None else 3 * len(Recipients),
+        'visibility': Queue.enqoptions.visibility,
+        'payload_present': Object,
+        'raw_payload_present': Raw,
+        'raw_payload_length': (
+            len(Props.payload) if Raw and Props.payload is not None else 0
+        ),
+        'enq_flags': _aq_delivery_flags(Queue.enqoptions.delivery_mode, False),
+        'has_json_flag': FieldVersion >= FIELD_VERSION_20_1,
+        'json_payload': bool(Queue.is_json),
+        'payload_toid': Queue.payload_toid,
+    }
+    return (
+        _fun_header(TNS_FUNC_AQ_ENQ, Seq, FieldVersion)
+        + _AQ_ENQ_THIN(Values)
+        + _aq_write_payload(Queue, Props)
     )
-    Out += encode_sb4(EnqFlags)  # enqueue flags
-    Out += bytes([0]) + encode_sb4(0)  # extensions 1 ptr + count
-    Out += bytes([0]) + encode_sb4(0)  # extensions 2 ptr + count
-    Out += bytes([0]) + encode_sb4(0)  # source sequence num ptr+len
-    Out += bytes([0]) + encode_sb4(0)  # max sequence num ptr + len
-    Out += bytes([0])  # output ack length
-    Out += bytes([0]) + encode_sb4(0)  # correlation ptr + len
-    Out += bytes([0]) + encode_sb4(0)  # sender name ptr + len
-    Out += bytes([0]) + encode_sb4(0)  # sender address ptr + len
-    Out += bytes([0])  # sender charset id ptr
-    Out += bytes([0])  # sender ncharset id ptr
-    if FieldVersion >= FIELD_VERSION_20_1:
-        Out += bytes([1 if Queue.is_json else 0])  # JSON payload ptr
-    # data section
-    # 11g reads the queue name as it stands, with no length byte: one made
-    # it read the payload a byte off, ORA-00600 [kpoaqeq: payload] (#2697).
-    Out += QName if FieldVersion < FIELD_VERSION_12_1 else _bytes_with_length(QName)
-    Out += Queue.payload_toid  # 16-byte type OID (raw)
-    Out += _aq_write_payload(Queue, Props)
-    return Out
 
 
 def encode_aq_deq(Seq: int, FieldVersion: int, Queue) -> bytes:
-    # AQ dequeue (TNS_FUNC_AQ_DEQ): the layout of python-oracledb's AqDeqMessage.
+    """A dequeue (TNS_FUNC_AQ_DEQ, #128): _AQ_DEQ after the function
+    header."""
     Opts = Queue.deqoptions
     QName = Queue.name.encode('utf-8')
-    Out = _fun_header(TNS_FUNC_AQ_DEQ, Seq, FieldVersion)
-    Out += bytes([1]) + encode_sb4(len(QName))  # queue name ptr + len
-    Out += bytes([1, 1, 1, 1])  # msg props + recipient list ptrs
-    Consumer = Opts.consumer_name.encode('utf-8') if Opts.consumer_name else None
-    if Consumer is not None:
-        Out += bytes([1]) + encode_sb4(len(Consumer))
-    else:
-        Out += bytes([0]) + encode_sb4(0)
-    Out += _encode_sb4i(Opts.mode)
-    Out += _encode_sb4i(Opts.navigation)
-    Out += _encode_sb4i(Opts.visibility)
-    Out += _encode_sb4i(Opts.wait)
-    if Opts.msgid:
-        Out += bytes([1]) + encode_sb4(TNS_AQ_MESSAGE_ID_LENGTH)
-    else:
-        Out += bytes([0]) + encode_sb4(0)
-    Correlation = Opts.correlation.encode('utf-8') if Opts.correlation else None
-    if Correlation is not None:
-        Out += bytes([1]) + encode_sb4(len(Correlation))
-    else:
-        Out += bytes([0]) + encode_sb4(0)
-    Out += bytes([1]) + encode_sb4(16)  # payload TOID ptr + len
-    Out += encode_sb4(TNS_AQ_MESSAGE_VERSION)  # message version (ub2)
-    Out += bytes([1])  # payload ptr
-    Out += bytes([1]) + encode_sb4(TNS_AQ_MESSAGE_ID_LENGTH)  # return msgid ptr+len
-    DeqFlags = 0
-    if Opts.delivery_mode == TNS_AQ_MSG_BUFFERED:
-        DeqFlags |= TNS_KPD_AQ_BUFMSG
-    elif Opts.delivery_mode == TNS_AQ_MSG_PERSISTENT_OR_BUFFERED:
-        DeqFlags |= TNS_KPD_AQ_EITHER
-    Out += encode_sb4(DeqFlags)  # dequeue flags
-    Condition = Opts.condition.encode('utf-8') if Opts.condition else None
-    if Condition is not None:
-        Out += bytes([1]) + encode_sb4(len(Condition))
-    else:
-        Out += bytes([0]) + encode_sb4(0)
-    Out += bytes([0]) + encode_sb4(0)  # extensions ptr + count
-    if FieldVersion >= FIELD_VERSION_20_1:
-        Out += bytes([0])  # JSON payload ptr
-    if FieldVersion >= FIELD_VERSION_21_1:
-        Out += _encode_sb4i(-1)  # shard id
-    # data section
-    # 11g reads each string of the data section as it stands, with no length
-    # byte: the queue name (#2697), and the consumer, the correlation and the
-    # condition, as JDBC thin 11.2 writes them (#2700).
-    Text = (lambda b: b) if FieldVersion < FIELD_VERSION_12_1 else _bytes_with_length
-    Out += Text(QName)
-    if Consumer is not None:
-        Out += Text(Consumer)
-    if Opts.msgid:
-        Out += bytes(Opts.msgid[:16]).ljust(16, b'\x00')
-    if Correlation is not None:
-        Out += Text(Correlation)
-    Out += Queue.payload_toid  # 16-byte type OID (raw)
-    if Condition is not None:
-        Out += Text(Condition)
-    return Out
+    MsgId = bytes(Opts.msgid[:16]).ljust(16, b'\x00') if Opts.msgid else None
+    Values = {
+        **_AQ_DEQ_FIXED,
+        **_aq_texts(FieldVersion),
+        'queue_name_length': len(QName),
+        'queue_name': QName,
+        **_aq_present('consumer', _aq_text_option(Opts.consumer_name)),
+        'mode': Opts.mode,
+        'navigation': Opts.navigation,
+        'visibility': Opts.visibility,
+        'wait': Opts.wait,
+        **_aq_present('msgid', MsgId),
+        **_aq_present('correlation', _aq_text_option(Opts.correlation)),
+        'deq_flags': _aq_delivery_flags(Opts.delivery_mode, True),
+        **_aq_present('condition', _aq_text_option(Opts.condition)),
+        'has_json_flag': FieldVersion >= FIELD_VERSION_20_1,
+        'has_shard': FieldVersion >= FIELD_VERSION_21_1,
+        'payload_toid': Queue.payload_toid,
+    }
+    return _fun_header(TNS_FUNC_AQ_DEQ, Seq, FieldVersion) + _AQ_DEQ_THIN(Values)
 
 
-def _aq_write_array_enq(Queue, PropsList, FieldVersion: int) -> bytes:
-    QName = Queue.name.encode('utf-8')
-    Flags = (
-        TNS_KPD_AQ_BUFMSG
-        if Queue.enqoptions.delivery_mode == TNS_AQ_MSG_BUFFERED
-        else 0
+def _aq_array_deq_item(Queue, Props, FieldVersion: int) -> dict:
+    # One message of an array dequeue: the queue, the placeholder properties
+    # and the dequeue options.
+    Opts = Queue.deqoptions
+    return {
+        **_AQ_ARRAY_DEQ_FIXED,
+        **_aq_string_values('queue_name', Queue.name),
+        **_aq_msg_props_values(Props, FieldVersion),
+        **_aq_string_values('consumer', _aq_text_option(Opts.consumer_name)),
+        'mode': Opts.mode,
+        'navigation': Opts.navigation,
+        'visibility': Opts.visibility,
+        'wait': Opts.wait,
+        **_aq_string_values('msgid', Opts.msgid),
+        **_aq_string_values('deq_correlation', _aq_text_option(Opts.correlation)),
+        **_aq_string_values('condition', _aq_text_option(Opts.condition)),
+        **_aq_string_values('payload_toid', Queue.payload_toid),
+        'deq_flags': _aq_delivery_flags(Opts.delivery_mode, True),
+    }
+
+
+def _aq_array_enq_rows(Queue, PropsList, FieldVersion: int) -> bytes:
+    # An array enqueue's rows: the row header, then per message its row and
+    # its payload, and a STATUS byte after the last.
+    Flags = _aq_delivery_flags(Queue.enqoptions.delivery_mode, False)
+    Raw = Queue.payload_type is None and not Queue.is_json
+    Out = _AQ_ARRAY_ENQ_HEAD_THIN(
+        {
+            'relative_msgid_length': 0,
+            **_aq_string_values('queue_name', Queue.name),
+            'payload_toid': Queue.payload_toid,
+            'message_version': TNS_AQ_MESSAGE_VERSION,
+            'enq_flags': Flags,
+        }
     )
-    Out = encode_sb4(0)  # relative msgid length
-    Out += bytes([TTI_RXH])  # ROW_HEADER marker
-    Out += _obj_two_lengths(QName)
-    Out += Queue.payload_toid
-    Out += encode_sb4(TNS_AQ_MESSAGE_VERSION)
-    Out += encode_sb4(Flags)
     for Props in PropsList:
-        Out += bytes([TTI_RXD])  # ROW_DATA marker
-        Out += encode_sb4(Flags)  # aqi flags
-        Out += _aq_write_msg_props(Props, FieldVersion)
-        Out += encode_sb4(0)  # num recipients (None)
-        Out += encode_sb4(Queue.enqoptions.visibility)
-        Out += encode_sb4(0)  # relative message id
-        Out += encode_sb4(0)  # sequence deviation
-        if Queue.payload_type is None and not Queue.is_json:
-            Out += encode_sb4(len(Props.payload))
+        Out += _AQ_ARRAY_ENQ_ITEM_THIN(
+            {
+                'aqi_flags': Flags,
+                **_aq_msg_props_values(Props, FieldVersion),
+                'num_recipients': 0,
+                'visibility': Queue.enqoptions.visibility,
+                'relative_msgid': 0,
+                'sequence_deviation': 0,
+                'has_raw_length': Raw,
+                'raw_payload_length': len(Props.payload) if Raw else 0,
+            }
+        )
         Out += _aq_write_payload(Queue, Props)
-    Out += bytes([TTI_STA])  # STATUS marker
-    return Out
-
-
-def _aq_write_array_deq(Queue, PropsList, FieldVersion: int) -> bytes:
-    Opts = Queue.deqoptions
-    QName = Queue.name.encode('utf-8')
-    Flags = 0
-    if Opts.delivery_mode == TNS_AQ_MSG_BUFFERED:
-        Flags |= TNS_KPD_AQ_BUFMSG
-    elif Opts.delivery_mode == TNS_AQ_MSG_PERSISTENT_OR_BUFFERED:
-        Flags |= TNS_KPD_AQ_EITHER
-    Consumer = Opts.consumer_name.encode('utf-8') if Opts.consumer_name else None
-    Correlation = Opts.correlation.encode('utf-8') if Opts.correlation else None
-    Condition = Opts.condition.encode('utf-8') if Opts.condition else None
-    Out = b''
-    for Props in PropsList:
-        Out += _obj_two_lengths(QName)
-        Out += _aq_write_msg_props(Props, FieldVersion)
-        Out += encode_sb4(0)  # num recipients
-        Out += _aq_value_with_length(Consumer)
-        Out += _encode_sb4i(Opts.mode)
-        Out += _encode_sb4i(Opts.navigation)
-        Out += _encode_sb4i(Opts.visibility)
-        Out += _encode_sb4i(Opts.wait)
-        Out += _aq_value_with_length(Opts.msgid)
-        Out += _aq_value_with_length(Correlation)
-        Out += _aq_value_with_length(Condition)
-        Out += encode_sb4(0)  # extensions
-        Out += encode_sb4(0)  # relative message id
-        Out += encode_sb4(0)  # sequence deviation
-        Out += _obj_two_lengths(Queue.payload_toid)
-        Out += encode_sb4(TNS_AQ_MESSAGE_VERSION)
-        Out += encode_sb4(0)  # payload length
-        Out += encode_sb4(0)  # raw payload length
-        Out += encode_sb4(0)
-        Out += encode_sb4(Flags)
-        Out += encode_sb4(0)  # extensions length
-        Out += encode_sb4(0)  # source sequence length
-    return Out
+    return Out + bytes([TTI_STA])
 
 
 def encode_aq_array(
     Seq: int, FieldVersion: int, Queue, Operation: int, PropsList, NumIters: int
 ) -> bytes:
-    # AQ array enqueue / dequeue (TNS_FUNC_ARRAY_AQ): the layout of python-oracledb's
-    # AqArrayMessage. For dequeue PropsList is NumIters placeholder properties.
-    Out = _fun_header(TNS_FUNC_ARRAY_AQ, Seq, FieldVersion)
-    if Operation == TNS_AQ_ARRAY_ENQ:
-        Out += bytes([0]) + encode_sb4(0)  # input params ptr + len
-    else:
-        Out += bytes([1]) + encode_sb4(NumIters)
-    Out += encode_sb4(TNS_AQ_ARRAY_FLAGS_RETURN_MESSAGE_ID)
-    if Operation == TNS_AQ_ARRAY_ENQ:
-        Out += bytes([1, 0])  # output params ptr + len
-    else:
-        Out += bytes([1, 1])
-    Out += _encode_sb4i(Operation)
-    Out += bytes([1 if Operation == TNS_AQ_ARRAY_ENQ else 0])  # num iters ptr
-    if FieldVersion >= FIELD_VERSION_21_1:
-        Out += encode_sb4(0xFFFF)  # shard id
-    if Operation == TNS_AQ_ARRAY_ENQ:
-        Out += encode_sb4(NumIters)
-        Out += _aq_write_array_enq(Queue, PropsList, FieldVersion)
-    else:
-        Out += _aq_write_array_deq(Queue, PropsList, FieldVersion)
+    """An array enqueue or dequeue (TNS_FUNC_ARRAY_AQ, #128): _AQ_ARRAY_CALL
+    after the function header, then an enqueue's rows. For a dequeue
+    PropsList is NumIters placeholder properties."""
+    Enq = Operation == TNS_AQ_ARRAY_ENQ
+    Values = {
+        'input_present': not Enq,
+        'input_length': 0 if Enq else NumIters,
+        'array_flags': TNS_AQ_ARRAY_FLAGS_RETURN_MESSAGE_ID,
+        'output_present': True,
+        'output_length_present': not Enq,
+        'operation': Operation,
+        'num_iters_present': Enq,
+        'has_shard': FieldVersion >= FIELD_VERSION_21_1,
+        'shard': 0xFFFF,
+        'is_enq': Enq,
+        'num_iters': NumIters,
+        'messages': (
+            []
+            if Enq
+            else [_aq_array_deq_item(Queue, P, FieldVersion) for P in PropsList]
+        ),
+    }
+    Out = _fun_header(TNS_FUNC_ARRAY_AQ, Seq, FieldVersion) + _AQ_ARRAY_CALL_THIN(
+        Values
+    )
+    if Enq:
+        Out += _aq_array_enq_rows(Queue, PropsList, FieldVersion)
     return Out
 
 

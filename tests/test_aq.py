@@ -16,18 +16,32 @@ from seerdb.client.connection import (
     _decode_aq_enq,
 )
 from seerdb.common.tns import (
+    _AQ_ARRAY_CALL_FROM_THIN,
+    _AQ_ARRAY_ENQ_HEAD_FROM_THIN,
+    _AQ_ARRAY_ENQ_ITEM_FROM_THIN,
+    _AQ_DEQ_FROM_THIN,
+    _AQ_ENQ_FROM_THIN,
     _DECODE_FIELD_VERSION,
     _DECODE_SERVER_FIELD_VERSION,
+    encode_aq_array,
     encode_aq_deq,
     encode_aq_enq,
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
+    FIELD_VERSION_20_1,
+    FIELD_VERSION_21_1,
+    FIELD_VERSION_23_1_EXT_1,
+    TNS_AQ_ARRAY_DEQ,
+    TNS_AQ_ARRAY_ENQ,
     TNS_AQ_DEQ_REMOVE,
+    TNS_AQ_MSG_BUFFERED,
     TNS_FUNC_AQ_ENQ,
+    TNS_KPD_AQ_BUFMSG,
     TTI_FUN,
     TTI_RPA,
+    TTI_STA,
 )
 
 
@@ -137,6 +151,125 @@ class TestTheDequeueStringsBefore12c(unittest.TestCase):
         out = self._dequeue(FIELD_VERSION_12_1)
         self.assertIn(b'\x04SUB1\x06corr-1', out)
         self.assertTrue(out.endswith(b'\x10tab.priority = 5'))
+
+
+class TestTheRequestsReadBack(unittest.TestCase):
+    # Each request read back through its schema's decoder (#2773): the fields
+    # the queue, the options and the properties gave, at the field versions
+    # where the layout changes (11g's bare strings, 20.1's JSON flag, 21.1's
+    # shard id).
+    VERSIONS = (FIELD_VERSION_11_2, FIELD_VERSION_12_1, FIELD_VERSION_21_1)
+
+    @staticmethod
+    def _body(out: bytes, version: int) -> bytes:
+        # Past the function header: its token number from 23ai.
+        return out[4:] if version >= FIELD_VERSION_23_1_EXT_1 else out[3:]
+
+    @staticmethod
+    def _given(version: int) -> dict:
+        return {
+            'has_shard': version >= FIELD_VERSION_21_1,
+            'has_json_flag': version >= FIELD_VERSION_20_1,
+            'texts_bare': version < FIELD_VERSION_12_1,
+            'texts_counted': version >= FIELD_VERSION_12_1,
+        }
+
+    def test_a_negative_priority(self):
+        # Signed, as the expiration is: a negative priority raised (#2782).
+        q = Queue(_FakeConn(), 'PYO_Q')
+        out = encode_aq_enq(
+            1, FIELD_VERSION_12_1, q, MessageProperties(payload=b'x', priority=-5)
+        )
+        given = self._given(FIELD_VERSION_12_1)
+        (got, _) = _AQ_ENQ_FROM_THIN(self._body(out, FIELD_VERSION_12_1), given)
+        self.assertEqual(got['priority'], -5)
+        self.assertEqual(out[6:8], b'\x81\x05')  # after the queue name's ptr and length
+
+    def test_an_enqueue(self):
+        for version in self.VERSIONS:
+            q = Queue(_FakeConn(), 'PYO_Q')
+            q.enqoptions.delivery_mode = TNS_AQ_MSG_BUFFERED
+            props = MessageProperties(
+                payload=b'hello', correlation='corr', priority=3, recipients=['A']
+            )
+            out = encode_aq_enq(1, version, q, props)
+            (got, rest) = _AQ_ENQ_FROM_THIN(
+                self._body(out, version), self._given(version)
+            )
+            with self.subTest(version=version):
+                self.assertEqual(rest, b'hello')
+                self.assertEqual(got['queue_name'], b'PYO_Q')
+                self.assertEqual((got['priority'], got['expiration']), (3, -1))
+                self.assertEqual(got['correlation'], b'corr')
+                self.assertEqual(got['recipients_length'], 3)
+                self.assertEqual(got['raw_payload_length'], 5)
+                self.assertEqual(got['enq_flags'], TNS_KPD_AQ_BUFMSG)
+                self.assertEqual(got['payload_toid'], q.payload_toid)
+                self.assertEqual(
+                    [e['keyword'] for e in got['extensions']], [0x40, 0x41, 0x42, 0x45]
+                )
+
+    def test_a_dequeue(self):
+        for version in self.VERSIONS:
+            q = Queue(_FakeConn(), 'PYO_Q')
+            o = q.deqoptions
+            (o.consumer_name, o.condition, o.msgid) = (
+                'SUB1',
+                'tab.priority = 5',
+                b'\x07',
+            )
+            out = encode_aq_deq(1, version, q)
+            (got, rest) = _AQ_DEQ_FROM_THIN(
+                self._body(out, version), self._given(version)
+            )
+            with self.subTest(version=version):
+                self.assertEqual(rest, b'')
+                self.assertEqual(got['consumer'], b'SUB1')
+                self.assertEqual(got['condition'], b'tab.priority = 5')
+                self.assertEqual(got['msgid'], b'\x07' + bytes(15))
+                self.assertFalse(got['correlation_present'])
+                self.assertEqual(
+                    got.get('shard'), -1 if version >= FIELD_VERSION_21_1 else None
+                )
+
+    def test_an_array_dequeue(self):
+        for version in self.VERSIONS:
+            q = Queue(_FakeConn(), 'PYO_Q')
+            q.deqoptions.condition = 'c'
+            props = [MessageProperties() for _ in range(2)]
+            out = encode_aq_array(1, version, q, TNS_AQ_ARRAY_DEQ, props, 2)
+            given = {'has_shard': version >= FIELD_VERSION_21_1, 'is_enq': 0}
+            (got, rest) = _AQ_ARRAY_CALL_FROM_THIN(self._body(out, version), given)
+            with self.subTest(version=version):
+                self.assertEqual(rest, b'')
+                self.assertEqual(got['input_length'], 2)
+                self.assertEqual(
+                    [m['condition'] for m in got['messages']], [b'c', b'c']
+                )
+                self.assertEqual(got['messages'][0]['queue_name'], b'PYO_Q')
+
+    def test_an_array_enqueue(self):
+        for version in self.VERSIONS:
+            q = Queue(_FakeConn(), 'PYO_Q')
+            props = [
+                MessageProperties(payload=b'p%d' % i, priority=i) for i in range(2)
+            ]
+            out = encode_aq_array(1, version, q, TNS_AQ_ARRAY_ENQ, props, 2)
+            given = {'has_shard': version >= FIELD_VERSION_21_1, 'is_enq': 1}
+            (call, rest) = _AQ_ARRAY_CALL_FROM_THIN(self._body(out, version), given)
+            (head, rest) = _AQ_ARRAY_ENQ_HEAD_FROM_THIN(rest)
+            rows = []
+            for i in range(call['num_iters']):
+                (row, rest) = _AQ_ARRAY_ENQ_ITEM_FROM_THIN(
+                    rest, {'has_shard': given['has_shard'], 'has_raw_length': 1}
+                )
+                rows.append((row['priority'], bytes(rest[: row['raw_payload_length']])))
+                rest = rest[row['raw_payload_length'] :]
+            with self.subTest(version=version):
+                self.assertEqual((call['num_iters'], call['messages']), (2, []))
+                self.assertEqual(head['queue_name'], b'PYO_Q')
+                self.assertEqual(rows, [(0, b'p0'), (1, b'p1')])
+                self.assertEqual(rest, bytes([TTI_STA]))
 
 
 class TestArrayJsonGate(unittest.TestCase):

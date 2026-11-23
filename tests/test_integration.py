@@ -19267,6 +19267,17 @@ class AqRawIntegration(_IntegrationBase):
         self.assertEqual(got.msgid, sent.msgid)
         self.assertIsNone(queue.deqone())
 
+    def test_a_negative_priority_comes_back(self):
+        # Any integer is a priority, the smaller first; a negative one raised
+        # before it was sent (#2782).
+        queue = self.conn.queue(self.QUEUE)
+        queue.deqoptions.wait = 0
+        queue.enqone(self.conn.msgproperties(payload=b'neg', priority=-5))
+        self.conn.commit()
+        got = queue.deqone()
+        self.conn.commit()
+        self.assertEqual((got.payload, got.priority), (b'neg', -5))
+
     def test_a_dequeue_by_correlation_and_by_condition(self):
         # The dequeue's correlation and condition are strings of its data
         # section, which 11g takes without a length byte (#2700).
