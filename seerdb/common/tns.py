@@ -9060,10 +9060,14 @@ def encode_end_to_end_piggyback(Seq: int, FieldVersion: int, Attrs: dict) -> byt
     (client_identifier / module / action / client_info / dbop) to either its new
     str value or None (clear); only the keys present are flushed. The piggyback
     rides in front of the next call's message. Byte layout + field order mirror
-    oracledb's _write_end_to_end_piggyback (validated against a 23ai capture)."""
+    oracledb's _write_end_to_end_piggyback (validated against a 23ai capture).
+
+    An empty value is sent as None, the header alone (#2784). Oracle keeps an
+    empty string as NULL, and a server reads no value behind a zero length: the
+    value's `00` byte, written too, closed the connection."""
 
     def enc(Name):
-        return Attrs[Name].encode('utf-8') if Attrs.get(Name) is not None else None
+        return Attrs[Name].encode('utf-8') if Attrs.get(Name) else None
 
     Mod = {
         Name: Name in Attrs
