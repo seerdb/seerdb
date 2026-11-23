@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2019 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
+import itertools
 import os
 import sys
 import unittest
@@ -6615,6 +6616,201 @@ class TestEndToEndClientInfoDbop(unittest.TestCase):
                     encode_end_to_end_piggyback(9, 24, {name: ''}),
                     encode_end_to_end_piggyback(9, 24, {name: None}),
                 )
+
+
+class TestTheClientPiggybacksReadBack(unittest.TestCase):
+    # Each piggyback the client writes, read back by the decoder the Mirror
+    # uses (decode_client_piggyback, #2773), at the field version it was
+    # written for, with the call behind it left in place.
+    CALL = bytes([0x03, 0x5E, 0x09])
+
+    def _read(self, fv, data):
+        from seerdb.common import tns
+
+        token = tns._DECODE_FIELD_VERSION.set(fv)
+        try:
+            return tns.decode_client_piggyback(data + self.CALL)
+        finally:
+            tns._DECODE_FIELD_VERSION.reset(token)
+
+    def _each_fv(self):
+        from seerdb.common.tns_consts import (
+            FIELD_VERSION_11_2,
+            FIELD_VERSION_12_1,
+            FIELD_VERSION_23_4,
+        )
+
+        return (FIELD_VERSION_11_2, FIELD_VERSION_12_1, FIELD_VERSION_23_4)
+
+    def assertCarries(self, fv, data, func, carried):
+        self.assertEqual(self._read(fv, data), (func, carried, self.CALL))
+
+    def test_the_tracing_attributes(self):
+        from seerdb.common import tns
+        from seerdb.common.tns_consts import TNS_FUNC_SET_END_TO_END_ATTR
+
+        attrs = {'module': 'M', 'action': None, 'client_info': 'café', 'dbop': 'D'}
+        for fv in self._each_fv():
+            with self.subTest(fv=fv):
+                data = tns.encode_end_to_end_piggyback(4, fv, attrs)
+                self.assertCarries(fv, data, TNS_FUNC_SET_END_TO_END_ATTR, attrs)
+
+    def test_an_application_context_set_and_cleared(self):
+        from seerdb.common import tns
+        from seerdb.common.tns_consts import TNS_FUNC_APP_CONTEXT
+
+        for fv in self._each_fv():
+            with self.subTest(fv=fv):
+                entries = [(b'K1', b'V1'), (b'K2', b'')]
+                data = tns.encode_app_context_piggyback(4, fv, b'NS', entries)
+                want = ('NS', {'K1': 'V1', 'K2': ''})
+                self.assertCarries(fv, data, TNS_FUNC_APP_CONTEXT, want)
+                data = tns.encode_app_context_piggyback(4, fv, b'NS', [])
+                self.assertCarries(fv, data, TNS_FUNC_APP_CONTEXT, ('NS', None))
+
+    def test_the_transaction_priority(self):
+        from seerdb.common import tns
+        from seerdb.common.tns_consts import TNS_FUNC_ALTER_SESSION
+
+        for fv, priority in itertools.product(self._each_fv(), ('HIGH', '')):
+            with self.subTest(fv=fv, priority=priority):
+                data = tns.encode_alter_session_piggyback(4, fv, priority)
+                want = [('TXN_PRIORITY', priority)]
+                self.assertCarries(fv, data, TNS_FUNC_ALTER_SESSION, want)
+
+    def test_the_session_state(self):
+        from seerdb.common import tns
+        from seerdb.common.tns_consts import (
+            TNS_FUNC_SESSION_STATE,
+            TNS_SESSION_STATE_EXPLICIT_BOUNDARY,
+            TNS_SESSION_STATE_REQUEST_END,
+        )
+
+        state = TNS_SESSION_STATE_REQUEST_END
+        for fv in self._each_fv():
+            with self.subTest(fv=fv):
+                data = tns.encode_session_state_piggyback(4, fv, state)
+                want = state | TNS_SESSION_STATE_EXPLICIT_BOUNDARY
+                self.assertCarries(fv, data, TNS_FUNC_SESSION_STATE, want)
+
+    def test_the_end_user_security_context(self):
+        # The Mirror doesn't read it, so the piggyback is left in place; its
+        # body reads back through its schema.
+        from seerdb.common import tns
+
+        for fv in self._each_fv():
+            with self.subTest(fv=fv):
+                data = tns.encode_end_user_sec_piggyback(4, fv, b'\xff\x4a\x5a')
+                self.assertIsNone(self._read(fv, data))
+                token = tns._DECODE_FIELD_VERSION.set(fv)
+                try:
+                    _, body = tns._PIGGYBACK_HEAD_FROM_THIN(data)
+                    fields, rest = tns._PIG_END_USER_SEC_FROM_THIN(body + self.CALL)
+                finally:
+                    tns._DECODE_FIELD_VERSION.reset(token)
+                self.assertEqual(rest, self.CALL)
+                pair = fields['pairs'][0]
+                self.assertEqual(pair['keyword'], b'ORCL_XS_AUTHZ_CONTEXT')
+                self.assertEqual(pair['value'], b'\xff\x4a\x5a')
+
+    def test_the_closed_temp_lobs(self):
+        from seerdb.common import tns
+        from seerdb.common.tns_consts import TTI_LOBOPS
+
+        locators = [bytes(range(40)), bytes(range(40, 80))]
+        for fv in self._each_fv():
+            with self.subTest(fv=fv):
+                data = tns.encode_free_temp_lobs_piggyback(4, fv, locators)
+                self.assertCarries(fv, data, TTI_LOBOPS, locators)
+
+    def test_a_schema_change(self):
+        # The client sends none (python-oracledb does), so the message is built
+        # from its schema.
+        from seerdb.common import tns
+        from seerdb.common.tns_consts import TNS_FUNC_SET_SCHEMA
+
+        for fv, name in itertools.product(self._each_fv(), (b'HR', b'S' * 30)):
+            with self.subTest(fv=fv, name=name):
+                body = {
+                    'schema_present': True,
+                    'schema_length': len(name),
+                    'schema': name,
+                }
+                data = tns._piggyback_head(TNS_FUNC_SET_SCHEMA, 4, fv)
+                data += tns._PIG_SET_SCHEMA_THIN(body)
+                self.assertCarries(fv, data, TNS_FUNC_SET_SCHEMA, name)
+
+    def test_the_pipeline_begin_and_a_cursor_close(self):
+        from seerdb.common import tns
+        from seerdb.common.tns_consts import TNS_FUNC_PIPELINE_BEGIN, TTI_OCCA
+
+        for fv in self._each_fv():
+            with self.subTest(fv=fv):
+                data = tns.encode_pipeline_begin(4, fv, 7, 2)
+                self.assertCarries(fv, data, TNS_FUNC_PIPELINE_BEGIN, 2)
+                data = tns.encode_close_cursors_piggyback(4, fv, [5, 9])
+                self.assertCarries(fv, data, TTI_OCCA, [5, 9])
+
+    def test_an_unknown_piggyback_is_left_in_place(self):
+        from seerdb.common.tns_consts import TTI_MSG_TYPE_PIGGYBACK
+
+        data = bytes([TTI_MSG_TYPE_PIGGYBACK, 0x77, 4, 0, 0])
+        self.assertIsNone(self._read(self._each_fv()[0], data))
+
+    def test_a_piggyback_cut_short_says_truncated(self):
+        # So the Mirror reads the rest of the message on, rather than refusing
+        # the call (#849).
+        from seerdb.common import tns
+        from seerdb.common.exceptions import Truncated
+
+        fv = self._each_fv()[1]
+        data = tns.encode_app_context_piggyback(4, fv, b'NS', [(b'K', b'V')])
+        token = tns._DECODE_FIELD_VERSION.set(fv)
+        try:
+            for cut in (4, 9, len(data) - 1):
+                with self.subTest(cut=cut), self.assertRaises(Truncated):
+                    tns.decode_client_piggyback(data[:cut])
+        finally:
+            tns._DECODE_FIELD_VERSION.reset(token)
+
+
+class TestTheServerPiggybacksReadPast(unittest.TestCase):
+    # SESS_RET and OS_PID_MTS, which a DRCP broker sends, read past by their
+    # schemas to the reply behind them (#130, #2773).
+    REPLY = bytes([0x04, 0x01, 0x02])
+
+    def test_a_pooled_session_with_its_state(self):
+        from seerdb.common import tns
+
+        for pairs in ([], [('K', 'V'), ('', 'V2')]):
+            with self.subTest(pairs=pairs):
+                fields = {
+                    'dty_count': 0,
+                    'dty_length': 0,
+                    'count': len(pairs),
+                    'pairs': [
+                        {
+                            'key_length': len(k),
+                            'key': k.encode(),
+                            'value_length': len(v),
+                            'value': v.encode(),
+                            'pair_flags': 0,
+                        }
+                        for k, v in pairs
+                    ],
+                    'session_flags': 1,
+                    'session_id': 2310,
+                    'serial': 47001,
+                }
+                data = tns._SESS_RET_THIN(fields)
+                rest = tns._decode_server_piggyback(data + self.REPLY)
+                self.assertEqual(rest, self.REPLY)
+
+    def test_a_shared_server_process_id(self):
+        from seerdb.common import tns
+
+        data = tns._OS_PID_MTS_THIN({'pid_length': 5, 'pid': b'12345'})
+        self.assertEqual(tns._decode_server_piggyback(data + self.REPLY), self.REPLY)
 
 
 class TestScrollableExecEncoding(unittest.TestCase):

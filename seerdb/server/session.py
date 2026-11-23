@@ -93,7 +93,7 @@ from seerdb.common.tns import (
     _carried,
     ddl_command_type,
     decode_bfile_locator,
-    decode_dalc,
+    decode_client_piggyback,
     decode_marker_type,
     decode_ub4,
     encode_batch_errors_status,
@@ -173,7 +173,6 @@ from seerdb.common.tns import (
     parse_exec_oci,
     parse_fetch,
     parse_fetch_oci,
-    parse_free_temp_lobs_piggyback,
     parse_kod_request,
     parse_lobops_locator,
     parse_lobops_read,
@@ -185,7 +184,6 @@ from seerdb.common.tns import (
     peek_exec_cursor,
     reexecute_cursor_oci,
     scroll_start_row,
-    skip_close_cursors_piggyback,
     strip_oci_piggyback,
 )
 from seerdb.common.tns_consts import (
@@ -206,7 +204,6 @@ from seerdb.common.tns_consts import (
     ORA_UNIQUE_CONSTRAINT_VIOLATED,
     ORA_UNSUPPORTED_NETWORK_DATATYPE,
     ORA_USER_REQUESTED_CANCEL,
-    TNS_APP_CONTEXT_FLAG_CLEAR,
     TNS_BIND_DIR_INPUT,
     TNS_BIND_DIR_INPUT_OUTPUT,
     TNS_BIND_DIR_OUTPUT,
@@ -2658,7 +2655,7 @@ def _answer_describe_oci(
     stream.write_packet(TNS_DATA, reply)
 
 
-def _apply_schema(backend: Backend | None, schema: bytes | list) -> None:
+def _apply_schema(backend: Backend | None, schema: bytes) -> None:
     """Apply a SET_SCHEMA piggyback to the backend (#837).
 
     Run as the statement rather than through a new backend method: every backend
@@ -2672,9 +2669,8 @@ def _apply_schema(backend: Backend | None, schema: bytes | list) -> None:
     schema change into a failure of the statement it happened to travel with
     would be its own bug.
     """
-    # decode_dalc reports both an empty and a null value as [], which is the
-    # one case with nothing to apply.
-    if backend is None or not isinstance(schema, bytes) or not schema:
+    # An empty name is the one case with nothing to apply.
+    if backend is None or not schema:
         return
     name = schema.decode('utf-8', 'replace')
     try:
@@ -2890,39 +2886,31 @@ def _skip_piggybacks(
     # backend raises applying an application context (#1778) goes in `refused`,
     # for the caller to fail the call with.
     while len(body) >= 3 and body[0] == TTI_MSG_TYPE_PIGGYBACK:
-        func = body[1]
-        rest = body[3:]  # skip the piggyback token, function code, sequence
-        if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1_EXT_1:
-            _, rest = decode_ub4(rest)  # the fv24 ub8 token
+        # Each one's bytes are read in common (decode_client_piggyback), by the
+        # session's field version; what is done with them is here.
+        piggyback = decode_client_piggyback(body)
+        if piggyback is None:
+            break
+        func, carried, rest = piggyback
         if func == TTI_OCCA:  # CLOSE_CURSORS
-            rest = skip_close_cursors_piggyback(body)
+            pass
         elif func == TNS_FUNC_SET_END_TO_END_ATTR:
-            attrs, rest = _parse_end_to_end_piggyback(rest)
             apply = getattr(backend, 'set_end_to_end', None) if backend else None
-            if apply is not None and attrs:
-                apply(attrs)
+            if apply is not None and carried:
+                apply(carried)
         elif func == TNS_FUNC_SET_SCHEMA:
             # `connection.current_schema = x` (#837). A client does not send a
             # statement for this -- it holds the value and rides it out as a
             # piggyback on its next call, so the Mirror has to both consume the
             # bytes and apply the change, or the call behind it is unreachable.
-            #
-            # Layout read off a live 23ai, varying the name to separate the
-            # fields: a constant flag byte, the length as a ub4, then the name as
-            # a DALC that repeats it. Two length fields look redundant and are,
-            # but both scale -- a 299-character name sends `02 01 2b` and then a
-            # chunked (0xFE) DALC -- so neither can be assumed single-byte.
-            rest = rest[1:]  # the constant flag
-            _, rest = decode_ub4(rest)  # declared length, restated by the DALC
-            schema, rest = decode_dalc(rest)
-            _apply_schema(backend, schema)
+            _apply_schema(backend, carried)
         elif func == TNS_FUNC_SESSION_STATE:
-            _, rest = decode_ub4(rest)  # the requested state (ignored)
+            pass  # the requested state (ignored)
         elif func == TNS_FUNC_ALTER_SESSION:
             # `connection.transaction_priority = x` (#1779): key-value pairs, of
             # which TXN_PRIORITY is the one a client sends; an empty value (pair
             # flag 1) restores the default. A refused value fails the call.
-            pairs, rest = _parse_alter_session_piggyback(rest)
+            pairs = carried
             hooks = _txn_priority_hooks(backend) if backend else None
             for key, value in pairs:
                 if hooks is None or key.upper() != 'TXN_PRIORITY':
@@ -2939,7 +2927,7 @@ def _skip_piggybacks(
             # set_app_context() / clear_app_context() (#1778): one namespace per
             # piggyback, applied before the call; every one in the message is,
             # as 23ai applies a good namespace beside a refused one.
-            namespace, values, rest = _parse_app_context_piggyback(rest)
+            namespace, values = carried
             apply_ctx = getattr(backend, 'apply_app_context', None) if backend else None
             if apply_ctx is not None:
                 try:
@@ -2954,118 +2942,20 @@ def _skip_piggybacks(
             # second large LOB insert of a session was the one that broke. The
             # counterpart of the FREE_TEMP call in _answer_lobops; a locator
             # the Mirror never saw written is simply not there to drop.
-            freed, rest = parse_free_temp_lobs_piggyback(rest)
             if temp_lobs is not None:
-                for locator in freed:
+                for locator in carried:
                     temp_lobs.free(locator)
         elif func == TNS_FUNC_PIPELINE_BEGIN:
-            # Opens a pipelined burst (#1059). Layout after the common header
-            # (encode_pipeline_begin): an sb4 0, a zero byte, then the error
-            # mode. It shares the first call's token, which the caller has
-            # already taken from the header for the reply. The Mirror answers
-            # every call regardless of mode -- the reference client runs its
-            # bursts in CONTINUE_ON_ERROR and enforces abort itself -- so the
-            # mode is read past rather than acted on.
-            _, rest = decode_ub4(rest)  # reserved sb4 0
-            rest = rest[2:]  # a zero byte, then the pipeline mode
+            # Opens a pipelined burst (#1059). It shares the first call's token,
+            # which the caller has already taken from the header for the reply.
+            # The Mirror answers every call regardless of mode -- the reference
+            # client runs its bursts in CONTINUE_ON_ERROR and enforces abort
+            # itself -- so the mode is read past rather than acted on.
+            pass
         else:
             break
         body = rest
     return body
-
-
-def _parse_app_context_piggyback(
-    rest: bytes,
-) -> tuple[str, dict[str, str] | None, bytes]:
-    # The func-154 body (the inverse of the client's encode_app_context_
-    # piggyback, docs/PROTOCOL.md §41): pointer, namespace length, pointer,
-    # entry count, flags, a zero byte from field version 12.1, the namespace,
-    # then per entry its key and value (each with two lengths) and a ub4.
-    # Returns the namespace, its values (None for a clear) and the rest.
-    rest = rest[1:]  # pointer
-    _, rest = decode_ub4(rest)  # namespace length, restated below
-    rest = rest[1:]  # entries pointer
-    count, rest = decode_ub4(rest)
-    flags, rest = decode_ub4(rest)
-    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
-        rest = rest[1:]
-    raw, rest = decode_dalc(rest)
-    namespace = bytes(raw).decode('utf-8')
-    values: dict[str, str] = {}
-    for _ in range(count):
-        key, rest = _two_lengths(rest)
-        value, rest = _two_lengths(rest)
-        _, rest = decode_ub4(rest)
-        values[key] = value
-    return namespace, None if flags & TNS_APP_CONTEXT_FLAG_CLEAR else values, rest
-
-
-def _parse_alter_session_piggyback(
-    rest: bytes,
-) -> tuple[list[tuple[str, str]], bytes]:
-    # The func-204 body (the inverse of the client's encode_alter_session_
-    # piggyback, docs/PROTOCOL.md §42): flags, pointer, pair count, then per
-    # pair its key and value (each with two lengths) and a flag.
-    _, rest = decode_ub4(rest)  # flags
-    rest = rest[1:]  # pointer
-    count, rest = decode_ub4(rest)
-    pairs: list[tuple[str, str]] = []
-    for _ in range(count):
-        key, rest = _two_lengths(rest)
-        value, rest = _two_lengths(rest)
-        _, rest = decode_ub4(rest)  # 1 for an empty value
-        pairs.append((key, value))
-    return pairs, rest
-
-
-def _two_lengths(rest: bytes) -> tuple[str, bytes]:
-    # A value written with two lengths: a ub4 count, then (when non-zero) the
-    # bytes with their own length.
-    length, rest = decode_ub4(rest)
-    if not length:
-        return '', rest
-    raw, rest = decode_dalc(rest)
-    return bytes(raw).decode('utf-8'), rest
-
-
-def _parse_end_to_end_piggyback(rest: bytes) -> tuple[dict[str, str | None], bytes]:
-    # The SET_END_TO_END_ATTR body (the inverse of the client's
-    # encode_end_to_end_piggyback): two pointer bytes and the flags word, then
-    # one (modified, length) header per attribute — client_identifier, module,
-    # action, client_info, dbop — with the unsupported fixed slots between them,
-    # then a length-prefixed value for every attribute that was set. Returns the
-    # modified attributes (a cleared one — modified flag, no value — as None)
-    # and the bytes after the piggyback.
-    rest = rest[2:]  # cidnam / cidser pointers
-    _, rest = decode_ub4(rest)  # flags
-    attrs: dict[str, str | None] = {}
-    with_value: list[str] = []
-    for slot in (
-        'client_identifier',
-        'module',
-        'action',
-        'cideci',
-        'cidcct',
-        'client_info',
-        'cidkstk',
-        'cidktgt',
-        'dbop',
-    ):
-        modified, rest = rest[0], rest[1:]
-        length, rest = decode_ub4(rest)
-        if modified and slot in _END_TO_END_ATTRS:
-            attrs[slot] = None
-            if length:
-                with_value.append(slot)
-    for slot in with_value:
-        raw, rest = decode_dalc(rest)
-        attrs[slot] = bytes(raw).decode('utf-8')
-    return attrs, rest
-
-
-_END_TO_END_ATTRS = frozenset(
-    {'client_identifier', 'module', 'action', 'client_info', 'dbop'}
-)
 
 
 # REF CURSOR ids start clear of the fixed ids the Mirror's other OCI replies
