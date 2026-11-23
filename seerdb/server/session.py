@@ -3686,6 +3686,11 @@ def _answer_bfile_content(
         stream.write_packet(TNS_DATA, encode_lobops_length(request.locator, length))
 
 
+# What getchunksize() answers (#2790): a live 23ai's for a temporary LOB on
+# 8 KiB blocks, of every LOB type (a SecureFile column's is 32600).
+_LOB_CHUNK_SIZE = 8132
+
+
 def _answer_lobops(
     stream: PacketStream,
     body: bytes,
@@ -3849,11 +3854,13 @@ def _answer_lobops(
             encode_lobops_is_open(request.locator, temp_lobs.is_open(request.locator)),
         )
         return lobs, current_lob, current_object_lob
-    if request.kind == 'ack':
-        # TRIM / GET_CHUNK_SIZE: acknowledge with the content-free reply the
-        # client accepts. The value-returning form (a real chunk size, applying
-        # TRIM's length) is deferred (#421) — no test client needs it.
-        stream.write_packet(TNS_DATA, encode_lobops_ack(request.locator))
+    if request.kind == 'get_chunk_size':
+        # `lob.getchunksize()`: a value, behind the locator echoed as sent, as
+        # GET_LENGTH answers (#2790). The Mirror stores no blocks, so it gives
+        # what a real 23ai gives a temporary LOB on 8 KiB blocks.
+        stream.write_packet(
+            TNS_DATA, encode_lobops_length(request.locator, _LOB_CHUNK_SIZE)
+        )
         return lobs, current_lob, current_object_lob
     # A READ of an emitted column locator. The queue is row-major, matching the
     # order the locators went out (#413), but a client reads a large LOB in

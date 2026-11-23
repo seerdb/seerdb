@@ -2274,6 +2274,21 @@ _LOBOPS_READ: wire_schema.Schema = (
     ('bytes', 'locator', 'source_length'),
     ('when', 'amount_present', (('n8', 'amount'),)),
 )
+# Every request a thin client makes (#2773): a READ's fields, with the charset
+# the head's pointer announces behind the locator, ahead of the amount.
+# python-oracledb's CREATE_TEMP is the one that sets it: a 40-byte zero
+# locator, the session duration (10) in the destination length, the charset
+# form in the source offset (1 a CLOB, 2 an NCLOB, 0 a BLOB), the LOB type in
+# the destination offset, then the charset and no amount (#1066). A WRITE has
+# no amount; its data follows as a LOB_DATA message of its own, in 32 KiB
+# chunks with ub4 lengths (_lobops_write_data), not a field here. The locator
+# is the field as sent: a temp LOB's with its ub2 length, counted in the
+# source length, a column LOB's raw.
+_LOBOPS_REQUEST: wire_schema.Schema = (
+    *_LOBOPS_READ[:-1],
+    ('when', 'charset_present', (('n2', 'charset'),)),
+    _LOBOPS_READ[-1],
+)
 # Its reply: the content as LOB_DATA, then the return parameters -- the
 # locator echoed and the amount read, in the LOB's own units -- then the
 # status (#405, #413, #903).
@@ -3036,6 +3051,8 @@ def decode_auth_oci(payload: bytes) -> dict[str, Any]:
 
 _LOBOPS_HEAD_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_HEAD, _THIN)
 _LOBOPS_HEAD_THIN = wire_schema.compile_encoder(_LOBOPS_HEAD, _THIN)
+_LOBOPS_REQUEST_THIN = wire_schema.compile_encoder(_LOBOPS_REQUEST, _THIN)
+_LOBOPS_REQUEST_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_REQUEST, _THIN)
 _LOBOPS_READ_FROM_OCI = wire_schema.compile_decoder(_LOBOPS_READ, _OCI)
 _LOBOPS_READ_FROM_OCI_WIDE = wire_schema.compile_decoder(_LOBOPS_READ, _OCI_WIDE)
 _LOB_READ_REPLY_THIN = wire_schema.compile_encoder(_LOB_READ_REPLY, _THIN)
@@ -5274,69 +5291,31 @@ def _decode_lobops_chunked(data: bytes) -> bytes:
         rest = rest[chunk_len:]
 
 
-# The opcodes the Mirror acknowledges with a content-free RPA+OER but does not
-# yet act on (#417): OPEN / CLOSE bracket a write, TRIM truncates. Recognising
-# them (instead of mis-routing to the READ path) is what keeps a programmatic
-# client from desyncing. FREE_TEMP is handled apart (it drops the temp buffer).
-# The value-returning form of GET_CHUNK_SIZE / TRIM is a #421 follow-up.
-_LOBOPS_ACK_OPS = frozenset(
-    {TNS_LOB_OP_OPEN, TNS_LOB_OP_CLOSE, TNS_LOB_OP_GET_CHUNK_SIZE}
+def _lobops_inner_locator(field: bytes) -> bytes:
+    # The locator inside a ub2-length-prefixed field, as FREE_TEMP and the BFILE
+    # calls send it.
+    return field[2 : 2 + int.from_bytes(field[:2], 'big')]
+
+
+# The operations parse_lobops_request answers by name; a message of one of
+# them that the request shape does not fit is an error, not a read.
+_LOBOPS_CLASSIFIED = frozenset(
+    {
+        TNS_LOB_OP_CREATE_TEMP,
+        TNS_LOB_OP_WRITE,
+        TNS_LOB_OP_FREE_TEMP,
+        TNS_LOB_OP_TRIM,
+        TNS_LOB_OP_GET_LENGTH,
+        TNS_LOB_OP_IS_OPEN,
+        TNS_LOB_OP_OPEN,
+        TNS_LOB_OP_CLOSE,
+        TNS_LOB_OP_GET_CHUNK_SIZE,
+        TNS_LOB_OP_FILE_OPEN,
+        TNS_LOB_OP_FILE_CLOSE,
+        TNS_LOB_OP_FILE_ISOPEN,
+        TNS_LOB_OP_FILE_EXISTS,
+    }
 )
-
-
-def _lobops_state_locator(rest: bytes, source_loc_len: int) -> bytes:
-    # The locator for the OPEN / CLOSE / IS_OPEN trio, which must agree on it
-    # because one records a state the next reads back (#903/#887).
-    #
-    # Skipped by the DECLARED source length rather than a ub2 prefix, the same
-    # way the READ path does it: the declared length spans the field in both
-    # forms -- it is the locator's own size when the locator is raw (a column
-    # LOB) and that size + 2 when it is ub2-prefixed (a temp LOB).
-    rest = rest[2:]  # scn-array pointer + length
-    _src_offset, rest = decode_ub4(rest)
-    _dest_offset, rest = decode_ub4(rest)
-    rest = rest[1:]  # amount pointer flag
-    rest = rest[6:]  # three reserved ub2 array-LOB slots
-    # No ub2 prefix to strip, and no guessing at whether there is one. The
-    # client writes the locator RAW (`write_bytes`, which adds no length) and
-    # declares `write_ub4(len(locator))` for the source length, so the declared
-    # length IS the locator's -- exactly, for every op.
-    #
-    # An earlier version decided by looking at the bytes: strip two if the first
-    # two read as len - 2. That is a coincidence, not a fact. A raw locator
-    # whose opening bytes happen to hold that value lost two bytes that were
-    # never a prefix, the echoed locator came back the wrong length, and the
-    # client read past it -- DPY-5002. It survived an isolated run of the LOB
-    # files and failed the moment the whole suite supplied other locators.
-    return rest[:source_loc_len]
-
-
-def _lobops_locator_after_operation(rest: bytes) -> bytes:
-    # From just past the operation code, walk the shared §14.1 tail to the
-    # ub2-length-prefixed locator (WRITE / FREE_TEMP / OPEN / CLOSE / TRIM /
-    # GET_CHUNK_SIZE all carry it identically; only what follows differs).
-    rest = rest[2:]  # scn-array pointer + length
-    _src_offset, rest = decode_ub4(rest)
-    _dest_offset, rest = decode_ub4(rest)
-    rest = rest[1:]  # amount pointer flag
-    rest = rest[6:]  # three reserved ub2 array-LOB slots
-    loc_len = struct.unpack('>H', rest[:2])[0]
-    return rest[2 : 2 + loc_len]
-
-
-def _lobops_locator_and_tail(rest: bytes, source_loc_len: int) -> tuple[bytes, bytes]:
-    # The locator field AND whatever follows it, for an op that carries a value
-    # -- TRIM writes its new length there as a trailing ub4 (#826).
-    #
-    # By the declared source length, and the field is returned AS SENT, because
-    # the reply echoes it verbatim. Reading a ub2 here instead mangles a COLUMN
-    # locator, which is sent raw (#903/#887).
-    rest = rest[2:]  # scn-array pointer + length
-    _src_offset, rest = decode_ub4(rest)
-    _dest_offset, rest = decode_ub4(rest)
-    rest = rest[1:]  # amount pointer flag
-    rest = rest[6:]  # three reserved ub2 array-LOB slots
-    return rest[:source_loc_len], rest[source_loc_len:]
 
 
 def parse_lobops_request(body: bytes) -> LobOpsRequest:
@@ -5346,153 +5325,113 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     temp LOB and the OPEN / CLOSE / TRIM / GET_CHUNK_SIZE state ops are
     acknowledged (#417); anything else (a READ of an emitted column locator) is
     served by the #413 read path."""
-    # The common request layout (§14.1, _LOBOPS_HEAD); then each operation's
-    # own fields, to the ub2-prefixed locator (and, for a WRITE, the 0x0E
-    # payload). CREATE_TEMP shares the layout up to the operation, so it is
-    # classified there too. The declared source-locator-length equals the
-    # locator byte count for a raw locator (a persistent / column-LOB op) and
-    # that count + 2 for a ub2-length-prefixed one (a temp-LOB op), so skipping
-    # this many bytes steps over the whole locator field either way.
-    (head, rest) = _LOBOPS_HEAD_FROM_THIN(body)
-    (source_loc_len, operation) = (head['source_length'], head['operation'])
+    # Every operation is the _LOBOPS_REQUEST shape, read once, and classified
+    # by its operation; a WRITE's data follows as a LOB_DATA message.
+    #
+    # The locator is taken by the DECLARED source length, the field as sent:
+    # the locator's own size when it is raw (a column LOB) and that size + 2
+    # when it is ub2-prefixed (a temp LOB). Where a reply echoes it, it echoes
+    # this field verbatim (#903/#887). Deciding by the bytes instead -- strip
+    # two if the first two read as len - 2 -- is a coincidence, not a fact: a
+    # raw locator whose opening bytes happened to hold that value lost two bytes
+    # that were never a prefix, and the client read past the echo (DPY-5002).
+    (head, _) = _LOBOPS_HEAD_FROM_THIN(body)
+    operation = head['operation']
+    try:
+        (fields, rest) = _LOBOPS_REQUEST_FROM_THIN(body)
+        if len(fields['locator']) < fields['source_length']:
+            raise Truncated(
+                f'LOB call: a {fields["source_length"]}-byte locator, '
+                f'{len(fields["locator"])} left'
+            )
+    except (IndexError, Truncated):
+        if operation not in _LOBOPS_CLASSIFIED:
+            # A READ, or an operation this does not know, that the shape does
+            # not fit reads the LOB whole, as before.
+            return LobOpsRequest(kind='read')
+        raise
+    locator = fields['locator']
+    amount = fields.get('amount', 0)
     if operation == TNS_LOB_OP_CREATE_TEMP:
         # Classified by the OPERATION, not by the opening bytes. CREATE_TEMP used
         # to be recognised by the prefix 01 01 28, on the belief that no other
         # request could open that way. A WRITE can: it opens with a pointer flag
         # and then the locator length plus two, and a real-size 38-byte locator
-        # makes that 01 01 28 exactly. The prefix only ever held because the
-        # Mirror's own locators were short; sized like a real server's, every
-        # WRITE became a second CREATE_TEMP and its bytes were lost (#846).
-        # CLOB vs BLOB is the LOB type byte (0x70 / 0x71) in the fixed block.
-        return LobOpsRequest(kind='create_temp', is_blob=0x71 in rest)
+        # makes that 01 01 28 exactly (#846). CLOB vs BLOB is the LOB type in the
+        # destination offset.
+        return LobOpsRequest(
+            kind='create_temp', is_blob=fields['dest_offset'] == TNS_TYPE_BLOB
+        )
     if operation == TNS_LOB_OP_WRITE:
-        rest = rest[2:]  # scn-array pointer + length
         # The 1-based position the write starts at. A client does not only
         # append: `lob.write(value, 1)` OVERWRITES from the start, so dropping
-        # this put every write on the end (#903/#887).
-        write_offset, rest = decode_ub4(rest)
-        _dest_offset, rest = decode_ub4(rest)
-        rest = rest[1:]  # amount pointer flag
-        rest = rest[6:]  # three reserved ub2 array-LOB slots
-        # The field as sent, by the declared source length -- which spans it in
-        # both forms, so the payload after it starts in the same place either
-        # way. A COLUMN LOB sends the locator RAW, and reading its first two
-        # bytes as a ub2 length yielded a garbage key, so the write was filed
-        # somewhere the following size() could not find (#903/#887).
-        #
-        # The REPLY must then echo this field verbatim (encode_lobops_echo).
-        # Passing it to encode_lobops_ack instead prepends a second length --
-        # 42 bytes where the client expects 40 -- which desynced 44 tests.
-        locator = rest[:source_loc_len]
-        rest = rest[source_loc_len:]
-        if rest and rest[0] == 0x0E:
+        # this put every write on the end (#903/#887). A COLUMN LOB sends the
+        # locator RAW, so the field is kept whole: its first two bytes read as a
+        # ub2 length yielded a garbage key, and the write was filed somewhere
+        # the following size() could not find. The reply echoes it verbatim
+        # (encode_lobops_echo); encode_lobops_ack would prepend a second length
+        # -- 42 bytes where the client expects 40.
+        if rest[:1] == bytes([TTI_LOB]):
             rest = rest[1:]
         return LobOpsRequest(
             kind='write',
             locator=locator,
             payload=_decode_lobops_chunked(rest),
-            offset=max(write_offset, 1),
+            offset=max(fields['source_offset'], 1),
         )
     if operation in _LOBOPS_FILE_KINDS:
         # A BFILE call: the locator carries the directory and file name, so the
-        # server needs no state to answer one (#1102).
-        #
-        # FILE_OPEN also sends its mode as a trailing amount, which the reply
-        # owes back, as a LOB's OPEN does (#1672).
-        locator = _lobops_locator_after_operation(rest)
-        tail = rest[2:]
-        _, tail = decode_ub4(tail)
-        _, tail = decode_ub4(tail)
-        tail = tail[7 + 2 + len(locator) :]
-        amount, _ = decode_ub4(tail) if tail else (0, b'')
+        # server needs no state to answer one (#1102). FILE_OPEN also sends its
+        # mode as the amount, which the reply owes back, as a LOB's OPEN does
+        # (#1672).
         return LobOpsRequest(
-            kind=_LOBOPS_FILE_KINDS[operation], locator=locator, amount=amount
+            kind=_LOBOPS_FILE_KINDS[operation],
+            locator=_lobops_inner_locator(locator),
+            amount=amount,
         )
     if operation == TNS_LOB_OP_FREE_TEMP:
-        return LobOpsRequest(
-            kind='free_temp', locator=_lobops_locator_after_operation(rest)
-        )
+        return LobOpsRequest(kind='free_temp', locator=_lobops_inner_locator(locator))
     if operation == TNS_LOB_OP_TRIM:
-        # TRIM carries its new length as a trailing ub4 and is answered with that
+        # TRIM carries its new length as the amount and is answered with that
         # length, exactly like GET_LENGTH -- not with a content-free ack, which is
         # what left `lob.trim()` desyncing (#826).
-        locator, tail = _lobops_locator_and_tail(rest, source_loc_len)
-        amount, _ = decode_ub4(tail) if tail else (0, b'')
         return LobOpsRequest(kind='trim', locator=locator, amount=amount)
     if operation == TNS_LOB_OP_GET_LENGTH:
         # `lob.size()`. It owes a real figure, so it cannot join the ack ops
-        # above -- and it must not fall through to the column-read path, which
+        # below -- and it must not fall through to the column-read path, which
         # answers with a read reply and a placeholder locator (#826).
-        return LobOpsRequest(
-            kind='get_length', locator=_lobops_state_locator(rest, source_loc_len)
-        )
+        return LobOpsRequest(kind='get_length', locator=locator)
     if operation == TNS_LOB_OP_IS_OPEN:
         # `lob.isopen()`. It owes a real answer, so like GET_LENGTH it cannot
         # join the ack ops -- and it must not reach the read path below, which
         # replies with a read shape the client walks off the end of (#903/#887).
-        #
-        # Skipped by the DECLARED source length, not by a ub2 prefix: a column
-        # LOB carries its locator raw, and reading the first two locator bytes
-        # as a length yields a garbage locator to echo back. The READ path below
-        # draws the same distinction for the same reason (#903).
-        return LobOpsRequest(
-            kind='is_open', locator=_lobops_state_locator(rest, source_loc_len)
-        )
+        return LobOpsRequest(kind='is_open', locator=locator)
     if operation in (TNS_LOB_OP_OPEN, TNS_LOB_OP_CLOSE):
         # Acknowledged like the ops below, but named apart so the server can
-        # remember the open state IS_OPEN has to report back -- and extracted
-        # the SAME way IS_OPEN extracts it, so the two agree on the key. They
-        # did not: OPEN stripped a ub2 prefix unconditionally while IS_OPEN
-        # skipped by the declared length, so on a raw column locator one of them
-        # keyed on garbage and `isopen()` denied an open it had just accepted.
-        field = _lobops_state_locator(rest, source_loc_len)
-        # OPEN carries its MODE as the trailing amount, and the reply owes that
-        # field back (encode_lobops_open_ack). CLOSE sends none.
-        mode = 0
-        if operation == TNS_LOB_OP_OPEN:
-            tail = rest[2:]
-            _s, tail = decode_ub4(tail)
-            _d, tail = decode_ub4(tail)
-            tail = tail[1:]
-            tail = tail[6:]
-            tail = tail[source_loc_len:]
-            if tail:
-                mode, _ = decode_ub4(tail)
+        # remember the open state IS_OPEN has to report back -- keyed on the
+        # same field IS_OPEN is, so the two agree. OPEN carries its MODE as the
+        # amount, and the reply owes that field back (encode_lobops_open_ack).
+        # CLOSE sends none.
         return LobOpsRequest(
             kind='open' if operation == TNS_LOB_OP_OPEN else 'close',
-            locator=field,
-            amount=mode,
+            locator=locator,
+            amount=amount if operation == TNS_LOB_OP_OPEN else 0,
         )
-    if operation in _LOBOPS_ACK_OPS:
-        return LobOpsRequest(kind='ack', locator=_lobops_locator_after_operation(rest))
+    if operation == TNS_LOB_OP_GET_CHUNK_SIZE:
+        # `lob.getchunksize()` owes a value too, behind the locator echoed as
+        # sent, as GET_LENGTH does (#2790). Answered with a content-free ack it
+        # desynced a temp LOB, and gave 0 on a column LOB only because the old
+        # walk ran past its raw locator into the request's trailing amount byte.
+        return LobOpsRequest(kind='get_chunk_size', locator=locator)
     # READ (the #413 column-LOB read) and anything else fall through to the read
     # path — unchanged, so an unrecognised op behaves as before rather than worse.
-    if operation == TNS_LOB_OP_READ:
-        # Walk to the trailing ub8 amount the client writes last of all (#903).
-        # A column-LOB READ sends the locator RAW (not ub2-length-prefixed the way
-        # a temp op does), so the locator cannot be skipped by reading a length
-        # prefix -- that read the first two locator bytes as a length, overshot,
-        # and dropped every read to the "whole LOB from offset 1" fallback, which
-        # served the wrong queue entry (#903). Skip it by the declared
-        # source-locator-length instead, which spans the field in both forms.
-        try:
-            tail = rest[2:]  # scn-array pointer + length
-            source_offset, tail = decode_ub4(tail)
-            _dest_offset, tail = decode_ub4(tail)
-            tail = tail[1:]  # amount pointer flag
-            tail = tail[6:]  # three reserved ub2 array-LOB slots
-            locator = tail[:source_loc_len]  # the locator, raw or ub2-prefixed
-            tail = tail[source_loc_len:]
-            amount, _ = decode_ub4(tail)
-            return LobOpsRequest(
-                kind='read',
-                offset=max(source_offset, 1),
-                amount=amount,
-                locator=locator,
-            )
-        except (IndexError, struct.error, Truncated):
-            # A shape this walk does not fit reads the LOB whole, as before.
-            return LobOpsRequest(kind='read')
+    if operation == TNS_LOB_OP_READ and 'amount' in fields:
+        return LobOpsRequest(
+            kind='read',
+            offset=max(fields['source_offset'], 1),
+            amount=amount,
+            locator=locator,
+        )
     return LobOpsRequest(kind='read')
 
 
@@ -8294,6 +8233,9 @@ def _read_lob_column(
 def _read_lob_column_parts(
     Rest: bytes, inline_image: bool
 ) -> tuple[bytes | None, bytes, bytes | None, bytes | None]:
+    # Hand-written, not a schema (#2773): its forms are told apart by the byte
+    # after the length, which no field names -- see the metadata form below.
+    #
     # LOB column layout in RXD (Oracle 11g):
     #
     #   ub1 0x00              → NULL LOB; total column size = 1 byte.
@@ -15888,6 +15830,15 @@ _O7_LOBOP_FLAGS = {
 }
 
 
+def _check_o7_lob_range(Offset: int, Amount: int) -> None:
+    # A pre-10g LOB call's offset and amount are ub4s, as a 9i LOB is at most
+    # 4 GiB: one past that is refused, not sent overflowed or cut short (#2788).
+    if Offset > 0xFFFFFFFF or Amount > 0xFFFFFFFF:
+        raise NotSupportedError(
+            'a LOB offset or amount past 4 GiB requires an Oracle 10g or later server'
+        )
+
+
 def _encode_o7_lobop(
     Seq: int,
     Locator: bytes,
@@ -15900,6 +15851,7 @@ def _encode_o7_lobop(
     # fetched, a ub2 length and the body (`_read_lob_column`), and its length
     # counts both; CLOB/BLOB locators are 86 bytes, BFILE locators vary with
     # the directory and file name.
+    _check_o7_lob_range(Offset, Amount)
     Values = {
         'seq': Seq,
         'token_number': None,
@@ -17563,6 +17515,7 @@ def encode_9i_oall8_lobop(
     # amount is GET_LENGTH's / GET_CHUNK_SIZE's 0, OPEN's mode, TRIM's new length,
     # a WRITE's count; IS_OPEN and CLOSE carry none. A WRITE's `Data` follows as
     # TTI_LOB content, framed as the compact path frames it (`0e 03 58 59 5a`).
+    _check_o7_lob_range(Offset, Amount)
     Values = {
         'seq': Seq & 0xFF,
         'token_number': None,
@@ -19042,138 +18995,146 @@ def decode_fv2_block_out(
     return (OutValues, RowCount, ErrCode)
 
 
-# The part of a CREATE_TEMP body every LOB type shares (#91, #1066).
-_CREATE_TEMP_HEAD = bytes.fromhex('01012800010a00000100010201100000')
-
-
-def _create_temp_body(is_blob: bool, csfrm: int = _CSFRM_DB) -> bytes:
-    """A CREATE_TEMP body for a CLOB, NCLOB or BLOB (#1066).
+def _create_temp_fields(is_blob: bool, csfrm: int = _CSFRM_DB) -> dict[str, Any]:
+    """A CREATE_TEMP's fields for a CLOB, NCLOB or BLOB (#1066), the
+    _LOBOPS_REQUEST shape.
 
     Captured from python-oracledb against a live 23ai (``createlob`` of each
-    type) and diffed. After a shared head the three differ in exactly two places:
+    type) and diffed. The three differ in exactly two places:
 
     ======  =================  ==============================
-    type    charset form       trailing charset id (sb4)
+    type    charset form       trailing charset id
     ======  =================  ==============================
-    CLOB    ``01 01``          873 (AL32UTF8)
-    NCLOB   ``01 02``          **2000 (AL16UTF16)**
-    BLOB    ``00`` (none)      873
+    CLOB    1                  873 (AL32UTF8)
+    NCLOB   2                  **2000 (AL16UTF16)**
+    BLOB    0 (none)           873
     ======  =================  ==============================
 
-    The trailing field is the CHARSET, not a constant: this used to be two
-    captured blobs ending in a fixed ``0x0369``, which is only right because
-    nobody had created an NCLOB. Note the NCLOB's bind OAC does NOT follow it --
-    that keeps charset 873 and differs only in its form (_encode_lob_bind_oac).
-    Between them sit the LOB-type field (``01 70`` / ``01 71``) and 47 zero
-    bytes, which are the same for all three."""
+    The form rides in the source offset and the LOB type (112 / 113) in the
+    destination offset. The trailing field is the CHARSET, not a constant: this
+    used to be two captured blobs ending in a fixed ``0x0369``, which is only
+    right because nobody had created an NCLOB. Note the NCLOB's bind OAC does
+    NOT follow it -- that keeps charset 873 and differs only in its form
+    (_encode_lob_bind_oac)."""
     if is_blob:
-        form, lob_type, charset = b'\x00', TNS_TYPE_BLOB, AL32UTF8_CHARSET
+        form, lob_type, charset = 0, TNS_TYPE_BLOB, AL32UTF8_CHARSET
     elif csfrm == _CSFRM_NCHAR:
-        form, lob_type, charset = b'\x01\x02', TNS_TYPE_CLOB, AL16UTF16_CHARSET
+        form, lob_type, charset = 2, TNS_TYPE_CLOB, AL16UTF16_CHARSET
     else:
-        form, lob_type, charset = b'\x01\x01', TNS_TYPE_CLOB, AL32UTF8_CHARSET
-    return (
-        _CREATE_TEMP_HEAD
-        + form
-        + bytes([0x01, lob_type])
-        + bytes(47)
-        + encode_sb4(charset)
-    )
+        form, lob_type, charset = 1, TNS_TYPE_CLOB, AL32UTF8_CHARSET
+    return {
+        'source_length': _CREATE_TEMP_LOCATOR_LENGTH,
+        'dest_length': _LOB_DURATION_SESSION,
+        'charset_present': True,
+        'null_lob_present': True,
+        'operation': TNS_LOB_OP_CREATE_TEMP,
+        'source_offset': form,
+        'dest_offset': lob_type,
+        'locator': bytes(_CREATE_TEMP_LOCATOR_LENGTH),
+        'charset': charset,
+    }
+
+
+# What every thin LOB request starts from (_LOBOPS_REQUEST): a source locator
+# and nothing else -- no destination, offsets, charset, SCN or array slots.
+_LOBOPS_REQUEST_FIXED: dict[str, Any] = {
+    'source_present': True,
+    'dest_present': False,
+    'dest_length': 0,
+    'short_source_offset': 0,
+    'short_dest_offset': 0,
+    'charset_present': False,
+    'short_amount_present': False,
+    'null_lob_present': False,
+    'scn_present': False,
+    'scn_length': 0,
+    'source_offset': 0,
+    'dest_offset': 0,
+    'amount_present': False,
+    'array_slot_1': False,
+    'array_length_1': 0,
+    'array_slot_2': False,
+    'array_length_2': 0,
+    'array_slot_3': False,
+    'array_length_3': 0,
+}
+# A CREATE_TEMP's empty locator, and the session duration it asks for.
+_CREATE_TEMP_LOCATOR_LENGTH = 40
+_LOB_DURATION_SESSION = 10
+
+
+def _lobops_write_data(Data: bytes) -> bytes:
+    # A WRITE's data, the LOB_DATA message behind the request (#91, §14.2):
+    # TTI_LOB, then the data with its length while it is at most 252 bytes,
+    # else 0xFE and chunks of up to 32 KiB, each with a ub4 length, ending at a
+    # zero one. Read back by _decode_lobops_chunked.
+    Out = bytes([TTI_LOB])
+    if len(Data) <= TNS_MAX_SHORT_LENGTH:
+        return Out + bytes([len(Data)]) + Data
+    Out += bytes([TNS_LONG_LENGTH_INDICATOR])
+    for K in range(0, len(Data), 0x7FFF):
+        Chunk = Data[K : K + 0x7FFF]
+        Out += encode_sb4(len(Chunk)) + Chunk
+    return Out + encode_sb4(0)  # zero-length terminator
 
 
 def encode_dictionary_lobops(Dictionary: dict) -> bytes:
-    # TTI_LOBOPS request. See docs/PROTOCOL.md §14 for the field layout.
-    # This builds a READ request specifically (operation = 0x0002) since
-    # that's all the driver currently issues; other opcodes plug into the
-    # same shape by varying `operation` and the pointer flags.
+    # TTI_LOBOPS request, every operation the _LOBOPS_REQUEST shape. See
+    # docs/PROTOCOL.md §14 for the field layout.
     Tseq = Dictionary['seq']
     FieldVersion = Dictionary.get('field_version', FIELD_VERSION_11_2)
     _ENCODE_FIELD_VERSION.set(FieldVersion)
     # LOB ops carry no request-pipelining token today, as the hand-built header
     # did (its token was always 0); the 23ai `token` field stays the zero byte.
-    TokenNum = 0
-
-    def _head(source_length: int, operation: int, *, null_lob: bool = False) -> bytes:
-        # The request head every operation shares (_LOBOPS_HEAD): the source
-        # locator (its length here, the bytes in the tail), no destination, no
-        # charset and no short amount, then the operation. FILE_EXISTS alone sets
-        # the null-lob pointer -- the field the server answers "is it null" into.
-        return _LOBOPS_HEAD_THIN(
-            {
-                'seq': Tseq,
-                'token_number': TokenNum,
-                'source_present': True,
-                'source_length': source_length,
-                'dest_present': False,
-                'dest_length': 0,
-                'short_source_offset': 0,
-                'short_dest_offset': 0,
-                'charset_present': False,
-                'short_amount_present': False,
-                'null_lob_present': null_lob,
-                'operation': operation,
-            }
-        )
-
+    Fields: dict[str, Any] = {
+        **_LOBOPS_REQUEST_FIXED,
+        'seq': Tseq,
+        'token_number': 0,
+    }
     if Dictionary.get('create_temp'):
         # CREATE_TEMP (op 0x0110, #91): allocate a session-duration temporary
         # LOB; the server returns the new locator in the response RPA. 12c+ only;
-        # 11g rejects CREATE_TEMP. Its body is its own shape, not the shared head.
-        return _fun_header(TTI_LOBOPS, Tseq, FieldVersion) + _create_temp_body(
-            bool(Dictionary.get('is_blob')), Dictionary.get('csfrm', _CSFRM_DB)
+        # 11g rejects CREATE_TEMP.
+        Fields.update(
+            _create_temp_fields(
+                bool(Dictionary.get('is_blob')), Dictionary.get('csfrm', _CSFRM_DB)
+            )
         )
-    if Dictionary.get('operation') == TNS_LOB_OP_WRITE:
+        return _LOBOPS_REQUEST_THIN(Fields)
+    Locator = Dictionary['locator']
+    Operation = Dictionary.get('operation', TNS_LOB_OP_READ)
+    if Operation == TNS_LOB_OP_WRITE:
         # WRITE (op 0x0040, #91): push `data` into the LOB at `source_offset`.
         # Reverse-engineered from python-oracledb on 21c (small + 60 KB CLOB
-        # writes, byte-for-byte). Differences from the READ shape above:
-        #   * operation = 0x0040
-        #   * the source-locator-length field counts the ub2 length prefix too
-        #     (len + 2), and the locator is sent as <ub2 len><bytes> rather than
-        #     raw — READ declares the bare length and sends the locator raw
-        #   * the amount pointer is absent (no trailing sb4 amount); the payload
-        #     is appended instead as a 0x0E marker + a chunked-bytes field:
-        #       <ub1 len><data>                       when len <= 0xFC, else
-        #       0xFE (<sb4 chunklen><chunk>)... <00>   (chunks <= 0x7FFF bytes)
-        # CLOB data must already be UTF-16BE; BLOB data is raw bytes.
-        Locator = Dictionary['locator']
-        Data = Dictionary['data']
-        SourceOffset = Dictionary.get('source_offset', 1)
+        # writes, byte-for-byte). Unlike a READ it sends no amount, and its data
+        # follows as a LOB_DATA message. CLOB data must already be UTF-16BE; BLOB
+        # data is raw bytes.
+        #
         # A TEMP locator rides ub2-length-prefixed with the length counting the
         # prefix; a PERSISTENT (column) locator rides bare with its own length,
         # exactly the split READ already makes. Sending a column locator in the
         # temp form is answered ORA-22275 "invalid LOB locator specified" (#964).
-        Prefixed = Dictionary.get('locator_prefixed', True)
-        Out = _head(len(Locator) + 2 if Prefixed else len(Locator), TNS_LOB_OP_WRITE)
-        Out += bytes([0])  # scn array pointer absent
-        Out += bytes([0])  # scn array length
-        Out += encode_sb4(SourceOffset)  # source offset (ub8)
-        Out += encode_sb4(0)  # dest offset (ub8)
-        Out += bytes([0])  # amount pointer absent
-        Out += struct.pack('>HHH', 0, 0, 0)  # three reserved ub16be slots
-        if Prefixed:
-            Out += struct.pack('>H', len(Locator))  # ub2 locator length prefix
-        Out += Locator
-        Out += bytes([0x0E])  # WRITE-data marker
-        if len(Data) <= TNS_MAX_SHORT_LENGTH:
-            Out += bytes([len(Data)]) + Data
-        else:
-            Out += bytes([TNS_LONG_LENGTH_INDICATOR])
-            for K in range(0, len(Data), 0x7FFF):
-                Chunk = Data[K : K + 0x7FFF]
-                Out += encode_sb4(len(Chunk)) + Chunk
-            Out += encode_sb4(0)  # zero-length terminator
-        return Out
-    if Dictionary.get('operation') in (
+        if Dictionary.get('locator_prefixed', True):
+            Locator = prefixed_locator(Locator)
+        Fields.update(
+            {
+                'source_length': len(Locator),
+                'operation': Operation,
+                'source_offset': Dictionary.get('source_offset', 1),
+                'locator': Locator,
+            }
+        )
+        return _LOBOPS_REQUEST_THIN(Fields) + _lobops_write_data(Dictionary['data'])
+    if Operation in (
         TNS_LOB_OP_FILE_OPEN,
         TNS_LOB_OP_FILE_CLOSE,
         TNS_LOB_OP_FILE_EXISTS,
     ):
-        # BFILE open / close (#46) and exists (#1109). Same field block as READ
-        # but with source offset 0 and no read amount. FILE_OPEN sets the amount
-        # pointer and sends the open mode (sb4 0x0B = read-only) where READ sends
-        # the read amount; FILE_CLOSE and FILE_EXISTS send neither. The locator is
-        # ub2-length-prefixed (declared len + 2), like every temp / BFILE LOBOPS.
-        # Reverse-engineered from python-oracledb on 21c and 23ai, byte-for-byte.
+        # BFILE open / close (#46) and exists (#1109): source offset 0, the
+        # locator ub2-length-prefixed like every temp / BFILE LOBOPS. FILE_OPEN
+        # sends the open mode (0x0B = read-only) as its amount; FILE_CLOSE and
+        # FILE_EXISTS send none. Reverse-engineered from python-oracledb on 21c
+        # and 23ai, byte-for-byte.
         #
         # FILE_EXISTS differs from the other two in ONE byte: it sets the
         # null-lob pointer, because the answer it asks for IS that field -- the
@@ -19181,30 +19142,32 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         # instead (pointer clear, an amount, source offset 1) is answered
         # `ORA-03137: malformed TTC packet from client rejected: [kpolob:lobnull
         # 0]`, which names the field outright.
-        Locator = Dictionary['locator']
-        Operation = Dictionary['operation']
+        #
+        # A BFILE locator as FETCHED leads with its own ub2 inner length, which
+        # is the prefix sent; one that arrives already stripped gets it added,
+        # so no caller has to know which it holds (#1109).
+        if not is_prefixed_locator(Locator):
+            Locator = prefixed_locator(Locator)
         IsOpen = Operation == TNS_LOB_OP_FILE_OPEN
-        Exists = Operation == TNS_LOB_OP_FILE_EXISTS
-        # A BFILE locator as FETCHED leads with its own ub2 inner length, and
-        # this branch re-adds that prefix -- so the body is what goes in. The
-        # FILE_OPEN / FILE_CLOSE callers strip it themselves before calling; a
-        # locator that arrives already stripped does not match the guard, so
-        # doing it here as well is a no-op for them and saves every other caller
-        # from having to know (#1109).
-        if is_prefixed_locator(Locator):
-            Locator = Locator[2:]
-        Out = _head(len(Locator) + 2, Operation, null_lob=Exists)
-        Out += bytes([0])  # scn array pointer absent
-        Out += bytes([0])  # scn array length
-        Out += encode_sb4(0)  # source offset (ub8)
-        Out += encode_sb4(0)  # dest offset (ub8)
-        Out += bytes([1 if IsOpen else 0])  # amount pointer (open mode)
-        Out += struct.pack('>HHH', 0, 0, 0)  # three reserved ub16be slots
-        Out += struct.pack('>H', len(Locator)) + Locator  # ub2-prefixed
-        if IsOpen:
-            Out += encode_sb4(0x0B)  # open mode: read-only
-        return Out
-    Locator = Dictionary['locator']
+        Fields.update(
+            {
+                'source_length': len(Locator),
+                'null_lob_present': Operation == TNS_LOB_OP_FILE_EXISTS,
+                'operation': Operation,
+                'amount_present': IsOpen,
+                'locator': Locator,
+                'amount': 0x0B,
+            }
+        )
+        return _LOBOPS_REQUEST_THIN(Fields)
+    # Persistent-LOB locators read back correctly with the bare length + raw
+    # locator. Temporary LOBs (#91) instead need the locator sent as a
+    # ub2-length-prefixed field with the declared length counting that prefix
+    # (len + 2) — exactly the form python-oracledb uses; without it a temp-LOB
+    # read returns empty content. Switching persistent reads to the prefixed
+    # form regresses them on 11g + 21c, so the prefix is opt-in per call.
+    if Dictionary.get('locator_prefixed', False):
+        Locator = prefixed_locator(Locator)
     # `amount` is in chars for CLOB / NCLOB and in bytes for BLOB / BFILE.
     # Don't pass the obvious-looking 0xFFFFFFFF "all" sentinel — XE 11g
     # quietly stops responding when given it (presumably Oracle tries to
@@ -19213,30 +19176,17 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     # staying inside signed-int32 territory, and the server returns just
     # the LOB's actual content rather than padding to the requested
     # ceiling.
-    Amount = Dictionary.get('amount', 0x40000000)
-    Operation = Dictionary.get('operation', TNS_LOB_OP_READ)
-    SourceOffset = Dictionary.get('source_offset', 1)  # 1-based: start
-    LocatorLen = len(Locator)
-    # Persistent-LOB locators read back correctly with the bare length + raw
-    # locator. Temporary LOBs (#91) instead need the locator sent as a
-    # ub2-length-prefixed field with the declared length counting that prefix
-    # (len + 2) — exactly the form python-oracledb uses; without it a temp-LOB
-    # read returns empty content. Switching persistent reads to the prefixed
-    # form regresses them on 11g + 21c, so the prefix is opt-in per call.
-    Prefixed = Dictionary.get('locator_prefixed', False)
-    Out = _head(LocatorLen + 2 if Prefixed else LocatorLen, Operation)
-    Out += bytes([0])  # scn array pointer absent
-    Out += bytes([0])  # scn array length
-    Out += encode_sb4(SourceOffset)  # source offset (ub8; small fits sb4)
-    Out += encode_sb4(0)  # dest offset (ub8)
-    Out += bytes([1])  # amount pointer present
-    Out += struct.pack('>HHH', 0, 0, 0)  # three reserved ub16be slots
-    if Prefixed:
-        Out += struct.pack('>H', LocatorLen) + Locator  # ub2-prefixed locator
-    else:
-        Out += Locator  # raw locator bytes (no DALC)
-    Out += encode_sb4(Amount)  # amount to read
-    return Out
+    Fields.update(
+        {
+            'source_length': len(Locator),
+            'operation': Operation,
+            'source_offset': Dictionary.get('source_offset', 1),  # 1-based
+            'amount_present': True,
+            'locator': Locator,
+            'amount': Dictionary.get('amount', 0x40000000),
+        }
+    )
+    return _LOBOPS_REQUEST_THIN(Fields)
 
 
 # Where the connect data starts in a CONNECT packet: the legacy 58 plus the

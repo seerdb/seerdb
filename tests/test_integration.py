@@ -8495,6 +8495,28 @@ class CreateLobIntegration(_IntegrationBase):
         self.assertEqual((c.read(), n.read(), b.read()), (Text, Text, Data))
         self.assertEqual(n_len, len(Text))
 
+    def test_a_read_past_4_gib(self):
+        # A LOB call's offset and amount are ub8s; written as ub4s they raised
+        # struct.error from 4 GiB up (#2788). Past the end there is nothing.
+        # Before 10g they are ub4s, as a LOB is at most 4 GiB there, so such a
+        # read is refused.
+        Clob = self.conn.createlob(seerdb.DB_TYPE_CLOB, 'abc')
+        if _sql_fv(self.conn) < FIELD_VERSION_10_2:
+            with self.assertRaises(seerdb.NotSupportedError):
+                Clob.read(2**32 + 5, 5)
+            return
+        self.assertEqual(Clob.read(2**32 + 5, 5), '')
+        self.assertEqual(Clob.read(1, 2**33), 'abc')
+
+    def test_the_chunk_size(self):
+        # A value back, as a real server answers, and the session still in step
+        # (#2790): the Mirror answered a temp LOB's with no value. A fetched
+        # LOB's is in python-oracledb's suite; seerdb reads one from the Mirror
+        # as 0 for another reason (#2791).
+        Clob = self.conn.createlob(seerdb.DB_TYPE_CLOB, 'abc')
+        self.assertGreater(Clob.getchunksize(), 0)
+        self.assertEqual(Clob.read(), 'abc')
+
     @_requires(_postgres_cannot('build an XMLType'))
     def test_a_large_clob_into_xmltype(self):
         # What the method is for: sys.xmltype() needs a genuine LOB argument,
