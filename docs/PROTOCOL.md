@@ -427,7 +427,21 @@ a very long descriptor outright: 9i and 10g refuse a 3000-byte one.
 
 ### 2.2 TNS_ACCEPT (Server -> Client)
 
-The server responds with TNS_ACCEPT. The client extracts the negotiated SDU from offset bytes 4-5 (16-bit big-endian) of the accept body. The negotiated SDU is used for all subsequent packet fragmentation.
+The server responds with TNS_ACCEPT. Its body opens with sixteen bytes every version sends, all big-endian:
+
+| Offset | Field |
+|---|---|
+| 0 | negotiated protocol version (ub2) |
+| 2 | global service options (ub2) |
+| 4 | SDU (ub2; zero from 315, see §2.6) |
+| 6 | TDU (ub2; zero from 315) |
+| 8 | NT characteristics (ub2) |
+| 10 | accept data length (ub2) |
+| 12 | accept data offset from the packet's start (ub2): 8 plus the body's length when there is no accept data |
+| 14 | connect flags 0 |
+| 15 | connect flags 1 |
+
+The client negotiates native network encryption (§33) when flags 0 has bit 0 set and bit 2 clear and flags 1 has bit 3 clear. Eight zero bytes follow the sixteen. A ≥315 accept goes on with the ub4 SDU and TDU, a byte, and the ub4 flags2 word (§2.6). The negotiated SDU is used for all subsequent packet fragmentation. `seerdb/common/tns.py` holds the layout as schemas (`encode_accept_body` / `decode_accept_body`); the client and the Mirror both go through them.
 
 ### 2.3 TNS_REFUSE (Server -> Client)
 
@@ -502,7 +516,7 @@ so the connection uses **legacy 2-byte packet framing** — no large-SDU uint32
 trailer. It is also `< 318` (`TNS_VERSION_MIN_OOB_CHECK`), so there is **no
 extended flags2 / end-of-response** negotiation. The negotiated SDU is the
 16-bit field at accept-body offset 4–5 (`8192` here). seerdb's own client
-parsers (`_parse_accept_sdu` / `_parse_accept_eor`) decode the captured ACCEPT
+parser (`decode_accept_body` in `seerdb/common/tns.py`) decodes the captured ACCEPT
 without error — the capture is conformant, not a guess.
 
 Unlike modern versions, **PRO and DTY are ordinary TTC `DATA` messages**, not

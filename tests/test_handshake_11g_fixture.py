@@ -13,7 +13,7 @@ import struct
 
 import handshake_11g as fx
 
-from seerdb.client.connection import _parse_accept_eor, _parse_accept_sdu
+from seerdb.client.connection import _parse_accept
 from seerdb.common.tns_consts import TNS_ACCEPT, TNS_CONNECT, TNS_DATA
 
 
@@ -34,9 +34,10 @@ def test_accept_is_version_314_legacy_framing() -> None:
     # 11g negotiates 314: < 315 => legacy 2-byte framing, no large SDU;
     # < 318 => no extended flags2 / end-of-response.
     assert version == 314
-    legacy_sdu = struct.unpack('>H', body[4:6])[0]
-    assert _parse_accept_sdu(version, body, legacy_sdu) == 8192
-    assert _parse_accept_eor(version, body) is False
+    accept = _parse_accept(body)
+    assert accept['version'] == 314
+    assert accept['sdu'] == 8192
+    assert accept['eor'] is False
 
 
 def test_pro_and_dty_are_ttc_data_messages() -> None:

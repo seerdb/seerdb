@@ -8,10 +8,12 @@
 import struct
 import unittest
 
-from seerdb.client.connection import _parse_accept_eor, _parse_accept_sdu
+from seerdb.client.connection import _parse_accept
 from seerdb.common.tns import (
     assemble_packet,
+    decode_accept_body,
     decode_packet,
+    encode_accept_body,
     encode_dictionary_dty,
     encode_dictionary_login,
     encode_packet,
@@ -155,21 +157,58 @@ class TestAcceptParse(unittest.TestCase):
     )
 
     def test_version_and_sdu(self):
-        (ver,) = struct.unpack('>H', self._ACCEPT[:2])
-        self.assertEqual(ver, 319)
-        self.assertEqual(_parse_accept_sdu(ver, self._ACCEPT, 0x2000), 8192)
+        accept = _parse_accept(self._ACCEPT)
+        self.assertEqual(accept['version'], 319)
+        self.assertEqual(accept['sdu'], 8192)
 
     def test_eor_bit_detected(self):
-        (ver,) = struct.unpack('>H', self._ACCEPT[:2])
-        self.assertTrue(_parse_accept_eor(ver, self._ACCEPT))
+        self.assertTrue(_parse_accept(self._ACCEPT)['eor'])
 
     def test_pre318_no_eor(self):
-        # A legacy (version < 318) accept never reports EOR.
-        self.assertFalse(_parse_accept_eor(313, self._ACCEPT))
+        # A legacy (version < 318) accept never reports EOR, whatever its
+        # flags2 holds.
+        body = struct.pack('>H', 316) + self._ACCEPT[2:]
+        self.assertFalse(_parse_accept(body)['eor'])
 
     def test_pre315_keeps_legacy_sdu(self):
         # Below the large-SDU floor the 16-bit legacy SDU is kept.
-        self.assertEqual(_parse_accept_sdu(313, self._ACCEPT, 0x2000), 0x2000)
+        body = bytearray(self._ACCEPT)
+        struct.pack_into('>HHH', body, 0, 313, 1, 0x1000)
+        self.assertEqual(_parse_accept(bytes(body))['sdu'], 0x1000)
+
+    def test_the_codec_writes_the_captured_accept_back(self):
+        # Every field of the capture, the random connection id included,
+        # encodes back to the same bytes: the accept-data offset (0x3d) is
+        # what the body's length makes it.
+        accept = decode_accept_body(self._ACCEPT)
+        self.assertEqual(accept['data_offset'], 8 + len(self._ACCEPT))
+        again = encode_accept_body(
+            accept['version'],
+            accept['options'],
+            accept['sdu'],
+            accept['tdu'],
+            accept['nt_chars'],
+            accept['flags0'],
+            accept['flags1'],
+            accept['flags2'],
+            self._ACCEPT[37:],
+        )
+        self.assertEqual(again, self._ACCEPT)
+
+    def test_a_short_large_accept_keeps_the_legacy_fields(self):
+        # A >= 315 accept that ends before its ub4 pair keeps the 16-bit one
+        # and reports no end-of-response, rather than reading past its end.
+        body = bytearray(self._ACCEPT[:26])
+        struct.pack_into('>H', body, 4, 0x1000)
+        accept = _parse_accept(bytes(body))
+        self.assertEqual(accept['sdu'], 0x1000)
+        self.assertFalse(accept['eor'])
+
+    def test_an_accept_shorter_than_its_head_is_refused(self):
+        from seerdb.common.exceptions import OperationalError
+
+        with self.assertRaises(OperationalError):
+            _parse_accept(self._ACCEPT[:12])
 
 
 class TestShortAcceptParse(unittest.TestCase):
@@ -197,28 +236,31 @@ class TestShortAcceptParse(unittest.TestCase):
         return bytes(packet[8:])  # body, header stripped
 
     def test_version_and_legacy_sdu(self):
-        body = self._short_accept_body()
-        (ver,) = struct.unpack('>H', body[:2])
-        self.assertEqual(ver, 314)
+        accept = _parse_accept(self._short_accept_body())
+        self.assertEqual(accept['version'], 314)
         # 314 < 315: the large-SDU field (offset 24) is absent, so the legacy SDU
-        # the caller already read is kept — and no read past the 24-byte body.
-        self.assertEqual(_parse_accept_sdu(ver, body, 8192), 8192)
+        # is kept — and no read past the 24-byte body.
+        self.assertEqual(accept['sdu'], 8192)
 
     def test_short_accept_disables_eor(self):
         # The flags2 field (offset 33) does not exist in the short form, so EOR
         # negotiation must fall back to off rather than overrun.
-        body = self._short_accept_body()
-        self.assertFalse(_parse_accept_eor(314, body))
+        self.assertFalse(_parse_accept(self._short_accept_body())['eor'])
 
     def test_short_accept_does_not_advertise_ano(self):
         # handle_login reads ACFL0/ACFL1 at body offsets 14/15 for the ANO gate;
         # on the short accept those bytes are zero, so no ANO negotiation is
         # triggered and the reads stay in bounds.
-        body = self._short_accept_body()
-        self.assertGreater(len(body), 15)
-        acfl0 = body[14]
-        acfl1 = body[15]
-        self.assertFalse((acfl0 & 0x01) and not (acfl0 & 0x04) and not (acfl1 & 0x08))
+        self.assertFalse(_parse_accept(self._short_accept_body())['ano'])
+
+    def test_the_ano_flags_gate_the_negotiation(self):
+        # ACFL0 bit 0 set, bit 2 clear, ACFL1 bit 3 clear: what the Mirror and
+        # a real 11g send (41 41).
+        body = bytearray(self._short_accept_body())
+        body[14:16] = b'\x41\x41'
+        self.assertTrue(_parse_accept(bytes(body))['ano'])
+        body[15] = 0x49
+        self.assertFalse(_parse_accept(bytes(body))['ano'])
 
 
 if __name__ == '__main__':

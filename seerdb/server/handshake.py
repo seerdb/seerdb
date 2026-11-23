@@ -42,6 +42,7 @@ from seerdb.common.tns import (
     _SERVER_DTY_TABLE,
     _SERVER_RUNTIME_CAPS,
     _datatype_table_12c,
+    encode_accept_body,
     encode_packet,
 )
 from seerdb.common.tns_consts import (
@@ -140,32 +141,24 @@ def server_tns_version(field_version: int) -> int:
     return TNS_VERSION_11_2
 
 
-# ACCEPT body fields that are server constants at 11g, read straight off the
-# captured XE 11.2 ACCEPT (tests/handshake_11g.py): protocol characteristics,
-# an accept-data length of 0, a flags word, and a reserved word.
-_ACCEPT_PROTO_CHARS = 0x0100
-_ACCEPT_DATA_LEN = 0x0000
-_ACCEPT_FLAGS = 0x0020
-_ACCEPT_RESERVED = 0x4141
+# The ACCEPT fields that are server constants, read off the captures: the XE
+# 11.2 ACCEPT (tests/handshake_11g.py) and, for the large-SDU forms, a live 21c
+# (version 318) and 26ai (319). The NT characteristics are the same in all
+# three; the second connect-flag byte is 0x41 at 11g and 0x01 above it. The
+# body's layout, and the accept-data offset that follows from its length, are
+# common's (encode_accept_body, PROTOCOL.md §2.6): a >= 315 ACCEPT carries the
+# real SDU / TDU as ub4s and zeroes the 16-bit pair, and a client reads flags2
+# only at >= 318, so at 316 it stays zero and no end-of-response is advertised.
+_ACCEPT_NT_CHARS = 0x0100
+_ACCEPT_FLAGS0 = 0x41
+_ACCEPT_FLAGS1 = 0x41
+_ACCEPT_LARGE_FLAGS1 = 0x01
 _DEFAULT_TDU = 0xFFFF
-
-# A >= 315 ACCEPT carries the real SDU/TDU as 32-bit fields and zeroes the 16-bit
-# pair the legacy form used, so the body grows past the legacy 24 bytes. Offsets
-# and length are read off a live 21c ACCEPT (version 318, body 37 bytes) — the
-# nearest capture below the end-of-response era: 16-byte fixed head, 8 zero bytes,
-# ub4 SDU at 24, ub4 TDU at 28, then a byte and the flags2 word at 33. A client
-# only reads flags2 at >= 318, so at 316 it stays zero and no end-of-response is
-# advertised. The 21c flags/reserved words differ from the 11g pair above.
-_ACCEPT_LARGE_BODY_LEN = 37
-_OFF_ACCEPT_SDU32 = 24
-_OFF_ACCEPT_TDU32 = 28
-_ACCEPT_LARGE_FLAGS = 0x002D
-_ACCEPT_LARGE_RESERVED = 0x4101
 _LARGE_DEFAULT_TDU = 0x2000
 
-# A 319 (23ai) ACCEPT grows again, read off a live 26ai (body 53 bytes): the
-# flags word is 0x003D rather than 21c's 0x002D, and sixteen bytes follow the
-# flags2 word — a per-connection identifier, random in every capture.
+# A 319 (23ai) ACCEPT grows again, read off a live 26ai (body 53 bytes):
+# sixteen bytes follow the flags2 word -- a per-connection identifier, random
+# in every capture.
 #
 # flags2 carries the capability bits a real 23ai sends as 0x1A000000. A client
 # enables each only when the version threshold *and* the flag agree, so what is
@@ -180,11 +173,6 @@ _LARGE_DEFAULT_TDU = 0x2000
 # options captured at add time.
 #
 # FAST_AUTH (0x10000000) stays clear; that one is still unimplemented.
-_ACCEPT_23_BODY_LEN = 53
-_ACCEPT_23_FLAGS = 0x003D
-# The flags2 word sits between the ub4 TDU and the connection id.
-_OFF_ACCEPT_FLAGS2 = 33
-_OFF_ACCEPT_CONN_ID = 37
 _ACCEPT_CONN_ID_LEN = 16
 
 # The classic sqlplus / thick-OCI PRO request leads its TTC payload with the ANO
@@ -333,54 +321,36 @@ def encode_accept(
     options = request.global_service_options & ~TNS_GSO_CAN_RECV_ATTENTION
     if version >= TNS_VERSION_MIN_LARGE_SDU:
         # The 16-bit SDU/TDU pair is zeroed and the real values move to the ub4
-        # fields the client reads at offsets 24 / 28.
-        is_23 = version >= TNS_VERSION_23_1
-        body_len = _ACCEPT_23_BODY_LEN if is_23 else _ACCEPT_LARGE_BODY_LEN
-        large_body = bytearray(body_len)
-        struct.pack_into(
-            '>HHHHHHHH',
-            large_body,
-            0,
+        # fields; encode_accept_body does that from the version.
+        body = encode_accept_body(
             version,
             options,
-            0,
-            0,
-            _ACCEPT_PROTO_CHARS,
-            _ACCEPT_DATA_LEN,
-            _ACCEPT_23_FLAGS if is_23 else _ACCEPT_LARGE_FLAGS,
-            _ACCEPT_LARGE_RESERVED,
-        )
-        struct.pack_into('>I', large_body, _OFF_ACCEPT_SDU32, negotiated_sdu)
-        struct.pack_into(
-            '>I', large_body, _OFF_ACCEPT_TDU32, min(request.tdu, _LARGE_DEFAULT_TDU)
-        )
-        if version >= TNS_VERSION_MIN_OOB_CHECK:
+            negotiated_sdu,
+            min(request.tdu, _LARGE_DEFAULT_TDU),
+            _ACCEPT_NT_CHARS,
+            _ACCEPT_FLAGS0,
+            _ACCEPT_LARGE_FLAGS1,
             # Only read by a client at this version and up, so setting it below
             # would be noise an older client never looks at.
-            struct.pack_into(
-                '>I',
-                large_body,
-                _OFF_ACCEPT_FLAGS2,
-                TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
-            )
-        if is_23:
+            TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE
+            if version >= TNS_VERSION_MIN_OOB_CHECK
+            else 0,
             # Random per connection, as it is on the real server. It identifies
             # the session in the server's own logs; nothing reads it back here.
-            large_body[_OFF_ACCEPT_CONN_ID:] = secrets.token_bytes(_ACCEPT_CONN_ID_LEN)
-        packet, _ = encode_packet(TNS_ACCEPT, bytes(large_body), sdu)
-        return packet
-    negotiated_tdu = min(request.tdu, _DEFAULT_TDU)
-    body = struct.pack(
-        '>HHHHHHHH',
-        version,
-        options,
-        negotiated_sdu,
-        negotiated_tdu,
-        _ACCEPT_PROTO_CHARS,
-        _ACCEPT_DATA_LEN,
-        _ACCEPT_FLAGS,
-        _ACCEPT_RESERVED,
-    ) + bytes(8)
+            secrets.token_bytes(_ACCEPT_CONN_ID_LEN)
+            if version >= TNS_VERSION_23_1
+            else b'',
+        )
+    else:
+        body = encode_accept_body(
+            version,
+            options,
+            negotiated_sdu,
+            min(request.tdu, _DEFAULT_TDU),
+            _ACCEPT_NT_CHARS,
+            _ACCEPT_FLAGS0,
+            _ACCEPT_FLAGS1,
+        )
     packet, _ = encode_packet(TNS_ACCEPT, body, sdu)
     return packet
 

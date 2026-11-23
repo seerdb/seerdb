@@ -4297,6 +4297,7 @@ from seerdb.common.tns_consts import (
     TNS_LOB_OP_OPEN,
     TNS_LOB_OP_TRIM,
     TNS_MAX_CONNECT_DATA,
+    TNS_VERSION_MIN_LARGE_SDU,
 )
 
 # The 11g tail between the fixed header and the SQL: a [0, 0, 1] marker and a
@@ -7301,6 +7302,30 @@ def is_prefixed_locator(Locator: bytes) -> bool:
     return len(Locator) >= 2 and int.from_bytes(Locator[:2], 'big') == len(Locator) - 2
 
 
+# What a TTI_LOBOPS reply leads with: the RPA token, then the locator as the
+# server now sees it after a big-endian ub2 of its length (§14.4). The same in
+# every dialect.
+_LOB_LOCATOR_REPLY = (
+    ('const', bytes([TTI_RPA])),
+    ('be2', 'locator_length'),
+    ('bytes', 'locator', 'locator_length'),
+)
+_LOB_LOCATOR_REPLY_THIN = wire_schema.compile_encoder(_LOB_LOCATOR_REPLY, _THIN)
+_LOB_LOCATOR_REPLY_FROM_THIN = wire_schema.compile_decoder(_LOB_LOCATOR_REPLY, _THIN)
+
+
+def _decode_lob_reply_head(Packet: bytes) -> tuple[bytes, bytes] | None:
+    # The locator a LOB call's reply leads with and the bytes after it, or
+    # None when the reply has no RPA head or ends inside its locator.
+    try:
+        (Values, Rest) = _LOB_LOCATOR_REPLY_FROM_THIN(Packet)
+    except (ValueError, IndexError):
+        return None
+    if len(Values['locator']) != Values['locator_length']:
+        return None
+    return (Values['locator'], Rest)
+
+
 def decode_lobops_locator(Packet: bytes) -> bytes | None:
     """The UPDATED locator a TTI_LOBOPS reply leads with, or ``None``.
 
@@ -7308,13 +7333,12 @@ def decode_lobops_locator(Packet: bytes) -> bytes | None:
     MUTATING call (WRITE / TRIM / OPEN / CLOSE) really does change it. Keeping
     the original meant the next read was served the pre-write value and the
     write looked like it had silently done nothing (#964) -- the same rule the
-    BFILE path already follows for FILE_OPEN (§14.4)."""
-    if not Packet or Packet[0] != TTI_RPA or len(Packet) < 3:
+    BFILE path already follows for FILE_OPEN (§14.4). An empty locator, or one
+    the reply ends inside, is ``None``."""
+    Head = _decode_lob_reply_head(Packet)
+    if Head is None or not Head[0]:
         return None
-    Length = (Packet[1] << 8) | Packet[2]
-    if Length <= 0 or 3 + Length > len(Packet):
-        return None
-    return bytes(Packet[3 : 3 + Length])
+    return Head[0]
 
 
 def decode_lobops_value(Packet: bytes) -> int | None:
@@ -7331,12 +7355,10 @@ def decode_lobops_value(Packet: bytes) -> int | None:
     The locator is binary and can contain anything, so it is skipped by its
     declared length rather than scanned for — the same reason
     :func:`decode_lobops_oer` does."""
-    if not Packet or Packet[0] != TTI_RPA or len(Packet) < 3:
+    Head = _decode_lob_reply_head(Packet)
+    if Head is None or not Head[1] or Head[1][0] == TTI_OER:
         return None
-    Pos = 3 + ((Packet[1] << 8) | Packet[2])
-    if Pos >= len(Packet) or Packet[Pos] == TTI_OER:
-        return None
-    (Value, _Rest) = decode_ub4(Packet[Pos:])
+    (Value, _Rest) = decode_ub4(Head[1])
     return Value
 
 
@@ -7352,7 +7374,10 @@ def decode_lobops_oer(Packet: bytes, FieldVersion: int) -> tuple[int, str | None
     _DECODE_FIELD_VERSION.set(FieldVersion)
     Pos = 0
     if Packet and Packet[0] == TTI_RPA and len(Packet) >= 3:
-        Pos = 3 + ((Packet[1] << 8) | Packet[2])  # skip ub2-prefixed locator
+        # Past the ub2-prefixed locator; a reply that ends inside it has no
+        # OER to find.
+        Head = _decode_lob_reply_head(Packet)
+        Packet = Head[1] if Head is not None else b''
     while Pos < len(Packet) - 1:
         if Packet[Pos] == TTI_OER and 1 <= Packet[Pos + 1] <= 4:
             Result = decode_token_oer(Packet[Pos:], (None, None, []))
@@ -15465,11 +15490,12 @@ def encode_o7_create_temp(Seq: int, is_blob: bool, csfrm: int, charset: int) -> 
 def decode_o7_create_temp(Data: bytes) -> bytes:
     """The new temporary LOB's locator from a 9i CREATE_TEMP reply, bare -- the
     RPA's ub2-length locator without its length, as a dialect's create_temp_lob
-    returns one."""
-    if not Data or Data[0] != TTI_RPA or len(Data) < 3:
+    returns one. A reply that ends inside its locator is refused like one with
+    no locator at all."""
+    Head = _decode_lob_reply_head(Data)
+    if Head is None:
         raise DataError(f'unexpected 9i CREATE_TEMP reply: {bytes(Data[:8]).hex()!r}')
-    Length = (Data[1] << 8) | Data[2]
-    return bytes(Data[3 : 3 + Length])
+    return Head[0]
 
 
 def encode_o7_lob_getlen(Seq: int, Locator: bytes) -> bytes:
@@ -18702,7 +18728,7 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         # locator that arrives already stripped does not match the guard, so
         # doing it here as well is a no-op for them and saves every other caller
         # from having to know (#1109).
-        if len(Locator) >= 2 and ((Locator[0] << 8) | Locator[1]) == len(Locator) - 2:
+        if is_prefixed_locator(Locator):
             Locator = Locator[2:]
         Out = _head(len(Locator) + 2, Operation, null_lob=Exists)
         Out += bytes([0])  # scn array pointer absent
@@ -18822,6 +18848,105 @@ def split_connect(Data: bytes) -> tuple[bytes, bytes | None]:
     if len(Data) - Offset <= TNS_MAX_CONNECT_DATA:
         return Data, None
     return Data[:Offset], Data[Offset:]
+
+
+# The ACCEPT body (§2.2, §2.6), after the 8-byte packet header. Every version
+# opens with the same sixteen bytes: the negotiated version and global service
+# options, the 16-bit SDU / TDU (zero from 315 up), the NT characteristics, the
+# accept data's length and offset (its offset from the packet's start, so 8 plus
+# the body's length when there is none), and the two connect-flag bytes whose
+# ANO bits a client gates its native-encryption negotiation on. Eight zero
+# bytes follow. From 315 the real SDU and TDU follow as ub4s, then a byte and
+# the flags2 word a client reads from 318 up; from 319 a sixteen-byte connection
+# id ends it. Measured: 11.2 (24 bytes), 21c (37), 23ai / 26ai (53).
+_ACCEPT_HEAD = (
+    ('be2', 'version'),
+    ('be2', 'options'),
+    ('be2', 'sdu16'),
+    ('be2', 'tdu16'),
+    ('be2', 'nt_chars'),
+    ('be2', 'data_length'),
+    ('be2', 'data_offset'),
+    ('u8', 'flags0'),
+    ('u8', 'flags1'),
+)
+_ACCEPT_HEAD_THIN = wire_schema.compile_encoder(_ACCEPT_HEAD, _THIN)
+_ACCEPT_HEAD_FROM_THIN = wire_schema.compile_decoder(_ACCEPT_HEAD, _THIN)
+_ACCEPT_ZEROS = (('pad', 8),)
+_ACCEPT_ZEROS_THIN = wire_schema.compile_encoder(_ACCEPT_ZEROS, _THIN)
+_ACCEPT_ZEROS_FROM_THIN = wire_schema.compile_decoder(_ACCEPT_ZEROS, _THIN)
+_ACCEPT_LARGE = (
+    ('be4', 'sdu'),
+    ('be4', 'tdu'),
+)
+_ACCEPT_LARGE_THIN = wire_schema.compile_encoder(_ACCEPT_LARGE, _THIN)
+_ACCEPT_LARGE_FROM_THIN = wire_schema.compile_decoder(_ACCEPT_LARGE, _THIN)
+_ACCEPT_FLAGS2 = (
+    ('pad', 1),
+    ('be4', 'flags2'),
+)
+_ACCEPT_FLAGS2_THIN = wire_schema.compile_encoder(_ACCEPT_FLAGS2, _THIN)
+_ACCEPT_FLAGS2_FROM_THIN = wire_schema.compile_decoder(_ACCEPT_FLAGS2, _THIN)
+_ACCEPT_CONN_ID_LEN = 16
+
+
+def encode_accept_body(
+    Version: int,
+    Options: int,
+    Sdu: int,
+    Tdu: int,
+    NtChars: int,
+    Flags0: int,
+    Flags1: int,
+    Flags2: int = 0,
+    ConnId: bytes = b'',
+) -> bytes:
+    """An ACCEPT body. From :data:`TNS_VERSION_MIN_LARGE_SDU` the SDU and TDU
+    go in the ub4 fields and the 16-bit pair is zero; below it they are the
+    16-bit pair and nothing follows the head. ``Flags2`` goes in at 315 and up
+    (a client reads it from 318), ``ConnId`` after it."""
+    Large = Version >= TNS_VERSION_MIN_LARGE_SDU
+    Tail = _ACCEPT_ZEROS_THIN({})
+    if Large:
+        Tail += (
+            _ACCEPT_LARGE_THIN({'sdu': Sdu, 'tdu': Tdu})
+            + _ACCEPT_FLAGS2_THIN({'flags2': Flags2})
+            + ConnId
+        )
+    Head = {
+        'version': Version,
+        'options': Options,
+        'sdu16': 0 if Large else Sdu,
+        'tdu16': 0 if Large else Tdu,
+        'nt_chars': NtChars,
+        'data_length': 0,
+        'data_offset': 8 + 16 + len(Tail),
+        'flags0': Flags0,
+        'flags1': Flags1,
+    }
+    return _ACCEPT_HEAD_THIN(Head) + Tail
+
+
+def decode_accept_body(Body: bytes) -> dict[str, Any]:
+    """An ACCEPT body's fields, as :func:`encode_accept_body` names them. ``sdu``
+    and ``tdu`` are the negotiated pair whatever the version; ``flags2`` is
+    there when the body has it. A large-SDU accept too short for its ub4 pair
+    keeps the 16-bit one, and one without flags2 reads as zero, so a short or
+    odd accept leaves the connection as it is without them."""
+    (Values, Rest) = _ACCEPT_HEAD_FROM_THIN(Body)
+    Values['sdu'] = Values['sdu16']
+    Values['tdu'] = Values['tdu16']
+    Values['flags2'] = 0
+    if Values['version'] >= TNS_VERSION_MIN_LARGE_SDU:
+        with contextlib.suppress(IndexError):
+            (_Zeros, Rest) = _ACCEPT_ZEROS_FROM_THIN(Rest)
+            (Large, Rest) = _ACCEPT_LARGE_FROM_THIN(Rest)
+            if Large['sdu'] > 0:
+                Values['sdu'] = Large['sdu']
+                Values['tdu'] = Large['tdu']
+            (Flags2, Rest) = _ACCEPT_FLAGS2_FROM_THIN(Rest)
+            Values['flags2'] = Flags2['flags2']
+    return Values
 
 
 def encode_dictionary_pig(Dictionary: dict) -> bytes:
