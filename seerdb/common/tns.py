@@ -23453,7 +23453,9 @@ def _aq_write_payload(Queue, Props) -> bytes:
         # descriptor than VECTOR_BIND_DESCRIPTOR (no second 0x28 byte).
         from seerdb.common.oson import encode_oson
 
-        Oson = encode_oson(Props.payload)
+        # The wide form when the compact one can't hold the value: a queue's
+        # payload has no text-cast fallback, as a JSON bind has (#2780).
+        Oson = encode_oson(Props.payload, allow_wide=True)
         # _bytes_with_length (the 12c+ single-byte/0xFE-chunked form) -- NOT
         # encode_chr, whose 11g branch chunks at 64 bytes when the encode field
         # version isn't set in this context and desyncs the server (ORA-03120).

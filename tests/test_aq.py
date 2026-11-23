@@ -75,6 +75,21 @@ class TestEncode(unittest.TestCase):
         self.assertIn(_AQ_JSON_DESCRIPTOR, out)
         self.assertIn(bytes.fromhex('ff4a5a'), out)  # OSON magic
 
+    def test_a_json_payload_past_the_compact_form(self):
+        # A string past 255 bytes, or more than 255 entries, takes OSON's wide
+        # form: the enqueue has no text-cast fallback to go to (#2780).
+        from seerdb.common.oson import decode_oson
+        from seerdb.common.tns import _AQ_JSON_DESCRIPTOR, _THIN
+
+        q = Queue(_FakeConn(), 'JQ', payload_type=None, is_json=True)
+        for value in ({'k': 'x' * 300}, {f'k{i}': i for i in range(300)}):
+            out = encode_aq_enq(3, 16, q, MessageProperties(payload=value))
+            at = out.index(_AQ_JSON_DESCRIPTOR) + len(_AQ_JSON_DESCRIPTOR)
+            length = int.from_bytes(out[at : at + 2], 'big')
+            (image, rest) = _THIN.read_value(out[at + 2 + 22 :])
+            self.assertEqual((len(image), rest), (length, b''))
+            self.assertEqual(decode_oson(image), value)
+
 
 class TestTheQueueNameBefore12c(unittest.TestCase):
     # 11g reads the queue name in the data section as it stands; a length

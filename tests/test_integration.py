@@ -19305,6 +19305,29 @@ class AqRawIntegration(_IntegrationBase):
         finally:
             self._drop_queue(name, table)
 
+    def test_a_long_json_payload_comes_back(self):
+        # A JSON queue (21c on): a string past 255 bytes takes OSON's wide
+        # form, which the enqueue raised on before (#2780).
+        if self.conn.field_version < FIELD_VERSION_20_1:
+            self.skipTest('a JSON queue needs a session at field version 20.1+')
+        (name, table) = (self.QUEUE + '_J', self.QUEUE_TABLE + '_J')
+        self._drop_queue(name, table)
+        self.cur.execute(
+            f"BEGIN DBMS_AQADM.CREATE_QUEUE_TABLE('{table}', 'JSON'); "
+            f"DBMS_AQADM.CREATE_QUEUE('{name}', '{table}'); "
+            f"DBMS_AQADM.START_QUEUE('{name}'); END;"
+        )
+        try:
+            queue = self.conn.queue(name, seerdb.JSON)
+            queue.deqoptions.wait = 0
+            sent = {'k': 'x' * 3000, 'n': 1}
+            queue.enqone(self.conn.msgproperties(payload=sent))
+            self.conn.commit()
+            self.assertEqual(queue.deqone().payload, sent)
+            self.conn.commit()
+        finally:
+            self._drop_queue(name, table)
+
     def test_an_object_payload_comes_back(self):
         # An object queue: the payload is the type's image, which a 10g or
         # 11g thin session sends as from 12c (#2708).
