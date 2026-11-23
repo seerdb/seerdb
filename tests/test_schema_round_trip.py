@@ -167,6 +167,12 @@ class _Values:
                 count = values.get(field[2], self._pick([0, 1, 2]))
                 values[field[2]] = count
                 items = []
+                # A flag an item tests but doesn't carry is the caller's, the
+                # same for every item: an array dequeue's messages each have a
+                # shard id when the session's version has one (#2773).
+                given = _given_flags(field[3])
+                for flag in given:
+                    values.setdefault(flag, self._pick([0, 1]))
                 for _ in range(count):
                     # A count inside an item (a RETURNING target's row count,
                     # #2466) is chosen ahead too; filled as a plain integer
@@ -175,6 +181,7 @@ class _Values:
                         ahead: self._pick([0, 1, 2])
                         for ahead in _needed_ahead(field[3])
                     }
+                    item.update({flag: values[flag] for flag in given})
                     self.fill(field[3], item)
                     items.append(item)
                 values[field[1]] = items
@@ -234,6 +241,25 @@ def _needed_ahead(schema: wire_schema.Schema) -> set[str]:
         elif field[0] in ('when', 'only'):
             names |= _needed_ahead(field[2])
     return names
+
+
+def _given_flags(schema: wire_schema.Schema) -> set[str]:
+    # The names a `when` tests that no field of the schema carries: what the
+    # caller gives. An `each` inside has its own.
+    (tested, carried) = (set(), set())
+
+    def walk(fields: wire_schema.Schema) -> None:
+        for field in fields:
+            if field[0] == 'when':
+                tested.add(field[1])
+                walk(field[2])
+            elif field[0] == 'only':
+                walk(field[2])
+            elif field[0] not in ('const', 'pad', 'each'):
+                carried.add(field[1])
+
+    walk(schema)
+    return tested - carried
 
 
 def _sample(
