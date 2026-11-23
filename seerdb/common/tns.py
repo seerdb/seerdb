@@ -255,6 +255,7 @@ from seerdb.common.tns_consts import (
     TNS_FUNC_SESSION_RELEASE,
     TNS_FUNC_SESSION_STATE,
     TNS_FUNC_SET_END_TO_END_ATTR,
+    TNS_FUNC_SET_SCHEMA,
     TNS_FUNC_TPC_TXN_CHANGE_STATE,
     TNS_FUNC_TPC_TXN_SWITCH,
     TNS_INIT_KPNDRREQ,
@@ -1702,6 +1703,44 @@ _SESS_SIGNATURE: wire_schema.Schema = (
     ('n8', 'client_signature'),
     ('n8', 'server_signature'),
 )
+# The session a DRCP broker hands out (SESS_RET, #130): the DTYs, the session's
+# state as key-value pairs behind a byte no field is known for, then its flags,
+# id and serial number. Read past, as python-oracledb reads it; that one came
+# makes the session a pooled server's.
+_SESS_RET: wire_schema.Schema = (
+    ('const', bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_SESS_RET])),
+    ('n2', 'dty_count'),
+    ('u8', 'dty_length'),
+    ('n2', 'count'),
+    (
+        'when',
+        'count',
+        (
+            ('pad', 1),
+            (
+                'each',
+                'pairs',
+                'count',
+                (
+                    ('n4', 'key_length'),
+                    ('when', 'key_length', (('value', 'key'),)),
+                    ('n4', 'value_length'),
+                    ('when', 'value_length', (('value', 'value'),)),
+                    ('n2', 'pair_flags'),
+                ),
+            ),
+        ),
+    ),
+    ('n4', 'session_flags'),
+    ('n4', 'session_id'),
+    ('n2', 'serial'),
+)
+# The shared server's process id (OS_PID_MTS), read past.
+_OS_PID_MTS: wire_schema.Schema = (
+    ('const', bytes([TTI_SVR_PIGGYBACK, TNS_SERVER_PIGGYBACK_OS_PID_MTS])),
+    ('n2', 'pid_length'),
+    ('value', 'pid'),
+)
 # The per-iteration affected-row counts an array DML answers when the client
 # asked for arraydmlrowcounts (#18/#859): the execute's return-parameters block
 # (TTI_RPA), its four ordinary words (al8o4l, al8txl, key/value pairs,
@@ -2054,6 +2093,141 @@ _PIGGYBACK_HEAD: wire_schema.Schema = (
     ('u8', 'func'),
     ('u8', 'seq'),
     ('token', 'token_number'),
+)
+# The bodies that follow _PIGGYBACK_HEAD, one per function (#2773). The client
+# writes them and the Mirror reads them (decode_client_piggyback). The head
+# stays out of them: its token is read by the field version, which the value
+# kind's chunking would then follow too, and the encoders write values past 252
+# bytes at the default.
+#
+# A key-value pair written with two lengths each (python-oracledb's
+# write_bytes_with_two_lengths: a ub4 count, then the bytes with their own
+# length when there are any), and a ub4 of flags.
+_PIG_KV_PAIR: wire_schema.Schema = (
+    ('n4', 'key_length'),
+    ('when', 'key_length', (('value', 'key'),)),
+    ('n4', 'value_length'),
+    ('when', 'value_length', (('value', 'value'),)),
+    ('n4', 'pair_flags'),
+)
+# SET_END_TO_END_ATTR (135, #183): two pointers no field is sent for, the flags
+# naming the attributes this flush changes, a (changed, length) header per
+# attribute slot, then the value of each one set. The execution context id and
+# sequence and the Kerberos forwarded ticket's key and target have slots and
+# are never sent.
+_E2E_ATTRS = ('client_identifier', 'module', 'action', 'client_info', 'dbop')
+_E2E_SLOTS = (
+    'client_identifier',
+    'module',
+    'action',
+    'cideci',
+    'cidcct',
+    'client_info',
+    'cidkstk',
+    'cidktgt',
+    'dbop',
+)
+_PIG_END_TO_END: wire_schema.Schema = (
+    ('ptr', 'cidnam_present'),
+    ('ptr', 'cidser_present'),
+    ('n4', 'flags'),
+    *(
+        field
+        for slot in _E2E_SLOTS
+        for field in (('ptr', f'{slot}_changed'), ('n4', f'{slot}_length'))
+    ),
+    *(('when', f'{name}_length', (('value', name),)) for name in _E2E_ATTRS),
+)
+# The application context (154, #1775): one namespace's entries set, or the
+# namespace cleared when there are none. The zero byte before the namespace
+# exists from field version 12.1; a server reading at 11.2 rejects it
+# (ORA-03120).
+_PIG_APP_CONTEXT: wire_schema.Schema = (
+    ('ptr', 'namespace_present'),
+    ('n4', 'namespace_length'),
+    ('ptr', 'entries_present'),
+    ('n4', 'count'),
+    ('n4', 'flags'),
+    ('when', 'has_namespace_pad', (('pad', 1),)),
+    ('value', 'namespace'),
+    ('each', 'entries', 'count', _PIG_KV_PAIR),
+)
+# ALTER SESSION (204, #1776): key-value pairs, of which TXN_PRIORITY is the one
+# a client sends; its pair flags are 1 for an empty value.
+_PIG_ALTER_SESSION: wire_schema.Schema = (
+    ('n4', 'flags'),
+    ('ptr', 'pairs_present'),
+    ('n4', 'count'),
+    ('each', 'pairs', 'count', _PIG_KV_PAIR),
+)
+# The session state (176, #464): a request boundary, as a ub8.
+_PIG_SESSION_STATE: wire_schema.Schema = (('n8', 'state'),)
+# The end-user security context (205, #460): an attach flag and keyword-value
+# pairs, each its flags, then keyword, text and value with two lengths each.
+_PIG_END_USER_SEC: wire_schema.Schema = (
+    ('n4', 'attach_flag'),
+    ('ptr', 'pairs_present'),
+    ('n4', 'count'),
+    (
+        'each',
+        'pairs',
+        'count',
+        (
+            ('n4', 'pair_flags'),
+            ('n4', 'keyword_length'),
+            ('when', 'keyword_length', (('value', 'keyword'),)),
+            ('n4', 'text_length'),
+            ('when', 'text_length', (('value', 'text'),)),
+            ('n4', 'value_length'),
+            ('when', 'value_length', (('value', 'value'),)),
+        ),
+    ),
+)
+# The close of temp LOBs (TTI_LOBOPS, 96, #852): FREE_TEMP's fixed block with
+# the ARRAY bit on the operation, then the locators, `locators_length` bytes of
+# them, each with a big-endian ub2 length. No count is sent. Every other field
+# is zero. The source locator's pointer is a ub4 here, and the SCN's length a
+# ub8 written as two ub4s.
+_PIG_FREE_TEMP_LOBS: wire_schema.Schema = (
+    ('ptr', 'locators_present'),
+    ('n4', 'locators_length'),
+    ('ptr', 'dest_present'),
+    ('n4', 'dest_length'),
+    ('n4', 'source_pointer'),
+    ('n4', 'source_length'),
+    ('u8', 'source_offset'),
+    ('u8', 'dest_offset'),
+    ('ptr', 'charset_present'),
+    ('n4', 'operation'),
+    ('ptr', 'scn_present'),
+    ('n4', 'lobscn'),
+    ('n4', 'lobscnl_high'),
+    ('n4', 'lobscnl_low'),
+    ('u8', 'flag'),
+    ('ptr', 'array_lob_1_present'),
+    ('n4', 'array_lob_1_length'),
+    ('ptr', 'array_lob_2_present'),
+    ('n4', 'array_lob_2_length'),
+    ('ptr', 'array_lob_3_present'),
+    ('n4', 'array_lob_3_length'),
+    ('bytes', 'locators', 'locators_length'),
+)
+# SET_SCHEMA (152, #837): `connection.current_schema = x` in python-oracledb.
+# Read off a live 23ai, varying the name to separate the fields: a constant
+# flag byte, the length as a ub4, then the name with its length again. Both
+# lengths scale -- a 299-character name sends `02 01 2b` and then a chunked
+# (0xFE) value -- so neither can be assumed single-byte.
+_PIG_SET_SCHEMA: wire_schema.Schema = (
+    ('ptr', 'schema_present'),
+    ('n4', 'schema_length'),
+    ('value', 'schema'),
+)
+# The pipeline's begin (199, #132): a reserved sb4, a byte no field is known
+# for, and the error mode.
+_PIG_PIPELINE_BEGIN: wire_schema.Schema = (
+    ('n4', 'reserved'),
+    ('pad', 1),
+    ('u8', 'mode'),
 )
 # TTI_LOBOPS (96), the head every operation shares (#412, #2064): the source
 # and destination locators' pointers and lengths, the short offsets, three
@@ -2869,6 +3043,35 @@ _LOB_READ_REPLY_OCI = wire_schema.compile_encoder(_LOB_READ_REPLY, _OCI)
 _CLOSE_CURSORS_THIN = wire_schema.compile_encoder(_CLOSE_CURSORS, _THIN)
 _CLOSE_CURSORS_FROM_THIN = wire_schema.compile_decoder(_CLOSE_CURSORS, _THIN)
 _PIGGYBACK_HEAD_THIN = wire_schema.compile_encoder(_PIGGYBACK_HEAD, _THIN)
+_PIGGYBACK_HEAD_FROM_THIN = wire_schema.compile_decoder(_PIGGYBACK_HEAD, _THIN)
+_PIG_END_TO_END_THIN = wire_schema.compile_encoder(_PIG_END_TO_END, _THIN)
+_PIG_END_TO_END_FROM_THIN = wire_schema.compile_decoder(_PIG_END_TO_END, _THIN)
+_PIG_APP_CONTEXT_THIN = wire_schema.compile_encoder(_PIG_APP_CONTEXT, _THIN)
+_PIG_APP_CONTEXT_FROM_THIN = wire_schema.compile_decoder(_PIG_APP_CONTEXT, _THIN)
+_PIG_ALTER_SESSION_THIN = wire_schema.compile_encoder(_PIG_ALTER_SESSION, _THIN)
+_PIG_ALTER_SESSION_FROM_THIN = wire_schema.compile_decoder(_PIG_ALTER_SESSION, _THIN)
+_PIG_SESSION_STATE_THIN = wire_schema.compile_encoder(_PIG_SESSION_STATE, _THIN)
+_PIG_SESSION_STATE_FROM_THIN = wire_schema.compile_decoder(_PIG_SESSION_STATE, _THIN)
+_PIG_END_USER_SEC_THIN = wire_schema.compile_encoder(_PIG_END_USER_SEC, _THIN)
+_PIG_END_USER_SEC_FROM_THIN = wire_schema.compile_decoder(_PIG_END_USER_SEC, _THIN)
+_PIG_FREE_TEMP_LOBS_THIN = wire_schema.compile_encoder(_PIG_FREE_TEMP_LOBS, _THIN)
+_PIG_FREE_TEMP_LOBS_FROM_THIN = wire_schema.compile_decoder(_PIG_FREE_TEMP_LOBS, _THIN)
+_PIG_SET_SCHEMA_THIN = wire_schema.compile_encoder(_PIG_SET_SCHEMA, _THIN)
+_PIG_SET_SCHEMA_FROM_THIN = wire_schema.compile_decoder(_PIG_SET_SCHEMA, _THIN)
+_PIG_PIPELINE_BEGIN_THIN = wire_schema.compile_encoder(_PIG_PIPELINE_BEGIN, _THIN)
+_PIG_PIPELINE_BEGIN_FROM_THIN = wire_schema.compile_decoder(_PIG_PIPELINE_BEGIN, _THIN)
+# The client piggybacks decode_client_piggyback reads by a body schema alone,
+# each by its decoder's module name (which tools/schema_corpus.py records).
+_PIG_FUNCS = frozenset(
+    {
+        TNS_FUNC_SET_END_TO_END_ATTR,
+        TNS_FUNC_APP_CONTEXT,
+        TNS_FUNC_ALTER_SESSION,
+        TNS_FUNC_SESSION_STATE,
+        TNS_FUNC_SET_SCHEMA,
+        TNS_FUNC_PIPELINE_BEGIN,
+    }
+)
 _CLOSE_CURSORS_FROM_OCI = wire_schema.compile_decoder(_CLOSE_CURSORS, _OCI)
 _CLOSE_CURSORS_O8I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O8I)
 _O8I_ALL8_O8I = wire_schema.compile_encoder(_O8I_ALL8, _O8I)
@@ -2981,6 +3184,10 @@ _EXT_SYNC_THIN = wire_schema.compile_encoder(_EXT_SYNC, _THIN)
 _EXT_SYNC_FROM_THIN = wire_schema.compile_decoder(_EXT_SYNC, _THIN)
 _SESS_SIGNATURE_THIN = wire_schema.compile_encoder(_SESS_SIGNATURE, _THIN)
 _SESS_SIGNATURE_FROM_THIN = wire_schema.compile_decoder(_SESS_SIGNATURE, _THIN)
+_SESS_RET_THIN = wire_schema.compile_encoder(_SESS_RET, _THIN)
+_SESS_RET_FROM_THIN = wire_schema.compile_decoder(_SESS_RET, _THIN)
+_OS_PID_MTS_THIN = wire_schema.compile_encoder(_OS_PID_MTS, _THIN)
+_OS_PID_MTS_FROM_THIN = wire_schema.compile_decoder(_OS_PID_MTS, _THIN)
 _SYNC_OCI = wire_schema.compile_encoder(_SYNC, _OCI)
 _ROWCOUNTS_BLOCK_THIN = wire_schema.compile_encoder(_ROWCOUNTS_BLOCK, _THIN)
 _CREATE_TEMP_RESPONSE_THIN = wire_schema.compile_encoder(_CREATE_TEMP_RESPONSE, _THIN)
@@ -7692,12 +7899,9 @@ def decode_token_server_piggyback(Data: bytes, Acc: tuple) -> tuple:
 
 def _decode_server_piggyback(Data: bytes) -> bytes:
     # Server-side piggyback (#130): a session-state block the server prepends to
-    # a response. DRCP-pooled sessions carry SESS_RET (the assigned session id /
-    # serial + any session-state key/value pairs) and OS_PID_MTS; consume it
-    # byte-for-byte (the values are not needed) and continue with the rest of the
-    # response. Mirrors python-oracledb _process_server_side_piggyback. ub2/ub4
-    # are the variable-length form (decode_ub4); skip_ub1 is one raw byte;
-    # skip_bytes is a single-byte/0xFE-chunked value (decode_dalc).
+    # a response, read by its opcode's schema, and the rest of the response
+    # after it. DRCP-pooled sessions carry SESS_RET and OS_PID_MTS, whose values
+    # are not needed. Mirrors python-oracledb _process_server_side_piggyback.
     Rest = Data[1:]
     Opcode = Rest[0]
     Rest = Rest[1:]
@@ -7705,25 +7909,9 @@ def _decode_server_piggyback(Data: bytes) -> bytes:
         Sink = _DECODE_SESSION_KEYWORDS.get()
         if Sink is not None:
             Sink[SESSION_KEYWORD_POOLED_SERVER] = None
-        (_, Rest) = decode_ub4(Rest)  # number of DTYs (ub2)
-        Rest = Rest[1:]  # length of DTYs (ub1)
-        (NumElements, Rest) = decode_ub4(Rest)  # number of pairs (ub2)
-        if NumElements > 0:
-            Rest = Rest[1:]  # skip_ub1
-            for _ in range(NumElements):
-                (KeyLen, Rest) = decode_ub4(Rest)
-                if KeyLen > 0:
-                    (_, Rest) = decode_dalc(Rest)
-                (ValLen, Rest) = decode_ub4(Rest)
-                if ValLen > 0:
-                    (_, Rest) = decode_dalc(Rest)
-                (_, Rest) = decode_ub4(Rest)  # pair flags (ub2)
-        (_, Rest) = decode_ub4(Rest)  # session flags (ub4)
-        (_, Rest) = decode_ub4(Rest)  # session id (ub4)
-        (_, Rest) = decode_ub4(Rest)  # serial number (ub2)
+        (_, Rest) = _SESS_RET_FROM_THIN(Data[:2] + Rest)
     elif Opcode == TNS_SERVER_PIGGYBACK_OS_PID_MTS:
-        (_, Rest) = decode_ub4(Rest)  # ub2
-        (_, Rest) = decode_dalc(Rest)  # pid bytes
+        (_, Rest) = _OS_PID_MTS_FROM_THIN(Data[:2] + Rest)
     elif Opcode == TNS_SERVER_PIGGYBACK_SYNC:
         # Session state as keyword-value pairs: the transaction id of a
         # sessionless transaction (keyword 201, #133; seerdb tracks that flag
@@ -8980,22 +9168,14 @@ def encode_pipeline_begin(
     # message (the caller sets the BEGIN_PIPELINE data flag on that packet) and
     # shares that message's token. Mirrors oracledb
     # _write_begin_pipeline_piggyback; byte-validated against a 23ai capture.
+    # The body is _PIG_PIPELINE_BEGIN.
     Out = _piggyback_head(TNS_FUNC_PIPELINE_BEGIN, Seq, FieldVersion, TokenNum)
-    return Out + encode_sb4(0) + bytes([0]) + bytes([Mode])
+    return Out + _PIG_PIPELINE_BEGIN_THIN({'reserved': 0, 'mode': Mode})
 
 
 def encode_pipeline_end(Seq: int, FieldVersion: int) -> bytes:
     # The PIPELINE_END (func 200) message closing a pipelined burst (#132).
     return _fun_header(TNS_FUNC_PIPELINE_END, Seq, FieldVersion) + encode_sb4(0)
-
-
-def _e2e_header(Modified: bool, Value: bytes | None) -> bytes:
-    # One end-to-end attribute's header: a pointer byte (1 if the attribute is
-    # being set this flush, else 0) + a ub4 length of its value (0 when unset or
-    # cleared). The value bytes themselves are appended later, in field order.
-    if Modified:
-        return bytes([1]) + encode_sb4(len(Value) if Value else 0)
-    return bytes([0]) + encode_sb4(0)
 
 
 def _piggyback_head(func: int, seq: int, field_version: int, token: int = 0) -> bytes:
@@ -9060,48 +9240,30 @@ def encode_end_to_end_piggyback(Seq: int, FieldVersion: int, Attrs: dict) -> byt
     (client_identifier / module / action / client_info / dbop) to either its new
     str value or None (clear); only the keys present are flushed. The piggyback
     rides in front of the next call's message. Byte layout + field order mirror
-    oracledb's _write_end_to_end_piggyback (validated against a 23ai capture).
+    oracledb's _write_end_to_end_piggyback (validated against a 23ai capture);
+    the body is _PIG_END_TO_END.
 
     An empty value is sent as None, the header alone (#2784). Oracle keeps an
     empty string as NULL, and a server reads no value behind a zero length: the
     value's `00` byte, written too, closed the connection."""
-
-    def enc(Name):
-        return Attrs[Name].encode('utf-8') if Attrs.get(Name) else None
-
-    Mod = {
-        Name: Name in Attrs
-        for Name in ('client_identifier', 'module', 'action', 'client_info', 'dbop')
+    Bits = {
+        'client_identifier': TNS_END_TO_END_CLIENT_IDENTIFIER,
+        'module': TNS_END_TO_END_MODULE,
+        'action': TNS_END_TO_END_ACTION,
+        'client_info': TNS_END_TO_END_CLIENT_INFO,
+        'dbop': TNS_END_TO_END_DBOP,
     }
-    Val = {Name: enc(Name) for Name in Mod}
-    Flags = 0
-    if Mod['action']:
-        Flags |= TNS_END_TO_END_ACTION
-    if Mod['client_identifier']:
-        Flags |= TNS_END_TO_END_CLIENT_IDENTIFIER
-    if Mod['client_info']:
-        Flags |= TNS_END_TO_END_CLIENT_INFO
-    if Mod['module']:
-        Flags |= TNS_END_TO_END_MODULE
-    if Mod['dbop']:
-        Flags |= TNS_END_TO_END_DBOP
-
-    Out = _piggyback_head(TNS_FUNC_SET_END_TO_END_ATTR, Seq, FieldVersion)
-    Out += bytes([0, 0]) + encode_sb4(Flags)  # cidnam, cidser pointers; flags
-    Out += _e2e_header(Mod['client_identifier'], Val['client_identifier'])
-    Out += _e2e_header(Mod['module'], Val['module'])
-    Out += _e2e_header(Mod['action'], Val['action'])
-    Out += bytes([0]) + encode_sb4(0)  # cideci (unsupported)
-    Out += bytes([0]) + encode_sb4(0)  # cidcct / cidecs (unsupported)
-    Out += _e2e_header(Mod['client_info'], Val['client_info'])
-    Out += bytes([0]) + encode_sb4(0)  # cidkstk (unsupported)
-    Out += bytes([0]) + encode_sb4(0)  # cidktgt (unsupported)
-    Out += _e2e_header(Mod['dbop'], Val['dbop'])
-    # values, in field order, only those set to a non-None value
-    for Name in ('client_identifier', 'module', 'action', 'client_info', 'dbop'):
-        if Mod[Name] and Val[Name] is not None:
-            Out += _bytes_with_length(Val[Name])
-    return Out
+    Fields: dict[str, Any] = {'cidnam_present': False, 'cidser_present': False}
+    Fields['flags'] = sum(Bit for Name, Bit in Bits.items() if Name in Attrs)
+    for Slot in _E2E_SLOTS:
+        Changed = Slot in Bits and Slot in Attrs
+        Value = Attrs[Slot].encode('utf-8') if Changed and Attrs[Slot] else b''
+        Fields[f'{Slot}_changed'] = Changed
+        Fields[f'{Slot}_length'] = len(Value)
+        Fields[Slot] = Value
+    return _piggyback_head(
+        TNS_FUNC_SET_END_TO_END_ATTR, Seq, FieldVersion
+    ) + _PIG_END_TO_END_THIN(Fields)
 
 
 # The single keyword under which the end-user security context OSON image is
@@ -9117,22 +9279,49 @@ def encode_end_user_sec_piggyback(
     Deep Data Security. `OsonBytes` is the OSON image of the context dict (see
     ``seerdb.common.end_user_sec.create_end_user_security_context``). The
     piggyback carries a single keyword-value pair — keyword
-    ``ORCL_XS_AUTHZ_CONTEXT``, value = the OSON image. It rides in front of the
-    next call's message and re-rides every call while a context is set (mirrors
-    oracledb's _write_end_user_sec_piggyback / _write_piggybacks). Byte layout
-    reconstructed from the reference thin client (docs/PROTOCOL.md §34); the
-    feature is tcps-only so it cannot be captured on a cleartext transport."""
-    Out = _piggyback_head(TNS_FUNC_END_USER_SECURITY_CTX, Seq, FieldVersion)
-    Out += encode_sb4(TNS_SECURITY_CONTEXT_ATTACH_FLAG)  # ub4 attach flag = 1
-    Out += bytes([1])  # pointer(kpdkve) non-null
-    Out += encode_sb4(1)  # number of key-value pairs = 1
-    # One str-keyword-value-pair (flags=0, text=NULL), each field written as
-    # write_bytes_with_two_lengths (ub4 count + length-prefixed bytes).
-    Out += encode_sb4(0)  # kv flags
-    Out += _obj_two_lengths(END_USER_SEC_CTX_KEYWORD)  # keyword
-    Out += _obj_two_lengths(b'')  # text (NULL)
-    Out += _obj_two_lengths(OsonBytes)  # value = OSON image
-    return Out
+    ``ORCL_XS_AUTHZ_CONTEXT``, value = the OSON image, no text. It rides in front
+    of the next call's message and re-rides every call while a context is set
+    (mirrors oracledb's _write_end_user_sec_piggyback / _write_piggybacks). Byte
+    layout reconstructed from the reference thin client (docs/PROTOCOL.md §34);
+    the feature is tcps-only so it cannot be captured on a cleartext transport.
+    The body is _PIG_END_USER_SEC."""
+    Pair = {
+        'pair_flags': 0,
+        'keyword_length': len(END_USER_SEC_CTX_KEYWORD),
+        'keyword': END_USER_SEC_CTX_KEYWORD,
+        'text_length': 0,
+        'value_length': len(OsonBytes),
+        'value': OsonBytes,
+    }
+    return _piggyback_head(
+        TNS_FUNC_END_USER_SECURITY_CTX, Seq, FieldVersion
+    ) + _PIG_END_USER_SEC_THIN(
+        {
+            'attach_flag': TNS_SECURITY_CONTEXT_ATTACH_FLAG,
+            'pairs_present': True,
+            'count': 1,
+            'pairs': [Pair],
+        }
+    )
+
+
+def _pig_kv_pair(Key: bytes, Value: bytes, Flags: int = 0) -> dict[str, Any]:
+    # A _PIG_KV_PAIR's fields.
+    return {
+        'key_length': len(Key),
+        'key': Key,
+        'value_length': len(Value),
+        'value': Value,
+        'pair_flags': Flags,
+    }
+
+
+def _pig_kv_text(Pair: dict[str, Any]) -> tuple[str, str]:
+    # A decoded _PIG_KV_PAIR's key and value as text, empty when not sent.
+    return (
+        Pair.get('key', b'').decode('utf-8'),
+        Pair.get('value', b'').decode('utf-8'),
+    )
 
 
 def encode_app_context_piggyback(
@@ -9141,20 +9330,26 @@ def encode_app_context_piggyback(
     """Build the application-context piggyback (func 154, #1775) for one
     namespace: set its ``Entries`` (key, value) pairs, or clear it when there
     are none. It rides in front of the next call's message once. Layout in
-    docs/PROTOCOL.md; the zero byte before the namespace exists from field
-    version 12.1, and a server reading at 11.2 or below (10g and 11g, or 23ai
-    held there) rejects a piggyback that has it (ORA-03120)."""
-    Out = _piggyback_head(TNS_FUNC_APP_CONTEXT, Seq, FieldVersion)
-    Out += bytes([1]) + encode_sb4(len(Namespace))  # pointer, namespace length
-    Out += bytes([1 if Entries else 0]) + encode_sb4(len(Entries))  # pointer, count
-    Flags = TNS_APP_CONTEXT_FLAG_SET if Entries else TNS_APP_CONTEXT_FLAG_CLEAR
-    Out += encode_sb4(Flags)  # ub2 flags
-    if FieldVersion >= FIELD_VERSION_12_1:
-        Out += bytes([0])
-    Out += _bytes_with_length(Namespace)
-    for Key, Value in Entries:
-        Out += _obj_two_lengths(Key) + _obj_two_lengths(Value) + encode_sb4(0)
-    return Out
+    docs/PROTOCOL.md, the body _PIG_APP_CONTEXT; the zero byte before the
+    namespace exists from field version 12.1, and a server reading at 11.2 or
+    below (10g and 11g, or 23ai held there) rejects a piggyback that has it
+    (ORA-03120)."""
+    return _piggyback_head(TNS_FUNC_APP_CONTEXT, Seq, FieldVersion) + (
+        _PIG_APP_CONTEXT_THIN(
+            {
+                'namespace_present': True,
+                'namespace_length': len(Namespace),
+                'entries_present': bool(Entries),
+                'count': len(Entries),
+                'flags': (
+                    TNS_APP_CONTEXT_FLAG_SET if Entries else TNS_APP_CONTEXT_FLAG_CLEAR
+                ),
+                'has_namespace_pad': FieldVersion >= FIELD_VERSION_12_1,
+                'namespace': Namespace,
+                'entries': [_pig_kv_pair(Key, Value) for Key, Value in Entries],
+            }
+        )
+    )
 
 
 def encode_alter_session_piggyback(Seq: int, FieldVersion: int, Priority: str) -> bytes:
@@ -9163,13 +9358,13 @@ def encode_alter_session_piggyback(Seq: int, FieldVersion: int, Priority: str) -
     single keyword-value pair whose flag is 1 for an empty value, which restores
     the default. It rides in front of the next call's message once. A server
     refuses it unless the client declared TNS_DATA_TYPE_ALTSESS. Layout in
-    docs/PROTOCOL.md."""
-    Out = _piggyback_head(TNS_FUNC_ALTER_SESSION, Seq, FieldVersion)
-    Out += encode_sb4(0)  # flags
-    Out += bytes([1]) + encode_sb4(1)  # pointer, one key-value pair
-    Out += _obj_two_lengths(b'TXN_PRIORITY') + _obj_two_lengths(Priority.encode())
-    Out += encode_sb4(0 if Priority else 1)
-    return Out
+    docs/PROTOCOL.md, the body _PIG_ALTER_SESSION."""
+    Pair = _pig_kv_pair(b'TXN_PRIORITY', Priority.encode(), 0 if Priority else 1)
+    return _piggyback_head(
+        TNS_FUNC_ALTER_SESSION, Seq, FieldVersion
+    ) + _PIG_ALTER_SESSION_THIN(
+        {'flags': 0, 'pairs_present': True, 'count': 1, 'pairs': [Pair]}
+    )
 
 
 def encode_session_state_piggyback(Seq: int, FieldVersion: int, State: int) -> bytes:
@@ -9178,11 +9373,37 @@ def encode_session_state_piggyback(Seq: int, FieldVersion: int, State: int) -> b
     boundary bit is OR'd in. It rides in front of the next call's message and is
     one-shot (the caller clears the desired state after emitting it). Mirrors
     oracledb's _write_session_state_piggyback; byte layout in docs/PROTOCOL.md
-    §35. Gated on the negotiated request-boundaries capability."""
-    Out = _piggyback_head(TNS_FUNC_SESSION_STATE, Seq, FieldVersion)
-    # ub8 (state | explicit-boundary); small values encode like ub4.
-    Out += encode_sb4(State | TNS_SESSION_STATE_EXPLICIT_BOUNDARY)
-    return Out
+    §35, the body _PIG_SESSION_STATE. Gated on the negotiated
+    request-boundaries capability."""
+    return _piggyback_head(
+        TNS_FUNC_SESSION_STATE, Seq, FieldVersion
+    ) + _PIG_SESSION_STATE_THIN({'state': State | TNS_SESSION_STATE_EXPLICIT_BOUNDARY})
+
+
+# The fields of a close of temp LOBs (_PIG_FREE_TEMP_LOBS) other than its
+# locators: all zero but the operation.
+_FREE_TEMP_LOBS_FIXED: dict[str, Any] = {
+    'locators_present': True,
+    'dest_present': False,
+    'dest_length': 0,
+    'source_pointer': 0,
+    'source_length': 0,
+    'source_offset': 0,
+    'dest_offset': 0,
+    'charset_present': False,
+    'operation': TNS_LOB_OP_FREE_TEMP | TNS_LOB_OP_ARRAY,
+    'scn_present': False,
+    'lobscn': 0,
+    'lobscnl_high': 0,
+    'lobscnl_low': 0,
+    'flag': 0,
+    'array_lob_1_present': False,
+    'array_lob_1_length': 0,
+    'array_lob_2_present': False,
+    'array_lob_2_length': 0,
+    'array_lob_3_present': False,
+    'array_lob_3_length': 0,
+}
 
 
 def encode_free_temp_lobs_piggyback(
@@ -9193,57 +9414,98 @@ def encode_free_temp_lobs_piggyback(
     next call once temp LOBs it created have gone out of scope. Each locator is
     the ub2-length-prefixed form CREATE_TEMP handed out (40 bytes for a real
     server's 38). Mirrors oracledb's _write_close_temp_lobs_piggyback; byte
-    layout in docs/PROTOCOL.md §14.5."""
-    Out = _piggyback_head(TTI_LOBOPS, Seq, FieldVersion)
+    layout in docs/PROTOCOL.md §14.5, the body _PIG_FREE_TEMP_LOBS."""
     Wire = b''.join(struct.pack('>H', len(L)) + L for L in Locators)
-    Out += bytes([1]) + encode_sb4(len(Wire))  # pointer + total locator bytes
-    Out += bytes([0]) + encode_sb4(0)  # dest locator pointer + length
-    Out += encode_sb4(0) + encode_sb4(0)  # source locator pointer + length
-    Out += bytes([0, 0, 0])  # source offset, dest offset, charset pointers
-    Out += encode_sb4(TNS_LOB_OP_FREE_TEMP | TNS_LOB_OP_ARRAY)
-    Out += bytes([0]) + encode_sb4(0)  # scn pointer + lobscn
-    Out += encode_sb4(0) + encode_sb4(0) + bytes([0])  # lobscnl (ub8 ×2), flag
-    Out += bytes([0]) + encode_sb4(0)  # the three array-LOB slots: a pointer
-    Out += bytes([0]) + encode_sb4(0)  # byte and a ub4 length each (none is
-    Out += bytes([0]) + encode_sb4(0)  # used; the locators just follow)
-    return Out + Wire
+    return _piggyback_head(TTI_LOBOPS, Seq, FieldVersion) + _PIG_FREE_TEMP_LOBS_THIN(
+        {**_FREE_TEMP_LOBS_FIXED, 'locators_length': len(Wire), 'locators': Wire}
+    )
 
 
 def parse_free_temp_lobs_piggyback(rest: bytes) -> tuple[list[bytes], bytes]:
-    """Walk a close-temp-LOBs piggyback from just past its header (the inverse
-    of encode_free_temp_lobs_piggyback). Returns the freed locators, each
-    without its ub2 length prefix, and the bytes after the piggyback.
-
-    The layout is a FREE_TEMP request's fixed block with the ARRAY bit set on the
-    operation and the locators concatenated after the array slots, `total` bytes
-    of them; no count is sent, so the locators are split by their own length
-    prefixes. Every scalar is zero on the wire (the ub8 SCNs included, which is
-    why decode_ub4 can read them: a zero is a single byte in either width)."""
-    rest = rest[1:]  # pointer
-    total, rest = decode_ub4(rest)
-    rest = rest[1:]  # dest locator pointer
-    _, rest = decode_ub4(rest)  # dest locator length
-    _, rest = decode_ub4(rest)  # source locator pointer
-    _, rest = decode_ub4(rest)  # source locator length
-    rest = rest[3:]  # source offset, dest offset, charset pointers
-    _operation, rest = decode_ub4(rest)  # FREE_TEMP | ARRAY
-    rest = rest[1:]  # scn pointer
-    _, rest = decode_ub4(rest)  # lobscn
-    _, rest = decode_ub4(rest)  # lobscnl
-    _, rest = decode_ub4(rest)
-    rest = rest[1:]
-    for _ in range(3):  # the array-LOB slots: pointer byte + ub4 length
-        rest = rest[1:]
-        _, rest = decode_ub4(rest)
-    if len(rest) < total:
+    """Read a close-temp-LOBs piggyback from just past its header (the inverse
+    of encode_free_temp_lobs_piggyback, _PIG_FREE_TEMP_LOBS). Returns the freed
+    locators, each without its ub2 length prefix, and the bytes after the
+    piggyback. No count is sent, so the locators are split by their own length
+    prefixes."""
+    Fields, rest = _PIG_FREE_TEMP_LOBS_FROM_THIN(rest)
+    wire = Fields['locators']
+    if len(wire) < Fields['locators_length']:
         raise Truncated('close-temp-LOBs piggyback')
-    wire, rest = rest[:total], rest[total:]
     locators = []
     while len(wire) >= 2:
         loc_len = struct.unpack('>H', wire[:2])[0]
         locators.append(wire[2 : 2 + loc_len])
         wire = wire[2 + loc_len :]
     return locators, rest
+
+
+def decode_client_piggyback(body: bytes) -> tuple[int, Any, bytes] | None:
+    """The client piggyback at the start of ``body``: its function, what it
+    carries, and the bytes after it; None for a function this codec doesn't
+    read, which is left in place. What each one carries:
+
+    - CLOSE_CURSORS: the cursor ids;
+    - SET_END_TO_END_ATTR: the changed attributes, name to text, None for a
+      clear;
+    - APP_CONTEXT: (namespace, its entries as a dict, or None for a clear);
+    - ALTER_SESSION: the (key, value) pairs;
+    - SESSION_STATE: the state; SET_SCHEMA: the schema's name as bytes, as
+      _apply_schema takes it; PIPELINE_BEGIN: the error mode;
+    - TTI_LOBOPS (the close of temp LOBs): the locators.
+
+    The end-user security context (205) is not read: the Mirror doesn't take
+    it, and refuses a call it rides on. The token in the head is read by the
+    session's field version. A message that ends inside the piggyback raises
+    Truncated."""
+    try:
+        return _decode_client_piggyback(body)
+    except IndexError as exc:
+        raise Truncated(f'client piggyback: {exc}') from None
+
+
+def _decode_client_piggyback(body: bytes) -> tuple[int, Any, bytes] | None:
+    func = body[1]
+    if func == TTI_OCCA:
+        Fields, rest = _CLOSE_CURSORS_FROM_THIN(body)
+        return func, [c['cursor'] for c in Fields['cursors']], rest
+    if func == TTI_LOBOPS:
+        _, rest = _PIGGYBACK_HEAD_FROM_THIN(body)
+        locators, rest = parse_free_temp_lobs_piggyback(rest)
+        return func, locators, rest
+    if func not in _PIG_FUNCS:
+        return None
+    _, rest = _PIGGYBACK_HEAD_FROM_THIN(body)
+    carried: Any
+    if func == TNS_FUNC_SET_END_TO_END_ATTR:
+        Fields, rest = _PIG_END_TO_END_FROM_THIN(rest)
+        carried = {
+            name: Fields[name].decode('utf-8') if Fields[f'{name}_length'] else None
+            for name in _E2E_ATTRS
+            if Fields[f'{name}_changed']
+        }
+    elif func == TNS_FUNC_APP_CONTEXT:
+        Fields, rest = _PIG_APP_CONTEXT_FROM_THIN(
+            rest,
+            {'has_namespace_pad': _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1},
+        )
+        values = dict(_pig_kv_text(Pair) for Pair in Fields['entries'])
+        carried = (
+            Fields['namespace'].decode('utf-8'),
+            None if Fields['flags'] & TNS_APP_CONTEXT_FLAG_CLEAR else values,
+        )
+    elif func == TNS_FUNC_ALTER_SESSION:
+        Fields, rest = _PIG_ALTER_SESSION_FROM_THIN(rest)
+        carried = [_pig_kv_text(Pair) for Pair in Fields['pairs']]
+    elif func == TNS_FUNC_SESSION_STATE:
+        Fields, rest = _PIG_SESSION_STATE_FROM_THIN(rest)
+        carried = Fields['state']
+    elif func == TNS_FUNC_SET_SCHEMA:
+        Fields, rest = _PIG_SET_SCHEMA_FROM_THIN(rest)
+        carried = Fields['schema']
+    else:
+        Fields, rest = _PIG_PIPELINE_BEGIN_FROM_THIN(rest)
+        carried = Fields['mode']
+    return func, carried, rest
 
 
 def encode_dictionary_close(Dictionary: dict) -> bytes:
