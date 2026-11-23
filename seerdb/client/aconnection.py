@@ -119,6 +119,7 @@ from seerdb.common.tns import (
     encode_dictionary_auth,
     encode_fast_auth,
     encode_flush_echo,
+    encode_marker_body,
     encode_packet,
     encode_pipeline_begin,
     encode_pipeline_end,
@@ -1006,7 +1007,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 self._in_break = False
                 return (Type, Packet)
             if not self._in_break:
-                await self.send(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+                await self.send(TNS_MARKER, encode_marker_body(TNS_MARKER_TYPE_RESET))
                 self._rederive_ano_after_reset()
                 self._in_break = True
 
@@ -1212,7 +1213,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                     # Single reset per break episode, then drain (#45).
                     if not self._in_break:
                         await self.send(
-                            TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET])
+                            TNS_MARKER, encode_marker_body(TNS_MARKER_TYPE_RESET)
                         )
                         self._rederive_ano_after_reset()
                         self._in_break = True
@@ -2981,7 +2982,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 else:
                     (Packet, _) = encode_packet(
                         TNS_MARKER,
-                        bytes([1, 0, TNS_MARKER_TYPE_INTERRUPT]),
+                        encode_marker_body(TNS_MARKER_TYPE_INTERRUPT),
                         self.sdu,
                         self._large_packets,
                     )

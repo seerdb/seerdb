@@ -3079,6 +3079,40 @@ def test_a_reexecute_names_its_cursor_and_fetch_count(
     assert _at_field_version(fv, parse_reexecute_oci, body) == (cursor, 15)
 
 
+@pytest.mark.parametrize(
+    ('body', 'field_version', 'cursor'),
+    [
+        (_OCI_REEXEC_REFCURSOR, 'FIELD_VERSION_18_1_EXT_1', 3),
+        (_OCI_REEXEC_REFCURSOR_11_2, 'FIELD_VERSION_11_2', 2),
+        (_OCI_REEXEC_REFCURSOR_10_2, 'FIELD_VERSION_10_2', 1),
+    ],
+    ids=['23.26', '11.2', '10.2'],
+)
+def test_the_parked_cursor_lookup_reads_the_reexecute_s_own_head(
+    body: bytes, field_version: str, cursor: int
+) -> None:
+    # The REF CURSOR store looks a re-execute's cursor up through the head
+    # parse_reexecute_oci reads, in each preamble width, not at a fixed offset.
+    # What is not a re-execute names no cursor.
+    from seerdb.common import tns_consts
+    from seerdb.common.tns import reexecute_cursor_oci
+
+    fv = getattr(tns_consts, field_version)
+    assert _at_field_version(fv, reexecute_cursor_oci, body) == cursor
+    assert _at_field_version(fv, reexecute_cursor_oci, body[:9]) is None
+    assert _at_field_version(fv, reexecute_cursor_oci, _OCI_FETCH_15_ROWS[0]) is None
+
+
+def test_the_parked_cursor_lookup_reads_the_fetch_s_own_fields() -> None:
+    # An OCI fetch's cursor comes from _FETCH, as its row count does; a
+    # message that is not a fetch, or ends before its cursor, names none.
+    from seerdb.common.tns import fetch_cursor_oci
+
+    assert [fetch_cursor_oci(f) for f in _OCI_FETCH_15_ROWS] == [2, 2]
+    assert fetch_cursor_oci(_OCI_FETCH_15_ROWS[0][:5]) is None
+    assert fetch_cursor_oci(_OCI_REEXEC_REFCURSOR) is None
+
+
 def test_the_refcursor_out_value_matches_the_live_reply() -> None:
     # The value's frame -- lead byte, describe-time tail, cursor id, return code
     # -- is the live server's, with the date the Mirror zeroes. The describe in
