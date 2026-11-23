@@ -2981,6 +2981,7 @@ _IMPLICIT_RESULTS_OCI = wire_schema.compile_encoder(_IMPLICIT_RESULTS, _OCI)
 _SESSION_STATE_RESPONSE_THIN = wire_schema.compile_encoder(
     _SESSION_STATE_RESPONSE, _THIN
 )
+_PRO_THIN = wire_schema.compile_encoder(_PRO, _THIN)
 _PRO_FROM_THIN = wire_schema.compile_decoder(_PRO, _THIN)
 _SYNC_PAIR_OCI = wire_schema.compile_encoder(_SYNC_PAIR, _OCI)
 
@@ -7582,6 +7583,39 @@ def decode_token_pro(Data: bytes) -> dict:
     }
 
 
+def encode_token_pro(
+    ServerVersion: int,
+    Banner: bytes,
+    CharsetId: int,
+    ServerFlags: int,
+    CharsetElements: bytes,
+    Fdo: bytes,
+    CompileCaps: bytes,
+    RuntimeCaps: bytes,
+) -> bytes:
+    """A TTI_PRO server response, the inverse of :func:`decode_token_pro`.
+    ``CharsetElements`` is the element array's bytes, five per element."""
+    return _PRO_THIN(
+        {
+            'server_version': ServerVersion,
+            'banner': Banner,
+            'charset_id': CharsetId,
+            'server_flags': ServerFlags,
+            'charset_count': len(CharsetElements) // 5,
+            'charset_elements': [
+                {'element': CharsetElements[At : At + 5]}
+                for At in range(0, len(CharsetElements), 5)
+            ],
+            'fdo_length': len(Fdo),
+            'fdo': Fdo,
+            'compile_caps_length': len(CompileCaps),
+            'compile_caps': CompileCaps,
+            'runtime_caps_length': len(RuntimeCaps),
+            'runtime_caps': RuntimeCaps,
+        }
+    )
+
+
 def _fdo_ncharset(Fdo: bytes) -> int | None:
     # The database's national charset, which the PRO reply's FDO carries as a
     # big-endian ub2 three bytes past two variable-length runs, as python-oracledb
@@ -10740,6 +10774,51 @@ def decode_dty_table(body: bytes) -> list:
 # all-zero (UTC) offset is stored as (60, 60, 60). The pad is a fixed 11.2 identity.
 _DB_TZ_FRAME_PAD = bytes.fromhex('80000000')
 _DB_TZ_BIAS = 60  # Oracle biases each of the h/m/s offset fields by +60
+
+# The server's thin DTY reply: TTI_DTY, then its type-conversion table, which
+# encode_dty_table / _datatype_table_12c build (encodes only).
+_DTY_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_DTY])),
+    ('raw', 'table'),
+)
+_DTY_REPLY_THIN = wire_schema.compile_encoder(_DTY_REPLY, _THIN)
+
+# The type reply sqlplus / thick OCI's third negotiation round gets (§4.2):
+# TTI_DTY, the DB session time-zone block (the pad, the biased h/m/s, the pad),
+# then -- for a client whose own request carried one -- the timezone-file
+# version as a big-endian ub4.
+_OCI_DTY_TZ_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_DTY])),
+    ('const', _DB_TZ_FRAME_PAD),
+    ('u8', 'tz_hours'),
+    ('u8', 'tz_minutes'),
+    ('u8', 'tz_seconds'),
+    ('const', _DB_TZ_FRAME_PAD),
+    ('when', 'has_tz_file_version', (('be4', 'tz_file_version'),)),
+)
+_OCI_DTY_TZ_REPLY_THIN = wire_schema.compile_encoder(_OCI_DTY_TZ_REPLY, _THIN)
+
+
+def encode_dty_reply_body(Table: bytes) -> bytes:
+    """The server's thin DTY reply carrying ``Table``."""
+    return _DTY_REPLY_THIN({'table': Table})
+
+
+def encode_oci_dty_tz_reply(
+    Hours: int, Minutes: int, Seconds: int, TzFileVersion: int | None
+) -> bytes:
+    """The OCI third-round type reply for a DB session time zone of
+    ``Hours:Minutes:Seconds``; ``TzFileVersion`` is left out when ``None``."""
+    return _OCI_DTY_TZ_REPLY_THIN(
+        {
+            'tz_hours': Hours + _DB_TZ_BIAS,
+            'tz_minutes': Minutes + _DB_TZ_BIAS,
+            'tz_seconds': Seconds + _DB_TZ_BIAS,
+            'has_tz_file_version': TzFileVersion is not None,
+            'tz_file_version': TzFileVersion,
+        }
+    )
+
 
 # The 42-byte 8i DTY header, built from its fields: the TTI_DTY message token, the
 # charset + national charset (both ISO Latin-1 / WE8ISO8859P1 = 31, the only charset
@@ -14203,6 +14282,64 @@ def encode_lob_fetch_rows_oci(
     return bytes(out) + _oci_lob_fetch_status(sequence)
 
 
+# The head of a client's TTI_DTY request, which every form of it opens with:
+# the token, the charset and national charset as little-endian ub2s, an
+# encoding flag, then the compile and runtime capabilities, each a length byte
+# then the array. What follows differs by form (the type table, the native 9.2
+# trailer, sqlplus's time-zone block).
+_DTY_REQUEST_HEAD: wire_schema.Schema = (
+    ('const', bytes([TTI_DTY])),
+    ('le2', 'charset'),
+    ('le2', 'ncharset'),
+    ('u8', 'flag'),
+    ('u8', 'compile_caps_length'),
+    ('bytes', 'compile_caps', 'compile_caps_length'),
+)
+_DTY_REQUEST_HEAD_THIN = wire_schema.compile_encoder(_DTY_REQUEST_HEAD, _THIN)
+_DTY_REQUEST_HEAD_FROM_THIN = wire_schema.compile_decoder(_DTY_REQUEST_HEAD, _THIN)
+_DTY_REQUEST_RUNTIME: wire_schema.Schema = (
+    ('u8', 'runtime_caps_length'),
+    ('bytes', 'runtime_caps', 'runtime_caps_length'),
+)
+_DTY_REQUEST_RUNTIME_THIN = wire_schema.compile_encoder(_DTY_REQUEST_RUNTIME, _THIN)
+_DTY_REQUEST_RUNTIME_FROM_THIN = wire_schema.compile_decoder(
+    _DTY_REQUEST_RUNTIME, _THIN
+)
+
+
+def encode_dty_request_head(
+    Charset: int, Flag: int, CompileCaps: bytes, RuntimeCaps: bytes
+) -> bytes:
+    """A TTI_DTY request's head, the same charset for both slots as seerdb
+    sends it."""
+    return _DTY_REQUEST_HEAD_THIN(
+        {
+            'charset': Charset,
+            'ncharset': Charset,
+            'flag': Flag,
+            'compile_caps_length': len(CompileCaps),
+            'compile_caps': CompileCaps,
+        }
+    ) + _DTY_REQUEST_RUNTIME_THIN(
+        {'runtime_caps_length': len(RuntimeCaps), 'runtime_caps': RuntimeCaps}
+    )
+
+
+def decode_dty_request_head(Data: bytes) -> tuple[dict[str, Any], bytes] | None:
+    """A TTI_DTY request's head fields and what follows it, or ``None`` when
+    ``Data`` is not a DTY request or ends before its compile capabilities. A
+    capability array the request ends inside comes back short; one that ends
+    before the runtime capabilities' length has no ``runtime_caps``."""
+    try:
+        (Fields, Rest) = _DTY_REQUEST_HEAD_FROM_THIN(Data)
+    except (ValueError, IndexError):
+        return None
+    with contextlib.suppress(IndexError):
+        (Runtime, Rest) = _DTY_REQUEST_RUNTIME_FROM_THIN(Rest)
+        Fields.update(Runtime)
+    return (Fields, Rest)
+
+
 def encode_dictionary_dty(Dictionary: dict) -> bytes:
     # TTI_DTY (Data Type Negotiation). Sent during the TTC handshake right
     # after TTI_PRO. Tells the server which native Oracle data types this
@@ -14229,7 +14366,7 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
     # static C table at link time; we emit it as a constant for the same reason.
     # The table form is version-gated below: 11g 1-byte vs 12c+ 2-byte.
     logger.debug('encode_dictionary_dty: %s', _redacted(Dictionary))
-    Charset = struct.pack('<H', CharsetDict.get(Dictionary['req'], AL32UTF8_CHARSET))
+    Charset = CharsetDict.get(Dictionary['req'], AL32UTF8_CHARSET)
 
     # Compile-time + runtime capability arrays, each emitted as a length byte
     # followed by the array (write_bytes_with_length in oracledb terms).
@@ -14249,8 +14386,6 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
         Caps = bytearray(CompileCaps)
         Caps[CCAP_TTC4] |= TNS_CCAP_END_OF_RESPONSE
         CompileCaps = bytes(Caps)
-    CapabilityHeader = bytes([len(CompileCaps)]) + CompileCaps
-    TableHeader = bytes([len(RuntimeCaps)]) + RuntimeCaps
 
     # Native 9i OALL8 (#790): a native 9.2 OCI client sends a *compact* DTY --
     # the populated capability arrays followed by a short trailer and NO
@@ -14259,12 +14394,7 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
     # what the 9.2 server closes the connection on. Flag 2 matches the capture.
     if Dictionary.get('oall8') and FieldVersion < FIELD_VERSION_10_2:
         return (
-            bytes([TTI_DTY])
-            + Charset
-            + Charset
-            + bytes([2])
-            + CapabilityHeader
-            + TableHeader
+            encode_dty_request_head(Charset, 2, CompileCaps, RuntimeCaps)
             + _O3_OALL8_DTY_TRAILER
         )
 
@@ -14482,13 +14612,7 @@ def encode_dictionary_dty(Dictionary: dict) -> bytes:
         Flag = 1
     # Same charset for IN (server-side) and OUT (client-side) negotiation.
     return (
-        bytes([TTI_DTY])
-        + Charset
-        + Charset
-        + bytes([Flag])
-        + CapabilityHeader
-        + TableHeader
-        + DataTypeTable
+        encode_dty_request_head(Charset, Flag, CompileCaps, RuntimeCaps) + DataTypeTable
     )
 
 
@@ -18792,48 +18916,100 @@ def encode_dictionary_login(Dictionary: dict) -> bytes:
     # handler that flips self._large_packets. The connect-data offset is 74 (the
     # legacy 58 plus the 16 trailing bytes: large SDU/TDU + connect flags).
     Sdu = Dictionary['sdu']
-    PacketVersion = struct.pack('>H', 319)
-    # Lowest compatible version we accept. The server negotiates
-    # min(its_max, our PacketVersion); it REFUSES the connect if that is below
-    # our floor. Oracle 9i's max protocol version is 312, so the 300 floor lets
-    # 9i settle on 312 while newer servers negotiate up to 319 (#90).
-    LowestCompatVersion = struct.pack('>H', 300)
-    GSO = struct.pack('>H', 0x0401)  # global/service options
-    SDU = struct.pack('>H', Sdu)
-    TDU = struct.pack('>H', Sdu)
-    ProtocolCharacteristics = struct.pack('>H', 0x4F98)
-    MaxUnackPackets = bytes([0, 0])  # Max packets before ACK
-    Endiannes = struct.pack('>h', 1)  # 1 in hardware byte order
     Data = encode_dictionary_description(Dictionary)
-    DataLength = struct.pack('>H', len(Data))  # Connect Data length
-    CDO = struct.pack('>H', _CONNECT_DATA_OFFSET)
-    MaxConnDataRecv = bytes(4)  # Max connect data that can be received
-    ANO = bytes([1, 1])  # advertise ANO (native encryption) capable (#437)
-    Padding = bytes(24)
-    # The 319-era trailing block before the connect data: 32-bit SDU and TDU,
-    # then connect_flags_1 (0) and connect_flags_2 (1 = OOB check), per capture.
-    Trailer = (
-        struct.pack('>I', Sdu)
-        + struct.pack('>I', Sdu)
-        + struct.pack('>I', 0)
-        + struct.pack('>I', 1)
-    )
-    return (
-        PacketVersion
-        + LowestCompatVersion
-        + GSO
-        + SDU
-        + TDU
-        + ProtocolCharacteristics
-        + MaxUnackPackets
-        + Endiannes
-        + DataLength
-        + CDO
-        + MaxConnDataRecv
-        + ANO
-        + Padding
-        + Trailer
-        + Data
+    Head = {
+        'version': 319,
+        # Lowest compatible version we accept. The server negotiates
+        # min(its_max, our version); it REFUSES the connect if that is below
+        # our floor. Oracle 9i's max protocol version is 312, so the 300 floor
+        # lets 9i settle on 312 while newer servers negotiate up to 319 (#90).
+        'lowest_version': 300,
+        'options': 0x0401,
+        'sdu16': Sdu,
+        'tdu16': Sdu,
+        'nt_chars': 0x4F98,
+        'byte_order': 1,
+        'data_length': len(Data),
+        'data_offset': _CONNECT_DATA_OFFSET,
+    }
+    Rest = {
+        # Advertise ANO (native encryption) capable (#437).
+        'flags0': 1,
+        'flags1': 1,
+        # The 319-era trailing block: 32-bit SDU and TDU, then connect flags 1
+        # (0) and connect flags 2 (1 = OOB check), per capture.
+        'sdu': Sdu,
+        'tdu': Sdu,
+        'connect_flags1': 0,
+        'connect_flags2': 1,
+    }
+    return _CONNECT_HEAD_THIN(Head) + _CONNECT_REST_THIN(Rest) + Data
+
+
+# The CONNECT body (§2.1), after the 8-byte packet header. The head is what
+# every version reads: the client's version and the lowest it accepts, the
+# global service options, the 16-bit SDU / TDU, the NT characteristics, the
+# max packets before an ACK (0), the byte order word (1 in the sender's
+# hardware order, written big-endian), then the connect data's length and its
+# offset from the packet's start. The rest is the max connect data the client
+# can receive (0), its two ANO-capable flag bytes, 24 zero bytes, and the
+# 319-era block of the ub4 SDU / TDU and two connect-flag words.
+_CONNECT_HEAD = (
+    ('be2', 'version'),
+    ('be2', 'lowest_version'),
+    ('be2', 'options'),
+    ('be2', 'sdu16'),
+    ('be2', 'tdu16'),
+    ('be2', 'nt_chars'),
+    ('pad', 2),
+    ('be2', 'byte_order'),
+    ('be2', 'data_length'),
+    ('be2', 'data_offset'),
+)
+_CONNECT_HEAD_THIN = wire_schema.compile_encoder(_CONNECT_HEAD, _THIN)
+_CONNECT_HEAD_FROM_THIN = wire_schema.compile_decoder(_CONNECT_HEAD, _THIN)
+_CONNECT_REST = (
+    ('pad', 4),
+    ('u8', 'flags0'),
+    ('u8', 'flags1'),
+    ('pad', 24),
+    ('be4', 'sdu'),
+    ('be4', 'tdu'),
+    ('be4', 'connect_flags1'),
+    ('be4', 'connect_flags2'),
+)
+_CONNECT_REST_THIN = wire_schema.compile_encoder(_CONNECT_REST, _THIN)
+_CONNECT_REST_FROM_THIN = wire_schema.compile_decoder(_CONNECT_REST, _THIN)
+
+
+def decode_connect_head(Body: bytes) -> dict[str, Any]:
+    """The fields of a CONNECT body's head (``_CONNECT_HEAD``), as a server
+    reads them. Raises :class:`IndexError` when the body is shorter than the
+    head."""
+    return _CONNECT_HEAD_FROM_THIN(Body)[0]
+
+
+# A TNS_REFUSE body: the user and system reasons, then the descriptor that
+# says why after a big-endian ub2 of its length (§2.3).
+_REFUSE = (
+    ('u8', 'user_reason'),
+    ('u8', 'system_reason'),
+    ('be2', 'data_length'),
+    ('bytes', 'data', 'data_length'),
+)
+_REFUSE_THIN = wire_schema.compile_encoder(_REFUSE, _THIN)
+_REFUSE_FROM_THIN = wire_schema.compile_decoder(_REFUSE, _THIN)
+
+
+def encode_refuse_body(UserReason: int, SystemReason: int, Data: bytes) -> bytes:
+    """A TNS_REFUSE body carrying ``Data``, the listener's descriptor."""
+    return _REFUSE_THIN(
+        {
+            'user_reason': UserReason,
+            'system_reason': SystemReason,
+            'data_length': len(Data),
+            'data': Data,
+        }
     )
 
 

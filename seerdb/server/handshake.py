@@ -29,21 +29,25 @@ from __future__ import annotations
 
 import re
 import secrets
-import struct
 from dataclasses import dataclass
 
 from seerdb.common import ano
 from seerdb.common.exceptions import InterfaceError
 from seerdb.common.tns import (
-    _DB_TZ_FRAME_PAD,
     _PRO_CHARSET_ELEMENTS,
     _PRO_FDO,
     _SERVER_COMPILE_CAPS,
     _SERVER_DTY_TABLE,
     _SERVER_RUNTIME_CAPS,
     _datatype_table_12c,
+    decode_connect_head,
+    decode_dty_request_head,
     encode_accept_body,
+    encode_dty_reply_body,
+    encode_oci_dty_tz_reply,
     encode_packet,
+    encode_refuse_body,
+    encode_token_pro,
 )
 from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
@@ -71,7 +75,6 @@ from seerdb.common.tns_consts import (
     TNS_VERSION_23_1,
     TNS_VERSION_MIN_LARGE_SDU,
     TNS_VERSION_MIN_OOB_CHECK,
-    TTI_DTY,
     TTI_PRO,
 )
 from seerdb.server.framing import DEFAULT_SDU
@@ -82,18 +85,10 @@ from seerdb.server.framing import DEFAULT_SDU
 # descriptor sits at body[offset - 8].
 _TNS_HEADER_LEN = 8
 
-# Fixed-header field offsets, relative to the CONNECT body. This prefix is
-# stable across protocol versions; where the descriptor lands varies (11g/v314
-# puts it at packet offset 58, v319 at 74), so the offset field below — not a
-# fixed position — is authoritative.
-_OFF_VERSION = 0
-_OFF_LOWEST = 2
-_OFF_OPTIONS = 4  # global service options
-_OFF_SDU = 6
-_OFF_TDU = 8
-_OFF_CDATA_LEN = 16
-_OFF_CDATA_OFFSET = 18
-_MIN_HEADER = 20  # bytes we must have to read every field above
+# The CONNECT's head (common's _CONNECT_HEAD) is stable across protocol
+# versions; where the descriptor lands varies (11g/v314 puts it at packet offset
+# 58, v319 at 74), so the head's data-offset field -- not a fixed position -- is
+# authoritative.
 
 # The TNS protocol version the Mirror answers with. 314 (0x013a) is 11.2: below
 # ``TNS_VERSION_MIN_LARGE_SDU`` (315), so the session keeps the legacy 2-byte
@@ -218,10 +213,6 @@ class ConnectRequest:
     instance_name: str | None = None
 
 
-def _u16(body: bytes, offset: int) -> int:
-    return struct.unpack('>H', body[offset : offset + 2])[0]
-
-
 def _match(pattern: re.Pattern[bytes], descriptor: bytes) -> str | None:
     found = pattern.search(descriptor)
     return found.group(1).decode('ascii', 'replace') if found else None
@@ -235,10 +226,12 @@ def connect_data_follows(body: bytes) -> bool:
     ends where the data would start (python-oracledb, seerdb #1768). The caller
     reads that packet and appends its body before :func:`parse_connect` (#1769).
     """
-    if len(body) < _MIN_HEADER:
+    try:
+        head = decode_connect_head(body)
+    except IndexError:
         return False
-    start = _u16(body, _OFF_CDATA_OFFSET) - _TNS_HEADER_LEN
-    return len(body) - start < _u16(body, _OFF_CDATA_LEN)
+    start = head['data_offset'] - _TNS_HEADER_LEN
+    return len(body) - start < head['data_length']
 
 
 def parse_connect(body: bytes) -> ConnectRequest:
@@ -249,22 +242,24 @@ def parse_connect(body: bytes) -> ConnectRequest:
     Raises :class:`InterfaceError` if the packet is too short or the connect
     descriptor is out of bounds.
     """
-    if len(body) < _MIN_HEADER:
-        raise InterfaceError(f'CONNECT too short: {len(body)} bytes')
+    try:
+        head = decode_connect_head(body)
+    except IndexError:
+        raise InterfaceError(f'CONNECT too short: {len(body)} bytes') from None
 
-    cdata_len = _u16(body, _OFF_CDATA_LEN)
-    cdata_offset = _u16(body, _OFF_CDATA_OFFSET)
+    cdata_len = head['data_length']
+    cdata_offset = head['data_offset']
     start = cdata_offset - _TNS_HEADER_LEN
     if start < 0 or start > len(body):
         raise InterfaceError(f'CONNECT descriptor offset out of range: {cdata_offset}')
     descriptor = body[start : start + cdata_len] if cdata_len else body[start:]
 
     return ConnectRequest(
-        protocol_version=_u16(body, _OFF_VERSION),
-        lowest_version=_u16(body, _OFF_LOWEST),
-        global_service_options=_u16(body, _OFF_OPTIONS),
-        sdu=_u16(body, _OFF_SDU),
-        tdu=_u16(body, _OFF_TDU),
+        protocol_version=head['version'],
+        lowest_version=head['lowest_version'],
+        global_service_options=head['options'],
+        sdu=head['sdu16'],
+        tdu=head['tdu16'],
         service_name=_match(_SERVICE_RE, descriptor) or _match(_SID_RE, descriptor),
         program=_match(_PROGRAM_RE, descriptor),
         user=_match(_USER_RE, descriptor),
@@ -294,7 +289,7 @@ def encode_refuse(code: int, version_no: int) -> bytes:
         f'(DESCRIPTION=(TMP=)(VSNNUM={vsnnum})(ERR={code})'
         f'(ERROR_STACK=(ERROR=(CODE={code})(EMFI=4))))'
     ).encode('ascii')
-    body = struct.pack('>BBH', _REFUSE_USER_REASON, 0, len(text)) + text
+    body = encode_refuse_body(_REFUSE_USER_REASON, 0, text)
     packet, _ = encode_packet(TNS_REFUSE, body, DEFAULT_SDU)
     return packet
 
@@ -392,7 +387,6 @@ _NULL_ALGO = 0  # null cipher / null checksum selected → plaintext
 # carrying the server's DB session time zone (UTC here) and its timezone-file
 # version. Each of the h/m/s offset fields is biased by +60 (Oracle's TZ
 # encoding), so a stored 60 means a zero offset.
-_DTY_TZ_BIAS = 60  # Oracle biases each of hours/min/sec by +60
 _DB_TZ_HMS = (0, 0, 0)  # DB session time zone = UTC (+00:00:00)
 _TZFILE_VERSION = 14  # the 11.2 default timezone-file (DST rules) version
 
@@ -447,22 +441,16 @@ def build_caps_block_reply(
     if txn_priority and not oci and field_version >= FIELD_VERSION_23_1:
         compile_caps += bytes(CCAP_FEATURE_BACKPORT2 + 1 - len(compile_caps))
         compile_caps[CCAP_FEATURE_BACKPORT2] |= CCAP_FEATURE_BACKPORT2_TXN_PRIORITY
-    return (
-        # TTI_PRO, the negotiated field version (6 = 11g), a zero, then the
-        # NUL-terminated version banner.
-        bytes([TTI_PRO, FIELD_VERSION_11_2, 0])
-        + b'x86_64/Linux 2.4.xx'
-        + b'\x00'
-        + struct.pack('<H', AL32UTF8_CHARSET)  # charset id, LE
-        + bytes([1])  # flags
-        + struct.pack('<H', len(_PRO_CHARSET_ELEMENTS) // 5)
-        + _PRO_CHARSET_ELEMENTS
-        + struct.pack('>H', len(_PRO_FDO))
-        + _PRO_FDO
-        + bytes([len(compile_caps)])
-        + bytes(compile_caps)
-        + bytes([len(_SERVER_RUNTIME_CAPS)])
-        + _SERVER_RUNTIME_CAPS
+    return encode_token_pro(
+        # The server's TTC version (6 = 11g) and its version banner.
+        FIELD_VERSION_11_2,
+        b'x86_64/Linux 2.4.xx',
+        AL32UTF8_CHARSET,
+        1,  # flags
+        _PRO_CHARSET_ELEMENTS,
+        _PRO_FDO,
+        bytes(compile_caps),
+        _SERVER_RUNTIME_CAPS,
     )
 
 
@@ -488,7 +476,7 @@ def build_dty_type_reply(field_version: int = FIELD_VERSION_11_2) -> bytes:
         if field_version >= FIELD_VERSION_12_1
         else _SERVER_DTY_TABLE
     )
-    return bytes([TTI_DTY]) + table
+    return encode_dty_reply_body(table)
 
 
 def build_ano_null_reply() -> bytes:
@@ -539,15 +527,9 @@ def build_oci_dty_reply(*, tz_file_version: bool = True) -> bytes:
     one with a break, and 10g and 11g both leave it out for that client (#1764).
     """
     (Hours, Minutes, Seconds) = _DB_TZ_HMS
-    tz_block = (
-        _DB_TZ_FRAME_PAD
-        + bytes([Hours + _DTY_TZ_BIAS, Minutes + _DTY_TZ_BIAS, Seconds + _DTY_TZ_BIAS])
-        + _DB_TZ_FRAME_PAD
+    return encode_oci_dty_tz_reply(
+        Hours, Minutes, Seconds, _TZFILE_VERSION if tz_file_version else None
     )
-    reply = bytes([TTI_DTY]) + tz_block
-    if tz_file_version:
-        reply += struct.pack('>I', _TZFILE_VERSION)
-    return reply
 
 
 def is_ano_negotiation(pro_body: bytes) -> bool:
@@ -648,16 +630,10 @@ def client_sends_tz_file_version(type_request: bytes) -> bool:
     be read keeps the 11.2 form, which every client the Mirror served before
     received.
     """
-    try:
-        if not type_request or type_request[0] != TTI_DTY:
-            return True
-        at = 6
-        at += 1 + type_request[at]  # compile capabilities
-        at += 1 + type_request[at]  # runtime capabilities
-    except IndexError:
+    head = decode_dty_request_head(type_request)
+    if head is None or 'runtime_caps' not in head[0]:
         return True
-    rest = len(type_request) - at
-    return rest != _TYPE_REQUEST_TZ_BLOCK + _TYPE_REQUEST_NCHARSET
+    return len(head[1]) != _TYPE_REQUEST_TZ_BLOCK + _TYPE_REQUEST_NCHARSET
 
 
 def client_field_version(dty_body: bytes) -> int | None:
@@ -686,16 +662,13 @@ def client_field_version(dty_body: bytes) -> int | None:
 def client_compile_cap(dty_body: bytes, index: int) -> int | None:
     """One slot of the compile capabilities a client sent in its DTY, or ``None``
     when the block cannot be read (see :func:`client_field_version`)."""
-    try:
-        if not dty_body or dty_body[0] != TTI_DTY:
-            return None
-        caps_len = dty_body[6]
-        caps = dty_body[7 : 7 + caps_len]
-        if len(caps) <= index:
-            return None
-        return caps[index]
-    except IndexError:
+    head = decode_dty_request_head(dty_body)
+    if head is None:
         return None
+    caps = head[0]['compile_caps']
+    if len(caps) <= index:
+        return None
+    return caps[index]
 
 
 # The bytes between a fast-auth bundle's PRO message and its DTY: the charset,

@@ -63,6 +63,8 @@ ONE_WAY = {
     '_O7_ALL7',
     # A direct path LOAD STREAM's rows, packed into pieces before (#2462).
     '_DIRECT_PATH_LOAD_STREAM',
+    # The server's thin DTY reply: its type table, built before (#2773).
+    '_DTY_REPLY',
 }
 SAMPLES = 12
 
