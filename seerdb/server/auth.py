@@ -33,7 +33,6 @@ values is layered on top separately.
 from __future__ import annotations
 
 import contextvars
-import struct
 from binascii import unhexlify
 from hashlib import pbkdf2_hmac, sha512
 from secrets import token_bytes
@@ -71,6 +70,8 @@ from seerdb.common.tns import (
     decode_kv,
     decode_ub4,
     encode_auth_pair_oci,
+    encode_auth_reply_oci,
+    encode_data_packet,
 )
 from seerdb.common.tns_consts import (
     FIELD_VERSION_11_2,
@@ -80,7 +81,6 @@ from seerdb.common.tns_consts import (
     TNS_LONG_LENGTH_INDICATOR,
     TTI_AUTH,
     TTI_FUN,
-    TTI_RPA,
     TTI_SESS,
 )
 from seerdb.server.identity import IDENTITY_11_2, ServerIdentity
@@ -283,13 +283,9 @@ def encode_kv_oci(key: bytes, val: bytes, flags: int = 0) -> bytes:
 
 def _oci_auth_packet(pairs: list[tuple[bytes, bytes, int]], trailer: bytes) -> bytes:
     """Assemble a full deadbeef-dialect O5LOGON DATA packet from its key-value
-    pairs and trailer: a TTI_RPA marker, the pair count, a zero lead byte, the
-    pairs, and the trailer — behind the 10-byte TNS DATA header."""
-    payload = bytes([TTI_RPA, len(pairs), 0])
-    payload += b''.join(encode_kv_oci(k, v, f) for k, v, f in pairs)
-    payload += trailer
-    header = struct.pack('>H', len(payload) + 10) + bytes([0, 0, 6, 0, 0, 0, 0, 0])
-    return header + payload
+    pairs and trailer: the RPA and its pairs, as the client reads a native login
+    reply (``encode_auth_reply_oci``), then the trailer, in a DATA packet."""
+    return encode_data_packet(encode_auth_reply_oci(pairs) + trailer, 0)
 
 
 def encode_challenge_oci(challenge: Challenge) -> bytes:

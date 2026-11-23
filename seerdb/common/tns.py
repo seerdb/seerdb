@@ -895,15 +895,14 @@ def set_decode_prev_row(Row) -> None:
 def assemble_packet(
     Data: bytes, Length: int, Large: bool = False
 ) -> tuple[bool, int | None, bytes | None, bytes | None]:
-    # Two on-wire packet-header layouts share an 8-byte size and put the type at
-    # byte 4. Legacy: len(ub2) + checksum(ub2) + type + flags + hdr-cksum(ub2).
-    # Large-SDU (#155, negotiated at protocol version >= 315): len(ub4) + type +
-    # flags + hdr-cksum(ub2) — the 4-byte length replaces the legacy len+cksum.
-    # `Zero` (the hdr-cksum at bytes 6-7) is read the same way in both.
-    if Large:
-        (PacketSize, Type, Flags, Zero) = struct.unpack('>IBBh', Data[:8])
-    else:
-        (PacketSize, _, Type, Flags, Zero) = struct.unpack('>HhBBh', Data[:8])
+    # The packet header in either layout (_PACKET_HEADER_LEGACY / _LARGE). `Zero`
+    # is its header checksum, at bytes 6-7 in both.
+    Header = decode_packet_header(Data, Large)
+    (PacketSize, Type, Zero) = (
+        Header['size'],
+        Header['type'],
+        Header['header_checksum'],
+    )
     if Type == TNS_DATA and Zero == 0:
         BodySize = PacketSize - 10
         Rest = Data[10:]
@@ -940,7 +939,7 @@ def ends_response(Packet: bytes) -> bool:
     # the END_OF_RESPONSE data flag, which a server that negotiated end-of-response
     # framing sets on the last packet of every reply (#1845). The data flags
     # follow the 8-byte header in both header layouts.
-    return bool(int.from_bytes(Packet[8:10], 'big') & TNS_DATA_FLAGS_END_OF_RESPONSE)
+    return bool(_data_flags_or_none(Packet) & TNS_DATA_FLAGS_END_OF_RESPONSE)
 
 
 def ends_session(Packet: bytes) -> bool:
@@ -948,7 +947,15 @@ def ends_session(Packet: bytes) -> bool:
     # the server ending the session: data flags of EOF alone and no payload, as
     # 11g's pool answers a call on a session that was killed (#2466) and as
     # python-oracledb reads one (TNS-12572, session shutdown).
-    return int.from_bytes(Packet[8:10], 'big') == TNS_DATA_FLAGS_EOF
+    return _data_flags_or_none(Packet) == TNS_DATA_FLAGS_EOF
+
+
+def _data_flags_or_none(Packet: bytes) -> int:
+    # A DATA packet's data flags, or 0 (none) for one that ends before them.
+    try:
+        return decode_data_flags(Packet)
+    except IndexError:
+        return 0
 
 
 _REDIRECT_HOST_RE = re.compile(rb'\(HOST\s*=\s*([^)\s]+)\s*\)', re.IGNORECASE)
@@ -1100,7 +1107,7 @@ def decode_packet(
             # tagging which pipelined op this response belongs to. The pipelined
             # responses arrive in op order, so consume the token and continue
             # decoding the op's response body (which ends on its own EOR).
-            (_, Rest) = decode_ub4(Data[1:])
+            (_, Rest) = _RESPONSE_TOKEN_FROM_THIN(Data)
             return decode_packet(Rest, Acc)
         case t if t == TTI_UDS:
             return decode_token_uds(Data, Acc)
@@ -8351,12 +8358,78 @@ def decode_token_wrn(Data: bytes, Acc: tuple) -> tuple:
     return decode_packet(Rest, Acc)
 
 
+# The 8-byte TNS packet header (§1). Legacy: a ub2 length and a ub2 packet
+# checksum. Large SDU (#155, protocol version >= 315): a ub4 length in their
+# place. Both then carry the type, the flags and a ub2 header checksum, so the
+# type sits at byte 4 in either. The checksums are written as zero.
+_PACKET_HEADER_LEGACY = (
+    ('be2', 'size'),
+    ('be2', 'checksum'),
+    ('u8', 'type'),
+    ('u8', 'flags'),
+    ('be2', 'header_checksum'),
+)
+_PACKET_HEADER_LARGE = (
+    ('be4', 'size'),
+    ('u8', 'type'),
+    ('u8', 'flags'),
+    ('be2', 'header_checksum'),
+)
+_PACKET_HEADER_LEGACY_THIN = wire_schema.compile_encoder(_PACKET_HEADER_LEGACY, _THIN)
+_PACKET_HEADER_LEGACY_FROM_THIN = wire_schema.compile_decoder(
+    _PACKET_HEADER_LEGACY, _THIN
+)
+_PACKET_HEADER_LARGE_THIN = wire_schema.compile_encoder(_PACKET_HEADER_LARGE, _THIN)
+_PACKET_HEADER_LARGE_FROM_THIN = wire_schema.compile_decoder(
+    _PACKET_HEADER_LARGE, _THIN
+)
+# A DATA packet's data flags, after its header in both layouts (§1.3).
+_DATA_FLAGS = (('be2', 'data_flags'),)
+_DATA_FLAGS_THIN = wire_schema.compile_encoder(_DATA_FLAGS, _THIN)
+_DATA_FLAGS_FROM_THIN = wire_schema.compile_decoder(_DATA_FLAGS, _THIN)
+# What a reply to a pipelined call leads with (#158, #1059): the token
+# number of the call it answers.
+_RESPONSE_TOKEN = (('const', bytes([TTI_TOKEN])), ('n4', 'token'))
+_RESPONSE_TOKEN_THIN = wire_schema.compile_encoder(_RESPONSE_TOKEN, _THIN)
+_RESPONSE_TOKEN_FROM_THIN = wire_schema.compile_decoder(_RESPONSE_TOKEN, _THIN)
+
+
 def _packet_header(Size: int, Type: int, Large: bool) -> bytes:
-    # The 8-byte TNS packet header in the legacy (ub2 length + ub2 checksum) or
-    # large-SDU (ub4 length, #155) layout. Type sits at byte 4 in both.
+    Fields = {
+        'size': Size,
+        'checksum': 0,
+        'type': Type,
+        'flags': 0,
+        'header_checksum': 0,
+    }
     if Large:
-        return struct.pack('>IBBh', Size, Type, 0, 0)
-    return struct.pack('>HhBBh', Size, 0, Type, 0, 0)
+        return _PACKET_HEADER_LARGE_THIN(Fields)
+    return _PACKET_HEADER_LEGACY_THIN(Fields)
+
+
+def decode_packet_header(Header: bytes, Large: bool) -> dict[str, int]:
+    """The fields of the packet header ``Header`` starts with: its size, type,
+    flags and header checksum, and in the legacy layout its packet checksum.
+    Raises :class:`IndexError` when ``Header`` is shorter than 8 bytes."""
+    if Large:
+        return _PACKET_HEADER_LARGE_FROM_THIN(Header)[0]
+    return _PACKET_HEADER_LEGACY_FROM_THIN(Header)[0]
+
+
+def encode_data_flags(DataFlags: int) -> bytes:
+    """A DATA packet's data flags, as they follow its header."""
+    return _DATA_FLAGS_THIN({'data_flags': DataFlags})
+
+
+def decode_data_flags(Packet: bytes) -> int:
+    """The data flags of the DATA packet ``Packet`` (header included) starts
+    with. Raises :class:`IndexError` when it ends before them."""
+    return _DATA_FLAGS_FROM_THIN(Packet[8:])[0]['data_flags']
+
+
+def encode_response_token(Token: int) -> bytes:
+    """The token that leads a reply to the pipelined call numbered ``Token``."""
+    return _RESPONSE_TOKEN_THIN({'token': Token})
 
 
 def encode_data_packet(Body: bytes, DataFlags: int, Large: bool = False) -> bytes:
@@ -8367,7 +8440,7 @@ def encode_data_packet(Body: bytes, DataFlags: int, Large: bool = False) -> byte
     # pipelined sender builds its packets here instead.
     return (
         _packet_header(len(Body) + 10, TNS_DATA, Large)
-        + struct.pack('>H', DataFlags)
+        + encode_data_flags(DataFlags)
         + Body
     )
 
@@ -8407,7 +8480,7 @@ def encode_packet(
             BodySize = Length - 10
             return (
                 _packet_header(BodySize + 10, Type, Large)
-                + struct.pack('>h', TNS_DATA_FLAGS_MORE)
+                + encode_data_flags(TNS_DATA_FLAGS_MORE)
                 + Data[:BodySize],
                 Data[BodySize:],
             )
@@ -8415,7 +8488,7 @@ def encode_packet(
         # final/whole packet uses 0x0000. The 2-byte data flags follow the
         # 8-byte header in both framing layouts.
         return (
-            _packet_header(PacketSize, Type, Large) + struct.pack('>h', 0) + Data,
+            _packet_header(PacketSize, Type, Large) + encode_data_flags(0) + Data,
             None,
         )
     else:
@@ -19774,6 +19847,29 @@ def encode_auth_oci11(
 
 
 _AUTH_REPLY_FROM_OCI = wire_schema.compile_decoder(_PRE10_AUTH_REPLY, _OCI)
+_AUTH_REPLY_OCI = wire_schema.compile_encoder(_PRE10_AUTH_REPLY, _OCI)
+
+
+def encode_auth_reply_oci(Pairs: list[tuple[bytes, bytes, int]]) -> bytes:
+    """A native login reply's RPA and its pairs, each ``(key, value, flags)``,
+    as :func:`decode_token_rpa_oci` reads them; the Mirror's challenge and
+    answer to sqlplus (#265). The status follows it."""
+    return _AUTH_REPLY_OCI(
+        {
+            'pair_count': len(Pairs),
+            'pairs': [
+                {
+                    'key_length': len(K),
+                    'key': K,
+                    'value_length': len(V),
+                    'value': V,
+                    'flags': F,
+                }
+                for (K, V, F) in Pairs
+            ],
+        }
+    )
+
 
 # A dedicated 11g session's password change in the native form, as OCI 11.2's
 # OCIPasswordChange on an open session makes it (#2463): an AUTH of mode 0x102

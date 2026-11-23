@@ -30,16 +30,18 @@ import logging
 import select
 import socket
 import ssl
-import struct
 import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from seerdb.common.tns import (
+    decode_data_flags,
+    decode_packet_header,
     encode_ano_fragment,
+    encode_data_flags,
     encode_data_packet,
     encode_packet,
-    encode_sb4,
+    encode_response_token,
 )
 from seerdb.common.tns_consts import (
     DEFAULT_SDU,
@@ -48,7 +50,6 @@ from seerdb.common.tns_consts import (
     TNS_DATA_FLAGS_MORE,
     TNS_MARKER,
     TTI_END_OF_RESPONSE,
-    TTI_TOKEN,
 )
 
 if TYPE_CHECKING:
@@ -59,9 +60,6 @@ __all__ = ['DEFAULT_SDU', 'BreakWatch', 'PacketStream']
 
 logger = logging.getLogger(__name__)
 
-_HEADER_LEGACY = struct.Struct('>HhBBh')  # size, cksum, type, flags, hdr-cksum
-_HEADER_LARGE = struct.Struct('>IBBh')  # size, type, flags, hdr-cksum
-_DATA_FLAGS = struct.Struct('>H')
 # The bounds a client's input is held to (GHSA-5827-wqfh-x2v3). A packet no
 # longer than the 16-bit legacy limit is always accepted, whatever the SDU: a
 # CONNECT uses it before one is agreed. Before login a message is the
@@ -189,12 +187,8 @@ class PacketStream:
 
     def _header(self) -> tuple[int, int]:
         # Parse (packet_size, type) from the 8-byte header at the front of _acc.
-        head = bytes(self._acc[:8])
-        if self.large:
-            size, packet_type, _flags, _zero = _HEADER_LARGE.unpack(head)
-        else:
-            size, _cksum, packet_type, _flags, _zero = _HEADER_LEGACY.unpack(head)
-        return size, packet_type
+        header = decode_packet_header(bytes(self._acc[:8]), self.large)
+        return header['size'], header['type']
 
     def _read_packet_within(self, seconds: float) -> tuple[int, bytes] | None:
         # read_packet with the socket timed out for the duration, restoring the
@@ -241,7 +235,14 @@ class PacketStream:
             packet = bytes(self._acc[:size])
             del self._acc[:size]
             if packet_type == TNS_DATA:
-                (data_flags,) = _DATA_FLAGS.unpack(packet[8:10])
+                try:
+                    data_flags = decode_data_flags(packet)
+                except IndexError:
+                    # A DATA packet too short to carry its data flags is no
+                    # more a packet than one whose length is out of bounds.
+                    raise ProtocolLimitError(
+                        f'DATA packet of {size} bytes, without its data flags'
+                    ) from None
                 # Kept for the caller: a pipelined burst is marked in these
                 # flags (BEGIN_PIPELINE / END_OF_REQUEST) and nowhere else, so
                 # a session cannot tell one from an ordinary call without them
@@ -294,7 +295,7 @@ class PacketStream:
                 # burst, `21 01 02 ...` for the second -- the marker, the token as
                 # a ub4, then the ordinary reply. One response carries it, so it
                 # is spent on the write that uses it.
-                body = bytes([TTI_TOKEN]) + encode_sb4(self.response_token) + body
+                body = encode_response_token(self.response_token) + body
                 self.response_token = None
             if self.end_of_response:
                 # Once the capability is negotiated the client expects EVERY
@@ -379,9 +380,10 @@ class PacketStream:
         data = ahead + raw
         pos = 0
         while pos + 8 <= len(data):
-            if data[pos + 4] == TNS_MARKER:
+            header = decode_packet_header(data[pos : pos + 8], self.large)
+            if header['type'] == TNS_MARKER:
                 return True
-            size = int.from_bytes(data[pos : pos + (4 if self.large else 2)], 'big')
+            size = header['size']
             if size < 8:
                 break
             pos += size
@@ -425,7 +427,7 @@ class PacketStream:
                 # the 8-byte header.
                 packet = (
                     packet[:8]
-                    + struct.pack('>H', TNS_DATA_FLAGS_END_OF_RESPONSE)
+                    + encode_data_flags(TNS_DATA_FLAGS_END_OF_RESPONSE)
                     + packet[10:]
                 )
             self._sock.sendall(packet)
