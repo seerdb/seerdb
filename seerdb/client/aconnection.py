@@ -22,7 +22,6 @@ cleaner.
 import asyncio
 import logging
 import socket
-import struct
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -65,8 +64,7 @@ from seerdb.client.connection import (
     _Decoded,
     _error_code,
     _normalize_sessionless_txn_id,
-    _parse_accept_eor,
-    _parse_accept_sdu,
+    _parse_accept,
     _type_attr,
 )
 from seerdb.client.defaults import defaults
@@ -111,6 +109,7 @@ from seerdb.common.tns import (
     MAX_FLUSH_OUT_BINDS,
     assemble_packet,
     decode_8i_server_version,
+    decode_lobops_locator,
     decode_packet,
     decode_token_pro,
     decode_token_rpa,
@@ -130,6 +129,7 @@ from seerdb.common.tns import (
     exec_oac_signature,
     find_fast_auth_rpa,
     has_long_class_bind,
+    is_prefixed_locator,
     max_string_size,
     prefixed_locator,
     recording_session_keywords,
@@ -1028,12 +1028,17 @@ class AsyncOracleConnect(_ConnectionLogic):
                 self._in_break = False
             match Type:
                 case t if t == TNS_ACCEPT:
-                    (Ver, Opts, Sdu) = struct.unpack('>Hhh', Packet[:6])
+                    Accept = _parse_accept(Packet)
+                    (Ver, Opts, Sdu) = (
+                        Accept['version'],
+                        Accept['options'],
+                        Accept['sdu'],
+                    )
                     # 319-era accept (#155): large SDU / 4-byte framing at
                     # version >= 315, end-of-response bit at >= 318.
-                    self.sdu = _parse_accept_sdu(Ver, Packet, Sdu)
+                    self.sdu = Sdu
                     self._large_packets = Ver >= TNS_VERSION_MIN_LARGE_SDU
-                    self._supports_eor = _parse_accept_eor(Ver, Packet)
+                    self._supports_eor = Accept['eor']
                     self._supports_oob = bool(  # OOB break (#144)
                         Opts & TNS_GSO_CAN_RECV_ATTENTION
                     )
@@ -1045,9 +1050,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                     # ACFL1 bit 3 clear) — the CONNECT advertised ANO-capable, so a
                     # supporting server expects the negotiation before PRO. Mirror
                     # of OracleConnect.handle_login.
-                    Acfl0 = Packet[14] if len(Packet) > 14 else 0
-                    Acfl1 = Packet[15] if len(Packet) > 15 else 0
-                    if (Acfl0 & 0x01) and not (Acfl0 & 0x04) and not (Acfl1 & 0x08):
+                    if Accept['ano']:
                         await self._negotiate_ano()
                     elif self.externalauth:
                         raise OperationalError(
@@ -2541,7 +2544,6 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def createlob(self, lob_type, data=None):
         """Async port of the sync ``createlob`` (#1066): a new temporary LOB of
         ``lob_type``, optionally holding ``data``. 12.1+ only."""
-        import struct
 
         from seerdb.common.lob import LOB
         from seerdb.common.tns_consts import TNS_TYPE_BLOB
@@ -2550,7 +2552,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         locator = await self.create_temp_lob(tns_type == TNS_TYPE_BLOB, csfrm=csfrm)
         lob = LOB(
             tns_type,
-            struct.pack('>H', len(locator)) + locator,
+            prefixed_locator(locator),
             connection=self,
             temp=True,
             csfrm=csfrm,
@@ -2576,7 +2578,6 @@ class AsyncOracleConnect(_ConnectionLogic):
             return cast(
                 bytes, await self._drive(self._dialect.create_temp_lob(is_blob, csfrm))
             )
-        from seerdb.common.tns_consts import TTI_RPA
 
         Data = encode_dictionary(
             self._make_dict(
@@ -2588,12 +2589,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         if Received is False:
             raise connection_closed('CREATE_TEMP')
         (_, Packet) = Received
-        if not Packet or Packet[0] != TTI_RPA:
+        Locator = decode_lobops_locator(Packet)
+        if Locator is None:
             raise InternalError(
                 f'unexpected CREATE_TEMP response: {Packet[:8].hex() if Packet else None!r}'
             )
-        LocLen = (Packet[1] << 8) | Packet[2]
-        return Packet[3 : 3 + LocLen]
+        return Locator
 
     async def write_temp_lob(
         self, Locator: bytes, Data: str | bytes, is_blob: bool = False
@@ -2726,12 +2727,11 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.common.tns_consts import (
             TNS_LOB_OP_FILE_CLOSE,
             TNS_LOB_OP_FILE_OPEN,
-            TTI_RPA,
         )
 
         # See the sync bfile_read_native: strip LOB.raw's leading ub2
         # inner-length so the encoder's prefix isn't doubled.
-        if len(Locator) >= 2 and ((Locator[0] << 8) | Locator[1]) == len(Locator) - 2:
+        if is_prefixed_locator(Locator):
             Locator = Locator[2:]
         await self.send(
             TNS_DATA,
@@ -2748,12 +2748,11 @@ class AsyncOracleConnect(_ConnectionLogic):
             raise connection_closed('BFILE FILE_OPEN')
         (_, Packet) = Received
         self._raise_lobops_error(Packet)
-        if not Packet or Packet[0] != TTI_RPA:
+        Opened = decode_lobops_locator(Packet)
+        if Opened is None:
             raise InternalError(
                 f'unexpected FILE_OPEN response: {Packet[:8].hex() if Packet else None!r}'
             )
-        OpenLen = (Packet[1] << 8) | Packet[2]
-        Opened = Packet[3 : 3 + OpenLen]
         try:
             await self.send(
                 TNS_DATA,

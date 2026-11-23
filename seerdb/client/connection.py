@@ -12,7 +12,6 @@ import logging
 import select
 import socket
 import ssl
-import struct
 import threading
 import time
 import uuid
@@ -76,7 +75,9 @@ from seerdb.common.tns import (
     _DTY_8I,
     assemble_packet,
     decode_8i_server_version,
+    decode_accept_body,
     decode_error_reply,
+    decode_lobops_locator,
     decode_packet,
     decode_token_pro,
     decode_token_rpa,
@@ -99,6 +100,7 @@ from seerdb.common.tns import (
     exec_oac_signature,
     find_fast_auth_rpa,
     has_long_class_bind,
+    is_prefixed_locator,
     max_string_size,
     prefixed_locator,
     recording_session_keywords,
@@ -505,28 +507,28 @@ def _decode_tpc_state(Packet: bytes) -> int:
     return State
 
 
-def _parse_accept_eor(version: int, packet: bytes) -> bool:
-    # End-of-response negotiation (#155). The accept body (8-byte header already
-    # stripped) is Ver/Opts then, for protocol version >= 318, an extended
-    # flags2 uint32 at offset 33 (mirrors oracledb connect.pyx: skip 10, flags1,
-    # skip 9, sdu(4), skip 5, flags2). The HAS_END_OF_RESPONSE bit means the
-    # server will honour the EOR cap. Best-effort: any short/odd packet disables
-    # EOR (the connection behaves exactly as it does without it).
-    if version < TNS_VERSION_MIN_OOB_CHECK or len(packet) < 37:
-        return False
-    (flags2,) = struct.unpack('>I', packet[33:37])
-    return bool(flags2 & TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE)
-
-
-def _parse_accept_sdu(version: int, packet: bytes, legacy_sdu: int) -> int:
-    # The negotiated SDU (#155). A >= 315 ("large SDU") accept carries the real
-    # SDU as a uint32 at offset 24; below that it is the legacy 16-bit field the
-    # caller already read from packet[4:6].
-    if version >= TNS_VERSION_MIN_LARGE_SDU and len(packet) >= 28:
-        (sdu,) = struct.unpack('>I', packet[24:28])
-        if sdu > 0:
-            return sdu
-    return legacy_sdu
+def _parse_accept(packet: bytes) -> dict[str, Any]:
+    # The ACCEPT body (8-byte header already stripped) as common decodes it
+    # (decode_accept_body), with what the client makes of it. `sdu` is the
+    # negotiated SDU: the ub4 a >= 315 ("large SDU") accept carries, else the
+    # legacy 16-bit field (#155). `eor` is end-of-response support: a >= 318
+    # server's flags2 HAS_END_OF_RESPONSE bit; an accept without flags2 never
+    # has it, so the connection behaves exactly as it does without it. `ano`
+    # is whether the server expects the native-encryption negotiation before
+    # the PRO (#437): ACFL0 bit 0 set, bit 2 clear, ACFL1 bit 3 clear, as a
+    # real client gates it.
+    try:
+        accept = decode_accept_body(packet)
+    except IndexError:
+        raise OperationalError(
+            f'the server sent a short ACCEPT ({len(packet)} bytes)'
+        ) from None
+    accept['eor'] = accept['version'] >= TNS_VERSION_MIN_OOB_CHECK and bool(
+        accept['flags2'] & TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE
+    )
+    (flags0, flags1) = (accept['flags0'], accept['flags1'])
+    accept['ano'] = bool(flags0 & 0x01) and not flags0 & 0x04 and not flags1 & 0x08
+    return accept
 
 
 def _apply_rowfactory(rows, rowfactory):
@@ -1718,13 +1720,18 @@ class OracleConnect(_ConnectionLogic):
                 case t if t == TNS_ACCEPT:
                     logger.debug('handle_login: accept')
                     # Extract negotiated SDU from the accept body
-                    (Ver, Opts, Sdu) = struct.unpack('>Hhh', Packet[:6])
+                    Accept = _parse_accept(Packet)
+                    (Ver, Opts, Sdu) = (
+                        Accept['version'],
+                        Accept['options'],
+                        Accept['sdu'],
+                    )
                     # 319-era accept (#155): a >= 315 server negotiates the
                     # large (32-bit) SDU and switches to 4-byte packet framing;
                     # a >= 318 server's flags2 carries the end-of-response bit.
-                    self.sdu = _parse_accept_sdu(Ver, Packet, Sdu)
+                    self.sdu = Sdu
                     self._large_packets = Ver >= TNS_VERSION_MIN_LARGE_SDU
-                    self._supports_eor = _parse_accept_eor(Ver, Packet)
+                    self._supports_eor = Accept['eor']
                     # OOB break support (#144): the accept's global service
                     # options carry CAN_RECV_ATTENTION when the server can
                     # receive an out-of-band break. When set we prefer the OOB
@@ -1745,9 +1752,7 @@ class OracleConnect(_ConnectionLogic):
                     # (body offset 14) bit 0 set, bit 2 clear, ACFL1 bit 3 clear.
                     # The negotiation is plaintext and only activates the cipher
                     # if the server actually selects an encryption algorithm.
-                    Acfl0 = Packet[14] if len(Packet) > 14 else 0
-                    Acfl1 = Packet[15] if len(Packet) > 15 else 0
-                    if (Acfl0 & 0x01) and not (Acfl0 & 0x04) and not (Acfl1 & 0x08):
+                    if Accept['ano']:
                         self._negotiate_ano()
                     elif self.externalauth:
                         raise OperationalError(
@@ -3283,7 +3288,6 @@ class OracleConnect(_ConnectionLogic):
         point: a statement that needs a genuine LOB argument (a large value into
         ``sys.xmltype()``, say) cannot take the same data as a plain string, the
         server refuses it (ORA-01461). 12.1+ only."""
-        import struct
 
         from seerdb.common.lob import LOB
         from seerdb.common.tns_consts import TNS_TYPE_BLOB
@@ -3295,7 +3299,7 @@ class OracleConnect(_ConnectionLogic):
         # ORA-22275 "invalid LOB locator" (PROTOCOL.md 14.4d).
         lob = LOB(
             tns_type,
-            struct.pack('>H', len(locator)) + locator,
+            prefixed_locator(locator),
             connection=self,
             temp=True,
             csfrm=csfrm,
@@ -3325,7 +3329,6 @@ class OracleConnect(_ConnectionLogic):
             return cast(
                 bytes, self._drive(self._dialect.create_temp_lob(is_blob, csfrm))
             )
-        from seerdb.common.tns_consts import TTI_RPA
 
         Data = encode_dictionary(
             self._make_dict(
@@ -3337,12 +3340,12 @@ class OracleConnect(_ConnectionLogic):
         if Received is False:
             raise connection_closed('CREATE_TEMP')
         (_, Packet) = Received
-        if not Packet or Packet[0] != TTI_RPA:
+        Locator = decode_lobops_locator(Packet)
+        if Locator is None:
             raise InternalError(
                 f'unexpected CREATE_TEMP response: {Packet[:8].hex() if Packet else None!r}'
             )
-        LocLen = (Packet[1] << 8) | Packet[2]
-        return Packet[3 : 3 + LocLen]
+        return Locator
 
     def lob_write(
         self,
@@ -3489,13 +3492,12 @@ class OracleConnect(_ConnectionLogic):
         from seerdb.common.tns_consts import (
             TNS_LOB_OP_FILE_CLOSE,
             TNS_LOB_OP_FILE_OPEN,
-            TTI_RPA,
         )
 
         # A BFILE locator as fetched (LOB.raw) leads with its own ub2
         # inner-length; the encoder re-adds that prefix, so pass the body. The
         # FILE_OPEN response RPA already hands back the body form.
-        if len(Locator) >= 2 and ((Locator[0] << 8) | Locator[1]) == len(Locator) - 2:
+        if is_prefixed_locator(Locator):
             Locator = Locator[2:]
         self.send(
             TNS_DATA,
@@ -3512,12 +3514,11 @@ class OracleConnect(_ConnectionLogic):
             raise connection_closed('BFILE FILE_OPEN')
         (_, Packet) = Received
         self._raise_lobops_error(Packet)
-        if not Packet or Packet[0] != TTI_RPA:
+        Opened = decode_lobops_locator(Packet)
+        if Opened is None:
             raise InternalError(
                 f'unexpected FILE_OPEN response: {Packet[:8].hex() if Packet else None!r}'
             )
-        OpenLen = (Packet[1] << 8) | Packet[2]
-        Opened = Packet[3 : 3 + OpenLen]
         try:
             self.send(
                 TNS_DATA,
