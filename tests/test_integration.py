@@ -9504,6 +9504,23 @@ class FetchFlowIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchone(), (None,))
 
     @_requires(_END_TO_END)
+    def test_an_empty_tracing_attribute_clears_it(self):
+        # An empty string clears the attribute, as None does, and the call
+        # behind it goes through: its value byte closed the connection (#2784).
+        self.conn.module = 'TOCLEAR'
+        self.conn.client_identifier = 'TOCLEAR'
+        self.cur.execute('SELECT 1 FROM dual')
+        self.conn.module = ''
+        self.conn.action = ''
+        self.conn.client_identifier = ''
+        self.cur.execute(
+            "SELECT SYS_CONTEXT('USERENV','MODULE'), "
+            "SYS_CONTEXT('USERENV','ACTION'), "
+            "SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') FROM dual"
+        )
+        self.assertEqual(self.cur.fetchone(), (None, None, None))
+
+    @_requires(_END_TO_END)
     def test_a_non_ascii_tracing_attribute(self):
         self.conn.clientinfo = 'caf\u00e9'
         self.cur.execute("SELECT SYS_CONTEXT('USERENV','CLIENT_INFO') FROM dual")

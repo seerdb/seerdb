@@ -6605,6 +6605,17 @@ class TestEndToEndClientInfoDbop(unittest.TestCase):
         self.assertIn('0200', out.hex())  # DBOP flag
         self.assertTrue(out.hex().endswith(b'OP'.hex()))
 
+    def test_an_empty_value_is_sent_as_a_clear(self):
+        # The header alone, with no value byte behind its zero length (#2784).
+        from seerdb.common.tns import encode_end_to_end_piggyback
+
+        for name in ('module', 'action', 'client_identifier', 'client_info', 'dbop'):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    encode_end_to_end_piggyback(9, 24, {name: ''}),
+                    encode_end_to_end_piggyback(9, 24, {name: None}),
+                )
+
 
 class TestScrollableExecEncoding(unittest.TestCase):
     # Server-side scrollable cursor wire encoding (#181, groundwork for 1.9.0).
