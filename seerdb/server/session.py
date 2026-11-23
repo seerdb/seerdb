@@ -94,6 +94,7 @@ from seerdb.common.tns import (
     ddl_command_type,
     decode_bfile_locator,
     decode_dalc,
+    decode_marker_type,
     decode_ub4,
     encode_batch_errors_status,
     encode_challenge,
@@ -116,6 +117,7 @@ from seerdb.common.tns import (
     encode_kod_reply,
     encode_lob_describe_oci,
     encode_lob_fetch_rows_oci,
+    encode_lob_locator_field,
     encode_lob_read_response_oci,
     encode_lob_read_response_thin,
     encode_lobops_ack,
@@ -128,10 +130,12 @@ from seerdb.common.tns import (
     encode_logoff_status_oci,
     encode_logoff_status_thin,
     encode_long_fetch_row_oci,
+    encode_marker_body,
     encode_out_bind_reexecute_thin,
     encode_out_bind_response_oci,
     encode_out_bind_response_thin,
     encode_ping_status_oci,
+    encode_pipeline_end_status_thin,
     encode_query_response,
     encode_query_response_oci,
     encode_reexec_row_oci,
@@ -147,6 +151,7 @@ from seerdb.common.tns import (
     encode_sync_piggyback,
     encode_token_result,
     encode_version_banner_oci,
+    fetch_cursor_oci,
     inline_long_after_type_change,
     inline_long_for_defines,
     is_reexecute_oci,
@@ -178,6 +183,7 @@ from seerdb.common.tns import (
     parse_reexecute_oci,
     parse_tpc_switch,
     peek_exec_cursor,
+    reexecute_cursor_oci,
     scroll_start_row,
     skip_close_cursors_piggyback,
     strip_oci_piggyback,
@@ -254,7 +260,6 @@ from seerdb.common.tns_consts import (
     TTI_OCCA,
     TTI_PING,
     TTI_ROLLBACK,
-    TTI_STA,
 )
 from seerdb.common.types import DbZoneDatetime
 from seerdb.server import lockout, stats
@@ -1245,8 +1250,8 @@ def _deny_login(
         # sqlplus reads a refusal in its own dialect, after the break / reset
         # marker exchange a live server opens it with. A thin OER is lost on it:
         # it saw only the connection close and reported ORA-03113 (#1290).
-        stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_BREAK]))
-        stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+        stream.write_packet(TNS_MARKER, encode_marker_body(TNS_MARKER_TYPE_BREAK))
+        stream.write_packet(TNS_MARKER, encode_marker_body(TNS_MARKER_TYPE_RESET))
         _await_reset_marker(stream)
         stream.write_packet(
             TNS_DATA,
@@ -1265,7 +1270,10 @@ def _await_reset_marker(stream: PacketStream) -> None:
         if received is None:
             return
         packet_type, body = received
-        if packet_type == TNS_MARKER and body[-1:] == bytes([TNS_MARKER_TYPE_RESET]):
+        if (
+            packet_type == TNS_MARKER
+            and decode_marker_type(body) == TNS_MARKER_TYPE_RESET
+        ):
             return
 
 
@@ -1710,7 +1718,7 @@ def _serve_thin_session(
             # Closes the burst. A live 23ai answers it with a bare status and
             # nothing else -- `09 01 01 00`, then the end-of-response marker --
             # and the client reads that one reply and discards it (#1059).
-            stream.write_packet(TNS_DATA, bytes([TTI_STA, 1, 1, 0]))
+            stream.write_packet(TNS_DATA, encode_pipeline_end_status_thin())
             continue
         if body[1] == TTI_ALL8:
             # A cached-cursor re-execute (cursor set, no SQL) omits the OACs; hand
@@ -2704,8 +2712,8 @@ def _answer_marker_oci(stream: PacketStream, body: bytes, seq: '_OciSequence') -
     and the client's reset is waited for, whatever it sends before it dropped,
     as the thin loop does (:func:`_answer_marker`); a lone reset gets the one
     reset. Either way the cancel's OER follows."""
-    marker_type = body[2] if len(body) >= 3 else 0
-    stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+    marker_type = decode_marker_type(body)
+    stream.write_packet(TNS_MARKER, encode_marker_body(TNS_MARKER_TYPE_RESET))
     if marker_type != TNS_MARKER_TYPE_RESET:
         _await_reset_marker(stream)
     stream.write_packet(
@@ -2745,7 +2753,7 @@ def _answer_marker(stream: PacketStream, body: bytes) -> None:
     in this file had already learned it. A break is answered with a reset, and the
     client's own reset closes the episode with the cancel it asked for.
     """
-    marker_type = body[2] if len(body) >= 3 else 0
+    marker_type = decode_marker_type(body)
     if marker_type != TNS_MARKER_TYPE_RESET:
         # An interrupt or break opens it: answer with a single reset, then wait
         # for the client's, dropping whatever it sent before it -- the request it
@@ -2753,7 +2761,7 @@ def _answer_marker(stream: PacketStream, body: bytes) -> None:
         # 26ai answers it (#1346). Answering that request in between left its
         # reply ahead of the cancel, one call out of step, and under encryption
         # sent with keys the client had already re-derived.
-        stream.write_packet(TNS_MARKER, bytes([1, 0, TNS_MARKER_TYPE_RESET]))
+        stream.write_packet(TNS_MARKER, encode_marker_body(TNS_MARKER_TYPE_RESET))
         _await_reset_marker(stream)
     # The client's reset ends the episode: report the cancellation, which is what
     # it is now waiting to read. With encryption on, both sides re-derive their
@@ -3228,7 +3236,9 @@ class _OciRefCursors:
     def take_streamed(self, body: bytes) -> tuple[list[ColumnMeta], list[tuple]] | None:
         # A re-executed cursor whose rows carry a LOB or LONG, handed over whole:
         # those stream over calls of their own, as a query's do (#2033).
-        cursor_id = int.from_bytes(body[7:11], 'little')
+        cursor_id = reexecute_cursor_oci(body)
+        if cursor_id is None:
+            return None
         opened = self._open.get(cursor_id)
         if opened is None or not (
             _is_lob_result(opened[0]) or _is_long_result(opened[0])
@@ -3240,7 +3250,7 @@ class _OciRefCursors:
     def serve_reexecute(
         self, stream: PacketStream, body: bytes, seq: '_OciSequence'
     ) -> bool:
-        cursor_id = int.from_bytes(body[7:11], 'little')
+        cursor_id = reexecute_cursor_oci(body)
         if cursor_id not in self._open:
             return False
         _cursor_id, count = parse_reexecute_oci(body)
@@ -3250,8 +3260,8 @@ class _OciRefCursors:
     def serve_fetch(
         self, stream: PacketStream, body: bytes, seq: '_OciSequence'
     ) -> bool:
-        cursor_id = int.from_bytes(body[3:7], 'little')
-        if cursor_id not in self._open:
+        cursor_id = fetch_cursor_oci(body)
+        if cursor_id is None or cursor_id not in self._open:
             return False
         self._serve(stream, cursor_id, parse_fetch_oci(body), seq)
         return True
@@ -3721,7 +3731,7 @@ def _answer_bfile(
     # client read the boolean from inside the locator, reporting a file that is
     # there as missing (#1120). FILE_OPEN / FILE_CLOSE below are unaffected:
     # `encode_lobops_ack` re-adds the prefix itself.
-    field = len(request.locator).to_bytes(2, 'big') + request.locator
+    field = encode_lob_locator_field(request.locator)
     if request.kind == 'file_exists':
         stream.write_packet(TNS_DATA, encode_lobops_is_open(field, present))
         return
@@ -3743,8 +3753,7 @@ def _answer_bfile(
         stream.write_packet(
             TNS_DATA,
             encode_lobops_open_ack(
-                len(request.locator).to_bytes(2, 'big') + request.locator,
-                request.amount,
+                encode_lob_locator_field(request.locator), request.amount
             ),
         )
         return

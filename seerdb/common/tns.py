@@ -2568,6 +2568,7 @@ _O8I_STATUS: wire_schema.Schema = (
     ('when', 'code', (('chr', 'message'),)),
 )
 _STA_OCI = wire_schema.compile_encoder(_STA, _OCI)
+_STA_THIN = wire_schema.compile_encoder(_STA, _THIN)
 # A commit's or rollback's whole thin reply, read for its call status (#2456).
 _STA_FROM_THIN = wire_schema.compile_decoder(_STA, _THIN)
 # The experimental 9i OALL8 describe (#792, #798): the OCI describe column
@@ -6128,6 +6129,24 @@ def parse_fetch_oci(payload: bytes) -> int:
     return _FETCH_FROM_OCI(payload)[0]['rows']
 
 
+def reexecute_cursor_oci(payload: bytes) -> int | None:
+    """The cursor an OCI re-execute names, or None for a message that is not
+    one in a form the session's field version knows."""
+    try:
+        return _oci_all8_head(payload, sql_present=False)[0]
+    except (InterfaceError, ValueError, IndexError):
+        return None
+
+
+def fetch_cursor_oci(payload: bytes) -> int | None:
+    """The cursor an OCI ``TTI_FETCH`` names, or None for a message that is
+    not one."""
+    try:
+        return _FETCH_FROM_OCI(payload)[0]['cursor']
+    except (ValueError, IndexError):
+        return None
+
+
 def is_version_call_oci(payload: bytes) -> bool:
     """True if this is the sqlplus / thick-OCI post-login version request.
 
@@ -7303,13 +7322,25 @@ def is_prefixed_locator(Locator: bytes) -> bool:
     return len(Locator) >= 2 and int.from_bytes(Locator[:2], 'big') == len(Locator) - 2
 
 
-# What a TTI_LOBOPS reply leads with: the RPA token, then the locator as the
-# server now sees it after a big-endian ub2 of its length (§14.4). The same in
-# every dialect.
-_LOB_LOCATOR_REPLY = (
-    ('const', bytes([TTI_RPA])),
+# A locator after a big-endian ub2 of its length: a BFILE's locator field
+# (§14.4d).
+_LOB_LOCATOR_FIELD = (
     ('be2', 'locator_length'),
     ('bytes', 'locator', 'locator_length'),
+)
+_LOB_LOCATOR_FIELD_THIN = wire_schema.compile_encoder(_LOB_LOCATOR_FIELD, _THIN)
+
+
+def encode_lob_locator_field(Locator: bytes) -> bytes:
+    """``Locator`` after a big-endian ub2 of its length (``_LOB_LOCATOR_FIELD``)."""
+    return _LOB_LOCATOR_FIELD_THIN({'locator_length': len(Locator), 'locator': Locator})
+
+
+# What a TTI_LOBOPS reply leads with: the RPA token, then the locator as the
+# server now sees it, as a locator field (§14.4). The same in every dialect.
+_LOB_LOCATOR_REPLY = (
+    ('const', bytes([TTI_RPA])),
+    *_LOB_LOCATOR_FIELD,
 )
 _LOB_LOCATOR_REPLY_THIN = wire_schema.compile_encoder(_LOB_LOCATOR_REPLY, _THIN)
 _LOB_LOCATOR_REPLY_FROM_THIN = wire_schema.compile_decoder(_LOB_LOCATOR_REPLY, _THIN)
@@ -13915,6 +13946,13 @@ def encode_logoff_status_thin() -> bytes:
     return _LOGOFF_REPLY_THIN({'call_status': 1, 'has_sequence': 1, 'sequence': 0})
 
 
+def encode_pipeline_end_status_thin() -> bytes:
+    """The thin reply to a pipeline's end (``TNS_FUNC_PIPELINE_END``): a bare
+    ``TTI_STA``, call status 1 and end-to-end sequence 0, as a live 23ai
+    answers it (``09 01 01 00``) (#1059)."""
+    return _STA_THIN({'call_status': 1, 'has_sequence': 1, 'sequence': 0})
+
+
 def _decode_describe_oci(payload: bytes) -> list[dict]:
     # The describe encode_describe_oci writes, read back by its own schema
     # (_DCB_COLUMN) at the session's field version: the thin client cannot parse
@@ -18999,6 +19037,30 @@ _REFUSE = (
 )
 _REFUSE_THIN = wire_schema.compile_encoder(_REFUSE, _THIN)
 _REFUSE_FROM_THIN = wire_schema.compile_decoder(_REFUSE, _THIN)
+
+
+# A TNS_MARKER body: a ub1 1, a zero, then the marker's type
+# (TNS_MARKER_TYPE_BREAK, _RESET or _INTERRUPT).
+_MARKER = (
+    ('u8', 'kind'),
+    ('pad', 1),
+    ('u8', 'marker_type'),
+)
+_MARKER_THIN = wire_schema.compile_encoder(_MARKER, _THIN)
+_MARKER_FROM_THIN = wire_schema.compile_decoder(_MARKER, _THIN)
+
+
+def encode_marker_body(MarkerType: int) -> bytes:
+    """A TNS_MARKER body of type ``MarkerType``."""
+    return _MARKER_THIN({'kind': 1, 'marker_type': MarkerType})
+
+
+def decode_marker_type(Body: bytes) -> int:
+    """The type a TNS_MARKER body carries, or 0 for one too short to carry it."""
+    try:
+        return _MARKER_FROM_THIN(Body)[0]['marker_type']
+    except IndexError:
+        return 0
 
 
 def encode_refuse_body(UserReason: int, SystemReason: int, Data: bytes) -> bytes:
