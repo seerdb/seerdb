@@ -4517,7 +4517,10 @@ def _answer_query(
         # al8i4 iteration count still says how many rows to apply (#33). Stand in
         # that many empty bind rows so the array path runs once per iteration.
         iter_rows = request.bind_rows or [[] for _ in range(request.iterations)]
-        if len(iter_rows) > 1:
+        # A batch-errors execute takes this path with a single row too: an
+        # executemany of one row arrives as one iteration, and its failure is a
+        # batch error at offset 0, as Oracle reports it, not a raise (#2794).
+        if len(iter_rows) > 1 or request.batcherrors:
             # Array DML (executemany): apply each bind row and report the total
             # affected-row count — one execute message, one aggregated reply.
             execute_many = getattr(backend, 'execute_many', None)
