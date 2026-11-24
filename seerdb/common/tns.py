@@ -112,11 +112,12 @@ def _native_lob_bind_value(image: bytes) -> bytes:
     #
     # Three bytes allows 16 MiB, past the 65,533-dimension maximum (a float64
     # vector that size is ~512 KB).
-    return (
-        _VECTOR_BIND_DESCRIPTOR_HEAD
-        + len(image).to_bytes(3, 'big')
-        + b'\x00' * 22
-        + encode_chr(image)
+    return _NATIVE_BIND_THIN(
+        {
+            'descriptor': _VECTOR_BIND_DESCRIPTOR_HEAD,
+            'image_length': len(image).to_bytes(3, 'big'),
+            'image': image,
+        }
     )
 
 
@@ -2443,6 +2444,45 @@ _OAC: wire_schema.Schema = (
     ('only', 'oci', (('when', 'oci_plain', (('n4', 'oaccolid'),)),)),
     ('only', 'thin', (('when', 'has_oaccolid', (('n4', 'oaccolid'),)),)),
 )
+# The values of the binds whose framing is not a plain DALC (#2773), each
+# written by encode_token_rxd and read by the Mirror's _read_bind_value.
+#
+# A REF CURSOR bind (#1047, #1048): a count, then that many cursor ids. An IN
+# bind hands the server an open cursor, a count of 1 and its id; the OUT form,
+# "open one for me", is written by hand (_refcursor_bind_value).
+_REFCURSOR_BIND: wire_schema.Schema = (
+    ('n4', 'count'),
+    ('each', 'ids', 'count', (('n4', 'id'),)),
+)
+# A CLOB / BLOB bound by its locator (#91, #412): python-oracledb's
+# write_lob_with_length, a ub4 length and the locator, its own ub2 length in
+# front, framed as text is -- in 64-byte chunks past 64 bytes before 12.1, as
+# ojdbc14 sends 9.2 a temporary CLOB's 86-byte locator (SeerODBC #169). A
+# BFILE's is the same with the locator a value whatever the version.
+_LOB_BIND: wire_schema.Schema = (('n4', 'length'), ('chr', 'locator'))
+_BFILE_BIND: wire_schema.Schema = (('n4', 'length'), ('value', 'locator'))
+# A native JSON (#70) or VECTOR (#62) bind's value, inline: the fixed
+# descriptor python-oracledb sends for a LOB-backed inline bind, the image's
+# length as three big-endian bytes (#1008), 22 zero bytes, then the image as a
+# RAW. The descriptor is not checked when read.
+# A UROWID cell (#484, #904), the Mirror's to write and the client's to read: a
+# ub4 byte count, then the rowid -- its tag and body -- as a value up to 252
+# bytes, and past that in the 0xFE run of 252-byte chunks a LONG takes, as an
+# index-organized table's long rowid comes. Either form is read by its marker.
+# A zero count is NULL.
+_UROWID_CELL: wire_schema.Schema = (
+    ('n4', 'length'),
+    ('derive', 'short_form', lambda v: 0 < v['length'] <= TNS_MAX_SHORT_LENGTH),
+    ('derive', 'long_form', lambda v: v['length'] > TNS_MAX_SHORT_LENGTH),
+    ('when', 'short_form', (('value', 'rowid'),)),
+    ('when', 'long_form', (('long', 'rowid'),)),
+)
+_NATIVE_BIND: wire_schema.Schema = (
+    ('bytes', 'descriptor', len(VECTOR_BIND_DESCRIPTOR) - 1),
+    ('bytes', 'image_length', 3),
+    ('pad', 22),
+    ('chr', 'image'),
+)
 # Oracle 9i's bind descriptor and define entry (#2284): thin's OAC through its
 # csfrm -- 9.2 has no max_chars -- at field version 2, without the fields only
 # OCI writes. The four fields between the size and the charset are the array
@@ -3240,6 +3280,15 @@ _O9I_REFCURSOR_OUT_FROM_OCI = wire_schema.compile_decoder(_O9I_REFCURSOR_OUT, _O
 _O9I_CURSOR_CELL_FROM_OCI = wire_schema.compile_decoder(_O9I_CURSOR_CELL, _OCI)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
 _OAC_THIN = wire_schema.compile_encoder(_OAC, _THIN)
+_REFCURSOR_BIND_THIN = wire_schema.compile_encoder(_REFCURSOR_BIND, _THIN)
+_REFCURSOR_BIND_FROM_THIN = wire_schema.compile_decoder(_REFCURSOR_BIND, _THIN)
+_LOB_BIND_THIN = wire_schema.compile_encoder(_LOB_BIND, _THIN)
+_LOB_BIND_FROM_THIN = wire_schema.compile_decoder(_LOB_BIND, _THIN)
+_BFILE_BIND_THIN = wire_schema.compile_encoder(_BFILE_BIND, _THIN)
+_NATIVE_BIND_THIN = wire_schema.compile_encoder(_NATIVE_BIND, _THIN)
+_UROWID_CELL_THIN = wire_schema.compile_encoder(_UROWID_CELL, _THIN)
+_UROWID_CELL_FROM_THIN = wire_schema.compile_decoder(_UROWID_CELL, _THIN)
+_NATIVE_BIND_FROM_THIN = wire_schema.compile_decoder(_NATIVE_BIND, _THIN)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
@@ -4761,24 +4810,45 @@ def _lob_bind_locator(Data: bytes) -> tuple[bytes, bytes] | None:
     # persistent one's 114, `01 72 72`. One the Mirror minted for a column it
     # served does not, and is the locator whole (#2505). Returns (the locator,
     # the bytes after it), or None for a value in some other form.
+    # Only the short form is a locator here: the length's echo in front of it
+    # is what tells one from a value bound as text (_LOB_BIND).
     try:
         (Length, Rest) = decode_ub4(Data)
     except (IndexError, ValueError, Truncated):
         return None
     if not 2 <= Length <= 252 or Rest[:1] != bytes([Length]):
         return None
-    Locator = Rest[1 : 1 + Length]
+    (Bind, Rest) = _LOB_BIND_FROM_THIN(Data)
+    Locator = Bind['locator']
     if len(Locator) != Length:
         return None
     if int.from_bytes(Locator[:2], 'big') == Length - 2:
-        return (bytes(Locator[2:]), Rest[1 + Length :])
-    return (bytes(Locator), Rest[1 + Length :])
+        return (bytes(Locator[2:]), Rest)
+    return (bytes(Locator), Rest)
 
 
-# The fixed head of a native JSON bind value (_native_lob_bind_value): the
-# 19-byte descriptor + a ub2 image length + 22 zero bytes; the OSON image
-# (bytes_with_length) follows.
-_JSON_BIND_HEAD_LEN = len(VECTOR_BIND_DESCRIPTOR) + 2 + 22
+# Where a native bind's image starts (_NATIVE_BIND): the descriptor, the
+# three-byte length and the 22 zeros.
+_NATIVE_BIND_IMAGE_AT = len(VECTOR_BIND_DESCRIPTOR) - 1 + 3 + 22
+
+
+def _read_native_bind(Data: bytes) -> tuple[bytes, bytes]:
+    # A native JSON / VECTOR bind's image (_NATIVE_BIND) and the bytes after
+    # it, b'' for none. A big request spans several DATA packets and the first
+    # parse runs off the end by design, so a value cut short says "read more"
+    # (#1000). An image the NULL marker or the absent-value placeholder stands
+    # for is none, as a DALC reads them.
+    if Data[_NATIVE_BIND_IMAGE_AT : _NATIVE_BIND_IMAGE_AT + 1] in (b'\xff', b'\xfd'):
+        (_, Rest) = decode_dalc(Data[_NATIVE_BIND_IMAGE_AT:])
+        return (b'', Rest)
+    try:
+        (Bind, Rest) = _NATIVE_BIND_FROM_THIN(Data)
+    except IndexError:
+        raise Truncated('native bind: cut short') from None
+    Image = bytes(Bind['image'])
+    if len(Image) < int.from_bytes(Bind['image_length'], 'big'):
+        raise Truncated('native bind: image cut short')
+    return (Image, Rest)
 
 
 def _read_bind_value(
@@ -4795,14 +4865,15 @@ def _read_bind_value(
         # DALC (#1048). Read as one, the count's magnitude byte came back as the
         # value and the id was left in the stream, so a client binding an open
         # cursor was answered about whichever cursor happened to share that
-        # number. The OUT form is a count of 1 holding the id 0, "open one for
-        # me"; an IN bind carries the real id. Zero ids yields 0, the same
-        # "nothing to reuse" answer.
-        (count, after) = decode_ub4(after)
-        cursor_id = 0
-        for _ in range(count):
-            (cursor_id, after) = decode_ub4(after)
-        return cursor_id, after
+        # number. The OUT form is a count of 0, "open one for me"; an IN bind
+        # carries the real id. Zero ids yields 0, the same "nothing to reuse"
+        # answer (_REFCURSOR_BIND).
+        try:
+            (bind, after) = _REFCURSOR_BIND_FROM_THIN(after)
+        except IndexError:
+            raise Truncated('REF CURSOR bind: cut short') from None
+        ids = bind['ids']
+        return (ids[-1]['id'] if ids else 0), after
     if data_type == TNS_TYPE_REF:
         # A REF bind (#139): the value is just the opaque locator (a DALC). Pair
         # it with the OID the OAC carried so the backend re-binds a DbRef with
@@ -4843,9 +4914,8 @@ def _read_bind_value(
         # instead, on the ordinary DALC path below). #70.
         from seerdb.common.oson import decode_oson
 
-        rest = after[_JSON_BIND_HEAD_LEN:]
-        image, rest = decode_dalc(rest)
-        if isinstance(image, list):
+        (image, rest) = _read_native_bind(after)
+        if not image:
             return None, rest
         # Re-wrap as a JSON marker so the backend re-binds it into a JSON column
         # rather than as its bare Python type: a bare list / scalar would
@@ -4858,11 +4928,9 @@ def _read_bind_value(
         # it to a type-preserving value (array.array by the image's own element
         # type) so the backend re-binds FLOAT64 / INT8 / BINARY faithfully rather
         # than as a default FLOAT32 list.
-        rest = after[_JSON_BIND_HEAD_LEN:]
-        raw_image, rest = decode_dalc(rest)
-        if isinstance(raw_image, list):
+        (image, rest) = _read_native_bind(after)
+        if not image:
             return None, rest
-        image = bytes(raw_image)
         decoded = decode_vector(image)
         if isinstance(decoded, SparseVector):
             return decoded, rest
@@ -8419,38 +8487,25 @@ def _read_urowid_column(Rest: bytes) -> tuple[str | None, bytes]:
     # live XE IOT row vs the SELECT ROWID text.
     from seerdb.common.types import urowid_to_string
 
+    # A large UROWID rides chunked (0xFE marker), like a LONG value: an
+    # index-organized table's rowid crosses the 252-byte short-length limit (its
+    # raw form carries a physical guess plus the primary key). Reading it as a
+    # single 1-byte-length block left the chunk-length prefix and the zero
+    # terminator in the stream, desyncing the row -- the leftover 0xFE then
+    # reached the token loop as "no decoder for response token 254" (#904).
+    # One cut short says "read more", whichever form it came in.
     if not Rest:
         return (None, Rest)
-    (NumBytes, Rest) = decode_ub4(Rest)
-    if NumBytes <= 0:
+    try:
+        (Cell, Rest) = _UROWID_CELL_FROM_THIN(Rest)
+    except IndexError:
+        raise Truncated('UROWID: cut short') from None
+    if Cell['length'] <= 0:
         return (None, Rest)
-    if Rest[0] == TNS_LONG_LENGTH_INDICATOR:
-        # A large UROWID rides chunked (0xFE marker), like a LONG value: an
-        # index-organized table's rowid crosses the 252-byte short-length limit
-        # (its raw form carries a physical guess plus the primary key). Reading it
-        # as a single 1-byte-length block left the chunk-length prefix and the
-        # zero terminator in the stream, desyncing the row -- the leftover 0xFE
-        # then reached the token loop as "no decoder for response token 254"
-        # (#904). Same framing as _read_long_column: ub4-length chunks on 12c+, a
-        # single length byte per chunk before, both ending on a zero-length chunk.
-        Rest = Rest[1:]
-        Chunks = b''
-        Wide = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-        while Rest:
-            if Wide:
-                (ChunkLen, Rest) = decode_ub4(Rest)
-            else:
-                ChunkLen = Rest[0]
-                Rest = Rest[1:]
-            if ChunkLen == 0:
-                break
-            Chunks += bytes(Rest[:ChunkLen])
-            Rest = Rest[ChunkLen:]
-        return (urowid_to_string(Chunks), Rest)
-    Rest = Rest[1:]  # 1-byte length echo (== NumBytes) for a short UROWID
-    Value = bytes(Rest[:NumBytes])
-    Rest = Rest[NumBytes:]
-    return (urowid_to_string(Value), Rest)
+    Rowid = bytes(Cell['rowid'])
+    if len(Rowid) < Cell['length']:
+        raise Truncated('UROWID: rowid cut short')
+    return (urowid_to_string(Rowid), Rest)
 
 
 def _read_long_column(Rest: bytes) -> tuple[bytes | None, bytes]:
@@ -21919,7 +21974,7 @@ def encode_urowid_value(Value: object) -> bytes:
     18-character form of a physical one held in a UROWID column; ``None`` (or
     empty) is a zero count (NULL)."""
     if Value is None or Value == '':
-        return encode_sb4(0)
+        return _urowid_cell(b'')
     Text = str(Value)
     if Text.startswith('*'):
         Body = Text[1:]  # drop the leading '*'
@@ -21938,23 +21993,21 @@ def encode_urowid_value(Value: object) -> bytes:
             + Block.to_bytes(4, 'big')
             + Slot.to_bytes(2, 'big')
         )
-    if len(Payload) <= TNS_MAX_SHORT_LENGTH:
-        return encode_sb4(len(Payload)) + bytes([len(Payload)]) + Payload
     # A large UROWID (an index-organized table's rowid) rides chunked, like a
     # LONG value: a single ub1 length cannot carry 253+ bytes and would collide
-    # with the 0xFE / 0xFF markers. ub4 total, the 0xFE marker, then a run of
-    # length-prefixed chunks (ub4 on 12c+, a single length byte before) closed by
-    # a zero-length chunk -- the inverse of the chunked branch in
-    # _read_urowid_column (#904). Without this the encoder raised on
-    # bytes([>255]) and the Mirror could not return an IOT rowid at all.
-    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-    encode_len = encode_sb4 if wide else (lambda n: bytes([n]))
-    out = bytearray(encode_sb4(len(Payload)) + bytes([TNS_LONG_LENGTH_INDICATOR]))
-    for start in range(0, len(Payload), TNS_MAX_SHORT_LENGTH):
-        chunk = Payload[start : start + TNS_MAX_SHORT_LENGTH]
-        out += encode_len(len(chunk)) + chunk
-    out += encode_len(0)  # zero-length chunk terminates the run
-    return bytes(out)
+    # with the 0xFE / 0xFF markers (#904, _UROWID_CELL).
+    return _urowid_cell(Payload)
+
+
+def _urowid_cell(Payload: bytes) -> bytes:
+    return _UROWID_CELL_THIN(
+        {
+            'length': len(Payload),
+            'short_form': 0 < len(Payload) <= TNS_MAX_SHORT_LENGTH,
+            'long_form': len(Payload) > TNS_MAX_SHORT_LENGTH,
+            'rowid': Payload,
+        }
+    )
 
 
 # A thin (seerdb / oracledb-thin) LONG / LONG RAW value streams inline in the RXD
@@ -22699,12 +22752,9 @@ def encode_token_rxd(Token: object) -> bytes:
         # 114 (`01 72 72`), measured against python-oracledb on 21c.
         if isinstance(Token, BfileBind):
             Prefixed = Token.locator
-            return encode_sb4(len(Prefixed)) + _bytes_with_length(Prefixed)
-        # encode_chr is _bytes_with_length at 12.1+; below it, it chunks past 64
-        # bytes, as ojdbc14 sends 9.2 a temporary CLOB's 86-byte locator
-        # (SeerODBC #169).
+            return _BFILE_BIND_THIN({'length': len(Prefixed), 'locator': Prefixed})
         Prefixed = prefixed_locator(Token.locator)
-        return encode_sb4(len(Prefixed)) + encode_chr(Prefixed)
+        return _LOB_BIND_THIN({'length': len(Prefixed), 'locator': Prefixed})
     if Token is None:
         return bytes([0])
     from seerdb.common.dbobject import DbObject, DbRef
@@ -22887,23 +22937,28 @@ def _refcursor_bind_value(Token: object) -> bytes:
     `cursor.execute(plsql, rcursor=open_cursor)`, which a PL/SQL block declares
     as a plain `sys_refcursor` IN parameter and fetches from.
 
-    The value is a **presence byte** then the id as a ub4. Captured from the
-    reference client, which sends the SAME OAC either way and differs only
-    here::
+    The value is a ub4 count of cursor ids, then the ids (_REFCURSOR_BIND).
+    Captured from the reference client, which sends the SAME OAC either way
+    and differs only here::
 
-        07 00              OUT: RXD, then an absent value
-        07 01 01 01 03     IN:  present, one of them, then ub4 3 -- the id
+        07 00              OUT: RXD, then a count of 0
+        07 01 01 01 03     IN:  a count of 1, then ub4 3 -- the id
 
-    The OUT form keeps its historical `01 00` spelling, which the server has
-    accepted for years even though the reference client sends the barer `00`.
-    Only the IN form is new, and it needs BOTH leading bytes: with the id alone
-    the server sizes a value it never receives and waits -- a HANG, not an
-    error, which is what makes a byte-for-byte capture the only way to find it.
+    The OUT form keeps its `01 00` spelling, the zero count in two bytes:
+    behind seerdb's descriptor the bare `00` fails (below). The IN form needs
+    its count: with the id alone the server sizes a value it never receives
+    and waits -- a HANG, not an error, which is what makes a byte-for-byte
+    capture the only way to find it.
     """
     CursorId = getattr(Token, 'id', 0) or 0
     if not CursorId:
+        # A zero count in a ub4's two-byte form, which no field kind writes.
+        # The reference client's bare `00` is not a form to move to: behind
+        # this descriptor, with IN binds after the cursor, 10g and 11g answer
+        # it ORA-03120 and 23ai ORA-03146 (measured on `OPEN :c FOR ... WHERE k
+        # BETWEEN :a AND :b`, #2773).
         return bytes([1, 0])
-    return bytes([1, 1]) + encode_sb4(CursorId)
+    return _REFCURSOR_BIND_THIN({'count': 1, 'ids': [{'id': CursorId}]})
 
 
 # The longest universal rowid's text, which a ROWID / UROWID bind is sized for.
