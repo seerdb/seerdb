@@ -1741,17 +1741,49 @@ _OS_PID_MTS: wire_schema.Schema = (
     ('n2', 'pid_length'),
     ('value', 'pid'),
 )
+# A key-value pair written with two lengths each (python-oracledb's
+# write_bytes_with_two_lengths: a ub4 count, then the bytes with their own
+# length when there are any), and a ub4 of flags. The client's piggybacks
+# carry them, and so do the server's session-state pairs (`_RPA_TAIL`), where
+# the flags are the keyword, and a 23ai column's annotations
+# (`_DCB_ANNOTATIONS`).
+_PIG_KV_PAIR: wire_schema.Schema = (
+    ('n4', 'key_length'),
+    ('when', 'key_length', (('value', 'key'),)),
+    ('n4', 'value_length'),
+    ('when', 'value_length', (('value', 'value'),)),
+    ('n4', 'pair_flags'),
+)
+# The return-parameters block's (TTI_RPA) three fields after its al8o4l words
+# (#1141): the transaction id (al8txl), raw bytes behind their length; the
+# session-state pairs, a count and `_PIG_KV_PAIR`s -- 11g reports a
+# CURRENT_SCHEMA change as two, the name under keyword 168 and its id under
+# 169; and 10g's change-notification registration, raw bytes behind their
+# length, which 9.2 predates and doesn't send (#2768). The caller passes
+# `has_registration`.
+_RPA_TAIL: wire_schema.Schema = (
+    ('n4', 'transaction_length'),
+    ('bytes', 'transaction', 'transaction_length'),
+    ('n4', 'pair_count'),
+    ('each', 'pairs', 'pair_count', _PIG_KV_PAIR),
+    (
+        'when',
+        'has_registration',
+        (
+            ('n4', 'registration_length'),
+            ('bytes', 'registration', 'registration_length'),
+        ),
+    ),
+)
 # The per-iteration affected-row counts an array DML answers when the client
 # asked for arraydmlrowcounts (#18/#859): the execute's return-parameters block
-# (TTI_RPA), its four ordinary words (al8o4l, al8txl, key/value pairs,
-# registration -- all empty here), then the count and one ub4 per iteration. A
-# prefix: the OER that ends the response follows separately.
+# (TTI_RPA), its al8o4l words and `_RPA_TAIL`, all empty here, then the count
+# and one ub4 per iteration. A prefix: the OER that ends the response follows
+# separately.
 _ROWCOUNTS_BLOCK: wire_schema.Schema = (
     ('const', bytes([TTI_RPA])),
     ('n4', 'al8o4l'),
-    ('n4', 'al8txl'),
-    ('n4', 'key_value_pairs'),
-    ('n4', 'registration'),
+    *_RPA_TAIL,
     ('n4', 'count'),
     ('each', 'counts', 'count', (('n4', 'value'),)),
 )
@@ -1940,6 +1972,29 @@ _LONG_CELL: wire_schema.Schema = (
     ('n4', 'actual_length'),
     ('only', 'thin', (('n4', 'return_code'),)),
 )
+# A 23ai column's annotation map (fv >= 23.1 EXT 3, #89, #1082): a ub4 that
+# is 1 when the column has annotations and 0 when it has none, which ends the
+# map; then a byte, the number of pairs, a byte, each pair as a `_PIG_KV_PAIR`
+# (the key, the value, a ub4 of flags), and a trailing ub4 of flags. 23ai
+# sends 01, 0x10, the count and 0x16 for one, two and three pairs alike
+# (captured); what the two bytes mean is not known, and python-oracledb skips
+# them, as it skips the flags.
+_DCB_ANNOTATIONS: wire_schema.Schema = (
+    ('n4', 'annotations_present'),
+    (
+        'when',
+        'annotations_present',
+        (
+            ('u8', 'annotations_lead'),
+            ('n4', 'annotation_count'),
+            ('u8', 'annotation_pairs_lead'),
+            ('each', 'annotations', 'annotation_count', _PIG_KV_PAIR),
+            ('n4', 'annotation_flags'),
+        ),
+    ),
+)
+_ANNOTATIONS_LEAD = 0x10
+_ANNOTATION_PAIRS_LEAD = 0x16
 # A describe column (TTI_DCB), in thin's field order, which OCI keeps (#2064).
 # OCI's own parts, measured against live 11g and 18c describes (#265, #1282,
 # #2050):
@@ -2011,7 +2066,7 @@ _DCB_COLUMN: wire_schema.Schema = (
                     ('when', 'domain_name_length', (('value', 'domain_name'),)),
                 ),
             ),
-            ('when', 'has_annotations', (('raw', 'annotations'),)),
+            ('when', 'has_annotations', _DCB_ANNOTATIONS),
             (
                 'when',
                 'has_vector',
@@ -2098,18 +2153,7 @@ _PIGGYBACK_HEAD: wire_schema.Schema = (
 # writes them and the Mirror reads them (decode_client_piggyback). The head
 # stays out of them: its token is read by the field version, which the value
 # kind's chunking would then follow too, and the encoders write values past 252
-# bytes at the default.
-#
-# A key-value pair written with two lengths each (python-oracledb's
-# write_bytes_with_two_lengths: a ub4 count, then the bytes with their own
-# length when there are any), and a ub4 of flags.
-_PIG_KV_PAIR: wire_schema.Schema = (
-    ('n4', 'key_length'),
-    ('when', 'key_length', (('value', 'key'),)),
-    ('n4', 'value_length'),
-    ('when', 'value_length', (('value', 'value'),)),
-    ('n4', 'pair_flags'),
-)
+# bytes at the default. Their key-value pairs are `_PIG_KV_PAIR`.
 # SET_END_TO_END_ATTR (135, #183): two pointers no field is sent for, the flags
 # naming the attributes this flush changes, a (changed, length) header per
 # attribute slot, then the value of each one set. The execution context id and
@@ -2581,13 +2625,46 @@ _O7_STATUS_HEAD: wire_schema.Schema = (
     ('n4', 'rowid_block'),
     ('n4', 'rowid_slot'),
 )
+
+
+def _batch_array(name: str, count: str, element: str) -> wire_schema.Schema:
+    # A batch-error code or offset array (#18, #2247), as every server from 9.2
+    # to 23ai writes it (captured, #2793): the count, then
+    # - one element as a value of its own, its length and the integer;
+    # - from two elements, 0xFE, each element as a chunk of its own, and a 00.
+    #   A chunk's length is a ub1 before 12.1 and a ub4 from it, as the value
+    #   kind frames chunks; the caller passes `chunk_ub1` / `chunk_ub4`.
+    # python-oracledb reads exactly that. The elements packed into one value
+    # read the same up to 252 bytes, and past that its chunks split elements.
+    one = f'{name}_one'
+    chunked = f'{name}_chunked'
+    chunk = (
+        ('when', 'chunk_ub1', (('u8', 'size'),)),
+        ('when', 'chunk_ub4', (('n4', 'size'),)),
+        ('n4', element),
+    )
+    return (
+        ('n4', count),
+        ('derive', one, lambda values: values[count] == 1),
+        ('derive', chunked, lambda values: values[count] > 1),
+        ('when', one, (('each', name, count, (('u8', 'size'), ('n4', element))),)),
+        (
+            'when',
+            chunked,
+            (('const', b'\xfe'), ('each', name, count, chunk), ('const', b'\x00')),
+        ),
+    )
+
+
 # ... and the rest: OS error, statement and call numbers, padding, the
-# iterations, the oerrdd, the arrays a `batcherrors` call collects -- each code
-# and offset array a count and one value packing that many ub4s, the messages a
-# count, an indicator and each message's length, text and two bytes (#2247) --
-# and, when the code is set, the server's message, ORA-01403's too, which the
-# server writes in chunks of 64 bytes past 64, as it writes text. Read from
-# 57 live 9.2.0.4 statuses with nothing left over.
+# iterations, the oerrdd, the arrays a `batcherrors` call collects -- the codes
+# and the offsets each a `_batch_array`, the messages a count, an indicator and
+# each message's length, text and two bytes (#2247) -- and, when the code is
+# set, the server's message, ORA-01403's too, which the server writes in chunks
+# of 64 bytes past 64, as it writes text. Read from 57 live 9.2.0.4 statuses
+# with nothing left over. The indicator is 0x16 from every server measured, 9.2
+# to 23ai; no reader uses it. A message's text follows its length even when
+# that is 0, as python-oracledb reads it.
 _O7_STATUS_TAIL: wire_schema.Schema = (
     ('n4', 'os_error'),
     ('u8', 'statement'),
@@ -2596,20 +2673,19 @@ _O7_STATUS_TAIL: wire_schema.Schema = (
     ('n4', 'iterations'),
     ('n4', 'oerrdd_length'),
     ('when', 'oerrdd_length', (('value', 'oerrdd'),)),
-    ('n4', 'batch_code_count'),
-    ('when', 'batch_code_count', (('value', 'batch_codes'),)),
-    ('n4', 'batch_offset_count'),
-    ('when', 'batch_offset_count', (('value', 'batch_offsets'),)),
+    *_batch_array('batch_codes', 'batch_code_count', 'code'),
+    *_batch_array('batch_offsets', 'batch_offset_count', 'offset'),
     ('n4', 'batch_message_count'),
     ('when', 'batch_message_count', (('u8', 'batch_message_indicator'),)),
     (
         'each',
         'batch_messages',
         'batch_message_count',
-        (('n4', 'length'), ('when', 'length', (('chr', 'text'),)), ('pad', 2)),
+        (('n4', 'length'), ('chr', 'text'), ('pad', 2)),
     ),
     ('when', 'code', (('chr', 'message'),)),
 )
+_BATCH_MESSAGE_INDICATOR = 0x16
 # 9i's row header (#2284): flags, the number of columns requested, the
 # iteration, the iterations the fetch asked for (10), the buffer length, then
 # (`_O7_VECTORS`, shared with the I/O vector) the column bit vector and the rowid, each a ub4 length
@@ -2944,6 +3020,9 @@ _OER_TAIL: wire_schema.Schema = (
     ('when', 'ext_20_1', (('n4', 'ext_sql_type'), ('n4', 'ext_checksum'))),
 )
 _OER_HEAD_FROM_THIN = wire_schema.compile_decoder(_OER_HEAD, _THIN)
+_OER_HEAD_THIN = wire_schema.compile_encoder(_OER_HEAD, _THIN)
+_OER_TAIL_THIN = wire_schema.compile_encoder(_OER_TAIL, _THIN)
+_RPA_TAIL_FROM_THIN = wire_schema.compile_decoder(_RPA_TAIL, _THIN)
 # 9.2's to a thin OALL8 session: the call status, then 9i's short status as it
 # is, with no end-to-end sequence and 9i's widths (#2768).
 _OER_HEAD_92_FROM_THIN = wire_schema.compile_decoder(
@@ -3331,11 +3410,8 @@ def _decode_describe_body(Rest: bytes) -> tuple[list, bytes]:
 
 
 def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
-    # Per-column metadata (_DCB_COLUMN), read with the thin decoder up to the
-    # 23ai annotation map and vector descriptor, which stay here because the
-    # annotations are a count sent twice around pointers (not a schema shape) and
-    # the schema marks their slot with a raw field. The schema's version
-    # conditionals ride in `given`: `oaccolid` follows max_size from 12.2, the
+    # Per-column metadata (_DCB_COLUMN), read with the thin decoder. The
+    # schema's version conditionals ride in `given`: `oaccolid` follows max_size from 12.2, the
     # sb1 (not variable) scale and `oaccolid` are what 12c+ changed from 11g
     # (oracledb base.pyx _process_metadata); `uds flags` is an 11g addition a 10g
     # describe omits -- reading a phantom ub4 there desynced the row (#84, #826);
@@ -3347,10 +3423,16 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
         'has_position': _decode_server_field_version() >= FIELD_VERSION_10_2,
         'has_uds': FieldVersion >= FIELD_VERSION_11_2,
         'has_domain': FieldVersion >= FIELD_VERSION_23_1,
-        # The annotation map and vector descriptor are read below, not by the
-        # schema (its `annotations` is a raw slot), so both branches are off.
-        'has_annotations': False,
-        'has_vector': False,
+        # After the domain fields a 23ai column carries its annotation map, from
+        # field version 23.1 EXT 3 (#89), and the vector descriptor, from 23.4.
+        # Each must be consumed exactly where it is sent or the row stream
+        # desyncs. Measured against 23ai, a column's describe grows by nothing
+        # through field version 19, by the annotation count's one byte at 20 to
+        # 23, and by the descriptor's three more at 24; reading both from 18
+        # broke every query of a client capped at 18 or 19, and a two-column one
+        # at 20 to 23.
+        'has_annotations': FieldVersion >= FIELD_VERSION_23_1_EXT_3,
+        'has_vector': FieldVersion >= FIELD_VERSION_23_4,
     }
     (Field, Rest) = _DCB_COLUMN_FROM_THIN(Rest, Given)
     DataType = Field['data_type']
@@ -3371,46 +3453,23 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
     UdsFlags = Field.get('uds_flags', 0)
     DomainSchema = Field.get('domain_schema', b'')
     DomainName = Field.get('domain_name', b'')
-    Annotations = {}
-    VecDims: int | None
-    VecFormat: int | None
-    VecFlags: int | None
-    # After the domain fields a 23ai column carries its annotation map, from
-    # field version 23.1 EXT 3, and the vector descriptor, from 23.4. Each must
-    # be consumed exactly where it is sent or the row stream desyncs. Measured
-    # against 23ai, a column's describe grows by nothing through field version
-    # 19, by the annotation count's one byte at 20 to 23, and by the descriptor's
-    # three more at 24; reading both from 18 broke every query of a client
-    # capped at 18 or 19, and a two-column one at 20 to 23.
-    if FieldVersion >= FIELD_VERSION_23_1_EXT_3:  # 23ai (#89)
-        # The annotations are the #89 payload. The count is sent twice around a
-        # 1-byte pointer, and each key/value pair is followed by a ub4 flags
-        # word, with a trailing ub4 flags after the loop.
-        (NumAnno, Rest) = decode_ub4(Rest)
-        if NumAnno > 0:
-            Rest = Rest[1:]  # pointer
-            (NumAnno, Rest) = decode_ub4(Rest)  # count, repeated
-            Rest = Rest[1:]  # pointer
-            for _ in range(NumAnno):
-                (Key, Rest) = _read_str_with_length(Rest)
-                (Val, Rest) = _read_str_with_length(Rest)
-                Annotations[Key] = Val or b''
-                (_, Rest) = decode_ub4(Rest)  # per-pair flags
-            (_, Rest) = decode_ub4(Rest)  # trailing flags
-    if FieldVersion >= FIELD_VERSION_23_4:
-        # Vector descriptor (23.4+): dimensions (ub4) + format + flags (ub1 each).
-        # For a native VECTOR column these carry the declared dimension count and
-        # element format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 = flexible),
-        # with flags bit 0x01 flexible-format and 0x02 sparse — the metadata a
-        # thin describe otherwise drops (a plain VECTOR column is indistinguishable
-        # by data type alone). Captured for TNS_TYPE_VECTOR, discarded otherwise.
-        (VecDims, Rest) = decode_ub4(Rest)
-        VecFormat, VecFlags = Rest[0], Rest[1]
-        Rest = Rest[2:]
-    else:
-        # No vector descriptor on the wire (a pre-23.4 server, or a session
-        # below field version 24): report None, not a fake 0 format.
-        VecDims = VecFormat = VecFlags = None
+    # The annotation map (#89), key to value, the flags dropped as
+    # python-oracledb drops them (#1082).
+    Annotations = {
+        Pair.get('key', b''): Pair.get('value', b'')
+        for Pair in Field.get('annotations', [])
+    }
+    # Vector descriptor (23.4+): dimensions (ub4) + format + flags (ub1 each).
+    # For a native VECTOR column these carry the declared dimension count and
+    # element format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 = flexible),
+    # with flags bit 0x01 flexible-format and 0x02 sparse — the metadata a
+    # thin describe otherwise drops (a plain VECTOR column is indistinguishable
+    # by data type alone). Captured for TNS_TYPE_VECTOR, discarded otherwise.
+    # With no descriptor on the wire (a pre-23.4 server, or a session below
+    # field version 24) they are None, not a fake 0 format.
+    VecDims: int | None = Field.get('vector_dimensions')
+    VecFormat: int | None = Field.get('vector_format')
+    VecFlags: int | None = Field.get('vector_flags')
     Col = {
         'column_name': ColName,
         'data_type': DataType,
@@ -3445,14 +3504,6 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
         Col['vector_dimensions'] = VecDims
         Col['vector_flags'] = VecFlags
     return (Col, Rest)
-
-
-def _str_with_length(data: bytes) -> bytes:
-    # Inverse of _read_str_with_length: a ub4 char-count then a DALC. An empty
-    # value is just the zero count (the reader returns b'' without a DALC).
-    if not data:
-        return encode_sb4(0)
-    return encode_sb4(len(data)) + _bytes_with_length(data)
 
 
 def _encode_signed_sb4(value: int) -> bytes:
@@ -3935,7 +3986,7 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
             # 23ai sends it at, as the client's reader takes them.
             'has_annotations': field_version >= FIELD_VERSION_23_1_EXT_3,
             'has_vector': field_version >= FIELD_VERSION_23_4,
-            'annotations': _encode_annotations(col.annotations),
+            **_annotation_values(col.annotations),
             'vector_dimensions': col.vector_dimensions or 0,
             'vector_format': (col.vector_format or 0) & 0xFF,
             'vector_flags': (col.vector_flags or 0) & 0xFF,
@@ -3958,20 +4009,17 @@ def _encode_describe_body(columns: list[ColumnMeta]) -> bytes:
     return body + _describe_trailer(oci=False)
 
 
-def _encode_annotations(annotations: tuple[tuple[bytes, bytes], ...]) -> bytes:
-    # A column's annotation map, as a 23ai (fv >= 23.1 EXT 3) describe carries it: the
-    # count, a pointer byte, the count again, a pointer byte, then per pair its
-    # key, its value and a ub4 flags word, and a trailing ub4 flags. None is a
-    # bare count of 0. The inverse of the client's reader (#89), which skips the
-    # pointer bytes and flags, as python-oracledb's does (#1082).
-    if not annotations:
-        return encode_sb4(0)
-    out = (
-        encode_sb4(len(annotations)) + b'\x01' + encode_sb4(len(annotations)) + b'\x01'
-    )
-    for key, value in annotations:
-        out += _str_with_length(key) + _str_with_length(value) + encode_sb4(0)
-    return out + encode_sb4(0)
+def _annotation_values(annotations: tuple[tuple[bytes, bytes], ...]) -> dict:
+    # The `_DCB_ANNOTATIONS` values of a column's annotation map, as 23ai sends
+    # them, each pair's flags and the trailing flags 0.
+    return {
+        'annotations_present': 1 if annotations else 0,
+        'annotations_lead': _ANNOTATIONS_LEAD,
+        'annotation_count': len(annotations),
+        'annotation_pairs_lead': _ANNOTATION_PAIRS_LEAD,
+        'annotations': [_pig_kv_pair(key, value) for (key, value) in annotations],
+        'annotation_flags': 0,
+    }
 
 
 def encode_describe(columns: list[ColumnMeta]) -> bytes:
@@ -4040,28 +4088,6 @@ def encode_implicit_results_oci(results: list[tuple[list[ColumnMeta], int]]) -> 
 # --- Mirror thin reply/response encoders (§6) ---
 
 
-def _encode_batch_ub4_array(values: list[int]) -> bytes:
-    # An array-DML batch field (#18): a ub4 count, then a DALC blob packing that
-    # many ub4 values back-to-back (the inverse of _read_batch_ub4_array). Empty
-    # is a bare zero count.
-    if not values:
-        return encode_sb4(0)
-    blob = b''.join(encode_sb4(v) for v in values)
-    return encode_sb4(len(values)) + _bytes_with_length(blob)
-
-
-def _encode_batch_messages(messages: list[str]) -> bytes:
-    # The batch-error message array (#18): a ub4 count, a 1-byte indicator, then
-    # per message a ub4 length + the length-prefixed text + a 2-byte trailer.
-    if not messages:
-        return encode_sb4(0)
-    out = bytearray(encode_sb4(len(messages)) + bytes([1]))
-    for message in messages:
-        text = message.encode('utf-8')
-        out += encode_sb4(len(text)) + encode_chr(text) + bytes([0, 0])
-    return bytes(out)
-
-
 def _physical_rowid(rowid: str | None) -> tuple[int, int, int, int]:
     # The four OER rowid fields for a printable extended rowid: the inverse of
     # what the client renders them as (rowid_to_string). Anything that is not one
@@ -4113,38 +4139,91 @@ def _encode_oer(
         call_status |= TNS_EOCS_FLAGS_TXN_IN_PROGRESS
     batch_errors = batch_errors or []
     (rowid_obj, rowid_file, rowid_block, rowid_slot) = _physical_rowid(rowid)
-    codes = [code for _offset, code, _msg in batch_errors]
-    offsets = [offset for offset, _code, _msg in batch_errors]
-    messages = [msg for _offset, _code, msg in batch_errors]
+    field_version = _ENCODE_FIELD_VERSION.get()
+    wide = field_version >= FIELD_VERSION_12_1
+    # The 20.1 fields follow the release the Mirror PRESENTS, as a real 21c /
+    # 23ai sends them to a client that negotiated lower too (#1145), and never
+    # a release below the negotiated one.
+    server_field_version = max(_ENCODE_SERVER_FIELD_VERSION.get() or 0, field_version)
+    values = {
+        'call_status': call_status,
+        'sequence': seq,
+        'rows': rowcount,  # the current row: a DML's affected rows on 11g
+        'code': ora_code,
+        'array_error': 0,
+        'array_error_2': 0,
+        'cursor': cursor_id,
+        'position': error_pos,
+        'sql_type': sql_type,
+        'fatal': 0,
+        'flags_ub2': not wide,
+        'flags_u8': wide,
+        'flags_wide': 0,
+        'flags_narrow': 0,
+        'cursor_options': 0,
+        'upi_param': 0,
+        'warnings': warn_flags,
+        'rowid_object': rowid_obj,
+        'rowid_file': rowid_file,
+        'rowid_block': rowid_block,
+        'rowid_slot': rowid_slot,
+        'os_error': 0,
+        'statement': 0,
+        'call': call_number,
+        'padding': 0,
+        'iterations': 1,
+        'oerrdd_length': 0,  # no logical rowid
+        **_batch_array_values(
+            'batch_codes', 'batch_code_count', 'code', [e[1] for e in batch_errors]
+        ),
+        **_batch_array_values(
+            'batch_offsets',
+            'batch_offset_count',
+            'offset',
+            [e[0] for e in batch_errors],
+        ),
+        'batch_message_count': len(batch_errors),
+        'batch_message_indicator': _BATCH_MESSAGE_INDICATOR,
+        'batch_messages': [
+            {'length': len(text), 'text': text}
+            for text in (e[2].encode('utf-8') for e in batch_errors)
+        ],
+        # From 12.1 the extended error number and the ub8 rowcount; from 20.1
+        # a SQL type and a server checksum.
+        'ext_12c': wide,
+        'ext_error_code': ora_code,
+        'ext_rowcount': rowcount,
+        'ext_20_1': wide and server_field_version >= FIELD_VERSION_20_1,
+        'ext_sql_type': 0,
+        'ext_checksum': 0,
+    }
     return (
-        bytes([TTI_OER])
-        + encode_sb4(call_status)
-        + encode_sb4(seq)  # end-to-end seq
-        + encode_sb4(rowcount)  # current row number == DML affected rows on 11g
-        + encode_sb4(ora_code)  # the ORA error number (0 on success)
-        + encode_sb4(0)  # array element error 1
-        + encode_sb4(0)  # array element error 2
-        + encode_sb4(cursor_id)  # current cursor id
-        + encode_sb4(error_pos)  # error position
-        + bytes(
-            [sql_type, 0, 0, 0, 0, warn_flags]
-        )  # sql_type, fatal, flags, opts, upi, warn
-        + encode_sb4(rowid_obj)  # rowid data object number
-        + encode_sb4(rowid_file)  # rowid relative file number
-        + bytes(1)  # rowid reserved
-        + encode_sb4(rowid_block)  # rowid block number
-        + encode_sb4(rowid_slot)  # rowid slot number
-        + encode_sb4(0)  # os error
-        + bytes([0, call_number])  # statement number, call number
-        + encode_sb4(0)  # padding
-        + encode_sb4(1)  # successful iterations
-        + _bytes_with_length(b'')  # oerrdd (logical rowid)
-        + _encode_batch_ub4_array(codes)  # batch error codes
-        + _encode_batch_ub4_array(offsets)  # batch error row offsets
-        + _encode_batch_messages(messages)  # batch error messages
-        + _oer_version_tail(ora_code, rowcount)
+        _OER_HEAD_THIN(values)
+        + _OER_TAIL_THIN(values)
         + _oer_message(ora_code, message)
     )
+
+
+def _batch_array_values(
+    name: str, count: str, element: str, items: list[int]
+) -> dict[str, Any]:
+    # The values `_batch_array(name, count, element)` writes `items` from, each
+    # element's chunk length in the session's framing.
+    wide = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+    return {
+        count: len(items),
+        f'{name}_one': len(items) == 1,
+        f'{name}_chunked': len(items) > 1,
+        name: [
+            {
+                'size': len(encode_sb4(item)),
+                element: item,
+                'chunk_ub1': not wide,
+                'chunk_ub4': wide,
+            }
+            for item in items
+        ],
+    }
 
 
 def _oer_message(ora_code: int, message: bytes) -> bytes:
@@ -4165,24 +4244,6 @@ def _oer_message(ora_code: int, message: bytes) -> bytes:
     if not ora_code and _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
         return b''
     return _THIN.value(message)
-
-
-def _oer_version_tail(ora_code: int, rowcount: int) -> bytes:
-    # The fields a 12.1+ client reads between the batch-error arrays and the
-    # message (its decode_token_oer): the extended error number and the ub8
-    # rowcount, then from 20.1 a SQL type and a server checksum. 11g has none.
-    # The last two follow the release the Mirror PRESENTS, as a real 21c / 23ai
-    # sends them to a client that negotiated lower too (#1145).
-    field_version = _ENCODE_FIELD_VERSION.get()
-    if field_version < FIELD_VERSION_12_1:
-        return b''
-    tail = encode_sb4(ora_code) + encode_sb4(rowcount)
-    # Never below the negotiated version: a server does not advertise less
-    # than a session agrees on.
-    server_field_version = max(_ENCODE_SERVER_FIELD_VERSION.get() or 0, field_version)
-    if server_field_version >= FIELD_VERSION_20_1:
-        tail += encode_sb4(0) + encode_sb4(0)  # sql type, server checksum
-    return tail
 
 
 def _national_wire_value(value: object, col: ColumnMeta) -> object:
@@ -4437,9 +4498,13 @@ def encode_rowcounts_block(counts: list[int]) -> bytes:
     return _ROWCOUNTS_BLOCK_THIN(
         {
             'al8o4l': 0,
-            'al8txl': 0,
-            'key_value_pairs': 0,
-            'registration': 0,
+            'transaction_length': 0,
+            'transaction': b'',
+            'pair_count': 0,
+            'pairs': [],
+            'has_registration': True,
+            'registration_length': 0,
+            'registration': b'',
             'count': len(counts),
             'counts': [{'value': c} for c in counts],
         }
@@ -7314,35 +7379,21 @@ def decode_token_net(Data: bytes, Acc: tuple) -> None:
     pass
 
 
-def _unpack_oer_ub4s(Blob: bytes, Count: int) -> list[int]:
-    # The `Count` ub4 values a batch-error code or offset array packs
-    # back-to-back in its DALC blob (the `_OER_TAIL` schema reads the blob whole
-    # as a value; this reads the integers out of it).
-    Buf = bytes(Blob)
-    Values = []
-    for _ in range(Count):
-        (Value, Buf) = decode_ub4(Buf)
-        Values.append(Value)
-    return Values
+def _oer_message_text(Text: bytes) -> str:
+    return bytes(Text).decode('utf-8', errors='replace').rstrip()
 
 
-def _oer_batch_errors(Tail: dict) -> list[dict]:
-    # The {offset, code, message} list of an OER's batch-error arrays (array-DML
-    # `batcherrors`, #18), from the `_OER_TAIL` schema's fields: error i hit row
-    # offsets[i] with ORA-code codes[i] and text messages[i]. For a plain
-    # statement all three counts are zero and the list is empty.
-    Codes = _unpack_oer_ub4s(
-        Tail.get('batch_codes', b''), Tail.get('batch_code_count', 0)
-    )
-    Offsets = _unpack_oer_ub4s(
-        Tail.get('batch_offsets', b''), Tail.get('batch_offset_count', 0)
-    )
-    Messages = [
-        bytes(M['text']).decode('utf-8', errors='replace').rstrip()
-        if 'text' in M
-        else ''
-        for M in Tail.get('batch_messages', [])
-    ]
+def _status_batch_errors(
+    Tail: dict, Message: Callable[[bytes], str | None] = _oer_message_text
+) -> list[dict]:
+    # The {offset, code, message} list of a status's batch-error arrays
+    # (array-DML `batcherrors`, #18, #2247), from `_O7_STATUS_TAIL`'s fields, the
+    # 10g+ OER's included: error i hit row offsets[i] with ORA-code codes[i] and
+    # text messages[i]. For a plain statement all three counts are zero and the
+    # list is empty.
+    Codes = [Item['code'] for Item in Tail.get('batch_codes', [])]
+    Offsets = [Item['offset'] for Item in Tail.get('batch_offsets', [])]
+    Messages = [Message(M['text']) for M in Tail.get('batch_messages', [])]
     return [
         {
             'offset': Offsets[I] if I < len(Offsets) else None,
@@ -7384,6 +7435,8 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
         'flags_u8': Wide,
         'ext_12c': Wide,
         'ext_20_1': Wide and ServerFieldVersion >= FIELD_VERSION_20_1,
+        'chunk_ub1': not Wide,
+        'chunk_ub4': Wide,
     }
     (Head, Rest) = (
         _OER_HEAD_FROM_THIN
@@ -7412,7 +7465,7 @@ def decode_token_oer(Data: bytes, Acc: tuple) -> tuple:
         Head['rowid_block'],
         Head['rowid_slot'],
     )
-    BatchErrors = _oer_batch_errors(Tail)
+    BatchErrors = _status_batch_errors(Tail)
     Message = None
     if ErrCode != 0 and Rest:
         try:
@@ -7939,42 +7992,28 @@ def decode_token_rpa_piggyback(Data: bytes, Acc: tuple) -> tuple:
 
 
 def _skip_rpa_tail_fields(Rest: bytes) -> bytes | None:
-    # The three fields after the al8o4l words (#1141), or None when they are
-    # not there to read -- the parse runs off the end, or does not land on what
-    # follows a block (a token, the end, or an armed row-count tail). Each is a
-    # ub2 count or length; zero is the usual case and a single 00 byte.
+    # The bytes after `_RPA_TAIL`, or None when it is not there to read -- the
+    # parse runs off the end, or does not land on what follows a block (a
+    # token, the end, or an armed row-count tail).
+    Given = {'has_registration': _decode_server_field_version() >= FIELD_VERSION_10_2}
     try:
-        (TxnLen, Rest) = decode_ub4(Rest)  # al8txl: transaction id, raw bytes
-        Rest = Rest[TxnLen:]
-        (Pairs, Rest) = decode_ub4(Rest)  # session-state key/value pairs
-        for _ in range(Pairs):
-            # A pair is `ub2 text length (+DALC) | ub2 binary length (+DALC) |
-            # ub2 keyword`, as in the server piggyback. 11g reports a
-            # CURRENT_SCHEMA change as two: the name under keyword 168, its id
-            # under 169.
-            (TextLen, Rest) = decode_ub4(Rest)
-            if TextLen > 0:
-                (_, Rest) = decode_dalc(Rest)
-            (BinLen, Rest) = decode_ub4(Rest)
-            if BinLen > 0:
-                (_, Rest) = decode_dalc(Rest)
-            (_, Rest) = decode_ub4(Rest)  # keyword number
-        # The registration, raw bytes: 10g's change notification, which 9.2
-        # predates and doesn't send (#2768).
-        RegLen = 0
-        if _decode_server_field_version() >= FIELD_VERSION_10_2:
-            (RegLen, Rest) = decode_ub4(Rest)
+        (Tail, Rest) = _RPA_TAIL_FROM_THIN(Rest, Given)
     except (IndexError, Truncated):
         return None
     # A query registered for change notification (#2460): the registration
-    # bytes end with its id, a big-endian low word then high word.
+    # bytes end with its id, a big-endian low word then high word. A
+    # registration cut short gives none.
+    Registration = Tail.get('registration', b'')
     Sink = _DECODE_QUERY_IDS.get()
-    if Sink is not None and RegLen >= 8 and len(Rest) >= RegLen:
-        (Low, High) = struct.unpack_from('>II', Rest, RegLen - 8)
+    if (
+        Sink is not None
+        and len(Registration) >= 8
+        and len(Registration) == Tail['registration_length']
+    ):
+        (Low, High) = struct.unpack_from('>II', Registration, len(Registration) - 8)
         Sink.append(High << 32 | Low)
-    Rest = Rest[RegLen:]
     if not Rest or Rest[0] in _KNOWN_TTI_TOKENS or _DECODE_DML_ROWCOUNTS.get():
-        return Rest
+        return bytes(Rest)
     return None
 
 
@@ -18565,8 +18604,12 @@ def _o7_status(Data: bytes) -> dict | None:
     except (IndexError, Truncated, DataError):
         return None
     try:
-        (Tail, Rest) = _O7_STATUS_TAIL_FROM_THIN(Rest, Status)
-    except (IndexError, Truncated, DataError):
+        # 9i frames a batch array's chunks with ub1 lengths.
+        (Tail, Rest) = _O7_STATUS_TAIL_FROM_THIN(
+            Rest, {**Status, 'chunk_ub1': True, 'chunk_ub4': False}
+        )
+    except (IndexError, Truncated, DataError, ValueError):
+        # ValueError: an array's chunk marker is not where its count says.
         return Status
     if not Rest:
         Status.update(Tail)
@@ -18812,37 +18855,8 @@ def _fv2_status(Data: bytes) -> dict | None:
         'slot': Status['rowid_slot'],
         'position': Status['position'],
         'warnings': Status['warnings'],
-        'batch_errors': _o7_batch_errors(Status),
+        'batch_errors': _status_batch_errors(Status, _fv2_message),
     }
-
-
-def _o7_batch_errors(Status: dict) -> list[dict]:
-    # The per-row errors of a `batcherrors` call (#2247), from its status's
-    # three arrays: error i hit row offsets[i] with codes[i] and messages[i].
-    Codes = _o7_ub4s(Status.get('batch_codes', b''), Status.get('batch_code_count', 0))
-    Offsets = _o7_ub4s(
-        Status.get('batch_offsets', b''), Status.get('batch_offset_count', 0)
-    )
-    Messages = [
-        _fv2_message(M.get('text', b'')) for M in Status.get('batch_messages', [])
-    ]
-    return [
-        {
-            'offset': Offsets[I] if I < len(Offsets) else None,
-            'code': Codes[I] if I < len(Codes) else None,
-            'message': Messages[I] if I < len(Messages) else None,
-        }
-        for I in range(max(len(Offsets), len(Codes), len(Messages)))
-    ]
-
-
-def _o7_ub4s(Blob: bytes, Count: int) -> list[int]:
-    # The `Count` ub4s a batch-error array's value packs.
-    Values = []
-    for _ in range(Count):
-        (Value, Blob) = decode_ub4(Blob)
-        Values.append(Value)
-    return Values
 
 
 def _skip_fv2_rpa(Data: bytes) -> bytes:

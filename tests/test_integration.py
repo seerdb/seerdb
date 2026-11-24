@@ -5380,6 +5380,19 @@ class CursorIntegration(_IntegrationBase):
         self.cur.execute(f'SELECT id FROM {self.TABLE} ORDER BY id')
         self.assertEqual([r[0] for r in self.cur.fetchall()], [1, 2, 3])
 
+    def test_executemany_many_batch_errors(self):
+        # 100 failed rows: past two, the server sends the codes and offsets
+        # each in a chunk of its own, and 100 codes are past 252 bytes, where
+        # the Mirror's packed form split them (#2793).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY)')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1)', [(1,)] * 101, batcherrors=True
+        )
+        errs = self.cur.getbatcherrors()
+        self.assertEqual([e.offset for e in errs], list(range(1, 101)))
+        self.assertEqual({e.code for e in errs}, {1})
+        self.assertIn('ORA-00001', str(errs[-1]))
+
     def test_executemany_without_batcherrors_raises(self):
         # Default behaviour is unchanged: a constraint violation aborts and
         # raises rather than being collected.
