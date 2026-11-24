@@ -4198,19 +4198,17 @@ def test_parse_lobops_request_classifies_the_state_opcodes() -> None:
     # refused (#903/#887).
     # OPEN / CLOSE / IS_OPEN take the locator RAW: the client writes it with no
     # length of its own and declares `len(locator)` as the source length, so the
-    # declared length is the locator's exactly. GET_CHUNK_SIZE still goes
-    # through the older ub2-prefixed walk.
+    # declared length is the locator's exactly. So does GET_CHUNK_SIZE, whose
+    # reply echoes it ahead of the value (#2790).
     for op, kind in (
         (TNS_LOB_OP_OPEN, 'open'),
         (TNS_LOB_OP_CLOSE, 'close'),
         (TNS_LOB_OP_IS_OPEN, 'is_open'),
+        (TNS_LOB_OP_GET_CHUNK_SIZE, 'get_chunk_size'),
     ):
         req = parse_lobops_request(_lobops_op_request(op, locator, prefixed=False))
         assert req.kind == kind, op
         assert req.locator == locator, op
-    chunk = parse_lobops_request(_lobops_op_request(TNS_LOB_OP_GET_CHUNK_SIZE, locator))
-    assert chunk.kind == 'ack'
-    assert chunk.locator == locator
     # TRIM joins the declared-length group: its reply echoes the locator
     # verbatim, so the parse must hand back the field as sent (#903/#887).
     trim = parse_lobops_request(
