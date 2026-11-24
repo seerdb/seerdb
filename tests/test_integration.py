@@ -5394,6 +5394,17 @@ class CursorIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.getbatcherrors(), [])
 
+    def test_a_batch_of_one_failed_row(self):
+        # One row is a batch too: its failure is collected, not raised, and
+        # the call returns (#2794).
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER PRIMARY KEY)')
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
+        self.cur.executemany(
+            f'INSERT INTO {self.TABLE} VALUES (:1)', [(1,)], batcherrors=True
+        )
+        errs = self.cur.getbatcherrors()
+        self.assertEqual([(e.offset, e.code) for e in errs], [(0, 1)])
+
     @_requires(_ARRAY_DML)
     def test_the_statement_runs_again_after_a_batch_error(self):
         # Below 12.1 the statement's server cursor is cached, and a batch error
