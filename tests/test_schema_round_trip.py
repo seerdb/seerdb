@@ -32,7 +32,7 @@ from seerdb.common.tns_consts import (
     FIELD_VERSION_23_4,
 )
 
-CODECS = {
+CODECS: dict[str, wire_schema.Codec] = {
     'thin': tns._THIN,
     'oci': tns._OCI,
     'oci-wide': tns._OCI_WIDE,
@@ -48,15 +48,6 @@ ONE_WAY = {
     '_REFCURSOR_OUT',
     '_OBJECT_FRAME',
     '_LOB_READ_REPLY',
-    '_DCB_COLUMN',
-    # 9i OALL8's describe and the schemas around it carry _DCB_COLUMN (#798).
-    '_DCB_COLUMN_9I',
-    '_O9I_DESCRIBE_BODY',
-    '_O9I_DESCRIBE',
-    '_O9I_CURSOR_CELL',
-    '_O9I_REFCURSOR_OUT',
-    # 11g's cursor cell carries the same columns (#2466).
-    '_OCI11_CURSOR_CELL',
     # The describe body it carries per result is pre-encoded, a raw field.
     '_IMPLICIT_RESULTS',
     # 9i's SQL length counts characters, not the bytes its text takes (#2275).
@@ -148,10 +139,12 @@ class _Values:
             if kind in ('const', 'pad'):
                 continue
             if kind == 'only':
-                if field[1] == self.codec_name.split('-')[0] or (
-                    field[1] == 'oci' and self.codec_name in ('o8i', 'o9i')
-                ):
+                if _in_dialect(field[1], self.codec_name):
                     self.fill(field[2], values)
+                else:
+                    # As for a `when` that is off, below.
+                    for ahead in _needed_ahead(field[2]) & _carried(field[2]):
+                        values.pop(ahead, None)
                 continue
             if kind == 'when':
                 # The test is a field read before, or what the caller gives.
@@ -159,6 +152,12 @@ class _Values:
                     values[field[1]] = self._pick([0, 1])
                 if values[field[1]]:
                     self.fill(field[2], values)
+                else:
+                    # A count chosen ahead whose own field is in this branch
+                    # is not written, so it does not come back: a column's
+                    # annotation pairs without annotations.
+                    for ahead in _needed_ahead(field[2]) & _carried(field[2]):
+                        values.pop(ahead, None)
                 continue
             if kind == 'each':
                 # The count chosen ahead, which a field read before the items
@@ -170,7 +169,7 @@ class _Values:
                 # A flag an item tests but doesn't carry is the caller's, the
                 # same for every item: an array dequeue's messages each have a
                 # shard id when the session's version has one (#2773).
-                given = _given_flags(field[3])
+                given = _given_flags(field[3], self.codec_name)
                 for flag in given:
                     values.setdefault(flag, self._pick([0, 1]))
                 for _ in range(count):
@@ -243,9 +242,28 @@ def _needed_ahead(schema: wire_schema.Schema) -> set[str]:
     return names
 
 
-def _given_flags(schema: wire_schema.Schema) -> set[str]:
-    # The names a `when` tests that no field of the schema carries: what the
-    # caller gives. An `each` inside has its own.
+def _carried(schema: wire_schema.Schema) -> set[str]:
+    # The names the fields of a schema carry, in any branch, not in an `each`'s
+    # items.
+    names: set[str] = set()
+    for field in schema:
+        if field[0] in ('when', 'only'):
+            names |= _carried(field[2])
+        elif field[0] not in ('const', 'pad', 'each'):
+            names.add(field[1])
+    return names
+
+
+def _in_dialect(dialect: str, codec_name: str) -> bool:
+    # Whether an `only` for `dialect` applies in a codec, as wire_schema tells:
+    # by the codec's own name, which the wide OCI codec shares with OCI.
+    return dialect == CODECS[codec_name].name
+
+
+def _given_flags(schema: wire_schema.Schema, codec_name: str) -> set[str]:
+    # The names a `when` tests that no field of the schema carries in this
+    # codec: what the caller gives. A describe column derives `has_oaccolid` in
+    # OCI and is given it in thin. An `each` inside has its own.
     (tested, carried) = (set(), set())
 
     def walk(fields: wire_schema.Schema) -> None:
@@ -254,7 +272,8 @@ def _given_flags(schema: wire_schema.Schema) -> set[str]:
                 tested.add(field[1])
                 walk(field[2])
             elif field[0] == 'only':
-                walk(field[2])
+                if _in_dialect(field[1], codec_name):
+                    walk(field[2])
             elif field[0] not in ('const', 'pad', 'each'):
                 carried.add(field[1])
 
