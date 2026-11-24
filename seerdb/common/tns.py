@@ -1936,33 +1936,39 @@ _O8I_ALL8: wire_schema.Schema = (
 )
 # The end of a describe (TTI_DCB), and of a REF CURSOR's inline one: the
 # describe time, four flags (dcbflag, dcbmdbz, dcbmnpr, dcbmxpr) and, from
-# 11.2, the result cache's query key. Thin sends an empty date and key; OCI a
-# lead byte, a 7-byte date in the two-length form (zero, as the Mirror leaves
-# it) and the key's ub4 length. A LOB describe sets dcbmdbz (#405).
+# 11.2, the result cache's query key. The date and the key are each a ub4
+# length then, in thin when there is one, the value, as python-oracledb skips
+# them; the Mirror sends both empty in thin. OCI has a lead byte, a 7-byte
+# date (zero, as the Mirror leaves it) and the key's length alone. A LOB
+# describe sets dcbmdbz (#405). 9.2's describe ends at the date (has_flags,
+# #2768).
 _DESCRIBE_TRAILER: wire_schema.Schema = (
-    ('only', 'oci', (('u8', 'date_lead'), ('n4', 'date_length'))),
-    ('value', 'date'),
-    ('n4', 'dcbflag'),
-    ('n4', 'dcbmdbz'),
-    ('n4', 'dcbmnpr'),
-    ('n4', 'dcbmxpr'),
+    ('only', 'oci', (('u8', 'date_lead'),)),
+    ('n4', 'date_length'),
+    ('only', 'oci', (('value', 'date'),)),
+    ('only', 'thin', (('when', 'date_length', (('value', 'date'),)),)),
     (
         'when',
-        'has_query_key',
+        'has_flags',
         (
-            ('only', 'thin', (('value', 'query_key'),)),
-            ('only', 'oci', (('n4', 'query_key_length'),)),
+            ('n4', 'dcbflag'),
+            ('n4', 'dcbmdbz'),
+            ('n4', 'dcbmnpr'),
+            ('n4', 'dcbmxpr'),
+            (
+                'when',
+                'has_query_key',
+                (
+                    ('n4', 'query_key_length'),
+                    (
+                        'only',
+                        'thin',
+                        (('when', 'query_key_length', (('value', 'query_key'),)),),
+                    ),
+                ),
+            ),
         ),
     ),
-)
-# A REF CURSOR OUT value (#483, #2014): a lead byte -- 0x01 in thin, 0x4c in
-# OCI -- the cursor's describe, its id and the return code every OUT value
-# ends on.
-_REFCURSOR_OUT: wire_schema.Schema = (
-    ('u8', 'lead'),
-    ('raw', 'describe'),
-    ('n4', 'cursor'),
-    ('n2', 'return_code'),
 )
 # A LONG / LONG RAW cell: the content, then its trailing indicators -- the
 # actual length and, in thin only, the return code -- zero for an ordinary
@@ -2078,6 +2084,27 @@ _DCB_COLUMN: wire_schema.Schema = (
             ),
         ),
     ),
+)
+# A describe from its max row size on, ahead of its trailer: what a query's
+# TTI_DCB carries after its preamble, an implicit result's describe and a REF
+# CURSOR's value inline. The max row size, the column count, in thin a byte
+# when there are columns, and the columns.
+_DESCRIBE_COLUMNS: wire_schema.Schema = (
+    ('n4', 'max_row_size'),
+    ('n4', 'count'),
+    ('only', 'thin', (('when', 'count', (('u8', 'reserved'),)),)),
+    ('each', 'columns', 'count', _DCB_COLUMN),
+)
+_DESCRIBE_BODY: wire_schema.Schema = (*_DESCRIBE_COLUMNS, *_DESCRIBE_TRAILER)
+# A REF CURSOR OUT value (#483, #2014): a lead byte -- 0x01 in thin, 0x4c in
+# OCI -- the cursor's describe, its id and the return code every OUT value
+# ends on. A CURSOR(...) column's cell in thin is the same without the return
+# code (#826).
+_REFCURSOR_OUT: wire_schema.Schema = (
+    ('u8', 'lead'),
+    *_DESCRIBE_BODY,
+    ('n4', 'cursor'),
+    ('when', 'has_return_code', (('n2', 'return_code'),)),
 )
 # A physical ROWID cell (#484, #2017): a lead byte -- thin's present
 # indicator, OCI's length -- then the data object, relative file, block and
@@ -2392,7 +2419,7 @@ _AUTH_HEAD: wire_schema.Schema = (
 # oaccolid slot. 41 bytes for a plain bind before 12c, 49 from it; 47 and 55 for
 # an object. OCI declares a character bind's length at its client buffer's
 # size -- three bytes a character, two for NCHAR -- and its characters as max
-# characters. Thin's oaccolid, from 12.2, its callers read.
+# characters. Thin's oaccolid follows max_chars from 12.2 (has_oaccolid).
 _OAC: wire_schema.Schema = (
     ('only', 'oci', (('u8', 'lead'),)),
     ('u8', 'data_type'),
@@ -2414,6 +2441,7 @@ _OAC: wire_schema.Schema = (
     ('only', 'oci', (('when', 'oci_plain', (('pad', 1),)),)),
     ('n4', 'max_chars'),
     ('only', 'oci', (('when', 'oci_plain', (('n4', 'oaccolid'),)),)),
+    ('only', 'thin', (('when', 'has_oaccolid', (('n4', 'oaccolid'),)),)),
 )
 # Oracle 9i's bind descriptor and define entry (#2284): thin's OAC through its
 # csfrm -- 9.2 has no max_chars -- at field version 2, without the fields only
@@ -2737,6 +2765,19 @@ _O7_IOV: wire_schema.Schema = (
     ('n4', 'iterations_this_time'),
     ('n2', 'buffer_length'),
 )
+# The I/O vector 10g+ sends and the Mirror writes, the head of a PL/SQL
+# block's reply: 9i's (`_O7_IOV`), then the fast-fetch bit vector and the
+# rowid, each a ub4 length and that many bytes as they are -- python-oracledb's
+# `_process_io_vector` skips them raw, where `_O7_VECTORS` frames them as
+# values; no server has sent either non-empty. One direction byte per bind
+# follows, `iterations * 256 + requests` of them, as after 9i's.
+_IOV: wire_schema.Schema = (
+    *_O7_IOV,
+    ('n4', 'bit_vector_length'),
+    ('bytes', 'bit_vector', 'bit_vector_length'),
+    ('n4', 'rowid_length'),
+    ('bytes', 'rowid', 'rowid_length'),
+)
 # A 9i TTI_LOBOPS request (#2284): the 10g+ head (`_LOBOPS_HEAD`) at field
 # version 2, then the SCN array's pointer and length, the source locator
 # whole -- a ub2 length and its body, the bytes `source_length` counts -- and
@@ -3038,6 +3079,8 @@ _O7_LOB_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LOB_CELL, _THIN)
 _O7_EMPTY_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_EMPTY_CELL, _THIN)
 _O7_LONG_CELL_FROM_THIN = wire_schema.compile_decoder(_O7_LONG_CELL, _THIN)
 _O7_IOV_FROM_THIN = wire_schema.compile_decoder(_O7_IOV, _THIN)
+_IOV_FROM_THIN = wire_schema.compile_decoder(_IOV, _THIN)
+_IOV_THIN = wire_schema.compile_encoder(_IOV, _THIN)
 _O7_LOBOPS_THIN = wire_schema.compile_encoder(_O7_LOBOPS, _THIN)
 _O7_LOBOPS_REPLY_FROM_THIN = wire_schema.compile_decoder(_O7_LOBOPS_REPLY, _THIN)
 _O7_LOBOPS_O8I = wire_schema.compile_encoder(_O7_LOBOPS, _O8I)
@@ -3196,6 +3239,7 @@ _O9I_DESCRIBE_FROM_OCI = wire_schema.compile_decoder(_O9I_DESCRIBE, _OCI)
 _O9I_REFCURSOR_OUT_FROM_OCI = wire_schema.compile_decoder(_O9I_REFCURSOR_OUT, _OCI)
 _O9I_CURSOR_CELL_FROM_OCI = wire_schema.compile_decoder(_O9I_CURSOR_CELL, _OCI)
 _OAC_OCI = wire_schema.compile_encoder(_OAC, _OCI)
+_OAC_THIN = wire_schema.compile_encoder(_OAC, _THIN)
 _O7_LOBOPS_O9I = wire_schema.compile_encoder(_O7_LOBOPS, _O9I)
 _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
@@ -3225,37 +3269,34 @@ _DESCRIBE_TRAILER_THIN = wire_schema.compile_encoder(_DESCRIBE_TRAILER, _THIN)
 _DESCRIBE_TRAILER_OCI = wire_schema.compile_encoder(_DESCRIBE_TRAILER, _OCI)
 _REFCURSOR_OUT_THIN = wire_schema.compile_encoder(_REFCURSOR_OUT, _THIN)
 _REFCURSOR_OUT_OCI = wire_schema.compile_encoder(_REFCURSOR_OUT, _OCI)
+_REFCURSOR_OUT_FROM_THIN = wire_schema.compile_decoder(_REFCURSOR_OUT, _THIN)
+_DESCRIBE_BODY_THIN = wire_schema.compile_encoder(_DESCRIBE_BODY, _THIN)
+_DESCRIBE_BODY_FROM_THIN = wire_schema.compile_decoder(_DESCRIBE_BODY, _THIN)
+_DESCRIBE_COLUMNS_OCI = wire_schema.compile_encoder(_DESCRIBE_COLUMNS, _OCI)
+
+
+def _describe_trailer_values(*, oci: bool, mdbz: int = 0) -> dict:
+    # The describe's trailer (_DESCRIBE_TRAILER) as the session's field version
+    # has it, in either dialect: thin's date and key empty, OCI's date zero.
+    date = bytes(_OCI_DCB_DATE_LEN) if oci else b''
+    return {
+        'date_lead': 0,
+        'date_length': len(date),
+        'date': date,
+        'has_flags': True,
+        'dcbflag': 0,
+        'dcbmdbz': mdbz,
+        'dcbmnpr': 0,
+        'dcbmxpr': 0,
+        'has_query_key': _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2,
+        'query_key_length': 0,
+        'query_key': b'',
+    }
 
 
 def _describe_trailer(*, oci: bool, mdbz: int = 0) -> bytes:
-    # The describe's trailer (_DESCRIBE_TRAILER) as the session's field version
-    # has it, in either dialect.
-    has_key = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2
-    if not oci:
-        return _DESCRIBE_TRAILER_THIN(
-            {
-                'date': b'',
-                'dcbflag': 0,
-                'dcbmdbz': mdbz,
-                'dcbmnpr': 0,
-                'dcbmxpr': 0,
-                'has_query_key': has_key,
-                'query_key': b'',
-            }
-        )
-    return _DESCRIBE_TRAILER_OCI(
-        {
-            'date_lead': 0,
-            'date_length': _OCI_DCB_DATE_LEN,
-            'date': bytes(_OCI_DCB_DATE_LEN),
-            'dcbflag': 0,
-            'dcbmdbz': mdbz,
-            'dcbmnpr': 0,
-            'dcbmxpr': 0,
-            'has_query_key': has_key,
-            'query_key_length': 0,
-        }
-    )
+    Encode = _DESCRIBE_TRAILER_OCI if oci else _DESCRIBE_TRAILER_THIN
+    return Encode(_describe_trailer_values(oci=oci, mdbz=mdbz))
 
 
 _ALL8_HEAD_THIN = wire_schema.compile_encoder(_ALL8_HEAD, _THIN)
@@ -3386,27 +3427,21 @@ def _decode_describe_body(Rest: bytes) -> tuple[list, bytes]:
     # describe (#121): max row size, column count, a reserved byte, the
     # per-column metadata, then the describe trailer. The token-specific
     # preamble (DCB's chunked uuid/timestamp, or the implicit-result ub1 block)
-    # is consumed by the caller before this point.
-    (_, Rest) = decode_ub4(Rest)  # max row size
-    (NumCols, Rest) = decode_ub4(Rest)
-    if NumCols > 0:
-        Rest = Rest[1:]  # reserved
-    Columns = []
-    for _ in range(NumCols):
-        (Col, Rest) = _decode_dcb_column(Rest)
-        Columns.append(Col)
-    Rest = _skip_bytes_with_length(Rest)  # current date
-    if _decode_server_field_version() < FIELD_VERSION_10_2:
-        # 9.2's describe ends at the date: the four flags are 10g's (#2768).
-        return (Columns, Rest)
-    for _ in range(4):
-        (_, Rest) = decode_ub4(Rest)  # dcbflag/dcbmdbz/dcbmnpr/dcbmxpr
-    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
-        # dcbqcky (query-cache key) is an 11g addition (the result cache landed
-        # in 11g); 10g's describe ends after the four ub4 flags, so skipping a
-        # phantom bytes-with-length here would consume the first row token (#84).
-        Rest = _skip_bytes_with_length(Rest)
-    return (Columns, Rest)
+    # is consumed by the caller before this point (_DESCRIBE_BODY).
+    (Body, Rest) = _DESCRIBE_BODY_FROM_THIN(Rest, _describe_body_given())
+    return ([_dcb_column_from_fields(F) for F in Body['columns']], Rest)
+
+
+def _describe_body_given() -> dict:
+    # A thin describe body's conditionals: its columns', and its trailer's. 9.2's
+    # describe ends at the date, the four flags being 10g's (#2768); the query
+    # key is 11g's (the result cache landed in 11g), and reading a phantom one
+    # from 10g consumed the first row token (#84).
+    return {
+        **_dcb_column_given(),
+        'has_flags': _decode_server_field_version() >= FIELD_VERSION_10_2,
+        'has_query_key': _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2,
+    }
 
 
 def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
@@ -3417,8 +3452,14 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
     # describe omits -- reading a phantom ub4 there desynced the row (#84, #826);
     # the SQL-domain schema and name are a 23c addition, each a DALC string, `00`
     # for no domain, not the plain ub4s that only survived the empty case (#53).
+    (Field, Rest) = _DCB_COLUMN_FROM_THIN(Rest, _dcb_column_given())
+    return (_dcb_column_from_fields(Field), Rest)
+
+
+def _dcb_column_given() -> dict:
+    # The field-version conditionals of a thin describe column (_DCB_COLUMN).
     FieldVersion = _DECODE_FIELD_VERSION.get()
-    Given = {
+    return {
         'has_oaccolid': FieldVersion >= FIELD_VERSION_12_2,
         'has_position': _decode_server_field_version() >= FIELD_VERSION_10_2,
         'has_uds': FieldVersion >= FIELD_VERSION_11_2,
@@ -3434,7 +3475,11 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
         'has_annotations': FieldVersion >= FIELD_VERSION_23_1_EXT_3,
         'has_vector': FieldVersion >= FIELD_VERSION_23_4,
     }
-    (Field, Rest) = _DCB_COLUMN_FROM_THIN(Rest, Given)
+
+
+def _dcb_column_from_fields(Field: dict) -> dict:
+    # A thin describe column's fields (_DCB_COLUMN) as the column the cursor
+    # keeps.
     DataType = Field['data_type']
     Precision = Field['precision']
     DataScale = Field['scale']
@@ -3503,7 +3548,7 @@ def _decode_dcb_column(Rest: bytes) -> tuple[dict, bytes]:
         Col['vector_format'] = VecFormat
         Col['vector_dimensions'] = VecDims
         Col['vector_flags'] = VecFlags
-    return (Col, Rest)
+    return Col
 
 
 def _encode_signed_sb4(value: int) -> bytes:
@@ -3940,73 +3985,84 @@ def _encode_dcb_column(col: ColumnMeta, position: int) -> bytes:
     # column at its position, #84, #814), 23.1 the SQL domain and 23.1 EXT 1
     # (23ai fv24) the annotations and vector descriptor (§20.5). Fields the
     # client skips are well-formed zeros.
+    return _DCB_COLUMN_THIN(_dcb_column_values(col, position))
+
+
+def _dcb_column_values(col: ColumnMeta, position: int) -> dict:
+    # A thin describe column's fields (_DCB_COLUMN) at the session's field
+    # version.
     col = _carried(col)
     field_version = _ENCODE_FIELD_VERSION.get()
-    return _DCB_COLUMN_THIN(
-        {
-            'data_type': col.data_type,
-            'flags': 0,
-            'precision': col.precision & 0xFF,
-            'scale': col.scale,
-            'buffer_size': describe_wire_length(col),
-            'max_array': 0,
-            'cont_flags': 0,
-            # For an ADT / REF column the referenced type's OID (#494).
-            'toid_length': len(col.type_oid),
-            'toid': col.type_oid,
-            'version': 0,
-            'charset': col.charset,
-            'csfrm': col.csfrm,
-            'max_size': describe_max_size(col),
-            'has_oaccolid': field_version >= FIELD_VERSION_12_2,
-            'oaccolid': 0,
-            'null_ok': col.null_ok,
-            'v7_name_length': 0,
-            'name_length': len(col.name),
-            'name': col.name,
-            'type_schema_length': len(col.type_schema),  # an ADT's owner
-            'type_schema': col.type_schema,
-            'type_name_length': len(col.type_name),
-            'type_name': col.type_name,
-            'has_position': 1,
-            'position': position,
-            # The uds flags (11g) mark a JSON / OSON column (#826).
-            'has_uds': field_version >= FIELD_VERSION_11_2,
-            'uds_flags': (_UDS_FLAGS_IS_JSON if col.is_json else 0)
-            | (_UDS_FLAGS_IS_OSON if col.is_oson else 0),
-            'has_domain': field_version >= FIELD_VERSION_23_1,
-            'domain_schema_length': len(col.domain_schema),
-            'domain_schema': col.domain_schema,
-            'domain_name_length': len(col.domain_name),
-            'domain_name': col.domain_name,
-            # The column's annotations (#1082) and a descriptor from its own
-            # vector metadata. The flags byte is RELAYED, not zeroed: a flexible
-            # column says it allows any dimensions there, and a zero told the
-            # client it allows exactly none (#1013). Each from the field version
-            # 23ai sends it at, as the client's reader takes them.
-            'has_annotations': field_version >= FIELD_VERSION_23_1_EXT_3,
-            'has_vector': field_version >= FIELD_VERSION_23_4,
-            **_annotation_values(col.annotations),
-            'vector_dimensions': col.vector_dimensions or 0,
-            'vector_format': (col.vector_format or 0) & 0xFF,
-            'vector_flags': (col.vector_flags or 0) & 0xFF,
-        }
-    )
+    return {
+        'data_type': col.data_type,
+        'flags': 0,
+        'precision': col.precision & 0xFF,
+        'scale': col.scale,
+        'buffer_size': describe_wire_length(col),
+        'max_array': 0,
+        'cont_flags': 0,
+        # For an ADT / REF column the referenced type's OID (#494).
+        'toid_length': len(col.type_oid),
+        'toid': col.type_oid,
+        'version': 0,
+        'charset': col.charset,
+        'csfrm': col.csfrm,
+        'max_size': describe_max_size(col),
+        'has_oaccolid': field_version >= FIELD_VERSION_12_2,
+        'oaccolid': 0,
+        'null_ok': col.null_ok,
+        'v7_name_length': 0,
+        'name_length': len(col.name),
+        'name': col.name,
+        'type_schema_length': len(col.type_schema),  # an ADT's owner
+        'type_schema': col.type_schema,
+        'type_name_length': len(col.type_name),
+        'type_name': col.type_name,
+        'has_position': 1,
+        'position': position,
+        # The uds flags (11g) mark a JSON / OSON column (#826).
+        'has_uds': field_version >= FIELD_VERSION_11_2,
+        'uds_flags': (_UDS_FLAGS_IS_JSON if col.is_json else 0)
+        | (_UDS_FLAGS_IS_OSON if col.is_oson else 0),
+        'has_domain': field_version >= FIELD_VERSION_23_1,
+        'domain_schema_length': len(col.domain_schema),
+        'domain_schema': col.domain_schema,
+        'domain_name_length': len(col.domain_name),
+        'domain_name': col.domain_name,
+        # The column's annotations (#1082) and a descriptor from its own
+        # vector metadata. The flags byte is RELAYED, not zeroed: a flexible
+        # column says it allows any dimensions there, and a zero told the
+        # client it allows exactly none (#1013). Each from the field version
+        # 23ai sends it at, as the client's reader takes them.
+        'has_annotations': field_version >= FIELD_VERSION_23_1_EXT_3,
+        'has_vector': field_version >= FIELD_VERSION_23_4,
+        **_annotation_values(col.annotations),
+        'vector_dimensions': col.vector_dimensions or 0,
+        'vector_format': (col.vector_format or 0) & 0xFF,
+        'vector_flags': (col.vector_flags or 0) & 0xFF,
+    }
+
+
+def _describe_body_values(columns: list[ColumnMeta]) -> dict:
+    # A thin describe body's fields (_DESCRIBE_BODY): the max row size (which
+    # the client skips), the columns, then the current-date / flag /
+    # query-cache-key trailer; a 10g describe ends after the flags (#84, #814).
+    return {
+        'max_row_size': sum(c.max_size for c in columns),
+        'count': len(columns),
+        'reserved': 0,
+        'columns': [
+            _dcb_column_values(col, position)
+            for position, col in enumerate(columns, start=1)
+        ],
+        **_describe_trailer_values(oci=False),
+    }
 
 
 def _encode_describe_body(columns: list[ColumnMeta]) -> bytes:
-    # The describe body shared by the TTI_DCB block and a REF CURSOR OUT bind's
-    # inline describe (#483): max row size, column count, the per-column DCB
-    # metadata, then the current-date / flag / query-cache-key trailer.
-    body = encode_sb4(sum(c.max_size for c in columns))  # max row size (skipped)
-    body += encode_sb4(len(columns))
-    if columns:
-        body += bytes([0])  # reserved
-    for position, col in enumerate(columns, start=1):
-        body += _encode_dcb_column(col, position)
-    # The current date, four flags and, from 11g, the result cache's query key:
-    # a 10g describe ends after the flags (#84, #814).
-    return body + _describe_trailer(oci=False)
+    # The describe body shared by the TTI_DCB block and an implicit result's
+    # describe (#121).
+    return _DESCRIBE_BODY_THIN(_describe_body_values(columns))
 
 
 def _annotation_values(annotations: tuple[tuple[bytes, bytes], ...]) -> dict:
@@ -4973,13 +5029,10 @@ def parse_exec(
     if options & _EXEC_OPTION_DEFINE and define_count:
         defines_rest = after
         for _ in range(define_count):
+            # A 12.2+ OAC ends in an oaccolid, read so the next define aligns.
             data_type, _maxlen, _scale, _charset, csfrm, _toid, defines_rest = (
-                decode_oac_fields(defines_rest)
+                decode_oac_fields(defines_rest, field_version >= FIELD_VERSION_12_2)
             )
-            if field_version >= FIELD_VERSION_12_2:
-                # The 12.2+ OAC appends an oaccolid the shared decoder stops short
-                # of -- consume it so the next define aligns.
-                _, defines_rest = decode_ub4(defines_rest)
             define_types.append((data_type, csfrm))
 
     binds: list = []
@@ -5021,12 +5074,9 @@ def parse_exec(
                     csfrm,
                     toid,
                     after,
-                ) = decode_oac_fields(after)
-                if field_version >= FIELD_VERSION_12_2:
-                    # The 12.2+ bind OAC appends an oaccolid the shared decoder
-                    # stops short of (the same trailer a 12.2+ describe column
-                    # carries) — consume it so the next OAC aligns.
-                    _, after = decode_ub4(after)
+                    # A 12.2+ bind OAC ends in an oaccolid (the same trailer a
+                    # 12.2+ describe column carries), read so the next aligns.
+                ) = decode_oac_fields(after, field_version >= FIELD_VERSION_12_2)
                 # Below 12.1 a CLOB / BLOB bind's OAC is the older layout, as every
                 # other bind's: seerdb's client sent the 12c one there, a byte
                 # longer, which this swallowed, and which a real 11g server
@@ -5684,8 +5734,9 @@ def _encode_refcursor_out(bind: RefCursorOutBind) -> bytes:
     return _REFCURSOR_OUT_THIN(
         {
             'lead': 1,  # a length prefix the client skips
-            'describe': _encode_describe_body(bind.columns),
+            **_describe_body_values(bind.columns),
             'cursor': bind.cursor_id,
+            'has_return_code': True,
             'return_code': 0,  # actual_num_bytes
         }
     )
@@ -5700,10 +5751,13 @@ def encode_refcursor_column_value(columns: list[ColumnMeta], cursor_id: int) -> 
     The reference client reads exactly `skip_ub1`, the describe body, then a ub2
     cursor id, and nothing after it.
     """
-    return (
-        bytes([1])  # length prefix (skipped by the client)
-        + _encode_describe_body(columns)
-        + encode_sb4(cursor_id)
+    return _REFCURSOR_OUT_THIN(
+        {
+            'lead': 1,  # a length prefix the client skips
+            **_describe_body_values(columns),
+            'cursor': cursor_id,
+            'has_return_code': False,
+        }
     )
 
 
@@ -5744,23 +5798,25 @@ def encode_out_bind_response_thin(
 
 
 def _encode_iov_header(count: int, directions: Sequence[int], iterations: int) -> bytes:
-    # The TTI_IOV vector heading a block's reply, as ``_read_iov`` decodes it: a
-    # flag, the bind count (num_requests + num_iters*256), how many iterations
-    # this reply carries, the zeroed uac / bit-vector / rowid lengths, then one
-    # direction byte per bind.
-    num_requests, num_iters = count % 256, count // 256
-    return (
-        bytes([TTI_IOV, 0])  # token + flag
-        + encode_sb4(num_requests)
-        + encode_sb4(num_iters)
-        + encode_sb4(iterations)
-        + encode_sb4(0)  # uac buffer length
-        + encode_sb4(0)  # fast-fetch bit vector length
-        + encode_sb4(0)  # rowid length
-        + bytes(
-            directions[i] if i < len(directions) else TNS_BIND_DIR_INPUT_OUTPUT
-            for i in range(count)
-        )  # direction per bind
+    # The TTI_IOV vector heading a block's reply (`_IOV`): the bind count
+    # (num_requests + num_iters*256), how many iterations this reply carries,
+    # no vectors, then one direction byte per bind, IN OUT where none is given.
+    head = _IOV_THIN(
+        {
+            'flags': 0,
+            'requests': count % 256,
+            'iterations': count // 256,
+            'iterations_this_time': iterations,
+            'buffer_length': 0,
+            'bit_vector_length': 0,
+            'bit_vector': b'',
+            'rowid_length': 0,
+            'rowid': b'',
+        }
+    )
+    return head + bytes(
+        directions[i] if i < len(directions) else TNS_BIND_DIR_INPUT_OUTPUT
+        for i in range(count)
     )
 
 
@@ -7272,20 +7328,14 @@ def _read_iov(
     # it is returned as a {'_refcursor': True, 'cursor_id', 'row_format'} record
     # the cursor turns into a nested Cursor. Detecting which is which needs the
     # bind list, threaded in via the decode Acc.
-    Rest = Data[1:]  # consume IOV token
-    Rest = Rest[1:]  # skip flag (ub1)
-    (NumRequests, Rest) = decode_ub4(Rest)
-    (NumIters, Rest) = decode_ub4(Rest)
-    NumBinds = NumIters * 256 + NumRequests
-    (_, Rest) = decode_ub4(Rest)  # num iters this time
-    (_, Rest) = decode_ub4(Rest)  # uac buffer length
-    (BvLen, Rest) = decode_ub4(Rest)  # fast-fetch bit vector
-    if BvLen > 0:
-        Rest = Rest[BvLen:]
-    (RidLen, Rest) = decode_ub4(Rest)  # rowid
-    if RidLen > 0:
-        Rest = Rest[RidLen:]
-    Directions = [Rest[I] for I in range(NumBinds)]
+    try:
+        (Iov, Rest) = _IOV_FROM_THIN(Data)
+    except IndexError:
+        raise Truncated('IOV: cut short') from None
+    NumBinds = Iov['iterations'] * 256 + Iov['requests']
+    if len(Rest) < NumBinds:
+        raise IndexError('IOV: directions cut short')
+    Directions = list(Rest[:NumBinds])
     Rest = Rest[NumBinds:]
     HasOut = any(D != TNS_BIND_DIR_INPUT for D in Directions)
     OutValues: list = []
@@ -7332,38 +7382,23 @@ def _read_iov(
 
 
 def _read_refcursor_out(Rest: bytes, *, indicator: bool = True) -> tuple[dict, bytes]:
-    # A REF CURSOR OUT value: a 1-byte length, then an inline describe (max row
-    # size, num columns, the same per-column metadata as a DCB), then the
-    # nested cursor id (ub2) and a 1-byte indicator. Mirrors oracledb's
-    # _create_cursor_from_describe; byte layout verified against XE 11g.
-    Rest = Rest[1:]  # skip_ub1 (length)
-    (_, Rest) = decode_ub4(Rest)  # max row size
-    (NumCols, Rest) = decode_ub4(Rest)
-    if NumCols > 0:
-        Rest = Rest[1:]  # reserved byte
-    Columns = []
-    for _ in range(NumCols):
-        (Col, Rest) = _decode_dcb_column(Rest)
-        Columns.append(Col)
-    Rest = _skip_bytes_with_length(Rest)  # current date
-    # 9.2's describe ends at the date, as a query's does (#2768).
-    Flags = 4 if _decode_server_field_version() >= FIELD_VERSION_10_2 else 0
-    for _ in range(Flags):  # dcbflag / mdbz / mnpr / mxpr
-        (_, Rest) = decode_ub4(Rest)
-    if _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
-        # dcbqcky (query-cache key) is an 11g addition; a 10g (field version 4)
-        # nested-cursor describe ends after the four ub4 flags. Skipping a
-        # phantom one here consumes the cursor id and desyncs the IOV decode of
-        # a REF CURSOR OUT bind (#84) — same pre-11g gap as decode_token_dcb.
-        Rest = _skip_bytes_with_length(Rest)  # dcbqcky
-    (CursorId, Rest) = decode_ub4(Rest)
-    if indicator:
-        # An OUT bind's value ends with a per-value indicator byte. A nested
-        # CURSOR COLUMN does not -- consuming one there swallows the next row's
-        # TTI_RXD token, and the decoder reports it as an unknown response token
-        # whose number is really the first byte of that row's data (#826).
-        Rest = Rest[1:]
-    return ({'_refcursor': True, 'cursor_id': CursorId, 'row_format': Columns}, Rest)
+    # A REF CURSOR OUT value (_REFCURSOR_OUT): a 1-byte length, the inline
+    # describe, then the nested cursor id and the return code. Mirrors
+    # oracledb's _create_cursor_from_describe; byte layout verified against XE
+    # 11g. A nested CURSOR column has no return code -- consuming one there
+    # swallows the next row's TTI_RXD token, and the decoder reports it as an
+    # unknown response token whose number is really the first byte of that
+    # row's data (#826).
+    if not Rest:
+        raise Truncated('REF CURSOR OUT: none yet')
+    (Cell, Rest) = _REFCURSOR_OUT_FROM_THIN(
+        Rest, {**_describe_body_given(), 'has_return_code': indicator}
+    )
+    Columns = [_dcb_column_from_fields(F) for F in Cell['columns']]
+    return (
+        {'_refcursor': True, 'cursor_id': Cell['cursor'], 'row_format': Columns},
+        Rest,
+    )
 
 
 def decode_token_lob(Data: bytes, Acc: tuple) -> tuple:
@@ -7624,18 +7659,18 @@ def decode_lobops_oer(Packet: bytes, FieldVersion: int) -> tuple[int, str | None
     return (0, None)
 
 
-def _decode_oac_walk(Data: bytes) -> tuple:
+def _decode_oac_walk(Data: bytes, oaccolid: bool = False) -> tuple:
     # Every OAC field in wire order, raw (_OAC): (DataType, Flg, DataScale,
     # MaxDataLength, Mal, Fl2, ToId, VSN, Charset, Csfrm, Mxlc, Rest). The
     # public decoders pick what they need from it. The type OID is written with
     # two lengths, a ub4 count then, only when non-empty, the length-prefixed
     # bytes (#139). A message that ends inside it must say "read more", not
     # raise: a big request spans several DATA packets, and the first parse runs
-    # off the end by design (#1000).
+    # off the end by design (#1000). `oaccolid` reads the 12.2+ trailer too.
     if len(Data) < 3:
         raise Truncated('OAC: header short')
     try:
-        (f, rest) = _OAC_FROM_THIN(Data)
+        (f, rest) = _OAC_FROM_THIN(Data, {'has_oaccolid': oaccolid})
     except IndexError:
         raise Truncated('OAC: cut short') from None
     return (
@@ -7654,13 +7689,15 @@ def _decode_oac_walk(Data: bytes) -> tuple:
     )
 
 
-def decode_oac_fields(Data: bytes) -> tuple[int, int, int, int, int, bytes, bytes]:
+def decode_oac_fields(
+    Data: bytes, oaccolid: bool = False
+) -> tuple[int, int, int, int, int, bytes, bytes]:
     # The full OAC field set, including the charset form (csfrm) byte the common
     # 5-tuple form skips, and the referenced type's OID (an object / REF bind,
     # #116/#139). csfrm distinguishes national char data (2 → AL16UTF16 /
     # UTF-16BE) from ordinary char data (1) — the server needs it to decode an
     # NCHAR / NVARCHAR bind (#484). Returns (DataType, MaxDataLength, DataScale,
-    # Charset, Csfrm, ToId, Rest).
+    # Charset, Csfrm, ToId, Rest). `oaccolid` consumes the 12.2+ trailer.
     (
         DataType,
         _Flg,
@@ -7674,7 +7711,7 @@ def decode_oac_fields(Data: bytes) -> tuple[int, int, int, int, int, bytes, byte
         Csfrm,
         _Mxlc,
         Rest,
-    ) = _decode_oac_walk(Data)
+    ) = _decode_oac_walk(Data, oaccolid)
     return (DataType, MaxDataLength, DataScale, Charset, Csfrm, ToId, Rest)
 
 
@@ -12948,6 +12985,12 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # one typed column (#2050): an opaque type, with the type's id, version,
     # schema and name.
     del position  # OCI's column carries none
+    return _DCB_COLUMN_OCI(_dcb_column_values_oci(col, first))
+
+
+def _dcb_column_values_oci(col: ColumnMeta, first: bool) -> dict:
+    # An OCI describe column's fields (_DCB_COLUMN) at the session's field
+    # version.
     col = _carried(col)
     field_version = _ENCODE_FIELD_VERSION.get()
     wide = field_version >= FIELD_VERSION_12_1
@@ -12961,51 +13004,47 @@ def _encode_dcb_column_oci(col: ColumnMeta, position: int, first: bool) -> bytes
     # it does the data length. Only fixed-width columns fill it (#405, #407).
     sized = col.data_type not in _OCI_UNSIZED_TYPES | _OCI_FIXED_WIDTH.keys()
     oid = _OCI_XMLTYPE_OID if xmltype else b''
-    return _DCB_COLUMN_OCI(
-        {
-            'marker': marker,
-            'lead': 0x00 if xmltype else 0x01,
-            'data_type': TNS_TYPE_OPAQUE if xmltype else col.data_type,
-            'flags': _OCI_DCB_CHAR_FLAG if is_char else 0,
-            'precision': col.precision & 0xFF,
-            'scale': col.scale,  # a signed byte (-127 for a NUMBER literal)
-            # A backend that cannot size the column (the PEP 249 tuple reports
-            # none for an interval or a ROWID) gets the length a live server
-            # describes it with, as on the thin path (#2017).
-            'buffer_size': _OCI_XMLTYPE_LENGTH
-            if xmltype
-            else _oci_describe_length(col),
-            'max_array': 0,
-            'oci_12c': wide,
-            # Character-length semantics (#1282): sqlplus sizes an NCHAR or
-            # NVARCHAR2 column by its character max size.
-            'cont_flags': _OCI_DCB_CHAR_SEMANTICS_FLAG << 8
-            if is_char and col.csfrm == _CSFRM_NCHAR
-            else 0,
-            'toid_length': len(oid),
-            'toid': oid,
-            'version': _OCI_XMLTYPE_VERSION if xmltype else 0,
-            'oci_plain': not xmltype,
-            'charset': int(col.charset) if is_char else 0,
-            'csfrm': col.csfrm if is_char else 0,
-            'max_size': col.max_size if sized and not xmltype else 0,
-            # 18c sets it on a character column, 11g leaves it zero; its
-            # meaning is unpinned, carried from the capture.
-            'has_oaccolid': not xmltype,
-            'oaccolid': _OCI_DCB_CHAR_12C_VALUE if wide and is_char else 0,
-            'null_ok': col.null_ok,
-            'v7_name_length': len(col.name),
-            'name_length': len(col.name),
-            'name': col.name,
-            'type_schema_length': len(col.type_schema) if xmltype else 0,
-            'type_schema': col.type_schema,
-            'type_name_length': len(col.type_name) if xmltype else 0,
-            'type_name': col.type_name,
-            'has_uds': field_version >= FIELD_VERSION_11_2,
-            'uds_flags': _oci_uds_flags(col),
-            'reserved': 0,
-        }
-    )
+    return {
+        'marker': marker,
+        'lead': 0x00 if xmltype else 0x01,
+        'data_type': TNS_TYPE_OPAQUE if xmltype else col.data_type,
+        'flags': _OCI_DCB_CHAR_FLAG if is_char else 0,
+        'precision': col.precision & 0xFF,
+        'scale': col.scale,  # a signed byte (-127 for a NUMBER literal)
+        # A backend that cannot size the column (the PEP 249 tuple reports
+        # none for an interval or a ROWID) gets the length a live server
+        # describes it with, as on the thin path (#2017).
+        'buffer_size': _OCI_XMLTYPE_LENGTH if xmltype else _oci_describe_length(col),
+        'max_array': 0,
+        'oci_12c': wide,
+        # Character-length semantics (#1282): sqlplus sizes an NCHAR or
+        # NVARCHAR2 column by its character max size.
+        'cont_flags': _OCI_DCB_CHAR_SEMANTICS_FLAG << 8
+        if is_char and col.csfrm == _CSFRM_NCHAR
+        else 0,
+        'toid_length': len(oid),
+        'toid': oid,
+        'version': _OCI_XMLTYPE_VERSION if xmltype else 0,
+        'oci_plain': not xmltype,
+        'charset': int(col.charset) if is_char else 0,
+        'csfrm': col.csfrm if is_char else 0,
+        'max_size': col.max_size if sized and not xmltype else 0,
+        # 18c sets it on a character column, 11g leaves it zero; its
+        # meaning is unpinned, carried from the capture.
+        'has_oaccolid': not xmltype,
+        'oaccolid': _OCI_DCB_CHAR_12C_VALUE if wide and is_char else 0,
+        'null_ok': col.null_ok,
+        'v7_name_length': len(col.name),
+        'name_length': len(col.name),
+        'name': col.name,
+        'type_schema_length': len(col.type_schema) if xmltype else 0,
+        'type_schema': col.type_schema,
+        'type_name_length': len(col.type_name) if xmltype else 0,
+        'type_name': col.type_name,
+        'has_uds': field_version >= FIELD_VERSION_11_2,
+        'uds_flags': _oci_uds_flags(col),
+        'reserved': 0,
+    }
 
 
 def encode_describe_oci(columns: list[ColumnMeta]) -> bytes:
@@ -13062,24 +13101,28 @@ def _oci_row_buffer_length(col: ColumnMeta) -> int:
 def _oci_describe_body(columns: list[ColumnMeta]) -> bytes:
     # The describe from the max row size on: what a query's DCB carries after its
     # preamble, and a REF CURSOR's OUT value inline (#2014).
-    out = bytearray()
+    return _DESCRIBE_COLUMNS_OCI(_describe_columns_values_oci(columns))
+
+
+def _describe_columns_values_oci(columns: list[ColumnMeta]) -> dict:
     # Max row size: the thick/OCI client allocates a row buffer of this many
     # bytes, so it must cover the widest row — a zero here overflows and crashes
     # sqlplus (unlike the thin client, which skips the field). A LONG / LONG RAW /
     # LOB is a locator or an inline stream, unbounded, so it contributes nothing to
     # the fixed row buffer (its data_length is 0 anyway); it is excluded to match a
     # live 11g describe, which reports max-row-size 0 for such a result (#405, #407).
-    out += _oci_ub4(
-        sum(
+    return {
+        'max_row_size': sum(
             _oci_row_buffer_length(c)
             for c in columns
             if c.data_type not in _OCI_UNSIZED_TYPES and not oci_is_xmltype(c)
-        )
-    )
-    out += _oci_ub4(len(columns))
-    for position, col in enumerate(columns, start=1):
-        out += _encode_dcb_column_oci(col, position, first=(position == 1))
-    return bytes(out)
+        ),
+        'count': len(columns),
+        'columns': [
+            _dcb_column_values_oci(col, first=(position == 1))
+            for position, col in enumerate(columns, start=1)
+        ],
+    }
 
 
 # The two OCI execute-response trailers, reduced to their load-bearing structure
@@ -14045,8 +14088,10 @@ def _oci_refcursor_out_value(bind: RefCursorOutBind) -> bytes:
     return _REFCURSOR_OUT_OCI(
         {
             'lead': _OCI_REFCURSOR_LEAD,
-            'describe': _oci_describe_body(bind.columns) + _describe_trailer(oci=True),
+            **_describe_columns_values_oci(bind.columns),
+            **_describe_trailer_values(oci=True),
             'cursor': bind.cursor_id,
+            'has_return_code': True,
             'return_code': 0,
         }
     )
@@ -20946,7 +20991,7 @@ def decode_oci11_piggybacks(Data: bytes) -> tuple[dict | None, bytes]:
     return (Session, Rest)
 
 
-_OCI11_DESCRIBE_GIVEN = {'oci_12c': False, 'has_uds': True}
+_OCI11_DESCRIBE_GIVEN = {'oci_12c': False, 'has_uds': True, 'has_flags': True}
 # 10g answers OCI 11.2 (#2518) with no uds_flags in a column and no query key
 # in the trailer; the describe's opaque leading field has a ub1 length, not
 # a ub4. A one-column describe hides the first: the trailer's date length then
@@ -21036,7 +21081,9 @@ def decode_oci11_describe(Data: bytes) -> tuple[list[dict], bytes]:
         for _ in range(Count):
             (Column, Rest) = _DCB_COLUMN_FROM_OCI(Rest, Given)
             Columns.append(Column)
-        (_, Rest) = _DESCRIBE_TRAILER_FROM_OCI(Rest, {'has_query_key': Eleven})
+        (_, Rest) = _DESCRIBE_TRAILER_FROM_OCI(
+            Rest, {'has_flags': True, 'has_query_key': Eleven}
+        )
     except IndexError as Exc:
         raise Truncated(f'11g native describe: {Exc}') from Exc
     return (_o9i_oall8_columns(Columns), Rest)
@@ -22809,17 +22856,14 @@ def _encode_lob_bind_oac(is_blob: bool, csfrm: int = _CSFRM_DB) -> bytes:
     charset id stays 873, measured against a live 23ai (#1066). That is NOT what
     its CREATE_TEMP does, which carries 2000 (_create_temp_body); the two were
     each captured, not inferred from the other."""
-    return (
-        bytes([TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB, 1, 0, 0])
-        + encode_sb4(_LOB_BIND_BUFFER_SIZE)  # max data length (fixed, not value)
-        + encode_sb4(0)  # max number of array elements
-        + encode_sb4(0x02000000)  # cont flag (ub8) — LOB
-        + encode_sb4(0)  # OID
-        + encode_sb4(0)  # version
-        + encode_sb4(0 if is_blob else AL32UTF8_CHARSET)  # charset id (ub2)
-        + bytes([0 if is_blob else csfrm])  # character set form
-        + encode_sb4(0)  # LOB prefetch length
-        + _oac_col_id()  # oaccolid (12.2+)
+    return _thin_bind_oac(
+        TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB,
+        TNS_BIND_USE_INDICATORS,
+        _LOB_BIND_BUFFER_SIZE,  # max data length (fixed, not the value's)
+        ContFlags=_OAC_CONT_FLAG_LOB,
+        Charset=0 if is_blob else AL32UTF8_CHARSET,
+        Csfrm=0 if is_blob else csfrm,
+        Oaccolid=_has_oac_col_id(),
     )
 
 
@@ -23553,18 +23597,14 @@ def _object_oac(oid: bytes, version: int, buffer_size: int) -> bytes:
     # python-oracledb _write_column_metadata's object branch. Below 12.1 it has
     # no oaccolid: 11g answered the byte with a fatal ORA-03106, and takes the
     # descriptor without it, as JDBC thin 11.2 sends it (#2704).
-    return (
-        bytes([TNS_TYPE_ADT, 1, 0, 0])  # type, flag (USE_INDICATORS), p, s
-        + encode_sb4(buffer_size)  # buffer size
-        + encode_sb4(0)  # max number of array elements
-        + encode_sb4(0)  # cont flag (ub8)
-        + _obj_two_lengths(oid)  # type OID (16 bytes)
-        + encode_sb4(version)  # type version
-        + encode_sb4(0)  # charset id (ub2)
-        + bytes([0])  # character set form
-        + encode_sb4(0)  # LOB prefetch length
-        + (_oac_col_id() if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1 else b'')
-    )  # oaccolid (12.2+)
+    return _thin_bind_oac(
+        TNS_TYPE_ADT,
+        TNS_BIND_USE_INDICATORS,
+        buffer_size,
+        Toid=oid,  # the type's 16-byte OID
+        Version=version,
+        Oaccolid=_ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2,
+    )
 
 
 def _encode_object_oac(Obj: 'DbObject') -> bytes:
@@ -23594,18 +23634,15 @@ def _encode_ref_oac(Ref: 'DbRef') -> bytes:
             'cannot bind a REF without its referenced type OID; the value must '
             'come from a fetched DbRef whose describe carried the type identity'
         )
-    return (
-        bytes([TNS_TYPE_REF, 3, 0, 0])  # type 111, flag, prec, scale
-        + encode_sb4(_REF_OAC_BUFFER_SIZE)  # buffer size
-        + encode_sb4(0)  # max number of array elements
-        + encode_sb4(0)  # cont flag (ub8)
-        + _obj_two_lengths(Ref.type_oid)  # referenced type OID (16 bytes)
-        + encode_sb4(1)  # type version
-        + encode_sb4(2)  # charset id (ub2) — per capture
-        + bytes([0])  # character set form
-        + encode_sb4(0)  # LOB prefetch length
-        + _oac_col_id()
-    )  # oaccolid (12.2+)
+    return _thin_bind_oac(
+        TNS_TYPE_REF,
+        3,
+        _REF_OAC_BUFFER_SIZE,
+        Toid=Ref.type_oid,  # the referenced type's 16-byte OID
+        Version=1,
+        Charset=2,  # per capture
+        Oaccolid=_has_oac_col_id(),
+    )
 
 
 def _encode_ref_bind_value(Ref: 'DbRef') -> bytes:
@@ -24420,15 +24457,56 @@ def encode_token_interval_ym(IV: IntervalYM) -> bytes:
     return (IV.years + 2**31).to_bytes(4, 'big') + bytes([IV.months + 60])
 
 
-def _oac_col_id() -> bytes:
-    # The trailing `oaccolid` of a hand-built bind OAC. A 12.2+ server reads it
+def _has_oac_col_id() -> bool:
+    # Whether a 12c bind OAC ends in its `oaccolid`. A 12.2+ server reads it
     # and a 12.1 one does not: sent to a 12.1 session it is one byte too many
     # and the server refuses the call (ORA-03106 / ORA-03120) (#1144). Below
     # 12.1 the byte stays, as it always has been sent there.
     field_version = _ENCODE_FIELD_VERSION.get()
-    if FIELD_VERSION_12_1 <= field_version < FIELD_VERSION_12_2:
-        return b''
-    return encode_sb4(0)
+    return not FIELD_VERSION_12_1 <= field_version < FIELD_VERSION_12_2
+
+
+def _oac_col_id() -> bytes:
+    # The trailing `oaccolid` of the hand-built native JSON / VECTOR OAC.
+    return encode_sb4(0) if _has_oac_col_id() else b''
+
+
+def _thin_bind_oac(
+    DataType: int,
+    Flags: int,
+    MaxLength: int,
+    *,
+    MaxArray: int = 0,
+    ContFlags: int = 0,
+    Toid: bytes = b'',
+    Version: int = 0,
+    Charset: int = 0,
+    Csfrm: int = 0,
+    MaxChars: int = 0,
+    Oaccolid: bool,
+) -> bytes:
+    # A bind descriptor as thin writes one (_OAC), its precision and scale 0.
+    # MaxChars is the 12c form's LOB prefetch length, and the 11g form's
+    # declared characters; Oaccolid ends a 12.2+ one in its oaccolid.
+    return _OAC_THIN(
+        {
+            'data_type': DataType,
+            'flags': Flags,
+            'precision': 0,
+            'scale': 0,
+            'max_length': MaxLength,
+            'max_array': MaxArray,
+            'cont_flags': ContFlags,
+            'toid_length': len(Toid),
+            'toid': Toid,
+            'version': Version,
+            'charset': Charset,
+            'csfrm': Csfrm,
+            'max_chars': MaxChars,
+            'has_oaccolid': Oaccolid,
+            'oaccolid': 0,
+        }
+    )
 
 
 def encode_token_raw(
@@ -24460,17 +24538,14 @@ def encode_token_raw(
         else:
             BindCharset, Csfrm = AL32UTF8_CHARSET, 1
         FlagByte = TNS_BIND_USE_INDICATORS | (TNS_BIND_ARRAY if Array else 0)
-        return (
-            bytes([DataType, FlagByte, 0, 0])
-            + encode_sb4(Length)
-            + encode_sb4(Array)  # max number of array elements
-            + encode_sb4(0)  # cont flag (ub8)
-            + encode_sb4(0)  # OID
-            + encode_sb4(0)  # version
-            + encode_sb4(BindCharset)  # charset id (ub2)
-            + bytes([Csfrm])  # character set form
-            + encode_sb4(0)  # LOB prefetch length
-            + _oac_col_id()  # oaccolid (12.2+)
+        return _thin_bind_oac(
+            DataType,
+            FlagByte,
+            Length,
+            MaxArray=Array,
+            Charset=BindCharset,
+            Csfrm=Csfrm,
+            Oaccolid=_has_oac_col_id(),
         )
     if Array:
         # An associative array before 12c, as JDBC thin 11.2 binds one on 11g
@@ -24478,25 +24553,27 @@ def encode_token_raw(
         # number of array elements, each element's length as the length, and
         # no form for a type without a charset. The bit in the cont flags and
         # the capacity as max chars made 11g answer PLS-00306.
-        return (
-            bytes([DataType, 3 | TNS_BIND_ARRAY, 0, 0])
-            + encode_sb4(Length)
-            + encode_sb4(Array)
-            + encode_sb4(Flag)
-            + bytes([0, 0])
-            + encode_sb4(Charset)
-            + bytes([FormOfUse if Charset else 0])
-            + encode_sb4(Max)
+        return _thin_bind_oac(
+            DataType,
+            3 | TNS_BIND_ARRAY,
+            Length,
+            MaxArray=Array,
+            ContFlags=Flag,
+            Charset=Charset,
+            Csfrm=FormOfUse if Charset else 0,
+            MaxChars=Max,
+            Oaccolid=False,
         )
-    return (
-        bytes([DataType, 3, 0, 0])
-        + encode_sb4(Length)
-        + bytes([0])
-        + encode_sb4(Flag)
-        + bytes([0, 0])
-        + encode_sb4(Charset)
-        + bytes([FormOfUse])
-        + encode_sb4(Max)
+    # The 11g form: no oaccolid.
+    return _thin_bind_oac(
+        DataType,
+        3,
+        Length,
+        ContFlags=Flag,
+        Charset=Charset,
+        Csfrm=FormOfUse,
+        MaxChars=Max,
+        Oaccolid=False,
     )
 
 
