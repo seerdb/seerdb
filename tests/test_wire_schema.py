@@ -240,10 +240,36 @@ def test_the_describe_trailer_is_the_same_fields_in_both_dialects() -> None:
 
 
 def test_a_ref_cursor_value_is_one_schema_with_its_dialects_lead() -> None:
-    values = {'lead': 1, 'describe': b'D', 'cursor': 300, 'return_code': 0}
-    assert tns._REFCURSOR_OUT_THIN(values) == b'\x01D\x02\x01\x2c\x00'
-    values['lead'] = 0x4C
-    assert tns._REFCURSOR_OUT_OCI(values) == b'\x4cD\x2c\x01\x00\x00\x00\x00'
+    # A cursor with no columns: the lead, the max row size and the count, the
+    # trailer, then the cursor id and the return code.
+    with _field_version(24):
+        values = {
+            'lead': 1,
+            'max_row_size': 0,
+            'count': 0,
+            'columns': [],
+            **tns._describe_trailer_values(oci=False),
+            'cursor': 300,
+            'has_return_code': True,
+            'return_code': 0,
+        }
+        trailer = tns._describe_trailer(oci=False)
+        thin = tns._REFCURSOR_OUT_THIN(values)
+        assert thin == b'\x01\x00\x00' + trailer + b'\x02\x01\x2c\x00'
+        values.update(tns._describe_trailer_values(oci=True), lead=0x4C)
+        trailer = tns._describe_trailer(oci=True)
+        oci = tns._REFCURSOR_OUT_OCI(values)
+        assert oci == b'\x4c' + bytes(8) + trailer + b'\x2c\x01\x00\x00\x00\x00'
+
+
+def test_a_ref_cursor_value_reads_a_servers_describe_time_and_query_key() -> None:
+    # A server fills in the describe time and the query key, each a ub4 length
+    # then the value, which python-oracledb skips; the Mirror sends both empty.
+    trailer = b'\x01\x07\x07' + bytes(range(7)) + b'\x00' * 4 + b'\x01\x02\x02AB'
+    value = b'\x01\x00\x00' + trailer + b'\x02\x01\x2c\x00' + b'TAIL'
+    with _field_version(24):
+        (cell, rest) = tns._read_refcursor_out(value)
+    assert (cell['cursor_id'], cell['row_format'], rest) == (300, [], b'TAIL')
 
 
 def _columns() -> list:

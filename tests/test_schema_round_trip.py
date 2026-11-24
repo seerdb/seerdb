@@ -45,7 +45,6 @@ FIELD_VERSIONS = (FIELD_VERSION_11_2, FIELD_VERSION_12_1, FIELD_VERSION_23_4)
 # Schemas holding a `raw` field: bytes already encoded, written as they are,
 # with no length to read them back by. Encode-only by design.
 ONE_WAY = {
-    '_REFCURSOR_OUT',
     '_OBJECT_FRAME',
     '_LOB_READ_REPLY',
     # The describe body it carries per result is pre-encoded, a raw field.
@@ -366,7 +365,8 @@ class TestThinIntegersAreSigned(unittest.TestCase):
         # A NUMBER bind's OAC with scale -127, as test_tns_decode's
         # test_tns_decode_token_oac_01 holds it.
         oac = bytes.fromhex('020000817f010200000000000000')
-        (values, rest) = wire_schema.compile_decoder(tns._OAC, tns._THIN)(oac)
+        decode = wire_schema.compile_decoder(tns._OAC, tns._THIN)
+        (values, rest) = decode(oac, {'has_oaccolid': False})
         self.assertEqual((values['scale'], rest), (-127, b''))
         self.assertEqual(wire_schema.compile_encoder(tns._OAC, tns._THIN)(values), oac)
 
