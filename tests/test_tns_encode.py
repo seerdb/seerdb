@@ -6924,6 +6924,57 @@ class Scroll92(unittest.TestCase):
         self.assertEqual(params, [0, 0, 1, 0, 10])
 
 
+class Native92ScrollFetch(unittest.TestCase):
+    """The native 9.2 form's scroll fetch (#2809) against OCI 9.2's own, one row
+    of cursor 1 at a long size of 4, captured on 9.2.0.4: its LAST, and its
+    ABSOLUTE 3, which it sends as CURRENT 3. Only the pointers differ, which
+    carry OCI's heap addresses."""
+
+    _LAST = (
+        '035e064000000001000000000000000000000000000000000000006c565100000000000c'
+        '0000000000000000000000000000009c5651000000000000000000000000000400000000'
+        '000000000000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000009e5651000000000018b05100000000000000000000'
+        '000000000000000100000000000000000000000000000000000000000000000100000000'
+        '0000000200000008000000ffffffff'
+    )
+    _ABSOLUTE_3 = (
+        '035e074000040001000000000000000000000000000000000000006c565100000000000c'
+        '0000000000000000000000000000009c5651000000000000000000000000000400000000'
+        '000000000000000000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000009e5651000000000018b05100000000000000000000'
+        '000000000000000100000000000000000000000000000000000000000000000100000000'
+        '000000020000000100000003000000'
+    )
+    # The four pointers, 8 bytes each.
+    _POINTERS = {i for start in (27, 51, 123, 131) for i in range(start, start + 8)}
+
+    def _check(self, captured: str, seq: int, orientation: int, position: int) -> None:
+        from seerdb.common.tns import encode_9i_oall8_scroll_fetch
+
+        cap = bytes.fromhex(captured)
+        ours = encode_9i_oall8_scroll_fetch(seq, 1, 1, 4, orientation, position)
+        self.assertEqual(len(ours), len(cap))
+        self.assertEqual(
+            [
+                i
+                for i in range(len(cap))
+                if ours[i] != cap[i] and i not in self._POINTERS
+            ],
+            [],
+        )
+
+    def test_last(self):
+        from seerdb.common.tns_consts import TNS_FETCH_ORIENTATION_LAST
+
+        self._check(self._LAST, 6, TNS_FETCH_ORIENTATION_LAST, 0)
+
+    def test_absolute_goes_as_current_at_its_row(self):
+        from seerdb.common.tns_consts import TNS_FETCH_ORIENTATION_ABSOLUTE
+
+        self._check(self._ABSOLUTE_3, 7, TNS_FETCH_ORIENTATION_ABSOLUTE, 3)
+
+
 class TestO8iOsesskeyMessages(unittest.TestCase):
     # Pinned against a live 9.2-client -> 8.1.7 handshake
     # (~/o8i/captures/cli8i_9.2_to_8i.trc, #244). 8i wraps the same DES O3LOGON

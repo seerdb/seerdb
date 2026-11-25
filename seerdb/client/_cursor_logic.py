@@ -359,6 +359,19 @@ class _CursorLogic:
         self._scroll_rowformat = colmeta
         self._scroll_set_window(server_rowcount, batch_len)
         self._scroll_eof = eof
+        self._scroll_last_row = self._rows[-1] if self._rows else None
+
+    def _scroll_prev_row(self):
+        # The row a scroll re-execute's first row may repeat by its bit vector:
+        # the last the server sent on this cursor, kept when a scroll ran off the
+        # end and emptied the buffer. 9.2 sent row 1 after such a scroll as "the
+        # same as the previous row", meaning the open's, and with no row to copy
+        # it read back as None (#2809).
+        return self._rows[-1] if self._rows else self._scroll_last_row
+
+    def _scroll_note(self, batch: list) -> None:
+        if batch:
+            self._scroll_last_row = batch[-1]
 
     def _scroll_set_window(self, server_rowcount, batch_len: int) -> None:
         # Place the buffer window from the server's cumulative rowcount (the

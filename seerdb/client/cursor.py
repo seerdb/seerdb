@@ -114,6 +114,7 @@ class Cursor(_CursorLogic):
                     # teardown the server frees it on session end anyway.
                     pass
         self._scroll_active = False
+        self._scroll_last_row: list | None = None
         self._scroll_cursor_id = 0
 
     def execute(
@@ -625,7 +626,7 @@ class Cursor(_CursorLogic):
         # scroll. So continue with CURRENT at consumed + 1 (#181).
         Conn = self._connection
         Size = max(int(self.arraysize), 1)
-        Prev = self._rows[-1] if self._rows else None
+        Prev = self._scroll_prev_row()
         Rows, Eof, ServerRowCount = Conn.scroll_fetch(
             self._scroll_cursor_id,
             TNS_FETCH_ORIENTATION_CURRENT,
@@ -635,6 +636,7 @@ class Cursor(_CursorLogic):
             PrevRow=Prev,
         )
         Batch = [_resolve_objects(Conn, _resolve_lobs(Conn, R)) for R in Rows]
+        self._scroll_note(Batch)
         self._rows = Batch
         # _scroll_set_window resets the window to empty when Batch is empty
         # (off the end), so a later scroll() can't buffer-hit a stale window.
@@ -814,7 +816,7 @@ class Cursor(_CursorLogic):
             return
         Conn = self._connection
         Size = max(int(self.arraysize), 1)
-        Prev = self._rows[-1] if self._rows else None
+        Prev = self._scroll_prev_row()
         Rows, Eof, ServerRowCount = Conn.scroll_fetch(
             self._scroll_cursor_id,
             Orientation,
@@ -824,6 +826,7 @@ class Cursor(_CursorLogic):
             PrevRow=Prev,
         )
         Batch = [_resolve_objects(Conn, _resolve_lobs(Conn, R)) for R in Rows]
+        self._scroll_note(Batch)
         if not Batch:
             # Scrolled off the end (oracledb resets the window; the next
             # fetchone returns None).

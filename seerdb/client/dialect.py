@@ -60,6 +60,7 @@ from seerdb.common.tns import (
     decode_9i_oall8_error_position,
     decode_9i_oall8_exec_response,
     decode_9i_oall8_lob_value,
+    decode_9i_oall8_return_parameters,
     decode_9i_oall8_terminal_error,
     decode_9i_oall8_warn_flags,
     decode_chgpwd_reply_oci11,
@@ -107,6 +108,7 @@ from seerdb.common.tns import (
     encode_9i_oall8_lobop,
     encode_9i_oall8_query,
     encode_9i_oall8_reexecute,
+    encode_9i_oall8_scroll_fetch,
     encode_9i_sql_text,
     encode_flush_echo,
     encode_o7_bfile_close,
@@ -1602,8 +1604,80 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 CAP_OBJECT_BIND,
                 CAP_REF_BIND,
                 CAP_ARRAY_BIND,
+                CAP_SCROLL,
             }
         )
+
+    def execute_scrollable(self, sql: str, bind: list | None, prefetch: int):
+        # A query opened scrollable, as OCI 9.2's OCI_STMT_SCROLLABLE_READONLY
+        # execute opens one (#2809): the scroll words on the execute, its first
+        # row with it, the rest by position (scroll_fetch), the cursor kept open.
+        # Returns the 9-tuple a query's execute does, the cursor's id in it and,
+        # as the row count, the position after its rows.
+        yield Send(
+            self._closing()
+            + encode_9i_oall8_query(
+                self._next_seq(),
+                self._sql_text(sql),
+                Oci11Dialect._null_lobs(bind),
+                Scrollable=True,
+            )
+        )
+        received = yield RECV
+        if received is False:
+            raise connection_closed('9i scrollable open')
+        packet = received[1]
+        if packet[:1] == bytes([TTI_OER]):
+            self._finished(self._cursor_id(packet))
+            _raise_ora(*self._terminal_error(packet))
+            raise InternalError('a 9i scrollable open answered without a describe')
+        (columns, rest) = yield from self._recv_describe(packet)
+        (rows, terminal, _) = yield from self.recv_rows(rest, columns, None)
+        cursor = self._cursor_id(terminal)
+        (code, message) = self._terminal_error(terminal)
+        if code not in (0, ORA_NO_DATA_FOUND):
+            self._finished(cursor)
+            _raise_ora(code, message)
+        return (0, code, cursor, (len(rows), columns), rows, None, None, [], None)
+
+    def scroll_fetch(
+        self,
+        cursor: int,
+        orientation: int,
+        position: int,
+        columns: list,
+        fetch: int,
+        last_row: list | None,
+    ):
+        # Up to `fetch` rows of a scrollable cursor from `position` (1-based), or
+        # its last row, as OCI 9.2's OCIStmtFetch2 asks (#2809). Returns (rows,
+        # at the end, the position of the last row returned). 9.2's status
+        # counts the rows fetched so far, not the position, so the position is
+        # the row asked for, and the last row's is its reply's return parameter
+        # [4], which 9.2 sends only to a one-row LAST.
+        last = orientation == TNS_FETCH_ORIENTATION_LAST
+        count = 1 if last else max(fetch, 1)
+        yield Send(
+            self._closing()
+            + encode_9i_oall8_scroll_fetch(
+                self._next_seq(),
+                cursor,
+                count,
+                self._long_size(columns, count),
+                orientation,
+                position,
+            )
+        )
+        (rows, terminal, _) = yield from self.recv_rows(b'', columns, last_row)
+        (code, message) = self._terminal_error(terminal)
+        if code not in (0, ORA_NO_DATA_FOUND):
+            _raise_ora(code, message)
+        if last:
+            params = decode_9i_oall8_return_parameters(terminal)
+            at = params[4] if len(params) > 4 and params[4] > 0 else 0
+        else:
+            at = position + len(rows) - 1 if rows else 0
+        return (rows, code == ORA_NO_DATA_FOUND or not rows, at)
 
     def create_temp_lob(self, is_blob: bool, csfrm: int = 1):
         # A temporary CLOB, NCLOB (csfrm 2) or BLOB of the session's duration,

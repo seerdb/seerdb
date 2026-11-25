@@ -85,6 +85,7 @@ class AsyncCursor(_CursorLogic):
                     # the server frees the cursor on session end regardless.
                     pass
         self._scroll_active = False
+        self._scroll_last_row: list | None = None
         self._scroll_cursor_id = 0
 
     async def execute(
@@ -645,7 +646,7 @@ class AsyncCursor(_CursorLogic):
 
         Conn = self._connection
         Size = max(int(self.arraysize), 1)
-        Prev = self._rows[-1] if self._rows else None
+        Prev = self._scroll_prev_row()
         Rows, Eof, ServerRowCount = await Conn.scroll_fetch(
             self._scroll_cursor_id,
             TNS_FETCH_ORIENTATION_CURRENT,
@@ -655,6 +656,7 @@ class AsyncCursor(_CursorLogic):
             PrevRow=Prev,
         )
         Batch = await self._resolve_rows(Rows)
+        self._scroll_note(Batch)
         self._rows = Batch
         # _scroll_set_window resets to empty for an off-the-end batch so a later
         # scroll() can't buffer-hit a stale window (mirrors sync).
@@ -779,7 +781,7 @@ class AsyncCursor(_CursorLogic):
             return
         Conn = self._connection
         Size = max(int(self.arraysize), 1)
-        Prev = self._rows[-1] if self._rows else None
+        Prev = self._scroll_prev_row()
         Rows, Eof, ServerRowCount = await Conn.scroll_fetch(
             self._scroll_cursor_id,
             Orientation,
@@ -789,6 +791,7 @@ class AsyncCursor(_CursorLogic):
             PrevRow=Prev,
         )
         Batch = await self._resolve_rows(Rows)
+        self._scroll_note(Batch)
         if not Batch:
             self._rows = []
             self._scroll_buf_min = self._scroll_buf_max = 0
