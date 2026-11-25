@@ -154,6 +154,7 @@ from seerdb.common.tns_consts import (
     AL32UTF8_CHARSET,
     FIELD_VERSION_11_2,
     ISO_LATIN_1_CHARSET,
+    ORA_ARRAY_DML_ERRORS,
     ORA_NO_DATA_FOUND,
     TNS_FETCH_ORIENTATION_LAST,
     TNS_LOB_FILE_READONLY,
@@ -1265,6 +1266,12 @@ class Oall8Dialect:
             raise connection_closed('8i DML')
         self._finished(decode_8i_cursor_id(received[1]))
         (row_count, err_code, message) = decode_8i_dml_response(received[1])
+        if err_code and batcherrors:
+            # A batch-errors executemany of one row, the only kind 8i runs:
+            # its failure is a batch error at offset 0 under ORA-24381, as
+            # Oracle reports one from 9i on and the cursor reads it (#2799).
+            failed = [{'offset': 0, 'code': err_code, 'message': message}]
+            return (0, ORA_ARRAY_DML_ERRORS, 0, (0, None), [], None, None, failed, None)
         _raise_ora(err_code, message)
         rowid = decode_8i_dml_rowid(received[1])  # the touched row (#1079)
         return (0, 0, 0, (row_count, None), [], None, rowid, [], None)
