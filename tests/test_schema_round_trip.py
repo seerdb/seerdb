@@ -75,8 +75,17 @@ def _o9i_iov(values: dict) -> None:
     values['binds'] = binds
 
 
+def _all8(values: dict) -> None:
+    # An execute's SQL goes one way or the other, length-framed from 12.1 or
+    # bare before, and a bare one is as long as the head's sql_length (#2773).
+    values['bare_sql'] = 0 if values.get('framed_sql') else 1
+    if values['bare_sql']:
+        values.setdefault('sql', b'')
+        values['sql_length'] = len(values['sql'])
+
+
 # What a caller keeps to that the schema does not say, per schema.
-CONTRACTS = {'_AUTH_HEAD': _auth_head, '_O9I_IOV': _o9i_iov}
+CONTRACTS = {'_AUTH_HEAD': _auth_head, '_O9I_IOV': _o9i_iov, '_ALL8': _all8}
 
 
 def _schemas() -> dict[str, wire_schema.Schema]:
