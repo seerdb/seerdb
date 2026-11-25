@@ -1244,6 +1244,52 @@ class _ConnectionLogic:
         # field version, which a thin OALL8 session to 9.2 runs above (#2768).
         return self._server_field_version() < FIELD_VERSION_10_2
 
+    def _scrolls_server_side(self) -> bool:
+        # Whether a scrollable cursor scrolls on the server (#181): on a session
+        # at 10.2 or later, a thin OALL8 one to 9.2 included (#2809). 9i's ALL7
+        # and native OALL8 forms keep the buffered scroll (#161).
+        return self.field_version >= FIELD_VERSION_10_2
+
+    def _scroll_request(self, Orientation: int, Position: int) -> tuple[int, int]:
+        # A scroll re-execute's orientation and position (#181), as the server
+        # reads them: 9.2 as OCI 9.2 sends them (oci92_scroll, #2809).
+        from seerdb.common.tns import oci92_scroll
+
+        if self._server_below_10_2():
+            return oci92_scroll(Orientation, Position)
+        return (Orientation, Position)
+
+    def _scroll_fetch_rows(self, Orientation: int, Fetch: int) -> int:
+        # The rows a scroll re-execute asks for. 9.2 reports the last row's
+        # number only when LAST asks for one row: asked for more, it sends the
+        # row and ORA-01403, with no return parameters (#2809).
+        from seerdb.common.tns_consts import TNS_FETCH_ORIENTATION_LAST
+
+        if self._server_below_10_2() and Orientation == TNS_FETCH_ORIENTATION_LAST:
+            return 1
+        return Fetch
+
+    def _scroll_row_count(
+        self,
+        Orientation: int,
+        Position: int,
+        Rows: list,
+        ServerRowCount: int,
+        Params: list[int],
+    ) -> int:
+        # The absolute number of the batch's last row, which places the scroll
+        # window (#181). 10.2 and later report it in the status. 9.2 reports the
+        # rows fetched so far on the cursor there instead, so the window is
+        # placed from the row asked for, and LAST's from its return parameters
+        # (#2809).
+        from seerdb.common.tns_consts import TNS_FETCH_ORIENTATION_LAST
+
+        if not self._server_below_10_2():
+            return ServerRowCount
+        if Orientation == TNS_FETCH_ORIENTATION_LAST:
+            return Params[4] if len(Params) > 4 and Params[4] > 0 else ServerRowCount
+        return Position + len(Rows) - 1 if Rows else 0
+
     def _tpc_field_version(self) -> int:
         # The field version a transaction switch goes at: the server's own when
         # it is below the session's, as a thin OALL8 session's to 9.2 is, whose

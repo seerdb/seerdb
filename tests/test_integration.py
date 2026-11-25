@@ -670,7 +670,10 @@ _CHANGE_PASSWORD = _Need(
 _PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV, protocol=True)
 _ARRAY_DML = _Need('executemany (array DML) is not supported on Oracle 8i', not_8i=True)
 _SERVER_SCROLL = _Need(
-    'server-side scroll needs 10g+ (9i uses buffered scroll)', min_fv=_FV
+    'server-side scroll needs a 10.2+ session (9i over thin OALL8, or 10g+); '
+    "9i's ALL7 and native OALL8 forms use the buffered scroll (#2809)",
+    min_fv=FIELD_VERSION_10_2,
+    protocol=True,
 )
 _LOBOPS = _Need('the 8i LOB object has no LOBOPS calls (9i: #2259)', not_8i=True)
 _OER_WARN_BYTE = _Need('the 8i OER warn byte is not located (9i: #2262)', not_8i=True)

@@ -290,10 +290,10 @@ class Cursor(_CursorLogic):
         if ReturnBinds:  # DML RETURNING ... INTO (#120)
             Kw['ReturnBinds'] = ReturnBinds
         # Server-side scrollable open (#181): mark the cursor scrollable and cap
-        # the open's prefetch to prefetchrows so it stays mid-stream. Gated to
-        # 10g+ (the OALL8 path); 9i (fv2) speaks the TTI_ALL7 dialect and falls
-        # back to the buffered scroll (#161).
-        if self._scrollable and not self._connection._server_below_10_2():
+        # the open's prefetch to prefetchrows so it stays mid-stream. Gated to a
+        # session at 10.2 or later, a thin OALL8 one to 9.2 included (#2809);
+        # 9i's ALL7 and native OALL8 forms fall back to the buffered scroll (#161).
+        if self._scrollable and self._connection._scrolls_server_side():
             Kw['scrollable'] = True
             # 0 is a real answer, not a missing one: it opens the cursor and
             # reads NOTHING, which is what binding it into a PL/SQL block needs
@@ -431,12 +431,12 @@ class Cursor(_CursorLogic):
             # count, not the total result set size; len(rows) is the answer
             # callers expect from cursor.rowcount.
             self._rowcount = len(self._rows)
-            if self._scrollable and not self._connection._server_below_10_2():
+            if self._scrollable and self._connection._scrolls_server_side():
                 # Server-side scrollable open (#181): the cursor stays open and
                 # this Result holds only the first prefetched batch. Record the
                 # window so scroll()/fetchone can reposition + pull more lazily.
-                # Gated to 10g+ to match _run; on 9i the open drained and scroll
-                # stays buffered (#161).
+                # Gated as _run is; where the open drained, scroll stays buffered
+                # (#161).
                 CursorId = (
                     Result[2] if len(Result) > 2 and isinstance(Result[2], int) else 0
                 )

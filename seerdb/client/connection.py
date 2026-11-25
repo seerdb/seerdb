@@ -72,6 +72,7 @@ from seerdb.common.sqltext import (
     statement_head,
 )
 from seerdb.common.tns import (
+    _DECODE_RPA_PARAMS,
     _DTY_8I,
     assemble_packet,
     decode_8i_server_version,
@@ -2736,7 +2737,9 @@ class OracleConnect(_ConnectionLogic):
         QueryDict = {
             'type': 'select',
             'auto': 0,
-            'fetch': self.fetch if Fetch is None else Fetch,
+            'fetch': self._scroll_fetch_rows(
+                Orientation, self.fetch if Fetch is None else Fetch
+            ),
             'server_version': self.server_version,
             'cursor': CursorId,
             'query': '',
@@ -2747,7 +2750,7 @@ class OracleConnect(_ConnectionLogic):
             'arraydmlrowcounts': None,
             'return_binds': None,
             'scrollable': True,
-            'scroll': (Orientation, Position),
+            'scroll': self._scroll_request(Orientation, Position),
         }
         Pre = (
             self._flush_cursor_closes_bytes()
@@ -2762,16 +2765,23 @@ class OracleConnect(_ConnectionLogic):
         # Seed the prior batch's last row so a reused (bit-unset) column on the
         # first row of this re-execute resolves to its real value (#181).
         set_decode_prev_row(PrevRow)
+        Params: list[int] = []
+        ParamsToken = _DECODE_RPA_PARAMS.set(Params)
         try:
             Result = self._handle_response((None, RowFormat, []))
         finally:
+            _DECODE_RPA_PARAMS.reset(ParamsToken)
             set_decode_prev_row(None)
         if not isinstance(Result, tuple) or len(Result) < 6:
             return ([], True, 0)
         (_, OraCode, _, RetFormat, Rows, *_) = Result
         AtEof = (OraCode == ORA_NO_DATA_FOUND) or not Rows
-        ServerRowCount = (
-            RetFormat[0] if (isinstance(RetFormat, tuple) and RetFormat) else 0
+        ServerRowCount = self._scroll_row_count(
+            Orientation,
+            Position,
+            list(Rows or []),
+            RetFormat[0] if (isinstance(RetFormat, tuple) and RetFormat) else 0,
+            Params,
         )
         return (list(Rows or []), AtEof, ServerRowCount)
 
