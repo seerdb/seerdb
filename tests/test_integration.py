@@ -759,6 +759,10 @@ _JSON = _Need(
 _BOOLEAN = _Need(
     'native BOOLEAN needs a session at field version 23.1+', min_fv=FIELD_VERSION_23_1
 )
+_PLSQL_BOOLEAN = _Need(
+    'a PL/SQL BOOLEAN bind needs a session at field version 12.1+',
+    min_fv=FIELD_VERSION_12_1,
+)
 _SESSION_CONTEXT = _Need(
     'session-context pairs need the fv > 23.1 FAST_AUTH',
     min_fv=FIELD_VERSION_23_1_EXT_1,
@@ -10306,12 +10310,27 @@ class BooleanIntegration(_IntegrationBase):
     def test_a_var_of_bool_is_a_boolean_out_bind(self):
         # cursor.var(bool) was refused (#2658); python-oracledb makes it a
         # BOOLEAN, as Transaction Guard's GET_LTXID_OUTCOME needs.
-        _skip_unless(self, _BOOLEAN)
+        _skip_unless(self, _PLSQL_BOOLEAN)
         out = self.cur.var(bool)
         self.cur.execute('BEGIN :b := TRUE; END;', [out])
         self.assertIs(out.getvalue(), True)
         self.cur.execute('BEGIN :b := FALSE; END;', [out])
         self.assertIs(out.getvalue(), False)
+
+    def test_a_boolean_bind_goes_in_and_comes_back_null(self):
+        # 18c and 21c refused a BOOLEAN Var, sent as a NUMBER (PLS-00306). A
+        # NULL comes back there as the value sent in with a -1 return code,
+        # and read as the value, it was True.
+        _skip_unless(self, _PLSQL_BOOLEAN)
+        for value, negated in ((True, False), (False, True), (None, None)):
+            var = self.cur.var(seerdb.DB_TYPE_BOOLEAN)
+            var.setvalue(0, value)
+            self.cur.execute('BEGIN :b := NOT :b; END;', [var])
+            self.assertIs(var.getvalue(), negated)
+        var = self.cur.var(seerdb.DB_TYPE_BOOLEAN)
+        var.setvalue(0, True)
+        self.cur.execute('BEGIN :b := NULL; END;', [var])
+        self.assertIsNone(var.getvalue())
 
     def test_boolean_bind_declared_number(self):
         # A bool whose bind was declared NUMBER, as SQLAlchemy's Oracle dialect
@@ -18825,6 +18844,13 @@ _TRANSACTION_GUARD = _Need(
 )
 
 
+def _no_grant(exc: seerdb.DatabaseError) -> bool:
+    # A package the user may not execute: ORA-00904, or PLS-00201 under
+    # ORA-06550. Any other ORA-06550 is a fault to report, not a missing grant:
+    # 18c's and 21c's PLS-00306, a BOOLEAN bind sent as a NUMBER, skipped here.
+    return exc.code == 904 or (exc.code == 6550 and 'PLS-00201' in str(exc))
+
+
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class LtxidIntegration(_IntegrationBase):
     """Connection.ltxid on the suite's own service (#2650)."""
@@ -18876,7 +18902,7 @@ class TransactionGuardIntegration(_IntegrationBase):
                     'dbms_app_cont.get_ltxid_outcome', [ltxid, committed, completed]
                 )
             except seerdb.DatabaseError as exc:
-                if exc.code in (904, 6550):
+                if _no_grant(exc):
                     self.skipTest('needs EXECUTE on DBMS_APP_CONT')
                 raise
             return (committed.getvalue(), completed.getvalue())
@@ -18885,7 +18911,9 @@ class TransactionGuardIntegration(_IntegrationBase):
         # Every commit failed here: "no decoder for response token 56" (#2654).
         with self._tg_connect() as conn:
             login = conn.ltxid
-            self.assertEqual(len(login), 56)
+            # 40 bytes on 18c and 56 from 21c, whose first 40 are laid out
+            # as 18c's, so the test asks only that the length holds.
+            self.assertIn(len(login), (40, 56))
             cur = conn.cursor()
             cur.execute(f'INSERT INTO {self.TABLE} VALUES (1)')
             conn.commit()
@@ -18897,6 +18925,7 @@ class TransactionGuardIntegration(_IntegrationBase):
             cur.execute(f'INSERT INTO {self.TABLE} VALUES (3)')
             third = conn.ltxid
             self.assertEqual(len({login, first, second, third}), 4)
+            self.assertEqual({len(i) for i in (first, second, third)}, {len(login)})
         self.cur.execute(f'SELECT COUNT(*) FROM {self.TABLE}')
         self.assertEqual(self.cur.fetchall(), [(3,)])
 
@@ -18918,7 +18947,7 @@ class TransactionGuardIntegration(_IntegrationBase):
             )
         except seerdb.DatabaseError as exc:
             conn.close()
-            if exc.code in (904, 6550):
+            if _no_grant(exc):
                 self.skipTest('needs EXECUTE on DBMS_TG_DBG')
             raise
         ltxid = conn.ltxid
@@ -18954,7 +18983,7 @@ class TransactionGuardIntegration(_IntegrationBase):
             )
         except seerdb.DatabaseError as exc:
             conn.close()
-            if exc.code in (904, 6550):
+            if _no_grant(exc):
                 self.skipTest('needs EXECUTE on DBMS_TG_DBG')
             raise
         self.assertTrue(conn.is_healthy())
@@ -19004,7 +19033,9 @@ class AsyncTransactionGuardIntegration(
             try:
                 await cur.execute('INSERT INTO pyo_async_tg VALUES (1)')
                 await conn.commit()
-                self.assertEqual(len(conn.ltxid), 56)
+                # 40 bytes on 18c, 56 from 21c.
+                self.assertIn(len(login), (40, 56))
+                self.assertEqual(len(conn.ltxid), len(login))
                 self.assertNotEqual(conn.ltxid, login)
             finally:
                 await cur.execute('DROP TABLE pyo_async_tg PURGE')
