@@ -8852,3 +8852,103 @@ class ProxyPre10Oauth(unittest.TestCase):
         )
         self.assertIn(b'13', proxy[proxy.index(b'AUTH_SESSION_ID') :][:32])
         self.assertIn(b'23069', proxy[proxy.index(b'AUTH_SERIAL_NUM') :][:32])
+
+
+class Pre10PasswordChange(unittest.TestCase):
+    """A password change on an 8i or 9i session (#2808), as OCI 9.2's
+    OCIPasswordChange makes one on a live session (captured on 9.2.0.4)."""
+
+    # OCI 9.2's change past its piggybacked session switch, up to the user: the
+    # OAUTH and its sequence, a pointer, the user's length, the mode 0x112, a
+    # pointer, the pair count (6), a zero word and two pointers.
+    _OCI_HEAD = bytes.fromhex(
+        '037305bcfdffbf7f0000000f00000012010000b0f4ffbf7f00000006000000'
+        '0000000090f1ffbf7f0000007ee7ffbf7f000000'
+    )
+    _POINTERS = [range(3, 11), range(19, 27), range(35, 43), range(43, 51)]
+
+    def _pairs(self):
+        return [
+            (b'AUTH_PROGRAM_NM', b'oci_pwchange@o9i (TNS V1-V3)'),
+            (b'AUTH_MACHINE', b'o9i'),
+            (b'AUTH_PID', b'8977'),
+        ]
+
+    def test_the_native_form_is_oci_92s(self):
+        import re
+
+        from seerdb.common.crypto import des_verifier
+        from seerdb.common.tns import encode_pre10_chgpwd
+
+        user = b'seerdb_pw_probe'
+        with patch.dict(os.environ, {'ORA_SDTZ': '+00:00'}):
+            ours = encode_pre10_chgpwd(
+                5,
+                user,
+                bytes(8),
+                des_verifier(user, b'probeold1'),
+                'probeold1',
+                'probenew2',
+                self._pairs(),
+                'oall8',
+            )
+        head = ours[: len(self._OCI_HEAD)]
+        skip = {i for r in self._POINTERS for i in r}
+        self.assertEqual(
+            [
+                i
+                for i in range(len(self._OCI_HEAD))
+                if head[i] != self._OCI_HEAD[i] and i not in skip
+            ],
+            [],
+        )
+        self.assertEqual(ours[len(self._OCI_HEAD) :][1:16], user)
+        self.assertEqual(
+            re.findall(rb'AUTH_[A-Z_]+', ours),
+            [
+                b'AUTH_PASSWORD',
+                b'AUTH_NEWPASSWORD',
+                b'AUTH_PROGRAM_NM',
+                b'AUTH_MACHINE',
+                b'AUTH_PID',
+                b'AUTH_ALTER_SESSION',
+            ],
+        )
+
+    def test_both_passwords_are_wrapped_under_the_login_session_key(self):
+        # As phase two wraps the login password, the session key unwrapped by
+        # the LOGIN password's verifier, whatever the old password is now.
+        from seerdb.common.crypto import des_verifier, o3logon
+        from seerdb.common.tns import encode_pre10_chgpwd
+
+        user, sesskey = b'U', bytes(range(8))
+        verifier = des_verifier(user, b'login1')
+        ours = encode_pre10_chgpwd(
+            1, user, sesskey, verifier, 'second2', 'third3', [], 'thin'
+        )
+        for password in (b'second2', b'third3'):
+            (cipher, _, _) = o3logon(sesskey, verifier, password)
+            pad = (8 - len(password) % 8) % 8
+            self.assertIn((cipher.hex().upper() + str(pad)).encode(), ours)
+
+    def test_8i_sends_no_time_zone(self):
+        from seerdb.common.tns import encode_pre10_chgpwd
+
+        ours = encode_pre10_chgpwd(
+            1, b'U', bytes(8), bytes(8), 'a', 'b', self._pairs(), 'o8i'
+        )
+        self.assertNotIn(b'AUTH_ALTER_SESSION', ours)
+        self.assertIn(b'AUTH_NEWPASSWORD', ours)
+
+    def test_the_reply_is_read_past_its_empty_rpa(self):
+        # 9.2's thin-coded reply, `08 00` and the status; the native one's RPA
+        # has a ub2 count, `08 00 00`.
+        from seerdb.common.tns import pre10_chgpwd_status
+
+        self.assertEqual(
+            pre10_chgpwd_status(bytes.fromhex('0800040102'), True)[:1], b'\x04'
+        )
+        self.assertEqual(
+            pre10_chgpwd_status(bytes.fromhex('080000040102'), False)[:1], b'\x04'
+        )
+        self.assertEqual(pre10_chgpwd_status(b'\x04\x01', True), b'\x04\x01')

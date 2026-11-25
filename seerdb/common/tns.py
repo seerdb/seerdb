@@ -20,6 +20,7 @@ from seerdb.common.crypto import (
     PBKDF2_VGEN_COUNT,
     VFR_11G_SHA1,
     encrypt_password,
+    o3logon,
     o5logon,
     server_proof,
     server_proof_padded,
@@ -20017,6 +20018,79 @@ def encode_o3logon_proxy_oauth(
         _PROXY_LOGON_MODE,
         _proxy_pairs(_o8i_info_pairs(Pairs), SessionId, SerialNum, TimeZone=False),
     )
+
+
+# A password change on an 8i or 9i session (#2808), as OCI 9.2's
+# OCIPasswordChange makes one on a live session (captured on 9.2.0.4): one
+# OAUTH, mode 0x112, the user, AUTH_PASSWORD and AUTH_NEWPASSWORD, then the
+# session's pairs and, from 9i, the time zone. There is no new OSESSKEY: both
+# passwords are wrapped under the login's session key, each as phase two wraps
+# the password (o3logon). The key is unwrapped by the verifier of the password
+# the session logged in with, which a second change on the session no longer
+# has as its old password: unwrapped by that one, 9.2 refused it (ORA-28008).
+# The server answers with an empty RPA and its status.
+_PRE10_CHGPWD_MODE = 0x112
+# The longest new password OCI 9.2 sends in one, measured against 8.1.7: it
+# refuses 31 characters itself with ORA-00988 and sends nothing.
+PRE10_PASSWORD_MAX = 30
+
+
+def encode_pre10_chgpwd(
+    Seq: int,
+    User: bytes,
+    SessKey: bytes,
+    Verifier: bytes,
+    Old: str,
+    New: str,
+    Pairs: list[tuple[bytes, bytes]],
+    Form: str,
+) -> bytes:
+    """An 8i or 9i password change under the login's session key, which its
+    login password's verifier unwraps: `Form` is 'o8i' (8i's widths), 'thin'
+    (9i's thin-coded form) or 'oall8' (the native 9.2 form)."""
+
+    def Wrapped(Password: str) -> bytes:
+        Raw = Password.encode('utf-8')
+        (Cipher, _, _) = o3logon(SessKey, Verifier, Raw)
+        Pad = (8 - len(Raw) % 8) % 8
+        return (Cipher.hex().upper() + str(Pad)).encode('ascii')
+
+    Head = [(b'AUTH_PASSWORD', Wrapped(Old)), (b'AUTH_NEWPASSWORD', Wrapped(New))]
+    if Form == 'o8i':
+        return _pre10_login(
+            TTI_AUTH, Seq, User, _PRE10_CHGPWD_MODE, [*Head, *_o8i_info_pairs(Pairs)]
+        )
+    if Form == 'oall8':
+        return _oall8_auth(
+            TTI_AUTH,
+            Seq,
+            User,
+            _PRE10_CHGPWD_MODE,
+            [*Head, *_o8i_info_pairs(Pairs), _login_time_zone_pair()],
+        )
+    return _pre10_login(
+        TTI_AUTH,
+        Seq,
+        User,
+        _PRE10_CHGPWD_MODE,
+        [*Head, *Pairs, _login_time_zone_pair()],
+        O8i=False,
+    )
+
+
+def pre10_chgpwd_status(Packet: bytes, Thin: bool) -> bytes:
+    """A pre-10g password change's reply from its status on: past the empty
+    RPA in front of it, a ub4 count of none in the thin-coded form, a ub2 in
+    8i's and the native 9.2 form's. A refusal may come with no RPA at all."""
+    if Packet[:1] != bytes([TTI_RPA]):
+        return Packet
+    if Thin:
+        (Count, Rest) = decode_ub4(Packet[1:])
+        for _ in range(max(Count, 0)):
+            (_, Rest) = decode_ub4(Rest)
+        return Rest
+    Count = int.from_bytes(Packet[1:3], 'little')
+    return Packet[3 + 4 * Count :]
 
 
 def encode_o7_proxy_oauth(
