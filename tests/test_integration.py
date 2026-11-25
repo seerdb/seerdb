@@ -669,7 +669,6 @@ _CHANGE_PASSWORD = _Need(
 )
 _PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV, protocol=True)
 _ARRAY_DML = _Need('executemany (array DML) is not supported on Oracle 8i', not_8i=True)
-_PROXY_AUTH = _Need('a proxy login on 8i is refused, not yet measured', not_8i=True)
 _SERVER_SCROLL = _Need(
     'server-side scroll needs 10g+ (9i uses buffered scroll)', min_fv=_FV
 )
@@ -8186,9 +8185,13 @@ class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
     CONNECT THROUGH <user>``), named by SEERDB_TEST_PROXY_USER. The suite's own
     account has no such grant, so without it the test says so and skips.
 
-    On 9i the target's session begins with a second OAUTH after the proxy
-    user's own login. Before that, 9i ignored the target and the session ran as
-    the proxy user, with no error.
+    On 8i and 9i the target's session begins with a second OAUTH after the
+    proxy user's own login. Before that, both ignored the target and the session
+    ran as the proxy user, with no error.
+
+    The proxy side logs in as SEERDB_TEST_PROXY_LOGIN_USER / _PASSWORD when set,
+    else as the suite's user: 8i refuses SYSTEM, its suite's user, as a proxy
+    (ORA-28154).
     """
 
     def _proxy_target(self) -> str:
@@ -8199,7 +8202,13 @@ class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
             )
         return proxy
 
-    @_requires(_PROXY_AUTH)
+    @staticmethod
+    def _proxy_login() -> tuple[str, str]:
+        user = os.environ.get('SEERDB_TEST_PROXY_LOGIN_USER')
+        if user:
+            return (user, os.environ.get('SEERDB_TEST_PROXY_LOGIN_PASSWORD', ''))
+        return (_USER or '', _PASSWORD)
+
     def test_a_target_the_user_may_not_proxy_for_is_refused(self):
         # Nobody grants the suite's user CONNECT THROUGH to SYSTEM. On 9i the
         # login went through as the proxy user itself.
@@ -8213,29 +8222,16 @@ class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
                 **_FV_KW,
             ).close()
 
-    @_requires(_ONLY_8I)
-    def test_8i_refuses_a_proxy_login(self):
-        # 8i's login has no target to send, so it ran as the proxy user.
-        with self.assertRaises(seerdb.NotSupportedError):
-            seerdb.connect(
-                host=_HOST,
-                port=_PORT,
-                user=f'{_USER}[system]',
-                password=_PASSWORD,
-                service_name=_SERVICE,
-                **_FV_KW,
-            ).close()
-
-    @_requires(_PROXY_AUTH)
     def test_an_async_session_runs_as_the_proxied_user(self):
         proxy = self._proxy_target()
+        (user, password) = self._proxy_login()
 
         async def run() -> tuple:
             conn = await seerdb.connect_async(
                 host=_HOST,
                 port=_PORT,
-                user=f'{_USER}[{proxy}]',
-                password=_PASSWORD,
+                user=f'{user}[{proxy}]',
+                password=password,
                 service_name=_SERVICE,
                 **_FV_KW,
             )
@@ -8249,16 +8245,16 @@ class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
             finally:
                 await conn.close()
 
-        self.assertEqual(asyncio.run(run()), (proxy.upper(), _USER.upper()))
+        self.assertEqual(asyncio.run(run()), (proxy.upper(), user.upper()))
 
-    @_requires(_PROXY_AUTH)
     def test_the_session_runs_as_the_proxied_user(self):
         proxy = self._proxy_target()
+        (user, password) = self._proxy_login()
         with seerdb.connect(
             host=_HOST,
             port=_PORT,
-            user=f'{_USER}[{proxy}]',
-            password=_PASSWORD,
+            user=f'{user}[{proxy}]',
+            password=password,
             service_name=_SERVICE,
             **_FV_KW,
         ) as conn:
@@ -8267,7 +8263,7 @@ class ProxyLoginIntegration(_ThrottleRetry, unittest.TestCase):
                 "SELECT SYS_CONTEXT('userenv', 'session_user'), "
                 "SYS_CONTEXT('userenv', 'proxy_user') FROM dual"
             )
-            self.assertEqual(cur.fetchone(), (proxy.upper(), _USER.upper()))
+            self.assertEqual(cur.fetchone(), (proxy.upper(), user.upper()))
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)

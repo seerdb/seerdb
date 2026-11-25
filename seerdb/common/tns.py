@@ -19956,25 +19956,47 @@ def encode_o7_oauth(
     )
 
 
-# A proxy login on 9i (#126): once the proxy user is logged in, a second OAUTH
-# begins the target's session on the proxy's, as OCI 9.2's OCISessionBegin with
-# OCI_CRED_PROXY sends it (captured from 9.2.0.4's own OCI). The target is the
-# user, the mode is 0x401, there is no password, and the proxy session's id and
-# serial follow the time zone. The server answers as it answers a login, and
+# A proxy login before 10g (#126): once the proxy user is logged in, a second
+# OAUTH begins the target's session on the proxy's, as OCI 9.2's OCISessionBegin
+# with OCI_CRED_PROXY sends it (captured from 9.2.0.4's own OCI). The target is
+# the user, the mode is 0x401, there is no password, and the proxy session's id
+# and serial follow the time zone. The server answers as it answers a login, and
 # the target's session is the one every later call runs in. 9.2 ignores 10g's
-# PROXY_CLIENT_NAME pair, so a `user[target]` login ran as the proxy user.
+# PROXY_CLIENT_NAME pair, so a `user[target]` login ran as the proxy user. 8.1.7
+# takes the same call at 8i's widths, with no time zone, as its login sends
+# none (#2818).
 _PROXY_LOGON_MODE = 0x401
 
 
 def _proxy_pairs(
-    Pairs: list[tuple[bytes, bytes]], SessionId: int, SerialNum: int
+    Pairs: list[tuple[bytes, bytes]],
+    SessionId: int,
+    SerialNum: int,
+    TimeZone: bool = True,
 ) -> list[tuple[bytes, bytes]]:
     return [
         *Pairs,
-        _login_time_zone_pair(),
+        *([_login_time_zone_pair()] if TimeZone else []),
         (b'AUTH_SESSION_ID', str(SessionId).encode('ascii')),
         (b'AUTH_SERIAL_NUM', str(SerialNum).encode('ascii')),
     ]
+
+
+def encode_o3logon_proxy_oauth(
+    Seq: int,
+    Target: bytes,
+    Pairs: list[tuple[bytes, bytes]],
+    SessionId: int,
+    SerialNum: int,
+) -> bytes:
+    """8i's proxy OAUTH, at the 8i codec's widths, begun on ``SessionId``."""
+    return _pre10_login(
+        TTI_AUTH,
+        Seq,
+        Target,
+        _PROXY_LOGON_MODE,
+        _proxy_pairs(_o8i_info_pairs(Pairs), SessionId, SerialNum, TimeZone=False),
+    )
 
 
 def encode_o7_proxy_oauth(
@@ -20012,14 +20034,15 @@ def encode_oall8_proxy_oauth(
     )
 
 
-def parse_9i_auth_session(Packet: bytes, O8i: bool) -> tuple[int, int]:
-    """The session id and serial a 9i login reply carries, for a proxy OAUTH."""
+def parse_pre10_auth_session(Packet: bytes, O8i: bool) -> tuple[int, int]:
+    """The session id and serial an 8i or 9i login reply carries, for a proxy
+    OAUTH."""
     from seerdb.common.exceptions import InterfaceError
 
     SessionId = _auth_int(parse_8i_auth_value(Packet, b'AUTH_SESSION_ID', O8i))
     SerialNum = _auth_int(parse_8i_auth_value(Packet, b'AUTH_SERIAL_NUM', O8i))
     if SessionId is None or SerialNum is None:
-        raise InterfaceError('the 9i login reply carried no session for a proxy login')
+        raise InterfaceError('the login reply carried no session for a proxy login')
     return (SessionId, SerialNum)
 
 

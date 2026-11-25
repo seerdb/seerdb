@@ -697,14 +697,6 @@ def _split_proxy_user(user: str) -> tuple[str, str | None]:
     return (user, None)
 
 
-def _refuse_8i_proxy(target: str | None) -> None:
-    # 8i's login sent no target, so a `user[target]` login ran as the proxy
-    # user itself, with no error. 9i's way (encode_o7_proxy_oauth) has not been
-    # measured on 8i, so refuse rather than answer as the wrong user.
-    if target:
-        raise NotSupportedError('proxy authentication is not supported on Oracle 8i')
-
-
 def _reject_sharding(shardingkey: object, supershardingkey: object) -> None:
     """Reject a sharding-key request with a clean NotSupportedError (#164).
 
@@ -1863,6 +1855,13 @@ class OracleConnect(_ConnectionLogic):
                                 if self._o3_phase == 1:
                                     self._send_8i_oauth_phase2(Packet)
                                     continue
+                                if self._o3_wants_proxy():
+                                    # A proxy login (#2818): the target's
+                                    # session begins on the one just logged in.
+                                    self.send(
+                                        TNS_DATA, self._o3_proxy_oauth(Packet, O8i=True)
+                                    )
+                                    continue
                                 self.conn_state = CONN_STATE_AUTHENTICATED
                                 self.server_version = decode_8i_server_version(Packet)
                                 logger.debug('handle_login: authenticated (8i O3LOGON)')
@@ -2328,7 +2327,6 @@ class OracleConnect(_ConnectionLogic):
         # informational pairs; the server replies with an AUTH_SESSKEY RPA.
         from seerdb.common.tns import encode_o3logon_osesskey_phase1
 
-        _refuse_8i_proxy(self.proxy_user)
         self.send(
             TNS_DATA,
             encode_o3logon_osesskey_phase1(

@@ -406,25 +406,35 @@ class _ConnectionLogic:
         )
 
     def _o3_wants_proxy(self) -> bool:
-        # A `user[target]` login on 9i whose own login just succeeded (#126):
-        # the target's session is still to begin (_o3_proxy_oauth).
+        # A `user[target]` login on 8i or 9i whose own login just succeeded
+        # (#126, #2818): the target's session is still to begin
+        # (_o3_proxy_oauth).
         return bool(self.proxy_user) and self._o3_phase == 2
 
-    def _o3_proxy_oauth(self, Packet: bytes) -> bytes:
-        # The second OAUTH of a 9i proxy login (encode_o7_proxy_oauth), on the
-        # session the proxy user's login reply (`Packet`) names. Phase 3 is the
-        # target's login; its reply completes the connect as phase 2's would.
+    def _o3_proxy_oauth(self, Packet: bytes, O8i: bool = False) -> bytes:
+        # The second OAUTH of an 8i or 9i proxy login (encode_o7_proxy_oauth), on
+        # the session the proxy user's login reply (`Packet`) names. Phase 3 is
+        # the target's login; its reply completes the connect as phase 2's would.
         from seerdb.common.tns import (
+            encode_o3logon_proxy_oauth,
             encode_o7_proxy_oauth,
             encode_oall8_proxy_oauth,
-            parse_9i_auth_session,
+            parse_pre10_auth_session,
         )
 
         assert self.proxy_user
         Oall8 = bool(getattr(self, '_o3_oall8', False))
-        (SessionId, SerialNum) = parse_9i_auth_session(Packet, O8i=Oall8)
+        (SessionId, SerialNum) = parse_pre10_auth_session(Packet, O8i=O8i or Oall8)
         Target = self.proxy_user.encode('utf-8')
         self._o3_phase = 3
+        if O8i:
+            return encode_o3logon_proxy_oauth(
+                self._next_seq(),
+                Target,
+                self._auth_info_pairs() + [(b'AUTH_ACL', b'8000')],
+                SessionId,
+                SerialNum,
+            )
         if Oall8:
             return encode_oall8_proxy_oauth(
                 self._next_seq(),

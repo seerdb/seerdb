@@ -8692,8 +8692,8 @@ class Oall8NineLobCharsetTest(unittest.TestCase):
         )
 
 
-class Proxy9iOauth(unittest.TestCase):
-    """A 9i proxy login's second OAUTH (#126 on 9i).
+class ProxyPre10Oauth(unittest.TestCase):
+    """An 8i or 9i proxy login's second OAUTH (#126, #2818).
 
     `_CAPTURED` is OCI 9.2.0.4's own, from OCISessionBegin(OCI_CRED_PROXY) on
     session 19, serial 53460, after its piggybacked session switch. The native
@@ -8770,3 +8770,29 @@ class Proxy9iOauth(unittest.TestCase):
         )
         self.assertIn(b'19', proxy[proxy.index(b'AUTH_SESSION_ID') :][:24])
         self.assertIn(b'53460', proxy[proxy.index(b'AUTH_SERIAL_NUM') :][:24])
+
+    def test_the_8i_form_is_8is_own_login_at_the_proxy_mode(self):
+        # 8.1.7 begins the target's session from this (#2818): 8i's phase two
+        # at mode 0x401, with no password and no time zone, as 8i's own login
+        # sends none, and the session's id and serial behind the pairs.
+        import re
+
+        from seerdb.common.tns import (
+            encode_o3logon_oauth_phase2,
+            encode_o3logon_proxy_oauth,
+        )
+
+        pairs = [(b'AUTH_PROGRAM_NM', b'p'), (b'AUTH_ACL', b'8000')]
+        proxy = encode_o3logon_proxy_oauth(7, b'T', pairs, 13, 23069)
+        login = encode_o3logon_oauth_phase2(7, b'T', b'X', pairs)
+        # OAUTH, seq, a pointer, the user's length, the mode, a pointer, the
+        # pair count: 0x101 and 3 pairs for the login, 0x401 and 4 here.
+        self.assertEqual(proxy[:17].hex(), '0373070101000000010400000104000000')
+        self.assertEqual(login[:17].hex(), '0373070101000000010100000103000000')
+        self.assertEqual(proxy[17:21], login[17:21])
+        self.assertEqual(
+            re.findall(rb'AUTH_[A-Z_]+', proxy),
+            [b'AUTH_PROGRAM_NM', b'AUTH_ACL', b'AUTH_SESSION_ID', b'AUTH_SERIAL_NUM'],
+        )
+        self.assertIn(b'13', proxy[proxy.index(b'AUTH_SESSION_ID') :][:32])
+        self.assertIn(b'23069', proxy[proxy.index(b'AUTH_SERIAL_NUM') :][:32])
