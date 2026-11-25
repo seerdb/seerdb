@@ -161,7 +161,7 @@ _8I_UNSUPPORTED = (
     # Genuine 8i limitations (8.1.7 predates the feature).
     (
         'methods_on_a_missing_directory',
-        '8i has no LOB object calls, fileexists() included',
+        '8i has no LOB object calls, fileexists() included (#2804)',
     ),
     ('timestamp', 'TIMESTAMP is a 9i+ type; Oracle 8i has only DATE'),
     ('interval', 'INTERVAL is a 9i+ type; Oracle 8i lacks it'),
@@ -345,6 +345,9 @@ class _Target(NamedTuple):
     # The session's own field version, where it differs from the server's: a
     # thin OALL8 session to 9.2 runs at 10.2 (#2768). 0 when it is the same.
     session_fv: int = 0
+    # Whether the temporal bind grid runs: everywhere but 8i, whose SQL it
+    # outruns, and 9i's compact form, which fails two of its bind shapes (#2811).
+    temporal_grid: bool = True
 
 
 def _sql_fv(conn) -> int:
@@ -451,6 +454,7 @@ def _target_of(conn) -> _Target:
         or _dialect_binds_refs(conn),
         temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
         conn.field_version,
+        not (_conn_is_8i(conn) or _conn_is_compact_9i(conn)),
     )
 
 
@@ -511,6 +515,7 @@ class _Need(NamedTuple):
     # Whether the field versions name what the session's form does (a parse, a
     # native RETURNING) rather than what SQL its server runs (#2768).
     protocol: bool = False
+    temporal_grid: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = (
@@ -539,6 +544,8 @@ class _Need(NamedTuple):
         if self.ref_binds and not target.ref_binds:
             return True
         if self.lob_out and not target.lob_out:
+            return True
+        if self.temporal_grid and not target.temporal_grid:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -662,7 +669,6 @@ _CHANGE_PASSWORD = _Need(
 )
 _PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV, protocol=True)
 _ARRAY_DML = _Need('executemany (array DML) is not supported on Oracle 8i', not_8i=True)
-_FV2_EXECUTE_PATH = _Need('fv2 (9i) uses a separate execute path', min_fv=_FV)
 _PROXY_AUTH = _Need('proxy authentication needs a 10g+ server', min_fv=_FV)
 _SERVER_SCROLL = _Need(
     'server-side scroll needs 10g+ (9i uses buffered scroll)', min_fv=_FV
@@ -779,7 +785,15 @@ _INTERVAL = _Need('INTERVAL is a 9i+ type; Oracle 8i lacks it', not_8i=True)
 _CHAR_LENGTH = _Need('Oracle 8i has no USER_TAB_COLUMNS.CHAR_LENGTH', not_8i=True)
 _8I_DESCRIBE_SPANS_PACKETS = _Need('a describe outgrows a packet on 8i', only_8i=True)
 _ONLY_8I = _Need('not an Oracle 8i server', only_8i=True)
-_GRID_10G = _Need('the grid starts at 10g', min_fv=FIELD_VERSION_10_2)
+# The BFILE classes are not _IntegrationBase's, whose name table gates the
+# missing-directory case, so a BFILE that exists is gated here.
+_8I_LOB_CALLS = _Need(
+    '8i has no LOB object calls, fileexists() included (#2804)', not_8i=True
+)
+_TEMPORAL_GRID = _Need(
+    'the temporal grid needs 10g+, or 9i over OALL8 or thin OALL8 (#2811)',
+    temporal_grid=True,
+)
 _MEDIAN_FUNCTION = _Need('MEDIAN is a 10g function', min_fv=FIELD_VERSION_10_2)
 _MEDIAN_ANALYTIC = _postgres_cannot(
     'window MEDIAN: PostgreSQL has no exact one (#1992)'
@@ -9572,7 +9586,6 @@ class FetchFlowIntegration(_IntegrationBase):
         self.cur.execute("SELECT SYS_CONTEXT('USERENV','CLIENT_INFO') FROM dual")
         self.assertEqual(self.cur.fetchone(), ('caf\u00e9',))
 
-    @_requires(_FV2_EXECUTE_PATH)
     def test_repeated_execute_no_cursor_leak(self):
         # #191: repeated execute() of one statement must not leak server
         # cursors. Pre-fix this tripped ORA-01000 after ~300 executes on 12c+
@@ -13045,7 +13058,7 @@ class ObjectTimeZoneAttributeIntegration(_IntegrationBase):
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
-@_requires(_REAL_SERVER_READS, _GRID_10G)
+@_requires(_REAL_SERVER_READS, _TEMPORAL_GRID)
 class TemporalBindGridIntegration(_IntegrationBase):
     """Every cell of the temporal bind grid, as the server reads it (#1338).
 
@@ -17034,6 +17047,7 @@ class BFILEIntegration(_ThrottleRetry, unittest.TestCase):
         self.assertEqual(Lob.directory_name, self.dir)
         self.assertEqual(Lob.filename, _BFILE_TEST_FILE)
 
+    @_requires(_8I_LOB_CALLS)
     def test_bfile_fileexists_against_a_real_directory(self):
         # The server's own answer for a directory that DOES exist: True for the
         # file that is there, False for one that is not -- no error either way,
@@ -17085,6 +17099,7 @@ class AsyncBFILEIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(Lob.is_file)
                 self.assertEqual(await Lob.aread(), _BFILE_TEST_CONTENT)
 
+    @_requires(_8I_LOB_CALLS)
     async def test_async_bfile_fileexists(self):
         # Sync/async parity for the BFILE round-trip (#1109).
         Dir = os.environ['SEERDB_TEST_BFILE_DIR']
