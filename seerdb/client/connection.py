@@ -697,6 +697,14 @@ def _split_proxy_user(user: str) -> tuple[str, str | None]:
     return (user, None)
 
 
+def _refuse_8i_proxy(target: str | None) -> None:
+    # 8i's login sent no target, so a `user[target]` login ran as the proxy
+    # user itself, with no error. 9i's way (encode_o7_proxy_oauth) has not been
+    # measured on 8i, so refuse rather than answer as the wrong user.
+    if target:
+        raise NotSupportedError('proxy authentication is not supported on Oracle 8i')
+
+
 def _reject_sharding(shardingkey: object, supershardingkey: object) -> None:
     """Reject a sharding-key request with a clean NotSupportedError (#164).
 
@@ -1865,8 +1873,13 @@ class OracleConnect(_ConnectionLogic):
                                 else:
                                     self._send_o3logon_phase2(Packet)
                                 continue
+                            if getattr(self, '_o3_phase', 0) and self._o3_wants_proxy():
+                                # A proxy login (#126): the target's session
+                                # begins on the one just logged in.
+                                self.send(TNS_DATA, self._o3_proxy_oauth(Packet))
+                                continue
                             if getattr(self, '_o3_oall8', False) and (
-                                getattr(self, '_o3_phase', 0) == 2
+                                getattr(self, '_o3_phase', 0) in (2, 3)
                             ):
                                 # Native OALL8 O3LOGON completion (#790): the 9.2
                                 # server accepts the OAUTH proof and answers with
@@ -1883,10 +1896,10 @@ class OracleConnect(_ConnectionLogic):
                                     'handle_login: authenticated (9i OALL8 O3LOGON)'
                                 )
                                 return 0
-                            if getattr(self, '_o3_phase', 0) == 2:
+                            if getattr(self, '_o3_phase', 0) in (2, 3):
                                 # 9i's OAUTH answered with its pairs (#2342):
                                 # authenticated, no server proof to check on the
-                                # pre-10g path.
+                                # pre-10g path. Phase 3 is a proxy's target.
                                 assert isinstance(self._dialect, Fv2Dialect)
                                 self.conn_state = CONN_STATE_AUTHENTICATED
                                 logger.debug('handle_login: authenticated (O3LOGON)')
@@ -1932,9 +1945,16 @@ class OracleConnect(_ConnectionLogic):
                                 raise from_ora_code(ErrCode)(
                                     Message or f'ORA-{ErrCode:05d}', code=ErrCode
                                 )
-                            if getattr(self, '_o3_phase', 0) == 2 and isinstance(
+                            if getattr(self, '_o3_phase', 0) in (2, 3) and isinstance(
                                 self._dialect, Fv2Dialect
                             ):
+                                if self._o3_wants_proxy():
+                                    # No pairs, so no session to begin the
+                                    # target's on.
+                                    raise InterfaceError(
+                                        'the 9i login reply carried no session '
+                                        'for a proxy login'
+                                    )
                                 # 9i's O3LOGON phase two answered with a clean OER
                                 # = authenticated (#90). No AUTH_SVR_RESPONSE to
                                 # validate on the pre-10g path; 8i's answer is an
@@ -2308,6 +2328,7 @@ class OracleConnect(_ConnectionLogic):
         # informational pairs; the server replies with an AUTH_SESSKEY RPA.
         from seerdb.common.tns import encode_o3logon_osesskey_phase1
 
+        _refuse_8i_proxy(self.proxy_user)
         self.send(
             TNS_DATA,
             encode_o3logon_osesskey_phase1(

@@ -8690,3 +8690,83 @@ class Oall8NineLobCharsetTest(unittest.TestCase):
             (Nclob[29:32], Clob[29:32]),
             (bytes.fromhex('d00702'), bytes.fromhex('690301')),
         )
+
+
+class Proxy9iOauth(unittest.TestCase):
+    """A 9i proxy login's second OAUTH (#126 on 9i).
+
+    `_CAPTURED` is OCI 9.2.0.4's own, from OCISessionBegin(OCI_CRED_PROXY) on
+    session 19, serial 53460, after its piggybacked session switch. The native
+    OALL8 form is laid out the same; only its pointers' values, which are OCI's
+    addresses, and one word OCI leaves set (0x3e at 31) differ.
+    """
+
+    _CAPTURED = bytes.fromhex(
+        '03730570b5510000000000130000000104000070f4ffbf7f000000070000003e000000'
+        '50f1ffbf7f000000d0b4ffbf7f000000135345455244425f50524f58595f5441524745'
+        '540f0000000f415554485f50524f4752414d5f4e4d19000000196f63695f70726f7879'
+        '406f39692028544e532056312d563329000000000c0000000c415554485f4d41434849'
+        '4e4503000000036f3969000000000800000008415554485f5049440400000004393934'
+        '34000000000800000008415554485f41434c0400000004383030300000000012000000'
+        '12415554485f414c5445525f53455353494f4e2500000025414c544552205345535349'
+        '4f4e205345542054494d455f5a4f4e453d272b30303a30302700010000000f0000000f'
+        '415554485f53455353494f4e5f494402000000023139000000000f0000000f41555448'
+        '5f53455249414c5f4e554d0500000005353334363000000000'
+    )
+    _PAIRS = [
+        (b'AUTH_PROGRAM_NM', b'oci_proxy@o9i (TNS V1-V3)'),
+        (b'AUTH_MACHINE', b'o9i'),
+        (b'AUTH_PID', b'9944'),
+        (b'AUTH_ACL', b'8000'),
+    ]
+    # The pointers (8 bytes each) and the word OCI sets at 31.
+    _OCI_OWN = [
+        range(3, 11),
+        range(19, 27),
+        range(31, 35),
+        range(35, 43),
+        range(43, 51),
+    ]
+
+    def test_the_oall8_form_is_oci_92s(self):
+        from seerdb.common.tns import encode_oall8_proxy_oauth
+
+        with patch.dict(os.environ, {'ORA_SDTZ': '+00:00'}):
+            ours = encode_oall8_proxy_oauth(
+                5, b'SEERDB_PROXY_TARGET', self._PAIRS, 19, 53460
+            )
+        self.assertEqual(len(ours), len(self._CAPTURED))
+        skip = {i for r in self._OCI_OWN for i in r}
+        self.assertEqual(
+            [
+                i
+                for i in range(len(ours))
+                if ours[i] != self._CAPTURED[i] and i not in skip
+            ],
+            [],
+        )
+
+    def test_the_thin_form_names_the_target_and_the_session(self):
+        import re
+
+        from seerdb.common.tns import encode_o7_proxy_oauth
+
+        pairs = [(b'AUTH_PROGRAM_NM', b'p'), (b'AUTH_ACL', b'8000')]
+        with patch.dict(os.environ, {'ORA_SDTZ': '+00:00'}):
+            proxy = encode_o7_proxy_oauth(7, b'SEERDB_PROXY_TARGET', pairs, 19, 53460)
+        # OAUTH, its sequence, and the mode 0x401 thin-coded among the head.
+        self.assertEqual(proxy[:3], bytes([0x03, 0x73, 7]))
+        self.assertIn(b'\x02\x04\x01', proxy[: proxy.index(b'SEERDB_PROXY_TARGET')])
+        self.assertNotIn(b'AUTH_PASSWORD', proxy)
+        self.assertEqual(
+            re.findall(rb'AUTH_[A-Z_]+', proxy),
+            [
+                b'AUTH_PROGRAM_NM',
+                b'AUTH_ACL',
+                b'AUTH_ALTER_SESSION',
+                b'AUTH_SESSION_ID',
+                b'AUTH_SERIAL_NUM',
+            ],
+        )
+        self.assertIn(b'19', proxy[proxy.index(b'AUTH_SESSION_ID') :][:24])
+        self.assertIn(b'53460', proxy[proxy.index(b'AUTH_SERIAL_NUM') :][:24])
