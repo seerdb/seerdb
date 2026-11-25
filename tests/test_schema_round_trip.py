@@ -183,10 +183,13 @@ class _Values:
                 for _ in range(count):
                     # A count inside an item (a RETURNING target's row count,
                     # #2466) is chosen ahead too; filled as a plain integer
-                    # it asked for billions of items.
+                    # it asked for billions of items. Only the item's own: a
+                    # length a nested `each`'s items carry is theirs to choose,
+                    # and an item without them would keep it, not read it back
+                    # (a CQN table without rows, #2773).
                     item: dict[str, Any] = {
                         ahead: self._pick([0, 1, 2])
-                        for ahead in _needed_ahead(field[3])
+                        for ahead in _needed_ahead(field[3]) & _carried(field[3])
                     }
                     item.update({flag: values[flag] for flag in given})
                     self.fill(field[3], item)
