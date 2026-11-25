@@ -291,17 +291,12 @@ class Subscription:
         # OAC token, then a record per notification.
         from seerdb.common.tns import (
             assemble_packet,
-            decode_aq_message_props,
             decode_error_reply,
             decode_notification,
         )
         from seerdb.common.tns_consts import TNS_DATA, TTI_OAC, TTI_OER
 
         FV = Emon.field_version
-
-        def skip(Rest: bytes) -> bytes:
-            return decode_aq_message_props(Rest, FV)[1]
-
         (Raw, Stream, Started) = (b'', b'', False)
         Sock = Emon._sock
         while True:
@@ -334,7 +329,7 @@ class Subscription:
                 (Stream, Started) = (Stream[1:], True)
             while Stream:
                 try:
-                    (Record, After) = decode_notification(Stream, self.namespace, skip)
+                    (Record, After) = decode_notification(Stream, self.namespace, FV)
                 except (Truncated, IndexError, ValueError, struct.error):
                     break  # the record is not whole yet
                 Stream = After

@@ -9829,6 +9829,40 @@ _SUBSCRIBE_THIN = wire_schema.compile_encoder(_SUBSCRIBE, _THIN)
 _NOTIFY_THIN = wire_schema.compile_encoder(_NOTIFY, _THIN)
 
 
+# A string as the subscription and AQ replies carry one (#128, #2460): a count,
+# then, when it is not zero, the bytes with their own length.
+def _aq_string(name: str) -> wire_schema.Schema:
+    return (('n4', f'{name}_length'), ('when', f'{name}_length', (('value', name),)))
+
+
+# The TTI_KPN reply's return parameters (#2460), as python-oracledb 26.1 reads
+# them (subscribe.pyx): the kpnrl out parameters and then as many short
+# registration ids; the kpngrl registrations, each its ub8 id and subscriber
+# name; the database instances and listener addresses the server could be
+# reached at, then the client id. A client-initiated subscription needs only
+# the id and the client id. The instances onward are 12.1's, and the client
+# subscribes from 12.1 only.
+_SUBSCRIBE_REPLY: wire_schema.Schema = (
+    ('n4', 'kpnrl_count'),
+    ('each', 'kpnrl', 'kpnrl_count', (('n4', 'out'),)),
+    ('each', 'short_ids', 'kpnrl_count', (('n4', 'short_id'),)),
+    ('n4', 'kpngrl_count'),
+    (
+        'each',
+        'registrations',
+        'kpngrl_count',
+        (('n8', 'registration_id'), *_aq_string('subscriber_name')),
+    ),
+    ('n4', 'instance_count'),
+    ('each', 'instances', 'instance_count', _aq_string('instance')),
+    ('n4', 'listener_count'),
+    ('each', 'listeners', 'listener_count', _aq_string('address')),
+    *_aq_string('client_id'),
+)
+_SUBSCRIBE_REPLY_THIN = wire_schema.compile_encoder(_SUBSCRIBE_REPLY, _THIN)
+_SUBSCRIBE_REPLY_FROM_THIN = wire_schema.compile_decoder(_SUBSCRIBE_REPLY, _THIN)
+
+
 def encode_subscribe(
     Seq: int,
     FieldVersion: int,
@@ -9903,26 +9937,25 @@ def encode_subscribe(
 
 
 def decode_subscribe_reply(Data: bytes) -> tuple[int, bytes, bytes]:
-    """The TTI_KPN reply's return parameters (#2460), ``Data`` from past the
-    TTI_RPA token: the registration id, the client id -- empty in the reply to
-    an unregister -- and what follows, the call's status. Between them, short
-    registration ids, the subscriber's name and the instances and listener
-    addresses the server could be reached at, which a client-initiated
-    subscription does not need."""
-    (Count, Rest) = decode_ub4(Data)
-    for _ in range(2 * Count):  # their out parameters, then short ids
-        (_, Rest) = decode_ub4(Rest)
-    (Count, Rest) = decode_ub4(Rest)
-    Registration = 0
-    for _ in range(Count):
-        (Registration, Rest) = decode_ub4(Rest)  # a ub8, the same width rule
-        (_, Rest) = _read_str_with_length(Rest)  # subscriber name
-    for _ in range(2):  # instances, then listener addresses
-        (Count, Rest) = decode_ub4(Rest)
-        for _ in range(Count):
-            (_, Rest) = _read_str_with_length(Rest)
-    (ClientId, Rest) = _read_str_with_length(Rest)
-    return (Registration, ClientId, Rest)
+    """The TTI_KPN reply's return parameters (#2460, _SUBSCRIBE_REPLY), ``Data``
+    from past the TTI_RPA token: the registration id, the client id -- empty
+    in the reply to an unregister -- and what follows, the call's status."""
+    (Values, Rest) = _SUBSCRIBE_REPLY_FROM_THIN(Data)
+    Strings = [
+        Values,
+        *Values['registrations'],
+        *Values['instances'],
+        *Values['listeners'],
+    ]
+    for Item in Strings:
+        _whole_strings(
+            Item,
+            ('client_id', 'subscriber_name', 'instance', 'address'),
+            'subscribe reply',
+        )
+    Registrations = Values['registrations']
+    Registration = Registrations[-1]['registration_id'] if Registrations else 0
+    return (Registration, Values.get('client_id', b''), Rest)
 
 
 def encode_notify(Seq: int, FieldVersion: int, ClientId: bytes) -> bytes:
@@ -9944,107 +9977,151 @@ def encode_notify(Seq: int, FieldVersion: int, ClientId: bytes) -> bytes:
 
 
 def decode_notification(
-    Data: bytes, Namespace: int, SkipProperties: Callable[[bytes], bytes]
+    Data: bytes, Namespace: int, FieldVersion: int
 ) -> tuple[dict | None, bytes]:
     """One notification record from the NOTIFY reply's stream (#2460), past
-    its leading TTI_OAC: a dict of its parts, or None for the STOP record that
-    ends the stream, and the bytes after it. An AQ record carries a message's
-    properties, passed over with ``SkipProperties``; a database-change one, a
-    payload decode_cqn_payload reads, None when the registration is gone.
-    Raises Truncated, IndexError or ValueError while the record is not whole."""
-    (Kind, Rest) = decode_ub4(Data)
-    if Kind == TNS_SUBSCR_STOP_NOTIF:
+    its leading TTI_OAC (_NOTIFICATION): a dict of its parts, or None for the
+    STOP record that ends the stream, and the bytes after it. An AQ record
+    carries a message's properties, which the session's field version shapes;
+    a database-change one, a payload decode_cqn_payload reads, None when the
+    registration is gone. Raises Truncated, IndexError or ValueError while the
+    record is not whole."""
+    Given = {
+        'is_change': Namespace != SUBSCR_NAMESPACE_AQ,
+        'has_shard': FieldVersion >= FIELD_VERSION_21_1,
+    }
+    Token = _DECODE_FIELD_VERSION.set(FieldVersion)
+    try:
+        (Record, Rest) = _NOTIFICATION_FROM_THIN(Data, Given)
+    finally:
+        _DECODE_FIELD_VERSION.reset(Token)
+    if not Record['is_record']:
         return (None, Rest)
-    (_Error, Rest) = decode_ub4(Rest)
-    (Registration, Rest) = decode_ub4(Rest)
-    (Queue, Rest) = _read_str_with_length(Rest)
-    (Consumer, Rest) = _read_str_with_length(Rest)
-    (MessageId, Rest) = _read_str_with_length(Rest)
-    (Properties, Rest) = decode_ub4(Rest)
-    if Properties > 0:
-        Rest = SkipProperties(Rest[1:])  # past the length byte, never valid
-    (_Jms, Rest) = _read_str_with_length(Rest)
-    Payload: bytes | None = None
-    if Namespace != SUBSCR_NAMESPACE_AQ:
-        for _ in range(3):  # payload type, flags, chunk number
-            (_, Rest) = decode_ub4(Rest)
-        (Payload, Rest) = _read_str_with_length(Rest)
-        (_Object, Rest) = _read_str_with_length(Rest)
+    _whole_strings(Record, _NOTIFICATION_STRINGS, 'notification')
     return (
         {
-            'registration_id': Registration,
-            'queue_name': Queue.decode('utf-8') if Queue else None,
-            'consumer_name': Consumer.decode('utf-8') if Consumer else None,
-            'msgid': MessageId or None,
-            'payload': Payload or None,
+            'registration_id': Record['registration_id'],
+            'queue_name': _utf8_or_none(Record.get('queue_name')),
+            'consumer_name': _utf8_or_none(Record.get('consumer_name')),
+            'msgid': Record.get('msgid') or None,
+            'payload': Record.get('payload') or None,
         },
         Rest,
     )
 
 
-def _cqn_tables(Data: bytes, At: int) -> tuple[list, int]:
-    # The tables of a database-change payload: a big-endian count, then each
-    # table's operation, name and object number, then its rows unless the
-    # operation says all rows changed (0x01, OPCODE_ALLROWS).
-    (Count,) = struct.unpack_from('>H', Data, At)
-    At += 2
-    Tables = []
-    for _ in range(Count):
-        (Operation, Length) = struct.unpack_from('>IH', Data, At)
-        At += 6
-        Name = Data[At : At + Length].decode('utf-8')
-        At += Length + 4  # the object number after it
-        Rows: list = []
-        if not Operation & 0x01:
-            (Rows, At) = _cqn_rows(Data, At)
-        Tables.append({'operation': Operation, 'name': Name, 'rows': Rows})
-    return (Tables, At)
+def _utf8_or_none(Value: bytes | None) -> str | None:
+    return Value.decode('utf-8') if Value else None
 
 
-def _cqn_rows(Data: bytes, At: int) -> tuple[list, int]:
-    (Count,) = struct.unpack_from('>H', Data, At)
-    At += 2
-    Rows = []
-    for _ in range(Count):
-        (Operation, Length) = struct.unpack_from('>IH', Data, At)
-        At += 6
-        Rows.append(
-            {'operation': Operation, 'rowid': Data[At : At + Length].decode('ascii')}
-        )
-        At += Length
-    return (Rows, At)
+def _whole_strings(Values: dict, Names: tuple, What: str) -> None:
+    # Thin's value reader returns what there is of a string cut short; a string
+    # shorter than its count means the message is not whole yet.
+    for Name in Names:
+        if len(Values.get(Name, b'')) < Values.get(f'{Name}_length', 0):
+            raise Truncated(f'{What}: {Name} is shorter than its count')
+
+
+# A database-change notification's payload (#2460), big-endian throughout, as
+# python-oracledb 26.1 reads it: a version, the registration id, the event
+# type, the database name, the transaction id and SCN (14 bytes, kept whole),
+# then for an object change (6) its tables, and for a query change (7) its
+# queries, each with its id's two words, its operation and its tables. A table
+# is its operation, name and object number, then its rows unless the operation
+# says all rows changed (OPCODE_ALLROWS, 0x01); a row, its operation and rowid.
+_CQN_EVENT_OBJCHANGE = 6
+_CQN_EVENT_QUERYCHANGE = 7
+_CQN_OPCODE_ALLROWS = 0x01
+_CQN_ROW: wire_schema.Schema = (
+    ('be4', 'operation'),
+    ('be2', 'rowid_length'),
+    ('bytes', 'rowid', 'rowid_length'),
+)
+_CQN_TABLES: wire_schema.Schema = (
+    ('be2', 'table_count'),
+    (
+        'each',
+        'tables',
+        'table_count',
+        (
+            ('be4', 'operation'),
+            ('be2', 'name_length'),
+            ('bytes', 'name', 'name_length'),
+            ('be4', 'object_number'),
+            ('derive', 'has_rows', lambda v: not v['operation'] & _CQN_OPCODE_ALLROWS),
+            (
+                'when',
+                'has_rows',
+                (('be2', 'row_count'), ('each', 'rows', 'row_count', _CQN_ROW)),
+            ),
+        ),
+    ),
+)
+_CQN_PAYLOAD: wire_schema.Schema = (
+    ('be2', 'version'),
+    ('be4', 'registration_id'),
+    ('be4', 'event_type'),
+    ('be2', 'dbname_length'),
+    ('bytes', 'dbname', 'dbname_length'),
+    ('bytes', 'transaction_id_and_scn', 14),
+    ('derive', 'is_object_change', lambda v: v['event_type'] == _CQN_EVENT_OBJCHANGE),
+    ('derive', 'is_query_change', lambda v: v['event_type'] == _CQN_EVENT_QUERYCHANGE),
+    ('when', 'is_object_change', _CQN_TABLES),
+    (
+        'when',
+        'is_query_change',
+        (
+            ('be2', 'query_count'),
+            (
+                'each',
+                'queries',
+                'query_count',
+                (
+                    ('be4', 'query_id_lsb'),
+                    ('be4', 'query_id_msb'),
+                    ('be4', 'operation'),
+                    *_CQN_TABLES,
+                ),
+            ),
+        ),
+    ),
+)
+_CQN_PAYLOAD_THIN = wire_schema.compile_encoder(_CQN_PAYLOAD, _THIN)
+_CQN_PAYLOAD_FROM_THIN = wire_schema.compile_decoder(_CQN_PAYLOAD, _THIN)
+
+
+def _cqn_tables(Tables: list) -> list:
+    return [
+        {
+            'operation': T['operation'],
+            'name': T['name'].decode('utf-8'),
+            'rows': [
+                {'operation': R['operation'], 'rowid': R['rowid'].decode('ascii')}
+                for R in T.get('rows', [])
+            ],
+        }
+        for T in Tables
+    ]
 
 
 def decode_cqn_payload(Payload: bytes) -> dict:
-    """A database-change notification's payload (#2460), big-endian: a version,
-    the registration id, the event type, the database name, the transaction id
-    and SCN (14 bytes, passed over), then for an object change (6) its tables
-    and for a query change (7) its queries, each with the query id and its
-    tables."""
-    (_Version, Registration, Event, Length) = struct.unpack_from('>HIIH', Payload, 0)
-    At = 12
-    Name = Payload[At : At + Length].decode('utf-8')
-    At += Length + 14
-    Tables: list = []
-    Queries = []
-    if Event == 6:
-        (Tables, At) = _cqn_tables(Payload, At)
-    elif Event == 7:
-        (Count,) = struct.unpack_from('>H', Payload, At)
-        At += 2
-        for _ in range(Count):
-            (Low, High, Operation) = struct.unpack_from('>III', Payload, At)
-            At += 12
-            (QueryTables, At) = _cqn_tables(Payload, At)
-            Queries.append(
-                {'id': High << 32 | Low, 'operation': Operation, 'tables': QueryTables}
-            )
+    """A database-change notification's payload (#2460, _CQN_PAYLOAD): its
+    registration id, event type, database name, and for an object change its
+    tables, for a query change its queries, each with its id and tables."""
+    (Values, _Rest) = _CQN_PAYLOAD_FROM_THIN(Payload)
     return {
-        'registration_id': Registration,
-        'type': Event,
-        'dbname': Name,
-        'tables': Tables,
-        'queries': Queries,
+        'registration_id': Values['registration_id'],
+        'type': Values['event_type'],
+        'dbname': Values['dbname'].decode('utf-8'),
+        'tables': _cqn_tables(Values.get('tables', [])),
+        'queries': [
+            {
+                'id': Q['query_id_msb'] << 32 | Q['query_id_lsb'],
+                'operation': Q['operation'],
+                'tables': _cqn_tables(Q['tables']),
+            }
+            for Q in Values.get('queries', [])
+        ],
     }
 
 
@@ -23824,12 +23901,6 @@ def _aq_write_payload(Queue, Props) -> bytes:
     return bytes(Payload)
 
 
-# An AQ string as the replies carry one (#128): a count, then, when it is not
-# zero, the bytes with their own length.
-def _aq_string(name: str) -> wire_schema.Schema:
-    return (('n4', f'{name}_length'), ('when', f'{name}_length', (('value', name),)))
-
-
 # A message's properties, as a dequeue, an array operation and a notification
 # return them (#128), python-oracledb's AqBaseMessage order. The enqueue time
 # is there when its flag is set. The extensions are each a text, a binary
@@ -23868,6 +23939,59 @@ _AQ_MSG_PROPS: wire_schema.Schema = (
 )
 _AQ_MSG_PROPS_THIN = wire_schema.compile_encoder(_AQ_MSG_PROPS, _THIN)
 _AQ_MSG_PROPS_FROM_THIN = wire_schema.compile_decoder(_AQ_MSG_PROPS, _THIN)
+
+# One record of a subscription's NOTIFY stream (#2460), past the stream's
+# leading TTI_OAC, as python-oracledb 26.1 reads it (notification.pyx): the
+# message type, and unless that is a STOP, which ends the stream, the error
+# code, the registration id, the queue's and consumer's names, the message id,
+# and the message's properties (_AQ_MSG_PROPS) behind a length byte that is
+# never valid, when there are any. Then the JMS properties, and for a
+# database-change subscription (is_change) the payload's type, flags and chunk
+# number, the payload decode_cqn_payload reads, and an object payload.
+_NOTIFICATION: wire_schema.Schema = (
+    ('n4', 'message_type'),
+    ('derive', 'is_record', lambda v: v['message_type'] != TNS_SUBSCR_STOP_NOTIF),
+    (
+        'when',
+        'is_record',
+        (
+            ('n4', 'error_code'),
+            ('n4', 'registration_id'),
+            *_aq_string('queue_name'),
+            *_aq_string('consumer_name'),
+            *_aq_string('msgid'),
+            ('n4', 'num_props'),
+            ('when', 'num_props', (('u8', 'props_length'), *_AQ_MSG_PROPS)),
+            *_aq_string('jms'),
+            (
+                'when',
+                'is_change',
+                (
+                    ('n4', 'payload_type'),
+                    ('n4', 'payload_flags'),
+                    ('n4', 'chunk_number'),
+                    *_aq_string('payload'),
+                    *_aq_string('object_payload'),
+                ),
+            ),
+        ),
+    ),
+)
+_NOTIFICATION_THIN = wire_schema.compile_encoder(_NOTIFICATION, _THIN)
+_NOTIFICATION_FROM_THIN = wire_schema.compile_decoder(_NOTIFICATION, _THIN)
+# The strings of a notification and of its properties, which thin's value
+# reader returns short rather than raise on when the record is not whole.
+_NOTIFICATION_STRINGS = (
+    'queue_name',
+    'consumer_name',
+    'msgid',
+    'jms',
+    'payload',
+    'object_payload',
+    'correlation',
+    'exceptionq',
+    'enq_txn_id',
+)
 
 # A RAW or JSON queue's payload: the type's, the object's and the snapshot's
 # ids (empty for these), a version, the image's length and flags, then the

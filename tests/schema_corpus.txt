@@ -8,7 +8,7 @@
 # came from. Regenerate after a schema or a capture changes. A message
 # the Mirror builds as the test runs carries its time (an OCI describe
 # head's), so that line changes on each regeneration.
-# 3140 messages; left out:
+# 3146 messages; left out:
 #   213 random or cut-short bytes, not messages
 _ACCEPT_FLAGS2	_THIN	6	{}	0000000000	tests/test_server_session.py::test_live_seerdb_login_at_a_higher_field_version[7]
 _ACCEPT_FLAGS2	_THIN	6	{}	0002000000	tests/test_server_session.py::test_live_seerdb_login_at_a_higher_field_version[16]
@@ -933,6 +933,7 @@ _CONNECT_HEAD	_THIN	6	{}	013f012c0401200020004f98000000010099004a	tests/test_ser
 _CONNECT_HEAD	_THIN	6	{}	013f012c0401200020004f9800000001009e004a	tests/test_server_tls.py::test_a_wallet_client_runs_sql_over_the_mirrors_own_tls
 _CONNECT_HEAD	_THIN	6	{}	0140012c0c412000ffff7f080000010000c3004a	tests/test_server_session.py::test_sqlplus_is_served_without_end_of_response
 _CONNECT_REST	_THIN	6	{}	00000000010100000000000000000000000000000000000000000000000000002000000020000000000000000001	tests/test_handshake_codec.py::test_the_mirror_reads_the_connect_the_client_writes
+_CQN_PAYLOAD	_THIN	6	{}	00010000000000000007000846524545504442310a000300ce3b00000000000000000001000000010000000000000007000100000002000e50594f2e534545525f43514e5f5400048e390001000000020012414142493435414141414141556973414141	tests/test_subscr.py::TestTheStream::test_a_query_change
 _DATA_FLAGS	_THIN	6	{}	0000	tests/test_connect_addresses.py::test_an_ipv6_host_connects[host]
 _DATA_FLAGS	_THIN	6	{}	0020	tests/test_packet_codec.py::test_data_flags_follow_the_header
 _DATA_FLAGS	_THIN	6	{}	0040	tests/test_session_shutdown.py::SessionShutdownTest::test_a_dialect_call_raises_and_disconnects
@@ -1273,6 +1274,9 @@ _MARKER	_THIN	6	{}	010003	tests/test_server_session.py::test_a_sqlplus_cancel_ge
 _NATIVE_BIND	_THIN	17	{}	0128280026000461080000000100000000000000150000000000000000000000000000000000000000000015db0000120400000004000000000000000001fe03fc	tests/test_server_query.py::test_parse_exec_decodes_a_native_vector_bind_type_preserving
 _NATIVE_BIND	_THIN	17	{}	01282800260004610800000001000000000000004b000000000000000000000000000000000000000000004bff4a5a01210603000c002900001831ab00000004000603617272016e0568656c6c6f8403030201000b0011001505776f726c643402c12bc403001d002100253402c1023402c1033402c104	tests/test_server_query.py::test_parse_exec_decodes_a_native_json_bind_as_a_json_value
 _NATIVE_BIND	_THIN	24	{}	01282800260004610800000001000000000000001d000000000000000000000000000000000000000000001dff4a5a012102010002000b0000e500000162a40101000000073402c103	tests/test_server_query.py::test_a_json_bind_is_not_sorted_to_the_end_of_the_row
+_NOTIFICATION	_THIN	24	{"has_shard":true,"is_change":false}	0101000201310112122250594f222e22534545525f4e54465f5122000110100000000000000000000000000466000001016c010400000000000103010107787e0b0d17073c0000000000000000	tests/test_subscr.py::TestTheStream::test_an_aq_message
+_NOTIFICATION	_THIN	24	{"has_shard":true,"is_change":true}	01030002012e00000000000101000001646400010000000000000007000846524545504442310a000300ce3b00000000000000000001000000010000000000000007000100000002000e50594f2e534545525f43514e5f5400048e39000100000002001241414249343541414141414155697341414100	tests/test_subscr.py::TestTheStream::test_a_query_change
+_NOTIFICATION	_THIN	24	{"has_shard":true,"is_change":true}	0104	tests/test_subscr.py::TestTheStream::test_a_stop_record_ends_it
 _O7_CELL	_THIN	6	{}	008101	tests/test_tns_decode.py::TestFv2ExecResponse::test_nulls_do_not_desync_rows
 _O7_CELL	_THIN	6	{}	014200	tests/test_tns_decode.py::TestFv2OutBinds::test_decode_mixed_two_outs
 _O7_CELL	_THIN	6	{}	018000	tests/test_tns_decode.py::TestFv2UnassignedOutBind::test_unassigned_out_does_not_desync_the_next_bind
@@ -3101,6 +3105,8 @@ _STA	_OCI	6	{"has_sequence":1}	09010000001b00	tests/test_native11_calls.py::Nati
 _STA	_THIN	4	{"has_sequence":false}	090105	tests/test_thin92.py::test_a_commit_s_status_has_no_sequence
 _STA	_THIN	6	{"has_sequence":true}	09010100	tests/test_connect_addresses.py::test_an_ipv6_host_connects[host]
 _STA	_THIN	17	{"has_sequence":true}	09000101	tests/test_connection_state.py::test_a_bare_status_records_its_call_status
+_SUBSCRIBE_REPLY	_THIN	6	{}	0101000001010201310000010101363628414444524553533d2850524f544f434f4c3d5443502928484f53543d3237303432646664383835612928504f52543d313532312929010a0a4f43493a45503a333034	tests/test_subscr.py::TestTheCalls::test_the_reply_gives_the_registration_and_the_client_id
+_SUBSCRIBE_REPLY	_THIN	6	{}	01010002012e010102012e0000010101363628414444524553533d2850524f544f434f4c3d5443502928484f53543d3237303432646664383835612928504f52543d313532312929010a0a4f43493a45503a333031	tests/test_subscr.py::TestTheCalls::test_the_reply_gives_the_registration_and_the_client_id
 _SYNC	_THIN	6	{}	170501011001011600010202830101c900	tests/test_sessionless.py::TestSyncPiggybackDecode::test_consumes_and_continues
 _SYNC	_THIN	6	{}	17050101100101160103036c6f770001cc00	tests/test_transaction_priority.py::test_a_reported_priority_is_recorded
 _SYNC	_THIN	6	{}	1705010110010116010404484947480001cc00	tests/test_server_session.py::test_the_login_reply_reports_the_priority

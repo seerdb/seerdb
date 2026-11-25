@@ -5,13 +5,14 @@
 to 23ai FREEPDB1, captured: a database-change subscription with a registered query
 (QOS query and ROWIDs), and an AQ one on a sharded RAW queue. Field version 24."""
 
+import struct
 import unittest
 from types import SimpleNamespace
 
 from seerdb.client import subscr
 from seerdb.client.subscr import Subscription
 from seerdb.common import tns
-from seerdb.common.exceptions import NotSupportedError
+from seerdb.common.exceptions import NotSupportedError, Truncated
 from seerdb.common.tns_consts import FIELD_VERSION_MAX
 
 _FV = FIELD_VERSION_MAX
@@ -164,6 +165,82 @@ class TestTheStream(unittest.TestCase):
         packet = (10 + 3).to_bytes(4, 'big') + bytes([6, 0, 0, 0]) + body
         sub._read(_emon(packet + b'never read'))  # type: ignore[arg-type]
         self.assertEqual(got, [])
+
+
+def _cqn_tables(tables: list) -> bytes:
+    # A CQN payload's tables, built by hand: big-endian counts, each table's
+    # operation, name and object number, then its rows unless ALLROWS (0x01).
+    out = struct.pack('>H', len(tables))
+    for operation, name, rows in tables:
+        out += struct.pack('>IH', operation, len(name)) + name + struct.pack('>I', 9)
+        if not operation & 1:
+            out += struct.pack('>H', len(rows))
+            for rowid in rows:
+                out += struct.pack('>IH', 2, len(rowid)) + rowid
+    return out
+
+
+def _cqn(event: int, body: bytes) -> bytes:
+    return struct.pack('>HIIH', 1, 302, event, 4) + b'FREE' + bytes(14) + body
+
+
+_TABLES = [(2, b'PYO.T', [b'AAAB' * 4, b'AAAC' * 4]), (1, b'PYO.U', [])]
+
+
+class TestTheChangePayload(unittest.TestCase):
+    # decode_cqn_payload through _CQN_PAYLOAD (#2773).
+    def test_an_object_change_gives_its_tables_and_rows(self):
+        found = tns.decode_cqn_payload(_cqn(6, _cqn_tables(_TABLES)))
+        self.assertEqual((found['type'], found['dbname']), (6, 'FREE'))
+        self.assertEqual(
+            found['tables'],
+            [
+                {
+                    'operation': 2,
+                    'name': 'PYO.T',
+                    'rows': [
+                        {'operation': 2, 'rowid': 'AAABAAABAAABAAAB'},
+                        {'operation': 2, 'rowid': 'AAACAAACAAACAAAC'},
+                    ],
+                },
+                {'operation': 1, 'name': 'PYO.U', 'rows': []},
+            ],
+        )
+
+    def test_a_query_change_gives_each_query_its_id_and_tables(self):
+        body = (
+            struct.pack('>H', 1) + struct.pack('>III', 5, 1, 4) + _cqn_tables(_TABLES)
+        )
+        found = tns.decode_cqn_payload(_cqn(7, body))
+        (query,) = found['queries']
+        self.assertEqual((query['id'], query['operation']), (1 << 32 | 5, 4))
+        self.assertEqual([t['name'] for t in query['tables']], ['PYO.T', 'PYO.U'])
+
+    def test_one_cut_short_raises_rather_than_give_a_part(self):
+        # The structs read before took a cut name or rowid for a short one.
+        payload = _cqn(6, _cqn_tables(_TABLES))
+        for cut in range(len(payload)):
+            with self.subTest(cut=cut), self.assertRaises(IndexError):
+                tns.decode_cqn_payload(payload[:cut])
+
+
+class TestACutRecord(unittest.TestCase):
+    def test_reads_on_wherever_it_is_cut(self):
+        # A record not whole yet raises what the stream loop reads on from.
+        for case, namespace in ((_CQN, 2), (_AQ, 1)):
+            # The stream's packet bodies joined, past the OAC token, as the
+            # subscription's loop reads them: the first record, whole.
+            (raw, stream) = (_bytes(case, 'stream'), b'')
+            while raw:
+                (_whole, _type, body, raw) = tns.assemble_packet(raw, 8192, True)
+                stream += body
+            (found, rest) = tns.decode_notification(stream[1:], namespace, _FV)
+            self.assertIsNotNone(found)
+            record = stream[1 : len(stream) - len(rest)]
+            for cut in range(len(record)):
+                with self.subTest(namespace=namespace, cut=cut):
+                    with self.assertRaises((Truncated, IndexError, ValueError)):
+                        tns.decode_notification(record[:cut], namespace, _FV)
 
 
 class TestTheArguments(unittest.TestCase):
