@@ -1150,15 +1150,21 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 else:
                                     await self._send_o3logon_phase2(Packet)
                                 continue
-                            if self._o3_oall8 and self._o3_phase == 2:
+                            if getattr(self, '_o3_phase', 0) and self._o3_wants_proxy():
+                                # A proxy login (#126): the target's session
+                                # begins on the one just logged in.
+                                await self.send(TNS_DATA, self._o3_proxy_oauth(Packet))
+                                continue
+                            if self._o3_oall8 and self._o3_phase in (2, 3):
                                 # Native OALL8 O3LOGON completion (#790): the
                                 # AUTH_ success pairs, as 8i's; its
                                 # AUTH_VERSION_NO in the 8i reply form (#798).
                                 self.conn_state = CONN_STATE_AUTHENTICATED
                                 self.server_version = decode_8i_server_version(Packet)
                                 return 0
-                            if getattr(self, '_o3_phase', 0) == 2:
-                                # 9i's OAUTH answered with its pairs (#2342).
+                            if getattr(self, '_o3_phase', 0) in (2, 3):
+                                # 9i's OAUTH answered with its pairs (#2342);
+                                # phase 3 is a proxy's target.
                                 assert isinstance(self._dialect, Fv2Dialect)
                                 self.conn_state = CONN_STATE_AUTHENTICATED
                                 self.server_version = cast(
@@ -1194,10 +1200,17 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 raise from_ora_code(ErrCode)(
                                     Message or f'ORA-{ErrCode:05d}', code=ErrCode
                                 )
-                            if getattr(self, '_o3_phase', 0) == 2 and isinstance(
+                            if getattr(self, '_o3_phase', 0) in (2, 3) and isinstance(
                                 self._dialect, Fv2Dialect
                             ):
                                 # 9i's answer; 8i's is an RPA (#2340).
+                                if self._o3_wants_proxy():
+                                    # No pairs, so no session to begin the
+                                    # target's on.
+                                    raise InterfaceError(
+                                        'the 9i login reply carried no session '
+                                        'for a proxy login'
+                                    )
                                 self.conn_state = CONN_STATE_AUTHENTICATED
                                 self.server_version = cast(
                                     int,
@@ -1939,8 +1952,10 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def _send_8i_osesskey(self) -> None:
         # Async port of OracleConnect._send_8i_osesskey: O3LOGON phase one, the
         # OSESSKEY (0x76) call carrying the username + informational pairs.
+        from seerdb.client.connection import _refuse_8i_proxy
         from seerdb.common.tns import encode_o3logon_osesskey_phase1
 
+        _refuse_8i_proxy(self.proxy_user)
         await self.send(
             TNS_DATA,
             encode_o3logon_osesskey_phase1(

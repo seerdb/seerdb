@@ -405,6 +405,42 @@ class _ConnectionLogic:
             self._auth_info_pairs() + [(b'AUTH_ACL', b'8000')],
         )
 
+    def _o3_wants_proxy(self) -> bool:
+        # A `user[target]` login on 9i whose own login just succeeded (#126):
+        # the target's session is still to begin (_o3_proxy_oauth).
+        return bool(self.proxy_user) and self._o3_phase == 2
+
+    def _o3_proxy_oauth(self, Packet: bytes) -> bytes:
+        # The second OAUTH of a 9i proxy login (encode_o7_proxy_oauth), on the
+        # session the proxy user's login reply (`Packet`) names. Phase 3 is the
+        # target's login; its reply completes the connect as phase 2's would.
+        from seerdb.common.tns import (
+            encode_o7_proxy_oauth,
+            encode_oall8_proxy_oauth,
+            parse_9i_auth_session,
+        )
+
+        assert self.proxy_user
+        Oall8 = bool(getattr(self, '_o3_oall8', False))
+        (SessionId, SerialNum) = parse_9i_auth_session(Packet, O8i=Oall8)
+        Target = self.proxy_user.encode('utf-8')
+        self._o3_phase = 3
+        if Oall8:
+            return encode_oall8_proxy_oauth(
+                self._next_seq(),
+                Target,
+                self._auth_info_pairs() + [(b'AUTH_ACL', b'8000')],
+                SessionId,
+                SerialNum,
+            )
+        return encode_o7_proxy_oauth(
+            self._next_seq(),
+            Target,
+            self._o7_session_pairs() + [(b'AUTH_ACL', b'8000')],
+            SessionId,
+            SerialNum,
+        )
+
     # --- The 11g native login, for a pooled 11g session (#2466) -----------
     # 11g's DRCP serves a pooled session only to a client speaking the native
     # form (seerdb.common.tns, "The 11g native login"). The converted form logs
