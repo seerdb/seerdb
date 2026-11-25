@@ -6842,6 +6842,46 @@ class TestFv2RefCursor(unittest.TestCase):
         self.assertEqual(_o7_bind_oac(rc).hex(), '66010000010100000000011f01')
         self.assertEqual(encode_tokens_rxd([_block_input(rc)], b'').hex(), '070100')
 
+    def test_a_date_var_sends_a_date_under_its_date_descriptor(self):
+        # #2811: a microsecond datetime in a DATE Var went as an 11-byte
+        # TIMESTAMP under the 7-byte DATE descriptor, and 9.2 refused the IN OUT
+        # block with ORA-01483. ojdbc14's oracle.sql.DATE, which 9.2 takes,
+        # sends the descriptor and the value below, captured on 9.2.0.4.
+        import datetime
+
+        import seerdb
+        from seerdb.client.dialect import _block_input
+        from seerdb.common.datatypes import Var
+        from seerdb.common.tns import _o7_bind_oac, encode_tokens_rxd
+
+        var = Var(seerdb.DB_TYPE_DATE)
+        var.setvalue(0, datetime.datetime(2024, 3, 15, 12, 30, 45, 500000))
+        self.assertEqual(_o7_bind_oac(var).hex(), '0c010000010700000000011f01')
+        self.assertEqual(
+            encode_tokens_rxd([_block_input(var)], b'').hex(), '0707787c030f0d1f2e'
+        )
+
+    def test_a_bc_date_is_described_as_a_date(self):
+        # #2811: an undeclared date before year 1 was described as a VARCHAR, so
+        # 9.2 read its DATE bytes as text and raised ORA-01722 on TO_CHAR. Its
+        # descriptor is now an undeclared datetime's, a DATE of 7 bytes, and a
+        # fraction makes it a TIMESTAMP, as on the thin and OALL8 forms.
+        import datetime
+
+        from seerdb.common.datatypes import BcDate
+        from seerdb.common.tns import _o7_bind_oac, encode_token_rxd
+
+        bc = BcDate(-44, 3, 15, 12, 30, 45)
+        self.assertEqual(
+            _o7_bind_oac(bc), _o7_bind_oac(datetime.datetime(2024, 3, 15, 12, 30, 45))
+        )
+        self.assertEqual(_o7_bind_oac(bc).hex(), '0c010000010700000000011f00')
+        self.assertEqual(encode_token_rxd(bc).hex(), '076438030f0d1f2e')
+        self.assertEqual(
+            _o7_bind_oac(BcDate(-44, 3, 15, 12, 30, 45, 500000))[:6].hex(),
+            'b4010000010b',
+        )
+
     def test_the_block_reads_the_ref_cursor_by_its_id(self):
         import seerdb
         from seerdb.client.dialect import RECV, Fv2Dialect, Send

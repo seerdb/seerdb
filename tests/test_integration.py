@@ -345,9 +345,6 @@ class _Target(NamedTuple):
     # The session's own field version, where it differs from the server's: a
     # thin OALL8 session to 9.2 runs at 10.2 (#2768). 0 when it is the same.
     session_fv: int = 0
-    # Whether the temporal bind grid runs: everywhere but 8i, whose SQL it
-    # outruns, and 9i's compact form, which fails two of its bind shapes (#2811).
-    temporal_grid: bool = True
 
 
 def _sql_fv(conn) -> int:
@@ -454,7 +451,6 @@ def _target_of(conn) -> _Target:
         or _dialect_binds_refs(conn),
         temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
         conn.field_version,
-        not (_conn_is_8i(conn) or _conn_is_compact_9i(conn)),
     )
 
 
@@ -515,7 +511,6 @@ class _Need(NamedTuple):
     # Whether the field versions name what the session's form does (a parse, a
     # native RETURNING) rather than what SQL its server runs (#2768).
     protocol: bool = False
-    temporal_grid: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = (
@@ -544,8 +539,6 @@ class _Need(NamedTuple):
         if self.ref_binds and not target.ref_binds:
             return True
         if self.lob_out and not target.lob_out:
-            return True
-        if self.temporal_grid and not target.temporal_grid:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -795,8 +788,8 @@ _8I_LOB_CALLS = _Need(
     '8i has no LOB object calls, fileexists() included (#2804)', not_8i=True
 )
 _TEMPORAL_GRID = _Need(
-    'the temporal grid needs 10g+, or 9i over OALL8 or thin OALL8 (#2811)',
-    temporal_grid=True,
+    "the temporal grid outruns 8.1.7's SQL (ORA-00905, the USERENV parameter)",
+    not_8i=True,
 )
 _MEDIAN_FUNCTION = _Need('MEDIAN is a 10g function', min_fv=FIELD_VERSION_10_2)
 _MEDIAN_ANALYTIC = _postgres_cannot(

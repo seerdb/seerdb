@@ -15791,6 +15791,14 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
             Type, MaxSize, Csfrm = TNS_TYPE_DATE, 7, 0
     elif isinstance(Value, datetime.date):
         Type, MaxSize, Csfrm = TNS_TYPE_DATE, 7, 0
+    elif isinstance(Value, BcDate):
+        # A date before year 1, as the thin and OALL8 forms type one: a DATE, or
+        # a TIMESTAMP with its fraction. Left a VARCHAR, its DATE bytes reached
+        # 9.2 as text, and TO_CHAR of it raised ORA-01722 (#2811).
+        if _is_wide_datetime(Value):
+            Type, MaxSize, Csfrm = TNS_TYPE_TIMESTAMP, 11, 0
+        else:
+            Type, MaxSize, Csfrm = TNS_TYPE_DATE, 7, 0
     elif isinstance(Value, datetime.timedelta):
         # INTERVAL DAY TO SECOND (#173): encode_token_rxd emits the 11-byte
         # interval; declare the matching type so the server does not read it as
