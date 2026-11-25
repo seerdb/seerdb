@@ -6868,6 +6868,62 @@ class TestScrollableExecEncoding(unittest.TestCase):
         self.assertNotIn('028082', self._exec().hex())
 
 
+class Scroll92(unittest.TestCase):
+    """A scroll on a 9.2 server (#2809), as OCI 9.2's OCIStmtFetch2 asks for
+    one, captured on 9.2.0.4: every orientation as CURRENT and the row the
+    client worked out, the last row as LAST and -1. 9.2 answered an ABSOLUTE
+    from the first row."""
+
+    def test_every_orientation_but_last_is_current_at_its_row(self):
+        from seerdb.common.tns import oci92_scroll
+        from seerdb.common.tns_consts import (
+            TNS_FETCH_ORIENTATION_ABSOLUTE,
+            TNS_FETCH_ORIENTATION_CURRENT,
+            TNS_FETCH_ORIENTATION_FIRST,
+            TNS_FETCH_ORIENTATION_LAST,
+            TNS_FETCH_ORIENTATION_RELATIVE,
+        )
+
+        for orientation in (
+            TNS_FETCH_ORIENTATION_ABSOLUTE,
+            TNS_FETCH_ORIENTATION_RELATIVE,
+            TNS_FETCH_ORIENTATION_FIRST,
+            TNS_FETCH_ORIENTATION_CURRENT,
+        ):
+            self.assertEqual(
+                oci92_scroll(orientation, 7), (TNS_FETCH_ORIENTATION_CURRENT, 7)
+            )
+        self.assertEqual(
+            oci92_scroll(TNS_FETCH_ORIENTATION_LAST, 0),
+            (TNS_FETCH_ORIENTATION_LAST, 0xFFFFFFFF),
+        )
+
+    def test_the_last_row_number_is_read_from_the_return_parameters(self):
+        # 9.2's reply to LAST for one row over thin OALL8: the row (10), its
+        # return parameters, whose [4] is the row's number, and the status. The
+        # status's row count is the rows fetched on the cursor so far, not the
+        # position, so it cannot place the window.
+        from seerdb.common.tns import (
+            _DECODE_FIELD_VERSION,
+            _DECODE_RPA_PARAMS,
+            decode_token_rpa_piggyback,
+        )
+
+        # The reply from its RPA on: the return parameters, then the status.
+        reply = bytes.fromhex(
+            '0801050000010100010a0000'
+            '0401010103000000010100030000000000000000000000000800010100000000'
+        )
+        params: list[int] = []
+        tokens = (_DECODE_RPA_PARAMS.set(params), _DECODE_FIELD_VERSION.set(4))
+        try:
+            decode_token_rpa_piggyback(reply, (None, None, []))
+        finally:
+            _DECODE_FIELD_VERSION.reset(tokens[1])
+            _DECODE_RPA_PARAMS.reset(tokens[0])
+        self.assertEqual(params, [0, 0, 1, 0, 10])
+
+
 class TestO8iOsesskeyMessages(unittest.TestCase):
     # Pinned against a live 9.2-client -> 8.1.7 handshake
     # (~/o8i/captures/cli8i_9.2_to_8i.trc, #244). 8i wraps the same DES O3LOGON

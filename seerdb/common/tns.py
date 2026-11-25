@@ -773,6 +773,13 @@ _DECODE_CALL_STATUS: contextvars.ContextVar[list[int] | None] = contextvars.Cont
     'decode_call_status', default=None
 )
 
+# A reply's return parameters (the al8o4 words of its RPA), recorded into the
+# caller's list when one is set: 9.2's scroll to the last row reports that row's
+# number in [4], where 10.2 and later report the position in the status (#2809).
+_DECODE_RPA_PARAMS: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    'decode_rpa_params', default=None
+)
+
 
 @contextlib.contextmanager
 def recording_session_keywords(
@@ -8107,13 +8114,18 @@ def decode_token_rpa_piggyback(Data: bytes, Acc: tuple) -> tuple:
     # with the OER token — so there we must consume exactly Num and not break on a
     # token-valued param byte, or the OER decodes off by those bytes (#181).
     BreakOnToken = _DECODE_FIELD_VERSION.get() < FIELD_VERSION_10_2
+    Params = _DECODE_RPA_PARAMS.get()
+    if Params is not None:
+        Params.clear()
     for _ in range(max(Num, 0)):
         if not Rest or (BreakOnToken and Rest[0] in _KNOWN_TTI_TOKENS):
             break
         try:
-            (_, Rest) = decode_ub4(Rest)
+            (Param, Rest) = decode_ub4(Rest)
         except IndexError:
             return (True, Acc)
+        if Params is not None:
+            Params.append(Param)
     Exact = None if BreakOnToken else _skip_rpa_tail_fields(Rest)
     if Exact is not None:
         Rest = Exact
@@ -20733,6 +20745,17 @@ _OCI11_SCROLL_FLAGS = TNS_EXEC_FLAGS_SCROLLABLE | TNS_EXEC_FLAGS_NO_CANCEL_ON_EO
 
 def _oci11_scroll_al8i4(Orientation: int, Position: int) -> list[int]:
     return [_OCI11_SCROLL_FLAGS, Orientation, Position & 0xFFFFFFFF]
+
+
+def oci92_scroll(Orientation: int, Position: int) -> tuple[int, int]:
+    """A scroll request as a 9.2 server reads it (#2809): CURRENT and the
+    1-based row the client worked out, or LAST and -1, as OCI 9.2's
+    OCIStmtFetch2 asks for every orientation (captured on 9.2.0.4). 9.2 ignores
+    the ABSOLUTE, RELATIVE and FIRST a 10.2+ server reads, and answered from the
+    first row."""
+    if Orientation == TNS_FETCH_ORIENTATION_LAST:
+        return (TNS_FETCH_ORIENTATION_LAST, 0xFFFFFFFF)
+    return (TNS_FETCH_ORIENTATION_CURRENT, Position)
 
 
 def encode_oci11_scroll_fetch(
