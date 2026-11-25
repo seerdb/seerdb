@@ -382,12 +382,24 @@ def _block_input(value: object) -> object:
     # A temporary LOB's is its locator, the marker itself (SeerODBC #169).
     from seerdb.common.datatypes import Var
     from seerdb.common.dbobject import DbObjectType
+    from seerdb.common.tns import _declared_value_bytes
 
     if _is_cursor_var(value):
         return b'\x00'
     if isinstance(value, Var) and isinstance(value.dbtype, DbObjectType):
         # An object's Var goes whole, so a NULL one is the object's NULL frame:
         # a bare NULL left 9i waiting for the frame (SeerODBC #172).
+        return value
+    if (
+        isinstance(value, Var)
+        and value.has_value
+        and _declared_value_bytes(value._value, value.dbtype.tns_type) is not None
+    ):
+        # A value whose declared type changes its bytes goes as that type, as
+        # its descriptor says (#701): a microsecond datetime in a DATE Var went
+        # as an 11-byte TIMESTAMP under a 7-byte DATE descriptor, and 9.2
+        # refused the IN OUT bind with ORA-01483, as it refuses ojdbc14's
+        # Timestamp in a DATE parameter (#2811).
         return value
     return value._value if isinstance(value, Var) else value
 
