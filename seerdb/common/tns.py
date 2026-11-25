@@ -7365,6 +7365,10 @@ def _object_bind_type(Bind: object) -> object | None:
     return None
 
 
+def _is_boolean_bind(Bind: object) -> bool:
+    return isinstance(Bind, Var) and Bind.dbtype.tns_type == TNS_TYPE_BOOLEAN
+
+
 def _is_object_bind(Bind: object) -> bool:
     # Whether this bind's OUT value arrives in the object framing (#888/#1029).
     return _object_bind_type(Bind) is not None
@@ -7486,7 +7490,12 @@ def _read_iov(
                 # fixed byte: a non-NULL value's code is ub4(0) = one 0x00 byte,
                 # but a NULL value's is ub4(-1) = 0x81 0x01 (two bytes). Skipping
                 # a fixed byte desynced the decoder on a NULL OUT bind.
-                (_, Rest) = decode_ub4(Rest)
+                (Code, Rest) = decode_ub4(Rest)
+                if Code < 0 and _is_boolean_bind(Bind):
+                    # A NULL PL/SQL BOOLEAN below 23ai keeps a value, the one
+                    # sent in, and only this code says it is NULL. Read as the
+                    # value, a NULL came back as True after a seeded True.
+                    Val = []
                 OutValues.append(b'' if Val == [] else bytes(Val))
     return (Directions, OutValues, Rest)
 
@@ -22775,6 +22784,15 @@ def _declared_value_bytes(Value: object, DataType: int) -> bytes | None:
         return None
     if isinstance(Value, (datetime.date, BcDate)) and DataType in _DECLARED_TEMPORAL:
         return _bytes_with_length(_encode_declared_temporal(Value, DataType))
+    if (
+        DataType == TNS_TYPE_BOOLEAN
+        and _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+    ):
+        # The value its BOOLEAN OAC announces, framed as 23ai's (`02 01 01` /
+        # `02 01 00`), as python-oracledb sends it to 18c and 21c too. Left to
+        # the plain encoder, a bool there was the NUMBER 0 or 1, which the
+        # server refused with ORA-03120.
+        return bytes([2, 1, 1 if Value else 0])
     if isinstance(Value, bool) and DataType == TNS_TYPE_NUMBER:
         # From 23.1 a bare bool goes out as a native BOOLEAN value, which a
         # NUMBER descriptor makes the server read as a non-zero NUMBER: False
@@ -22823,6 +22841,15 @@ def encode_token_rxd(Token: object) -> bytes:
             if Token._value is None:
                 return encode_object_column_value(None, Token.dbtype.oid)
             return _encode_object_bind_value(cast('DbObject', Token._value))
+        if (
+            Token._value is None
+            and Token.dbtype.tns_type == TNS_TYPE_BOOLEAN
+            and _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        ):
+            # A NULL BOOLEAN is `fd 01`, as python-oracledb sends it. 18c read
+            # the bare 0x00 of any other NULL as FALSE, so `:b := NOT :b`
+            # answered TRUE for a NULL.
+            return bytes([0xFD, 1])
         if Token._value is None:
             return bytes([0])
         if getattr(Token.dbtype, 'csfrm', 1) == 2 and isinstance(Token._value, str):
@@ -23119,12 +23146,15 @@ def encode_token_oac(Token: object) -> bytes:
             )
         if DT == TNS_TYPE_BOOLEAN:
             # Native BOOLEAN Var, what setinputsizes(bool) / DB_TYPE_BOOLEAN
-            # produces (#870). The same OAC a plain bool value already gets --
-            # type 252, fixed size 4 -- and the same pre-23ai fallback to NUMBER,
-            # which pairs with the NUMBER value encode_token_rxd writes there.
-            # Only this Var path was missing, so binding a boolean through a Var
-            # raised and, through the Mirror, surfaced as ORA-00600.
-            if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_23_1:
+            # produces (#870): type 252, fixed size 4. Only this Var path was
+            # missing, so binding a boolean through a Var raised and, through
+            # the Mirror, surfaced as ORA-00600.
+            #
+            # From 12.1, not 23.1: SQL has no BOOLEAN before 23ai, but PL/SQL
+            # does, and 18c and 21c refused a BOOLEAN parameter the NUMBER this
+            # sent (PLS-00306), Transaction Guard's GET_LTXID_OUTCOME among
+            # them. A plain bool keeps its NUMBER, which SQL there can take.
+            if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
                 return encode_token_raw(TNS_TYPE_BOOLEAN, 4, 0, 0, 0, A)
             return encode_token_raw(TNS_TYPE_NUMBER, 22, 0, 0, 0, A)
         if DT in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and (

@@ -8197,18 +8197,85 @@ class TestBooleanVarBind(unittest.TestCase):
         self.assertEqual(oac[0], TNS_TYPE_BOOLEAN)
         self.assertEqual(oac, encode_token_oac(True))
 
-    def test_boolean_var_falls_back_to_number_before_23ai(self):
+    def test_boolean_var_is_native_from_12_1(self):
+        from seerdb.common.datatypes import DB_TYPE_BOOLEAN, Var
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION
+        from seerdb.common.tns_consts import TNS_TYPE_BOOLEAN, TNS_TYPE_NUMBER
+
+        # SQL has no BOOLEAN before 23ai, but PL/SQL does: 18c and 21c refused
+        # the NUMBER a BOOLEAN Var went out as with PLS-00306. A plain bool,
+        # which SQL there takes, stays a NUMBER.
+        for fv in (7, 8, 10, 16):
+            _ENCODE_FIELD_VERSION.set(fv)
+            with self.subTest(field_version=fv):
+                oac = encode_token_oac(Var(DB_TYPE_BOOLEAN))
+                self.assertEqual(oac[0], TNS_TYPE_BOOLEAN)
+                self.assertEqual(oac, encode_token_oac(Var(DB_TYPE_BOOLEAN)))
+                self.assertEqual(encode_token_oac(True)[0], TNS_TYPE_NUMBER)
+
+    def test_boolean_var_value_is_framed_as_23ai_frames_it_from_12_1(self):
+        # As python-oracledb sends it to 18c: TRUE `02 01 01`, FALSE `02 01 00`,
+        # NULL `fd 01`. The NUMBER 1 it went out as drew ORA-03120, and 18c
+        # read a bare 0x00 NULL as FALSE.
+        from seerdb.common.datatypes import DB_TYPE_BOOLEAN, Var
+        from seerdb.common.tns import _ENCODE_FIELD_VERSION
+
+        for fv in (7, 10, 24):
+            _ENCODE_FIELD_VERSION.set(fv)
+            for value, wire in ((True, '020101'), (False, '020100'), (None, 'fd01')):
+                with self.subTest(field_version=fv, value=value):
+                    var = Var(DB_TYPE_BOOLEAN)
+                    var.setvalue(0, value)
+                    self.assertEqual(encode_token_rxd(var).hex(), wire)
+
+    def test_boolean_var_falls_back_to_number_before_12_1(self):
         from seerdb.common.datatypes import DB_TYPE_BOOLEAN, Var
         from seerdb.common.tns import _ENCODE_FIELD_VERSION
         from seerdb.common.tns_consts import TNS_TYPE_NUMBER
 
-        # There is no native BOOLEAN before 23ai, so the Var rides as a NUMBER --
+        # No PL/SQL BOOLEAN bind before 12.1, so the Var rides as a NUMBER --
         # pairing with the NUMBER value encode_token_rxd writes there, exactly as
         # a plain bool already does.
-        _ENCODE_FIELD_VERSION.set(8)
-        oac = encode_token_oac(Var(DB_TYPE_BOOLEAN))
+        _ENCODE_FIELD_VERSION.set(6)
+        var = Var(DB_TYPE_BOOLEAN)
+        oac = encode_token_oac(var)
         self.assertEqual(oac[0], TNS_TYPE_NUMBER)
         self.assertEqual(oac, encode_token_oac(True))
+        var.setvalue(0, True)
+        self.assertEqual(encode_token_rxd(var), encode_token_rxd(True))
+
+
+class TestBooleanOutValue(unittest.TestCase):
+    """A NULL PL/SQL BOOLEAN OUT value below 23ai.
+
+    18c answers `BEGIN :b := NULL; END;` with the value sent in and a return
+    code of -1, where 23ai sends an empty value. The reply is 18c's, captured
+    for a Var seeded True. Read as the value, the NULL came back True.
+    """
+
+    _IOV = '0b0501010001010000001007'
+
+    def _out(self, value_and_code: str, var: object) -> list:
+        from seerdb.common.tns import _read_iov
+
+        (_, values, rest) = _read_iov(bytes.fromhex(self._IOV + value_and_code), [var])
+        self.assertEqual(rest, b'')
+        return values
+
+    def test_a_negative_return_code_makes_a_boolean_null(self):
+        from seerdb.common.datatypes import DB_TYPE_BOOLEAN, Var
+
+        self.assertEqual(self._out('0201018101', Var(DB_TYPE_BOOLEAN)), [b''])
+
+    def test_a_zero_return_code_keeps_the_boolean(self):
+        from seerdb.common.datatypes import DB_TYPE_BOOLEAN, Var
+
+        self.assertEqual(self._out('02010100', Var(DB_TYPE_BOOLEAN)), [b'\x01\x01'])
+
+    def test_other_types_keep_their_value(self):
+        from seerdb.common.datatypes import Var
+
+        self.assertEqual(self._out('0201018101', Var(bytes)), [b'\x01\x01'])
 
 
 class ArrayDmlRowCountsGate(unittest.TestCase):
