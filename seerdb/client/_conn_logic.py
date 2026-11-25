@@ -1246,9 +1246,12 @@ class _ConnectionLogic:
 
     def _scrolls_server_side(self) -> bool:
         # Whether a scrollable cursor scrolls on the server (#181): on a session
-        # at 10.2 or later, a thin OALL8 one to 9.2 included (#2809). 9i's ALL7
-        # and native OALL8 forms keep the buffered scroll (#161).
-        return self.field_version >= FIELD_VERSION_10_2
+        # at 10.2 or later, a thin OALL8 one to 9.2 included, or in a dialect's
+        # own form, 9.2's native OALL8 one's (#2809). 9i's ALL7 form keeps the
+        # buffered scroll (#161).
+        return self.field_version >= FIELD_VERSION_10_2 or dialect_scrolls(
+            self._dialect
+        )
 
     def _scroll_request(self, Orientation: int, Position: int) -> tuple[int, int]:
         # A scroll re-execute's orientation and position (#181), as the server
@@ -1658,9 +1661,9 @@ def native_returning(Dialect, Bind, ReturnBinds) -> 'TypeGuard[Oci11Dialect]':
     )
 
 
-def dialect_scrolls(Dialect) -> 'TypeGuard[Oci11Dialect]':
+def dialect_scrolls(Dialect) -> 'TypeGuard[Oci11Dialect | Fv2Oall8Dialect]':
     """Whether a pre-10g dialect serves a server-side scrollable cursor in its
-    own form (a pooled 11g session, #2466)."""
+    own form (a pooled 11g session, #2466; a native 9.2 session, #2809)."""
     from seerdb.client.dialect import CAP_SCROLL
 
     return Dialect is not None and CAP_SCROLL in Dialect.capabilities()

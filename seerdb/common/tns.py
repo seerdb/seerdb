@@ -17020,6 +17020,7 @@ def _encode_9i_oall8(
     Binds: list,
     Batch: list | None = None,
     BatchErrors: bool = False,
+    Scrollable: bool = False,
 ) -> bytes:
     # The native 9i (9.2) OALL8 (TTI_ALL8, 0x5e) execute — the 64-bit form the
     # server accepts once the OALL8 opt-in caps are negotiated (#716). It is 8i's
@@ -17087,6 +17088,10 @@ def _encode_9i_oall8(
         al8i4_1=0 if IsQuery else len(Rows),
         al8i4_7=StmtType,
     )
+    if Scrollable:
+        # A scrollable open (#2809), as OCI 9.2's OCI_STMT_SCROLLABLE_READONLY
+        # execute: the scroll words at the first row (o9i_scroll_al8i4).
+        Values.update(o9i_scroll_al8i4(TNS_FETCH_ORIENTATION_CURRENT, 1))
     # The SQL text is a pre-10g chunked string (encode_chr at field version 2): a
     # plain length byte up to 64 bytes, else 0xFE, 64-byte chunks and a zero --
     # byte-verified against a native 9.2 161-byte query (chunks 64, 64, 33). A
@@ -17721,13 +17726,64 @@ def encode_oci11_reexecute(Seq: int, Cursor: int, Binds: list | None = None) -> 
     )
 
 
-def encode_9i_oall8_query(Seq: int, Sql: bytes, Binds: list | None = None) -> bytes:
+def encode_9i_oall8_query(
+    Seq: int, Sql: bytes, Binds: list | None = None, Scrollable: bool = False
+) -> bytes:
     # 9i SELECT over the native 64-bit OALL8 (#792): the 64-bit execute with the
     # FETCH option set, so the reply carries the fv2 describe + the first row
     # batch; encode_9i_oall8_fetch pulls the rest. The reply is the shared fv2
     # DCB/RXD stream (8i and 9i are both field_version 2), so the dialect reuses
-    # recv_rows to decode it.
-    return _encode_9i_oall8(Seq, Sql, O8I_STMT_SELECT, Binds or [])
+    # recv_rows to decode it. `Scrollable` opens it as a scrollable cursor
+    # (#2809).
+    return _encode_9i_oall8(
+        Seq, Sql, O8I_STMT_SELECT, Binds or [], Scrollable=Scrollable
+    )
+
+
+# A scrollable cursor's al8i4[9:12] on a native 9.2 session, as OCI 9.2 sends
+# them (captured on 9.2.0.4, #2809): the exec flags SCROLLABLE alone (0x02, where
+# 11.2 adds NO_CANCEL_ON_EOF), the orientation and the 1-based row. Every
+# orientation but the last is CURRENT and the row OCI worked out (oci92_scroll).
+def o9i_scroll_al8i4(Orientation: int, Position: int) -> dict:
+    (Orientation, Position) = oci92_scroll(Orientation, Position)
+    return {
+        'al8i4_9': TNS_EXEC_FLAGS_SCROLLABLE,
+        'al8i4_10': Orientation,
+        'al8i4_11': Position & 0xFFFFFFFF,
+    }
+
+
+def encode_9i_oall8_scroll_fetch(
+    Seq: int,
+    Cursor: int,
+    Count: int,
+    LongSize: int,
+    Orientation: int,
+    Position: int,
+) -> bytes:
+    """Up to ``Count`` rows of a scrollable ``Cursor`` from ``Position``, or its
+    last row, as OCI 9.2's OCIStmtFetch2 asks on a native 9.2 session (#2809).
+    Its LAST, a one-row fetch, clears the single-row option bit that its
+    one-row CURRENT fetches keep."""
+    Last = Orientation == TNS_FETCH_ORIENTATION_LAST
+    Values = _o9i_fetch_values(Seq, Cursor, Count, LongSize)
+    if Last:
+        Values['options'] = TNS_EXEC_OPTION_FETCH
+    Values.update(o9i_scroll_al8i4(Orientation, Position))
+    return _O8I_ALL8_O9I(Values)
+
+
+def decode_9i_oall8_return_parameters(Terminal: bytes) -> list[int]:
+    """The return parameters (al8o4) of a native 9.2 reply's leading RPA, or []
+    when it has none. A scroll to the last row reports that row's number in
+    [4] (#2809)."""
+    if Terminal[:1] != bytes([TTI_RPA]):
+        return []
+    try:
+        (Fields, _) = _O8I_RPA_FROM_O9I(Terminal)
+    except (IndexError, DataError):
+        return []
+    return [P['value'] for P in Fields['parameters']]
 
 
 # The native 9i array-fetch (TTI_ALL8 0x5e, FETCH option, no SQL) — the 64-bit
@@ -17749,6 +17805,10 @@ def encode_9i_oall8_fetch(
     # Option byte 5 is 0x04 on a single-row fetch (the LONG case) and 0x00
     # otherwise -- byte-verified against both fetches of native_9i_fetch_
     # arraysize2.pcap, as the 195-byte skeleton this replaces was.
+    return _O8I_ALL8_O9I(_o9i_fetch_values(Seq, Cursor, Count, LongSize))
+
+
+def _o9i_fetch_values(Seq: int, Cursor: int, Count: int, LongSize: int) -> dict:
     Values = dict(_O8I_ALL8_FIXED)
     Values.update(
         seq=Seq & 0xFF,
@@ -17766,7 +17826,7 @@ def encode_9i_oall8_fetch(
         al8i4_1=Count,
         al8i4_7=O8I_STMT_SELECT,
     )
-    return _O8I_ALL8_O9I(Values)
+    return Values
 
 
 def encode_9i_oall8_lobop(

@@ -345,6 +345,9 @@ class _Target(NamedTuple):
     # The session's own field version, where it differs from the server's: a
     # thin OALL8 session to 9.2 runs at 10.2 (#2768). 0 when it is the same.
     session_fv: int = 0
+    # Whether a scrollable cursor scrolls on the server, as the connection
+    # decides (#2809).
+    server_scroll: bool = False
 
 
 def _sql_fv(conn) -> int:
@@ -451,6 +454,7 @@ def _target_of(conn) -> _Target:
         or _dialect_binds_refs(conn),
         temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
         conn.field_version,
+        conn._scrolls_server_side(),
     )
 
 
@@ -511,6 +515,7 @@ class _Need(NamedTuple):
     # Whether the field versions name what the session's form does (a parse, a
     # native RETURNING) rather than what SQL its server runs (#2768).
     protocol: bool = False
+    server_scroll: bool = False
 
     def missing(self, target: _Target) -> bool:
         fv = (
@@ -539,6 +544,8 @@ class _Need(NamedTuple):
         if self.ref_binds and not target.ref_binds:
             return True
         if self.lob_out and not target.lob_out:
+            return True
+        if self.server_scroll and not target.server_scroll:
             return True
         if self.min_fv and fv < self.min_fv:
             return True
@@ -663,10 +670,8 @@ _CHANGE_PASSWORD = _Need(
 _PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV, protocol=True)
 _ARRAY_DML = _Need('executemany (array DML) is not supported on Oracle 8i', not_8i=True)
 _SERVER_SCROLL = _Need(
-    'server-side scroll needs a 10.2+ session (9i over thin OALL8, or 10g+); '
-    "9i's ALL7 and native OALL8 forms use the buffered scroll (#2809)",
-    min_fv=FIELD_VERSION_10_2,
-    protocol=True,
+    "server-side scroll: 9i's ALL7 form and 8i use the buffered scroll (#2809)",
+    server_scroll=True,
 )
 _LOBOPS = _Need('the 8i LOB object has no LOBOPS calls (9i: #2259)', not_8i=True)
 _OER_WARN_BYTE = _Need('the 8i OER warn byte is not located (9i: #2262)', not_8i=True)
