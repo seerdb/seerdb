@@ -859,6 +859,8 @@ class AsyncOracleConnect(_ConnectionLogic):
         self._ano = None
         self.conn_key = None
         self._o3_phase = 0
+        self._o3_sesskey: bytes | None = None
+        self._o3_verifier: bytes | None = None
         self._o3_oall8 = False
         self._native11 = False
         self._native11_sending = False
@@ -1921,6 +1923,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.common.tns import encode_o7_oauth, parse_8i_auth_sesskey
 
         SessKey = parse_8i_auth_sesskey(Packet, O8i=False)
+        # Kept for a password change on this session, which wraps both
+        # passwords under it (#2808).
+        self._o3_sesskey = SessKey
+        self._o3_verifier = des_verifier(
+            self.user.encode('utf-8'), self.password.encode('utf-8')
+        )
         UserB = self.user.encode('utf-8')
         PassB = self.password.encode('utf-8')
         Verifier = des_verifier(UserB, PassB)
@@ -1979,6 +1987,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.common.tns import encode_o3logon_oauth_phase2, parse_8i_auth_sesskey
 
         SessKey = parse_8i_auth_sesskey(Packet)
+        # Kept for a password change on this session, which wraps both
+        # passwords under it (#2808).
+        self._o3_sesskey = SessKey
+        self._o3_verifier = des_verifier(
+            self.user.encode('utf-8'), self.password.encode('utf-8')
+        )
         UserB = self.user.encode('utf-8')
         PassB = self.password.encode('utf-8')
         Verifier = des_verifier(UserB, PassB)
@@ -2957,9 +2971,15 @@ class AsyncOracleConnect(_ConnectionLogic):
                 'session (ORA-56609)'
             )
         if self._server_below_10_2():
-            raise NotSupportedError(
-                'changepassword is not supported on Oracle 9i'
-            )  # (#168)
+            # 8i and 9i change a password in the O3LOGON exchange's form, under
+            # the login's session key (#2808), as OracleConnect.changepassword.
+            if self.conn_state != CONN_STATE_AUTHENTICATED:
+                raise InterfaceError(
+                    'changepassword requires an authenticated connection'
+                )
+            await self._drive(self._pre10_change_password(old_password, new_password))
+            self.password = new_password
+            return
         if self.conn_state != CONN_STATE_AUTHENTICATED or self.conn_key is None:
             raise InterfaceError('changepassword requires an authenticated connection')
         Auth = {

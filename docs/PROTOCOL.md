@@ -7504,8 +7504,25 @@ The login is the compact form's thin-coded OSESSKEY/OAUTH (`0x76`/`0x73`).
 **What 9.2 doesn't take in this form**, and what seerdb sends instead:
 - **LOB calls:** 9.2 refuses the 10g LOBOPS (ORA-22275), so they go in the compact form (§19.5), whose statuses now lead with the call status. A wrong password's refusal leads with it the same way.
 - **Transaction switches (TPC):** at 9.2's field version.
-- **TTI_PING, the application-context piggyback, scrollable cursors and changepassword:** refused or replaced as on the compact form.
+- **TTI_PING and the application-context piggyback:** refused or replaced as on the compact form.
+- **Scrollable cursors:** 10.2's scroll re-execute, but asked as OCI 9.2 asks (#2809). 9.2 reads no ABSOLUTE, RELATIVE or FIRST: every orientation goes as CURRENT and the row the client worked out, and the last row as LAST and -1. 9.2's status reports the rows fetched on the cursor so far, not the batch's position, so the window is placed from the row asked for, and for LAST from the return parameters' [4], which 9.2 sends only when LAST asks for one row.
+- **changepassword:** the pre-10g change (§19.20).
 - **DML RETURNING:** runs as a PL/SQL block (#801). 9.2's native RETURNING with a too-small variable is ORA-00600 [17172], after which the transaction is unusable.
+
+### 19.20 A password change before 10g (#2808)
+
+8i and 9i change a password on a live session as OCI 9.2's `OCIPasswordChange` does (captured on 9.2.0.4). It is one OAUTH (`03 73`), with no new OSESSKEY:
+
+| field | value |
+|---|---|
+| user | the session's user |
+| mode | `0x112` |
+| pairs | `AUTH_PASSWORD`, `AUTH_NEWPASSWORD`, then the session's pairs and, from 9i, the time zone (`AUTH_ALTER_SESSION`) |
+
+- **The passwords** are each wrapped as phase two wraps the login password: `hex(DES blocks) + decimal pad count`, under the login's session key. That key is unwrapped by the verifier of the password the session **logged in** with. After one change, that is no longer the old password, and unwrapped by the old one, a second change on the session was refused (ORA-28008).
+- **The reply** is an empty RPA (`08 00` thin-coded, `08 00 00` at 8i's and the native form's widths), then the status. A wrong old password is ORA-28008.
+- **A long new password:** OCI 9.2 refuses one over 30 characters itself with ORA-00988 and sends nothing. 8.1.7 ends the session (TNS-12572) on a 1500-character one, where 9.2 refuses it, so seerdb refuses it as OCI does.
+- **The forms:** each at its own widths, 8i's (no time zone), 9i's thin-coded one (ALL7 and thin OALL8), and the native 9.2 one, which matches OCI's head byte for byte apart from its pointers.
 
 ## 20. Oracle 23ai field version 24 — fast-auth + the fv24 framing (#89)
 

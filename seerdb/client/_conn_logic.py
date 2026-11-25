@@ -229,6 +229,11 @@ class _ConnectionLogic:
     user: str
     proxy_user: str | None
     password: str
+    # An 8i or 9i login's O3LOGON session key and its password's verifier, which
+    # a password change on the session wraps both passwords under (#2808); None
+    # after any other login.
+    _o3_sesskey: bytes | None
+    _o3_verifier: bytes | None
     cclass: str | None
     purity: int
     server_type: str | None
@@ -374,6 +379,58 @@ class _ConnectionLogic:
             self._next_seq(), self.user.encode('utf-8'), self._auth_info_pairs()
         )
 
+    def _pre10_change_password(self, old_password: str, new_password: str):
+        # A password change on an 8i or 9i session (#2808), as OCI 9.2's
+        # OCIPasswordChange makes one (encode_pre10_chgpwd): one OAUTH on the
+        # live session, both passwords under the login's session key. A sans-io
+        # generator, driven as a dialect's calls are; its refusal is raised as
+        # the login's would be.
+        from seerdb.client.dialect import RECV, Send
+        from seerdb.common.exceptions import InterfaceError, from_ora_code
+        from seerdb.common.tns import (
+            PRE10_PASSWORD_MAX,
+            encode_pre10_chgpwd,
+            pre10_chgpwd_status,
+        )
+
+        if self._o3_sesskey is None or self._o3_verifier is None:
+            raise InterfaceError('changepassword requires an authenticated connection')
+        if len(new_password) > PRE10_PASSWORD_MAX:
+            # OCI 9.2 refuses a longer new password itself, with this code, and
+            # sends nothing. Sent, a 1500-character one made 8.1.7 end the
+            # session (TNS-12572), where 9.2 refuses it.
+            raise from_ora_code(988)(
+                'ORA-00988: missing or invalid password(s)', code=988
+            )
+        if isinstance(self._dialect, O8iDialect):
+            (Form, Pairs) = ('o8i', self._auth_info_pairs())
+        elif getattr(self, '_o3_oall8', False):
+            (Form, Pairs) = ('oall8', self._auth_info_pairs())
+        else:
+            (Form, Pairs) = ('thin', self._o7_session_pairs())
+        yield Send(
+            encode_pre10_chgpwd(
+                self._next_seq(),
+                self.user.encode('utf-8'),
+                self._o3_sesskey,
+                self._o3_verifier,
+                old_password,
+                new_password,
+                Pairs,
+                Form,
+            )
+        )
+        received = yield RECV
+        if received is False:
+            raise InterfaceError(
+                'the server closed the connection on a password change'
+            )
+        (Code, Message) = self._pre10_login_error(
+            pre10_chgpwd_status(received[1], Thin=Form == 'thin')
+        )
+        if Code:
+            raise from_ora_code(Code)(Message or f'ORA-{Code:05d}', code=Code)
+
     def _oall8_oauth(self, Packet: bytes) -> bytes:
         # Native 9i OALL8 O3LOGON phase two: recover the session key, DES-encrypt
         # the password under it (the same crypto as the thin 9i / 8i paths), and
@@ -390,6 +447,12 @@ class _ConnectionLogic:
         )
 
         SessKey = parse_oall8_auth_sesskey(Packet)
+        # Kept for a password change on this session, which wraps both
+        # passwords under it (#2808).
+        self._o3_sesskey = SessKey
+        self._o3_verifier = des_verifier(
+            self.user.encode('utf-8'), self.password.encode('utf-8')
+        )
         UserB = self.user.encode('utf-8')
         PassB = self.password.encode('utf-8')
         (AuthPass, _, _) = o3logon(SessKey, des_verifier(UserB, PassB), PassB)

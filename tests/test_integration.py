@@ -94,7 +94,6 @@ _FV2_UNSUPPORTED = (
         'lob_attributes_read_in_any_order',
         "the 9i bed's database cannot hold the national text (#174)",
     ),
-    ('changepassword', 'changepassword is not supported on Oracle 9i'),
     # The 9i test DB is WE8ISO8859P1 (Latin-1). #174 made representable VARCHAR2
     # text round-trip (see test_db_charset_varchar_roundtrip) and full Unicode
     # work through DB_TYPE_NVARCHAR / DB_TYPE_NCHAR (test_national_char_var_bind,
@@ -662,10 +661,7 @@ _NATIONAL_OUT_BIND = _Need(
     'a national OUT bind is refused on fv2 (ORA-03120)', min_fv=_FV
 )
 _CHANGE_PASSWORD = _Need(
-    'changepassword is not supported on Oracle 9i, and a pooled 11g session '
-    'refuses it (ORA-56609)',
-    min_fv=_FV,
-    password_change=True,
+    'a pooled 11g session refuses changepassword (ORA-56609)', password_change=True
 )
 _PARSE = _Need('cursor.parse() needs 10g+', min_fv=_FV, protocol=True)
 _ARRAY_DML = _Need('executemany (array DML) is not supported on Oracle 8i', not_8i=True)
@@ -11469,8 +11465,8 @@ class ChangePasswordIntegration(_ThrottleRetry, unittest.TestCase):
         )
 
     def setUp(self):
-        # changepassword is gated on Oracle 9i (its O3LOGON password change
-        # differs); skip the live tests there (#168).
+        # A pooled 11g session's server refuses a change; 8i and 9i change it
+        # in the O3LOGON exchange's form (#2808).
         _skip_unless(self, _CHANGE_PASSWORD)
 
     def test_a_rejected_change_reports_the_servers_code(self):
