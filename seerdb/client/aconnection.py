@@ -1141,6 +1141,13 @@ class AsyncOracleConnect(_ConnectionLogic):
                                 if self._o3_phase == 1:
                                     await self._send_8i_oauth_phase2(Packet)
                                     continue
+                                if self._o3_wants_proxy():
+                                    # A proxy login (#2818): the target's
+                                    # session begins on the one just logged in.
+                                    await self.send(
+                                        TNS_DATA, self._o3_proxy_oauth(Packet, O8i=True)
+                                    )
+                                    continue
                                 self.conn_state = CONN_STATE_AUTHENTICATED
                                 self.server_version = decode_8i_server_version(Packet)
                                 return 0
@@ -1952,10 +1959,8 @@ class AsyncOracleConnect(_ConnectionLogic):
     async def _send_8i_osesskey(self) -> None:
         # Async port of OracleConnect._send_8i_osesskey: O3LOGON phase one, the
         # OSESSKEY (0x76) call carrying the username + informational pairs.
-        from seerdb.client.connection import _refuse_8i_proxy
         from seerdb.common.tns import encode_o3logon_osesskey_phase1
 
-        _refuse_8i_proxy(self.proxy_user)
         await self.send(
             TNS_DATA,
             encode_o3logon_osesskey_phase1(
