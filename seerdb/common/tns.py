@@ -1919,6 +1919,66 @@ _ALL8_HEAD: wire_schema.Schema = (
     ('ptr', 'defines_present'),
     ('wn4', 'define_count'),
 )
+# A thin OALL8 whole: the head above, then the fields python-oracledb names
+# (execute.pyx), the SQL and the al8i4 array; the OAC and RXD tokens follow it.
+# Each block comes in by the field version, or by the server's version:
+# - has_objects: the registration id's low word and the al8objlist / al8objlen
+#   pointers, the `00 00 01` all but 9.2 read (#2768);
+# - has_blv: al8blv to al8regid_msb, which 11g reads and a 10.x server does not;
+# - has_al8pidmlrc: 12.1's array-DML row-count pointers and iteration count
+#   (#18), which a 12.1 server refuses the call without (#1144);
+# - has_sql_signature: 12.2's SQL signature and SQL id;
+# - has_chunk_ids: 12.2 EXT 1's chunk ids.
+# The SQL, when there is one, is length-framed from 12.1 (framed_sql) and bare
+# before (bare_sql), after a sql_length that 9.2 counts in characters
+# (_o7_sql_length). A message has the one or the other.
+_ALL8: wire_schema.Schema = (
+    *_ALL8_HEAD,
+    (
+        'when',
+        'has_objects',
+        (
+            ('n4', 'registration_id'),
+            ('ptr', 'al8objlist'),
+            ('ptr', 'al8objlen'),
+        ),
+    ),
+    (
+        'when',
+        'has_blv',
+        (
+            ('ptr', 'al8blv'),
+            ('n4', 'al8blvl'),
+            ('ptr', 'al8dnam'),
+            ('n4', 'al8dnaml'),
+            ('n4', 'registration_id_msb'),
+        ),
+    ),
+    (
+        'when',
+        'has_al8pidmlrc',
+        (
+            ('ptr', 'al8pidmlrc'),
+            ('n4', 'al8pidmlrcbl'),
+            ('ptr', 'al8pidmlrcl'),
+        ),
+    ),
+    (
+        'when',
+        'has_sql_signature',
+        (
+            ('ptr', 'al8sqlsig'),
+            ('n4', 'sql_signature_length'),
+            ('ptr', 'sql_id'),
+            ('n4', 'sql_id_size'),
+            ('ptr', 'sql_id_length'),
+        ),
+    ),
+    ('when', 'has_chunk_ids', (('ptr', 'chunk_ids'), ('n4', 'chunk_id_count'))),
+    ('when', 'framed_sql', (('when', 'sql_present', (('value', 'sql'),)),)),
+    ('when', 'bare_sql', (('when', 'sql_present', (('bytes', 'sql', 'sql_length'),)),)),
+    ('each', 'al8i4', 'al8i4_length', (('n4', 'word'),)),
+)
 # Oracle 8i's OALL8 (#2284): the execute a 9.2 OCI client sends, as 8.1.7 reads
 # it. The OALL8 head above through al8kvl -- 9.2 has no defines -- then the SQL
 # text when there is one, then the al8i4 array of twelve ub4s. What the
@@ -3352,6 +3412,25 @@ _ALL8_HEAD_THIN = wire_schema.compile_encoder(_ALL8_HEAD, _THIN)
 _ALL8_HEAD_FROM_THIN = wire_schema.compile_decoder(_ALL8_HEAD, _THIN)
 _ALL8_HEAD_FROM_OCI = wire_schema.compile_decoder(_ALL8_HEAD, _OCI)
 _ALL8_HEAD_FROM_OCI_WIDE = wire_schema.compile_decoder(_ALL8_HEAD, _OCI_WIDE)
+_ALL8_THIN = wire_schema.compile_encoder(_ALL8, _THIN)
+_ALL8_FROM_THIN = wire_schema.compile_decoder(_ALL8, _THIN)
+
+
+def _all8_blocks(field_version: int, *, server_92: bool, server_10: bool) -> dict:
+    # Which of _ALL8's version-gated blocks an execute carries, at the session's
+    # field version and, before 12.1, by the server's own version.
+    modern = field_version >= FIELD_VERSION_12_1
+    return {
+        'has_objects': modern or not server_92,
+        'has_blv': modern or not (server_92 or server_10),
+        'has_al8pidmlrc': modern,
+        'has_sql_signature': field_version >= FIELD_VERSION_12_2,
+        'has_chunk_ids': field_version >= FIELD_VERSION_12_2_EXT_1,
+        'framed_sql': modern,
+        'bare_sql': not modern,
+    }
+
+
 _FETCH_THIN = wire_schema.compile_encoder(_FETCH, _THIN)
 _FETCH_FROM_THIN = wire_schema.compile_decoder(_FETCH, _THIN)
 _FETCH_FROM_OCI = wire_schema.compile_decoder(_FETCH, _OCI)
@@ -4703,15 +4782,6 @@ from seerdb.common.tns_consts import (
     TNS_VERSION_MIN_LARGE_SDU,
 )
 
-# The 11g tail between the fixed header and the SQL: a [0, 0, 1] marker and a
-# 5-byte server-version slot (empty only when the client thinks it is talking to
-# 10g; an 11g-pinned Mirror always gets the 5-byte form).
-_MARKER_LEN = 3
-
-
-_SERVER_VERSION_SLOT = 5
-
-
 # The autocommit bit in the OALL8 options word: the client sets it (0x100) when
 # the connection is in autocommit mode, asking the server to commit after this
 # statement (set_opts encodes it as Param * 256 into the options word).
@@ -4983,26 +5053,6 @@ def peek_exec_cursor(payload: bytes) -> tuple[int, bool]:
     return (head['cursor'], head['sql_present'])
 
 
-def _skip_exec_middle_12c(rest: bytes, field_version: int) -> bytes:
-    # The 12.1+ OALL8 block between the fixed head and the SQL (the client's
-    # encode_dictionary_exec `Middle`): the 0,0,1 marker, the registration
-    # fields, the array-DML row-count block (a 1 + sb4 iteration count + 1 when
-    # arraydmlrowcounts was requested, else three zeros), the SQL-signature /
-    # SQL-id slot, and from 12.2_EXT1 up two chunk-id bytes.
-    rest = rest[3:]  # 0, 0, 1
-    rest = rest[5:]  # reg_lsb .. reg_msb
-    if rest[:1] == b'\x01':
-        _, rest = decode_ub4(rest[1:])  # iteration count
-        rest = rest[1:]
-    else:
-        rest = rest[3:]
-    if field_version >= FIELD_VERSION_12_2:
-        rest = rest[5:]  # al8sqlsig / SQL id
-    if field_version >= FIELD_VERSION_12_2_EXT_1:
-        rest = rest[2:]  # chunk ids
-    return rest
-
-
 def parse_exec(
     payload: bytes,
     bind_types: list | None = None,
@@ -5029,44 +5079,36 @@ def parse_exec(
     if len(payload) < 3 or payload[0] != TTI_FUN or payload[1] != TTI_ALL8:
         raise InterfaceError('not an OALL8 execute')
 
-    (head, rest) = _ALL8_HEAD_FROM_THIN(payload)
+    # The OALL8 through its al8i4 array (_ALL8). The client presents itself to
+    # an 11g+ server, so before 12.1 both of 11g's blocks are there, the
+    # registration's and al8blv's; from 12.1 the row-count block and, by the
+    # field version, the SQL signature's and the chunk ids' (#1144), and the
+    # SQL is length-framed.
+    field_version = _DECODE_FIELD_VERSION.get()
+    try:
+        (head, after) = _ALL8_FROM_THIN(
+            payload, _all8_blocks(field_version, server_92=False, server_10=False)
+        )
+    except IndexError as exc:
+        # A message cut short is Truncated, which the session reads on from.
+        raise Truncated(f'OALL8: {exc}') from exc
+    bare = head['bare_sql'] and head['sql_present']
+    if bare and len(head['sql']) < head['sql_length']:
+        raise Truncated('OALL8: the SQL is shorter than its length')
     options = head['options']
     autocommit = bool(options & _EXEC_OPTION_COMMIT)
     batcherrors = bool(options & TNS_EXEC_OPTION_BATCH_ERRORS)
     parse_only, describe_only = parse_options(options)
-    (cursor, query_flag, query_len) = (
-        head['cursor'],
-        head['sql_present'],
-        head['sql_length'],
-    )
-    (all8_len, fetch) = (head['al8i4_length'], head['prefetch_rows'])
+    cursor = head['cursor']
+    sql = bytes(head['sql']).decode('utf-8') if head['sql_present'] else ''
+    fetch = head['prefetch_rows']
     (bind_count, define_count) = (head['bind_count'], head['define_count'])
 
-    field_version = _DECODE_FIELD_VERSION.get()
-    if field_version >= FIELD_VERSION_12_1:
-        # 12.1+ replaces the marker + server-version slot with the registration /
-        # array-DML row-count block (and from 12.2 the SQL-signature one), and
-        # length-prefixes the SQL (#1144).
-        rest = _skip_exec_middle_12c(rest, field_version)
-        if query_flag:
-            raw, after = decode_dalc(rest)
-            sql = bytes(raw).decode('utf-8')
-        else:
-            sql, after = '', rest
-    else:
-        rest = rest[_MARKER_LEN + _SERVER_VERSION_SLOT :]
-        sql = rest[:query_len].decode('utf-8') if query_flag else ''
-        after = rest[query_len:]
-
-    # The al8i4 option array follows the SQL text; decode all `all8_len` sb4
-    # elements so `after` lands on the OAC/RXD tokens and the scroll request
-    # (al8i4[9] exec flags, [10] orientation, [11] position) is available. A
-    # scroll re-execute carries no binds, so this must run unconditionally, not
-    # only in the bind path (#181/#485).
-    al8: list[int] = []
-    for _ in range(all8_len):
-        al8_elem, after = decode_ub4(after)
-        al8.append(al8_elem)
+    # The al8i4 option array, read whole whatever the call, so `after` lands on
+    # the OAC/RXD tokens and the scroll request (al8i4[9] exec flags, [10]
+    # orientation, [11] position) is there: a scroll re-execute carries no
+    # binds (#181/#485).
+    al8: list[int] = [item['word'] for item in head['al8i4']]
     scrollable = len(al8) > 9 and bool(al8[9] & TNS_EXEC_FLAGS_SCROLLABLE)
     # The request is the DML_ROWCOUNTS bit alone. Testing the composite the
     # client sends (which also carries IMPLICIT_RESULTSET) matched EVERY execute
@@ -15197,11 +15239,6 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
     Type = Dictionary['query']['type']
     Auto = Dictionary['query']['auto']
     Fetch = Dictionary['query']['fetch']
-    ServerVersion = (
-        b''
-        if (Dictionary['query']['server_version'] >> 24) == 10
-        else bytes([0, 0, 0, 0, 0])
-    )
     Cursor = Dictionary['query']['cursor']
     Query = Dictionary['query']['query'].encode('utf-8')
     QueryLen = len(Query)
@@ -15372,7 +15409,6 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
 
     All8Len = len(All8)
     All8Flag = 1 if All8Len > 0 else 0
-    All8s = reduce(lambda x, y: x + y, [encode_sb4(A) for A in All8])
 
     RowData = b''.join(encode_tokens_rxd(R, b'') for R in Rows)
     if BindLen == DefLen == 0:
@@ -15390,82 +15426,79 @@ def encode_dictionary_exec(Dictionary: dict) -> bytes:
     else:
         raise Exception('Unhandled tokens combination', Bind, Batch, Def, Query)
 
-    # The OALL8 head from the _ALL8_HEAD schema (#2293). The al8o4 / al8app /
-    # al8txn / al8txl / al8kv / al8kvl pointers are null, and al8o4l too; the
-    # five flag fields are the 0/1 the ptr primitive writes as 00/01. Every
-    # value is computed above exactly as before; only the layout moves to the
-    # schema the Mirror already decodes this message with.
-    Head = _ALL8_HEAD_THIN(
-        {
-            'seq': Tseq,
-            'token_number': TokenNum,
-            'options': Opt,
-            'cursor': Cursor,
-            'sql_present': QueryFlag,
-            'sql_length': QueryLen,
-            'al8i4_present': All8Flag,
-            'al8i4_length': All8Len,
-            'al8o4': False,
-            'al8o4l': False,
-            'prefetch_size': LMax,
-            'prefetch_rows': Fetch,
-            'max_long': Max,
-            'binds_present': BindFlag,
-            'bind_count': BindLen,
-            'al8app': False,
-            'al8txn': False,
-            'al8txl': False,
-            'al8kv': False,
-            'al8kvl': False,
-            'defines_present': DefFlag,
-            'define_count': DefLen,
-        }
-    )
-
-    if FieldVersion >= FIELD_VERSION_12_1:
-        # 12c+ OALL8 carries extra al8 fields after the 11g header: the DML
-        # row-count block from 12.1, then (12.2+) the SQL-signature / SQL-id
-        # pointers and (12.2_EXT1+) the chunk-id pointers — all zero/null for
-        # us. Gating the whole tail on 12.2 sent a 12.1 session the 11g shape,
-        # and a real server refused every call ORA-03120 (#1144). The SQL is
-        # length-prefixed (write_bytes_with_length). Without these the server
-        # reads the SQL/al8i4 array from the wrong offset and returns ORA-03120
-        # (two-task conversion routine: integer overflow). See oracledb
-        # execute.pyx _write_execute_message.
-        # A query a subscription registers carries the registration, its low
-        # word first and its high word after four empty fields (#2460).
-        Registration = int(Dictionary['query'].get('registration_id') or 0)
-        Middle = (
-            encode_sb4(Registration & 0xFFFFFFFF)
-            + bytes([0, 1, 0, 0, 0, 0])
-            + encode_sb4(Registration >> 32)
-        )
-        if ArrayDmlRowCounts:
-            # al8pidmlrc = pointer(1) + ub4 iteration count + 1. The server
-            # returns that many per-iteration row counts in the response RPA
-            # region (#18). Matches oracledb byte-for-byte (e.g. 4 iters →
-            # 01 01 04 01).
-            Middle += bytes([1]) + encode_sb4(1 + BatchLen) + bytes([1])
-        else:
-            Middle += bytes([0, 0, 0])  # al8pidmlrc block
-        if FieldVersion >= FIELD_VERSION_12_2:
-            Middle += bytes([0, 0, 0, 0, 0])  # 12.2 al8sqlsig / SQL id
-        if FieldVersion >= FIELD_VERSION_12_2_EXT_1:
-            Middle += bytes([0, 0])  # 12.2_EXT1 chunk ids
-        # The length-prefixed SQL is written only when there is SQL to parse. On
-        # a no-parse re-execute (Cursor != 0, empty query — e.g. a #181 scroll
-        # re-execute) oracledb omits the SQL bytes entirely; emitting the
-        # zero-length prefix (a stray 0x00) shifts the server's read of the
-        # al8i4 array by one byte and it rejects the call as malformed
-        # (ORA-03137 [12316]).
-        Sql = _bytes_with_length(Query) if QueryLen else b''
-        return Head + Middle + Sql + All8s + Tokens
-
-    if Server92:
-        # 9.2 reads the SQL straight after the define count: the block below
-        # is 10g's, and 9.2 answers it ORA-03120, as ojdbc6's OALL8 shows (#2768).
-        return Head + Query + All8s + Tokens
-    return Head + bytes([0, 0, 1]) + ServerVersion + Query + All8s + Tokens
+    # The OALL8 through its al8i4 array, from the _ALL8 schema (#2293, #2773).
+    # The al8o4 / al8app / al8txn / al8txl / al8kv / al8kvl pointers are null,
+    # and al8o4l too, as are every pointer and length of the blocks after the
+    # define count but al8objlen and, for array-DML row counts, al8pidmlrc.
+    # Which blocks there are goes by the field version (_all8_blocks): 12.1 adds
+    # the row-count block and frames the SQL, and without it a 12.1 server
+    # refuses every call ORA-03120 (#1144). Before 12.1 the server's own
+    # version decides: 9.2 reads the SQL straight after the define count, and
+    # answers ORA-03120 to anything else, as ojdbc6's OALL8 shows (#2768); a
+    # 10.x server reads 11g's block without al8blv to al8regid_msb.
+    Modern = FieldVersion >= FIELD_VERSION_12_1
+    # A query a subscription registers carries the registration, its low word
+    # first and its high word in al8regid_msb (#2460), from 12.1; before, both
+    # stay zero, as they always have.
+    Registration = int(Dictionary['query'].get('registration_id') or 0) if Modern else 0
+    Values = {
+        **_all8_blocks(
+            FieldVersion,
+            server_92=Server92,
+            server_10=(Dictionary['query']['server_version'] >> 24) == 10,
+        ),
+        'seq': Tseq,
+        'token_number': TokenNum,
+        'options': Opt,
+        'cursor': Cursor,
+        'sql_present': QueryFlag,
+        'sql_length': QueryLen,
+        'al8i4_present': All8Flag,
+        'al8i4_length': All8Len,
+        'al8o4': False,
+        'al8o4l': False,
+        'prefetch_size': LMax,
+        'prefetch_rows': Fetch,
+        'max_long': Max,
+        'binds_present': BindFlag,
+        'bind_count': BindLen,
+        'al8app': False,
+        'al8txn': False,
+        'al8txl': False,
+        'al8kv': False,
+        'al8kvl': False,
+        'defines_present': DefFlag,
+        'define_count': DefLen,
+        'registration_id': Registration & 0xFFFFFFFF,
+        'al8objlist': False,
+        'al8objlen': True,
+        'al8blv': False,
+        'al8blvl': 0,
+        'al8dnam': False,
+        'al8dnaml': 0,
+        'registration_id_msb': Registration >> 32,
+        # Array-DML row counts (#18): the pointer, the iteration count and the
+        # second pointer, as python-oracledb writes them (4 iterations read
+        # `01 01 04 01`). The server answers that many per-iteration counts.
+        'al8pidmlrc': ArrayDmlRowCounts,
+        'al8pidmlrcbl': 1 + BatchLen if ArrayDmlRowCounts else 0,
+        'al8pidmlrcl': ArrayDmlRowCounts,
+        'al8sqlsig': False,
+        'sql_signature_length': 0,
+        'sql_id': False,
+        'sql_id_size': 0,
+        'sql_id_length': False,
+        'chunk_ids': False,
+        'chunk_id_count': 0,
+        # The SQL goes only when there is SQL to parse (sql_present). On a
+        # no-parse re-execute (Cursor != 0, no SQL, e.g. a #181 scroll
+        # re-execute) python-oracledb writes nothing, and from 12.1 a
+        # zero-length frame's stray `00` shifts the server's read of the al8i4
+        # array: ORA-03137 [12316].
+        'sql': Query,
+        'al8i4': [{'word': A} for A in All8],
+    }
+    return _ALL8_THIN(Values) + Tokens
 
 
 def encode_dictionary_fetch(Dictionary: dict) -> bytes:
