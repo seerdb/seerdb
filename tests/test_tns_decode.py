@@ -6428,6 +6428,26 @@ class TestFv2OerError(unittest.TestCase):
         # An RPA (08) token is not an error.
         self.assertEqual(decode_fv2_oer_error(bytes.fromhex('08010109')), (0, None))
 
+    def test_a_cut_status_gives_its_code_and_no_stray_text(self):
+        # A status cut before its message has the code alone. The scan that
+        # looked for a final DALC took a byte of the cut head for the message
+        # (#2773).
+        from seerdb.common.tns import decode_fv2_oer_error
+
+        for cut in (7, 10, 19, 22):
+            with self.subTest(cut=cut):
+                self.assertEqual(
+                    decode_fv2_oer_error(self.BAD_TABLE[:cut]), (942, None)
+                )
+
+    def test_a_status_cut_in_its_head_is_truncated(self):
+        # Too short to hold even the code: cut, never read as no error.
+        from seerdb.common.exceptions import Truncated
+        from seerdb.common.tns import decode_fv2_oer_error
+
+        with self.assertRaises(Truncated):
+            decode_fv2_oer_error(self.BAD_TABLE[:3])
+
 
 class TestFv2DmlResponse(unittest.TestCase):
     """Oracle 9i DML over TTI_ALL7 (#101): RPA piggyback + short OER whose first

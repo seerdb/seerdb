@@ -18836,41 +18836,21 @@ def decode_fv2_oer_error(Packet: bytes) -> tuple[int, str | None]:
     # ORA-00942) with the server's own text instead of letting the caller march
     # on into a desync (#102). The message is the status's last field, read with
     # the rest of it (`_O7_STATUS_TAIL`); a long one comes in the 0xFE chunked
-    # form, whose chunk lengths are not text (#810).
+    # form, whose chunk lengths are not text (#810). A status the schema does
+    # not read whole gives its code alone: the scan for a final DALC that stood
+    # in for its message before #2284 was dropped in #2773, when no 8i or 9i
+    # reply in the integration suite reached it any more.
     if not Packet or Packet[0] != TTI_OER:
         return (0, None)
     Status = _o7_status(Packet)
     if Status is not None and 'message' in Status:
         return (Status['code'], _fv2_message(Status['message']))
-    return _scan_fv2_message(Packet)
-
-
-def _scan_fv2_message(Packet: bytes) -> tuple[int, str | None]:
-    # A status the schema does not read whole: its code, and its message found
-    # as the final DALC, the offset whose DALC consumes exactly the rest of the
-    # packet -- the reading before #2284, kept for a reply that ends early.
-    Packet = _o7_without_call_status(Packet)
-    (ErrCode, Rest) = decode_ub4(decode_ub4(Packet[1:])[1])
-    Fallback = None
-    for I in range(len(Rest)):
-        if not Rest[I]:
-            continue
-        try:
-            (Value, Tail) = decode_dalc(Rest[I:])
-        except DataError:
-            continue
-        if Tail or not Value:
-            continue
-        Text = bytes(Value).decode('utf-8', errors='replace').rstrip('\x00').rstrip()
-        if not Text:
-            continue
-        # A server message opens with its own code, which makes for a decisive
-        # check; anything else is kept only as a fallback.
-        if Text.startswith(('ORA-', 'PLS-')):
-            return (ErrCode, Text)
-        if Fallback is None:
-            Fallback = Text
-    return (ErrCode, Fallback)
+    if Status is not None:
+        return (Status['code'], None)
+    # Too short for the head's later fields: the code is the second ub4, after
+    # the call status, and a status shorter still raises Truncated.
+    (Code, _) = decode_ub4(decode_ub4(_o7_without_call_status(Packet)[1:])[1])
+    return (Code, None)
 
 
 def decode_fv2_exec_response(Data: bytes, Columns: list) -> tuple[list, int]:
