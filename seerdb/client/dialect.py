@@ -100,6 +100,7 @@ from seerdb.common.tns import (
     encode_8i_oall8_fetch,
     encode_8i_oall8_query,
     encode_8i_sql_text,
+    encode_9i_oall8_client_identifier,
     encode_9i_oall8_close_cursors,
     encode_9i_oall8_create_temp,
     encode_9i_oall8_dml,
@@ -1561,12 +1562,27 @@ class Fv2Oall8Dialect(Oall8Dialect):
         next_seq: Callable[[], int],
         charset: int | None = None,
         ncharset: int | None = None,
+        take_end_to_end: Callable[[], dict] | None = None,
     ) -> None:
         super().__init__(next_seq)
         # The database's charset and its national one, from the login's TTI_PRO:
         # a temporary LOB is made in the one its type has (#2537).
         self._db_charset = charset
         self._db_ncharset = ncharset
+        # Hands over the client identifier if it changed since the last call,
+        # and forgets it (#2810).
+        self._take_end_to_end = take_end_to_end
+
+    def _closing(self) -> bytes:
+        # OCI 9.2's order: the cursors' close, then the client identifier's
+        # change, each taking its sequence number (#2810).
+        frames = super()._closing()
+        attrs = self._take_end_to_end() if self._take_end_to_end else {}
+        if 'client_identifier' in attrs:
+            frames += encode_9i_oall8_client_identifier(
+                self._next_seq(), attrs['client_identifier']
+            )
+        return frames
 
     def flush_cursors(self, cache: dict):
         return self._flush_native_cache(cache)

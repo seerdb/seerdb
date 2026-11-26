@@ -659,16 +659,35 @@ class _ConnectionLogic:
         # SET_END_TO_END_ATTR piggyback (func 135, #183). From 10.2 the thin
         # form has no dbop slot below 12.1, as JDBC thin 11.2 sends it (#2810),
         # and a native 10g or 11g session sends OCI's form, which has none
-        # either. Below 10.2 it is refused.
+        # either. 9.2 has the client identifier alone, which each 9i form sends
+        # as its reference client does: OCI 9.2's piggyback on the native form,
+        # ojdbc14's dbms_session call on the compact one (#2810). JDBC thin
+        # 11.2, which the thin OALL8 form follows, sends 9.2 none; 8.1.7 has
+        # none.
         if self.field_version < FIELD_VERSION_12_1:
             if not getattr(self, '_native11', False) and self._server_below_10_2():
-                raise NotSupportedError(
-                    'end-to-end tracing attributes require an Oracle 10.2+ server'
-                )
+                if name != 'client_identifier' or not isinstance(
+                    self._dialect, (Fv2Dialect, Fv2Oall8Dialect)
+                ):
+                    raise NotSupportedError(
+                        'end-to-end tracing attributes require an Oracle 10.2+ '
+                        'server; on 9i, client_identifier alone, and not with '
+                        'thin_oall8=True'
+                    )
             if name == 'dbop':
                 raise NotSupportedError('dbop requires an Oracle 12.1+ server')
         self._e2e_values[name] = value
         self._e2e_pending[name] = value
+
+    def _fv2_client_identifier_call(self) -> tuple[str, list] | None:
+        # The call that sets a changed client identifier on a compact 9i
+        # session, run ahead of the next statement, as ojdbc14's
+        # setClientIdentifier runs it (#2810). A NULL clears it on 9.2. None
+        # when there is nothing to send.
+        if not isinstance(self._dialect, Fv2Dialect) or not self._e2e_pending:
+            return None
+        Value = self._take_end_to_end().get('client_identifier')
+        return ('begin dbms_session.set_identifier(:1); end;', [Value])
 
     def _pending_e2e_with_module_action(self) -> dict:
         # The server rejects a module update that does not also carry action
@@ -1426,6 +1445,7 @@ class _ConnectionLogic:
                     self._next_seq,
                     getattr(self, '_server_charset', None),
                     getattr(self, '_server_ncharset', None),
+                    self._take_end_to_end,
                 )
                 if getattr(self, '_oall8', False)
                 else Fv2Dialect()

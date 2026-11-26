@@ -8664,6 +8664,79 @@ class Oall8NineTempLobTest(unittest.TestCase):
         )
 
 
+class Pre10ClientIdentifierTest(unittest.TestCase):
+    # The client identifier on 9.2 (#2810): the native form's piggyback
+    # against OCI 9.2's, whose pointer holds its own heap address, and the
+    # call the compact form runs, as ojdbc14 does.
+    POINTER = slice(3, 11)
+
+    _capture = staticmethod(Oall8NineTempLobTest._capture)
+
+    def test_the_native_form_is_oci_9_2s(self):
+        from seerdb.common.tns import encode_9i_oall8_client_identifier
+
+        for name, value in (
+            ('oci92_client_identifier_set.hexdump', 'PYOCLID'),
+            ('oci92_client_identifier_clear.hexdump', None),
+        ):
+            with self.subTest(name):
+                theirs = bytearray(self._capture(name))
+                ours = bytearray(encode_9i_oall8_client_identifier(theirs[2], value))
+                self.assertNotEqual(ours[self.POINTER], bytes(8))
+                ours[self.POINTER] = theirs[self.POINTER] = bytes(8)
+                self.assertEqual(ours, theirs)
+
+    def test_it_rides_behind_the_cursors_close_once(self):
+        from seerdb.client.dialect import Fv2Oall8Dialect
+
+        pending = {'client_identifier': 'PYOCLID'}
+
+        def take():
+            taken = dict(pending)
+            pending.clear()
+            return taken
+
+        seqs = iter(range(6, 100))
+        dialect = Fv2Oall8Dialect(lambda: next(seqs), take_end_to_end=take)
+        dialect._to_close = [7]
+        frames = dialect._closing()
+        self.assertEqual(frames[:2], b'\x11\x69')
+        at = frames.index(b'\x11\x87')
+        self.assertEqual(frames[at + 2], 7)
+        self.assertNotIn(b'\x11\x87', dialect._closing())
+
+    def test_the_compact_form_runs_ojdbc14s_call(self):
+        from seerdb.client._conn_logic import _ConnectionLogic
+        from seerdb.client.dialect import Fv2Dialect, Fv2Oall8Dialect, O8iDialect
+        from seerdb.common.exceptions import NotSupportedError
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2
+
+        class Session(_ConnectionLogic):
+            pass
+
+        def session(dialect):
+            conn = Session.__new__(Session)
+            (conn.field_version, conn._native11) = (FIELD_VERSION_9_2, False)
+            (conn._e2e_values, conn._e2e_pending) = ({}, {})
+            conn._dialect = dialect
+            return conn
+
+        conn = session(Fv2Dialect())
+        self.assertIsNone(conn._fv2_client_identifier_call())
+        conn.client_identifier = 'PYOCLID'
+        self.assertEqual(
+            conn._fv2_client_identifier_call(),
+            ('begin dbms_session.set_identifier(:1); end;', ['PYOCLID']),
+        )
+        self.assertIsNone(conn._fv2_client_identifier_call())
+        with self.assertRaises(NotSupportedError):
+            conn.module = 'M'
+        session(Fv2Oall8Dialect(lambda: 1)).client_identifier = 'X'
+        for dialect in (O8iDialect(lambda: 1), None):
+            with self.assertRaises(NotSupportedError):
+                session(dialect).client_identifier = 'X'
+
+
 class Pre10TpcTest(unittest.TestCase):
     # Two-phase commit on 8i and on a native 9i session (#2807), against OCI
     # 9.2's OCITrans* calls and the servers' answers. The 9.2 form's pointers
