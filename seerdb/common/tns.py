@@ -21167,6 +21167,72 @@ def encode_oci11_tpc_change_state(
     )
 
 
+# 8i's and the native 9.2 form's two calls (#2807), as OCI 9.2 sends them:
+# OCITransStart and OCITransDetach a switch, OCITransPrepare, OCITransCommit
+# and OCITransRollback a change of state. Captured on 8.1.7 and 9.2.0.4:
+# - both have 10.2's switch, with no names, and 9.2's change of state, with no
+#   flags;
+# - 8i's fields are ub4s with one-byte pointers (_O8I), and no bytes follow
+#   the switch's timeout or the change of state's state;
+# - the native 9.2 form's are a 64-bit OCI client's (_OCI_WIDE): a ub8
+#   operation, eight-byte pointers, and the four bytes behind the timeout and
+#   the state that 11g's wide form has.
+# The context the server returns is 152 bytes on 8.1.7 and 168 on 9.2.
+_TPC_SWITCH_O8I = wire_schema.compile_encoder(_TPC_SWITCH, _O8I)
+_TPC_CHANGE_STATE_O8I = wire_schema.compile_encoder(_TPC_CHANGE_STATE, _O8I)
+
+
+def encode_pre10_tpc_switch(
+    Seq: int,
+    Operation: int,
+    Xid,
+    Flags: int,
+    Timeout: int,
+    Context: bytes | None,
+    O8i: bool,
+) -> bytes:
+    """Start or detach a branch on an 8i session (``O8i``) or a native 9.2
+    one."""
+    Encode = _TPC_SWITCH_O8I if O8i else _TPC_SWITCH_OCI_WIDE
+    return Encode(
+        {
+            **_oci11_tpc_fields(Seq, Operation, Xid, Context),
+            **_tpc_names(None, None),
+            'flags': Flags,
+            'timeout': Timeout,
+            'app_value_present': True,
+            'return_context_present': True,
+            'return_length_present': True,
+            'has_names': False,
+            'app_value': 0,
+        }
+    )
+
+
+def encode_pre10_tpc_change_state(
+    Seq: int,
+    Operation: int,
+    State: int,
+    Xid,
+    Context: bytes | None,
+    O8i: bool,
+) -> bytes:
+    """Prepare, commit or roll back a branch on an 8i session (``O8i``) or a
+    native 9.2 one."""
+    Encode = _TPC_CHANGE_STATE_O8I if O8i else _TPC_CHANGE_STATE_OCI_WIDE
+    return Encode(
+        {
+            **_oci11_tpc_fields(Seq, Operation, Xid, Context),
+            'timeout': 0,
+            'state': State,
+            'wide': True,
+            'out_state_present': True,
+            'has_flags': False,
+            'flags': 0,
+        }
+    )
+
+
 # A two-phase commit call's return parameters (#131), one message in both
 # dialects: a switch (begin, resume) returns an application value and the
 # transaction context, which a later prepare or commit replays; a change of

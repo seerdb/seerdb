@@ -353,7 +353,7 @@ exercise.
 | **Native network encryption** — Advanced Networking (ANO): AES-CBC encryption + SHA-2 data-integrity negotiated at connect, for a server with `SQLNET.ENCRYPTION_SERVER` / `CRYPTO_CHECKSUM_SERVER` set | ✅ |
 | **Advanced Queuing (AQ)** — enqueue / dequeue over `DBMS_AQ`, including JSON payloads | ✅ |
 | **Implicit result sets** — `DBMS_SQL.RETURN_RESULT` (`getimplicitresults`) | ✅ |
-| **Two-phase commit / XA** — `tpc_begin` / `tpc_prepare` / `tpc_commit` / `tpc_rollback` with an `Xid`; `tpc_recover` lists in-doubt branches (needs SELECT on `DBA_PENDING_TRANSACTIONS`); `tpc_forget` is refused, as in python-oracledb's thin mode. 9.2 and later, in the thin form and the native 10g and 11g one; on 9i, open the connection with `xa=True` | ✅ |
+| **Two-phase commit / XA** — `tpc_begin` / `tpc_prepare` / `tpc_commit` / `tpc_rollback` with an `Xid`; `tpc_recover` lists in-doubt branches (needs SELECT on `DBA_PENDING_TRANSACTIONS`); `tpc_forget` is refused, as in python-oracledb's thin mode. Every server, 8i included, in each form; on 8i and 9i, open the connection with `xa=True` | ✅ |
 | **Direct path load** — `direct_path_load(schema, table, columns, data, batch_size=...)` streams rows, or a DataFrame, into a table without SQL, as in python-oracledb's thin mode: committed when the load finishes, nothing kept if it fails. 12c and later | ✅ |
 | **Dynamic SQL helpers** — `enquote_literal`, `enquote_name`, `is_simple_sql_name`, as in python-oracledb 4.0 | ✅ |
 | **Request pipelining** — `create_pipeline()` batches operations into one round trip (23ai) | ✅ |

@@ -8611,6 +8611,117 @@ class Oall8NineTempLobTest(unittest.TestCase):
         )
 
 
+class Pre10TpcTest(unittest.TestCase):
+    # Two-phase commit on 8i and on a native 9i session (#2807), against OCI
+    # 9.2's OCITrans* calls and the servers' answers. The 9.2 form's pointers
+    # are a 64-bit client's heap and stack addresses; the server only reads
+    # whether they are null.
+    SWITCH_POINTERS = ((11, 19), (35, 43), (59, 67), (67, 75), (75, 83))
+    CHANGE_POINTERS = ((11, 19), (35, 43), (59, 67))
+    (A, B) = ((2807, b'gtridA', b'bqA'), (2807, b'gtridB', b'bqB'))
+
+    _capture = staticmethod(Oall8NineTempLobTest._capture)
+    _masked = Oall8NineTempLobTest._masked
+
+    def _drive(self, gen, reply):
+        from seerdb.client.dialect import RECV, Send
+
+        sent = gen.send(None)
+        self.assertIsInstance(sent, Send)
+        self.assertIs(gen.send(None), RECV)
+        try:
+            gen.send((6, reply))
+        except StopIteration as done:
+            return (sent.data, done.value)
+        self.fail('the call did not end with its reply')
+
+    def test_8is_calls_are_oci_9_2s(self):
+        from seerdb.common.tns import (
+            encode_pre10_tpc_change_state,
+            encode_pre10_tpc_switch,
+        )
+
+        Start = self._capture('o8i_tpc_start.hexdump')
+        self.assertEqual(
+            encode_pre10_tpc_switch(Start[2], 1, self.B, 1, 60, None, True), Start
+        )
+        Detach = self._capture('o8i_tpc_detach.hexdump')
+        Context = bytes(Detach[40:192])
+        self.assertEqual(
+            encode_pre10_tpc_switch(Detach[2], 2, self.B, 0, 0, Context, True), Detach
+        )
+        Prepare = self._capture('o8i_tpc_prepare.hexdump')
+        Context = bytes(Prepare[38:190])
+        self.assertEqual(
+            encode_pre10_tpc_change_state(Prepare[2], 3, 0, self.A, Context, True),
+            Prepare,
+        )
+
+    def test_9_2s_native_calls_are_oci_9_2s(self):
+        from seerdb.common.tns import (
+            encode_pre10_tpc_change_state,
+            encode_pre10_tpc_switch,
+        )
+
+        for Name, Ours, Pointers in (
+            (
+                'oci92_tpc_start.hexdump',
+                lambda Seq, _: encode_pre10_tpc_switch(
+                    Seq, 1, self.B, 1, 60, None, False
+                ),
+                self.SWITCH_POINTERS[1:],
+            ),
+            (
+                'oci92_tpc_prepare.hexdump',
+                lambda Seq, Theirs: encode_pre10_tpc_change_state(
+                    Seq, 3, 0, self.A, bytes(Theirs[67:235]), False
+                ),
+                self.CHANGE_POINTERS,
+            ),
+        ):
+            with self.subTest(Name):
+                Theirs = self._capture(Name)
+                Mine = Ours(Theirs[2], Theirs)
+                for Start, End in Pointers:
+                    self.assertNotEqual(Mine[Start:End], bytes(End - Start))
+                self.assertEqual(
+                    self._masked(Mine, Pointers), self._masked(Theirs, Pointers)
+                )
+
+    def test_each_tier_reads_its_replies(self):
+        from seerdb.client.dialect import Fv2Oall8Dialect, O8iDialect
+
+        for Dialect, Tier, Length in (
+            (O8iDialect, 'o8i', 152),
+            (Fv2Oall8Dialect, 'oci92', 168),
+        ):
+            with self.subTest(Tier):
+                (Sent, Context) = self._drive(
+                    Dialect(lambda: 7).tpc_switch(1, self.B, 1, 60, None),
+                    self._capture(f'{Tier}_tpc_start_reply.hexdump'),
+                )
+                self.assertEqual(Sent[:3], b'\x03\x67\x07')
+                self.assertEqual(len(Context), Length)
+                (_, State) = self._drive(
+                    Dialect(lambda: 8).tpc_change_state(3, 0, self.A, Context),
+                    self._capture(f'{Tier}_tpc_prepare_reply.hexdump'),
+                )
+                self.assertEqual(State, 1)
+
+    def test_a_refusal_is_raised(self):
+        from seerdb.client.dialect import Fv2Oall8Dialect, O8iDialect
+        from seerdb.common.exceptions import DatabaseError
+
+        for Dialect, Tier in ((O8iDialect, 'o8i'), (Fv2Oall8Dialect, 'oci92')):
+            with self.subTest(Tier):
+                with self.assertRaises(DatabaseError) as Raised:
+                    self._drive(
+                        Dialect(lambda: 7).tpc_switch(1, self.B, 1, 60, None),
+                        self._capture(f'{Tier}_tpc_refused_reply.hexdump'),
+                    )
+                self.assertEqual(Raised.exception.code, 2048)
+
+
 class Oall8NineObjectBindTest(unittest.TestCase):
     # An object or a collection bound on a native 9i session, against OCI 9.2's.
     DESCRIPTOR_HEAD = bytes.fromhex('006d000000d007')
