@@ -2361,7 +2361,8 @@ server sizes its buffer from the OAC and then waits for bytes that do not fit: a
 hang, not an error. A server that reads the value as a DALC gets the count where
 it wanted the id, and the two are often both 1. The bound cursor must still be
 open on the server with rows unread; one already fetched to its end is answered
-`ORA-01007`.
+`ORA-01007`. 10.2 and 11g take the IN bind from a thin session too, in that
+session's own OAC layout; measured on 10.2.0.5 and 11.2 (#2806).
 
 **A NULL bind still has to declare a type** (#696). The row data for one is the
 same single `0x00` whatever it stands for, so the OAC in front of it is the only

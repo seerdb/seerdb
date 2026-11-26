@@ -315,8 +315,8 @@ class _Target(NamedTuple):
     # Whether the server refuses a password change on the session: a pooled 11g
     # one answers ORA-56609 (#2466).
     no_password_change: bool = False
-    # Whether the session binds an open cursor IN: 12.1+, and a pooled 11g one
-    # in the native form (#2466).
+    # Whether the session binds an open cursor IN: 12.1+, the native form on
+    # 10g and 11g (#2466), and a thin 10g or 11g session (#2806).
     refcursor_in: bool = False
     # Whether the session binds an object or a collection, IN and OUT: 12.1+,
     # a 10g or 11g thin session (#2704), and 11g's native form, pooled or
@@ -413,7 +413,8 @@ def _target_of(conn) -> _Target:
         bool(getattr(conn, '_native11', False))
         and getattr(conn, 'server_type', None) == 'pooled',
         conn.field_version >= FIELD_VERSION_12_1
-        or bool(getattr(conn, '_native11', False)),
+        or bool(getattr(conn, '_native11', False))
+        or (getattr(conn, '_dialect', None) is None and not conn._server_below_10_2()),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False))
         or _dialect_binds_objects(conn)
@@ -690,7 +691,7 @@ _LOB_OUT_BIND = _Need(
     lob_out=True,
 )
 _REFCURSOR_IN_BIND = _Need(
-    'a REF CURSOR IN bind needs the 12c+ bind OAC, or a pooled 11g session',
+    'a REF CURSOR IN bind needs a 10.2+ server',
     refcursor_in=True,
 )
 _VECTOR_BIND = _Need('a VECTOR bind needs a 12.1+ session (#1762)', min_fv=_FV)

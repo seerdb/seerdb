@@ -416,8 +416,8 @@ integration suite, with these differences from the default compact form:
 `oall8=True`). A pooled 11g session always speaks OCI 11.2's native form, the
 only one 11g's pool serves (#2466); with the flag a dedicated 11g session does
 too, in place of the converted form. It runs temporary LOBs (`createlob()`, and
-a large value bound into PL/SQL), LOB Var binds and a REF CURSOR bound IN, which
-the converted form below 12.1 does not: **on 11g, use `oall8=True` for those**.
+a large value bound into PL/SQL) and LOB Var binds, which the converted form
+below 12.1 does not: **on 11g, use `oall8=True` for those**.
 The converted form stays the default; its own way to make a temporary LOB below
 12.1 has no reference to build from (#2463). The native form keeps no cursor
 cache, as a pooled session doesn't, so a repeated statement is parsed again:
@@ -425,11 +425,11 @@ about 0.3 ms an execute on the 11g bed.
 
 **Experimental: the native form on 10g** (the same `oall8=True`). OCI 11.2's
 native form at 10.2's widths, in place of the converted form (#2518). It adds
-what it adds on 11g, the temporary LOBs, the LOB Var binds and the REF CURSOR
-bound IN, and writes to a LOB, on which 10g closes the converted form's
-connection. Validated on 10.2.0.5 only. Object, collection and
-associative-array binds need no flag on 10g or 11g: the converted form binds
-them too (#2704, #2706).
+what it adds on 11g, the temporary LOBs and the LOB Var binds, and writes to a
+LOB, on which 10g closes the converted form's connection. Validated on 10.2.0.5
+only. Object, collection and associative-array binds and a REF CURSOR bound IN
+need no flag on 10g or 11g: the converted form binds them too (#2704, #2706,
+#2806).
 
 The flag is ignored on other tiers.
 
