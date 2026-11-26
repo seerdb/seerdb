@@ -21413,6 +21413,43 @@ def encode_oci11_end_to_end(Seq: int, Attrs: dict) -> bytes:
     return _OCI11_END_TO_END_OCI_WIDE(Fields)
 
 
+# The client identifier on a native 9.2 session (#2810), as OCI 9.2 sends
+# OCI_ATTR_CLIENT_IDENTIFIER to 9.2.0.4: piggybacked behind the cursors' close,
+# ahead of the next call. 9.2 has no other attribute of the set. A pointer, the
+# flags (the client identifier's alone), then the identifier's length and its
+# value, set or cleared by a zero length. OCI sends the pointer, writing its
+# heap address, whether it sets or clears. No field is known for the twelve
+# bytes behind the flags, the four behind the value, or the closing `16 01`,
+# which OCI sends each time.
+_O9I_END_TO_END: wire_schema.Schema = (
+    ('const', bytes([TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SET_END_TO_END_ATTR])),
+    ('u8', 'seq'),
+    ('ptr', 'attributes_present'),
+    ('n4', 'flags'),
+    ('pad', 12),
+    ('n4', 'client_identifier_length'),
+    ('when', 'client_identifier_length', (('value', 'client_identifier'),)),
+    ('pad', 4),
+    ('const', b'\x16\x01'),
+)
+_O9I_END_TO_END_OCI = wire_schema.compile_encoder(_O9I_END_TO_END, _OCI)
+
+
+def encode_9i_oall8_client_identifier(Seq: int, Value: str | None) -> bytes:
+    """A native 9.2 session's client identifier set to `Value`, or cleared by
+    None, as it is sent ahead of the next call."""
+    Bytes = (Value or '').encode('utf-8')
+    return _O9I_END_TO_END_OCI(
+        {
+            'seq': Seq,
+            'attributes_present': True,
+            'flags': TNS_END_TO_END_CLIENT_IDENTIFIER,
+            'client_identifier_length': len(Bytes),
+            'client_identifier': Bytes,
+        }
+    )
+
+
 def encode_oci11_app_context(Seq: int, Namespace: str, Entries: dict) -> bytes:
     """An application context namespace's change, piggybacked ahead of a pooled
     11g session's next call: its ``Entries`` (key: value) set, or the

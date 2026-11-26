@@ -4054,7 +4054,24 @@ the wire. 8.1.7 has no client identifier either: `SYS_CONTEXT('USERENV',
 - ojdbc14 (JDBC thin 9.2) runs `begin dbms_session.set_identifier(:1); end;`;
 - JDBC thin 11.2 sends 9.2 nothing.
 
-seerdb refuses the attributes below 10.2.
+seerdb follows each 9i form's reference client (#2810):
+- **the native form** (`oall8=True`) sends OCI 9.2's piggyback behind the
+  cursors' close, ahead of the next call;
+- **the compact form** runs ojdbc14's call ahead of the next statement. A
+  NULL clears the identifier on 9.2; ojdbc14's own clear,
+  `dbms_session.clear_identifier(:1)`, is refused there;
+- **the thin OALL8 form** refuses it, as do 8i and every 8i and 9i form for
+  the other attributes.
+
+OCI 9.2's piggyback, after `11 87 <seq>`:
+- a pointer, which OCI sends whether it sets or clears;
+- the flags (`ub4`, `1`);
+- twelve zero bytes;
+- the identifier's length (`ub4`), and its value with a length byte, which a
+  clear (a zero length) leaves out;
+- four zero bytes, then `16 01`.
+
+No field is known for the zero bytes or the closing pair.
 
 ## 8. Transaction Control
 

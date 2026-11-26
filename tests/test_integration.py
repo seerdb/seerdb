@@ -9599,6 +9599,28 @@ class FetchFlowIntegration(_IntegrationBase):
         self.cur.execute("SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') FROM dual")
         self.assertEqual(self.cur.fetchone(), (None,))
 
+    def test_a_pre_10_2_session_sets_what_its_server_has(self):
+        # 9.2 has the client identifier alone, which the compact and the
+        # native 9i forms set as ojdbc14 and OCI 9.2 do. JDBC thin 11.2, which
+        # the thin OALL8 form follows, sends 9.2 none, and 8.1.7 has none
+        # (#2810).
+        from seerdb.client.dialect import Fv2Dialect, Fv2Oall8Dialect
+
+        if not self.conn._server_below_10_2():
+            self.skipTest('a pre-10.2 server')
+        with self.assertRaises(seerdb.NotSupportedError):
+            self.conn.module = 'M'
+        if not isinstance(self.conn._dialect, (Fv2Dialect, Fv2Oall8Dialect)):
+            with self.assertRaises(seerdb.NotSupportedError):
+                self.conn.client_identifier = 'PYOCLID'
+            return
+        for value in ('PYOCLID', 'CLID2', None):
+            self.conn.client_identifier = value
+            self.cur.execute(
+                "SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') FROM dual"
+            )
+            self.assertEqual(self.cur.fetchone(), (value,))
+
     @_requires(_END_TO_END)
     def test_an_empty_tracing_attribute_clears_it(self):
         # An empty string clears the attribute, as None does, and the call

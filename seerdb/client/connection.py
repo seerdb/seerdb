@@ -2420,6 +2420,9 @@ class OracleConnect(_ConnectionLogic):
         # driven by _drive; the connection is a thin orchestrator (#369). Neither
         # tier carries an autocommit bit, so commit is explicit.
         if self._dialect is not None:
+            Call = self._fv2_client_identifier_call()
+            if Call is not None:
+                self.execute(*Call)
             # Whether the fetch keeps LOB objects or reads their content (#2259).
             self._dialect.keep_lobs = self.fetch_lobs
             if ParseOnly and dialect_parses(self._dialect):

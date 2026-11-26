@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 9.2's OCI_ATTR_CLIENT_IDENTIFIER piggyback (func 135) to Oracle 9.2.0.4,
+# cleared (a zero length) (#2810); the close ahead of it and the OALL8 behind it left out.
+# Captured 2026-11-26 from an OCI 9.2 program on the 9i VM (x86-64 Linux)
+# under tcpdump. The TTC payload, without the packet's header, as
+# `hexdump -C` output; the offset column and the |ascii| gutter are ignored
+# by tests.replay.parse_hexdump.
+00000000  11 87 0d d8 af 51 00 00  00 00 00 01 00 00 00 00  |.....Q..........|
+00000010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000020  00 00 00 16 01                                    |.....|
+00000025

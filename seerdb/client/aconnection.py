@@ -1664,6 +1664,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         if self._dialect is not None:
             from seerdb.client.connection import _check_fv2_bind_sizes
 
+            Call = self._fv2_client_identifier_call()
+            if Call is not None:
+                await self.execute(*Call)
             # Whether the fetch keeps LOB objects or reads their content (#2259).
             self._dialect.keep_lobs = self.fetch_lobs
             if ParseOnly and dialect_parses(self._dialect):

@@ -225,7 +225,8 @@ What works:
   transaction id (`ltxid`)
 - End-to-end application tracing: `connection.module` / `action` /
   `client_identifier` / `clientinfo` / `dbop` flow to the server for
-  monitoring (V$SESSION etc.). 10g and later; `dbop` from 12c
+  monitoring (V$SESSION etc.). 10g and later; `dbop` from 12c; on 9i,
+  `client_identifier` alone, but not with `thin_oall8=True`
 - Multiple character set support, including the national charset: bind
   full Unicode through `DB_TYPE_NVARCHAR` / `DB_TYPE_NCHAR` regardless of
   the database charset, and read NVARCHAR2 / NCHAR / NCLOB back as `str`
