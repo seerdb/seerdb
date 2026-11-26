@@ -197,10 +197,6 @@ _8I_UNSUPPORTED = (
         'local_time_zone_attribute',
         'TIMESTAMP WITH LOCAL TIME ZONE is a 9i+ type; Oracle 8i has only DATE',
     ),
-    ('cache_evicts', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
-    ('reuses_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
-    ('forgets_the_cached_cursor', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
-    ('never_cached', 'the 8i dialect keeps no cursor cache (9i: #2261)'),
 )
 
 

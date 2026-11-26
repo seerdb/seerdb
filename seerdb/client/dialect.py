@@ -99,6 +99,7 @@ from seerdb.common.tns import (
     encode_8i_oall8_dml,
     encode_8i_oall8_fetch,
     encode_8i_oall8_query,
+    encode_8i_reexecute,
     encode_8i_sql_text,
     encode_9i_oall8_client_identifier,
     encode_9i_oall8_close_cursors,
@@ -1313,16 +1314,28 @@ class Oall8Dialect:
         # SELECT but with the statement-type option word and no fetch. The
         # affected-row count comes back in the response OER. (Autocommit: caller.)
         # No array DML here: the caller refuses a batch (refuse_pre10_batch).
+        # A reusable DML's cursor is cached and re-executed by id, as OCI 9.2
+        # re-executes a statement handle on 8.1.7 (#2804).
         assert not batch
         stmt_type = o8i_stmt_type(sql.strip().upper())
-        yield Send(
-            self._closing() + self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
-        )
+        key = self._cache_key(sql, bind, batch, batcherrors, cache)
+        cached = cache.get(key, 0) if cache is not None and key is not None else 0
+        # The close piggyback takes its sequence number before the call does.
+        closing = self._closing()
+        if cached:
+            request = encode_8i_reexecute(self._next_seq(), cached, bind)
+        else:
+            request = self._encode_dml(encode_8i_sql_text(sql), stmt_type, bind)
+        yield Send(closing + request)
         received = yield RECV
         if received is False:
             raise connection_closed('8i DML')
-        self._finished(decode_8i_cursor_id(received[1]))
+        cursor = cached or decode_8i_cursor_id(received[1])
         (row_count, err_code, message) = decode_8i_dml_response(received[1])
+        if key is not None and cache is not None:
+            self._cache_keep(cache, key, cursor, failed=bool(err_code))
+        else:
+            self._finished(cursor)  # closed with the next call
         if err_code and batcherrors:
             # A batch-errors executemany of one row, the only kind 8i runs:
             # its failure is a batch error at offset 0 under ORA-24381, as
@@ -1524,6 +1537,13 @@ class O8iDialect(Oall8Dialect):
     type so the login tier stays detectable and the 9i OALL8 dialect distinct."""
 
     _close_on_fetch = True
+    # A reusable DML's cursor stays open and is re-executed by id (#2804), as
+    # OCI 9.2 keeps a statement handle's on 8.1.7; DDL and a PL/SQL block close
+    # them all, as on 9i's native form (#2535).
+    _caches_cursors = True
+
+    def flush_cursors(self, cache: dict):
+        return self._flush_native_cache(cache)
 
     def _unfetchable(self, columns: list) -> list:
         # 8i describes SQL's BITAND as type 29, which no client fetches: its

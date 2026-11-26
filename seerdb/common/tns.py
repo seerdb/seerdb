@@ -17752,6 +17752,28 @@ def encode_9i_oall8_reexecute(
     )
 
 
+def encode_8i_reexecute(Seq: int, Cursor: int, Binds: list | None = None) -> bytes:
+    """A cached DML cursor's re-execute on 8i (#2804): OCI 9.2's to 8.1.7 is its
+    re-execute to 9.2 byte for byte (oci92_reexecute_8i.hexdump), with the bind
+    values as 8i's execute writes them, a LONG-class one after the others."""
+    Binds = Binds or []
+    Token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_9_2)
+    try:
+        Long = [
+            int.from_bytes(_encode_8i_bind_oac(Value)[4:6], 'little') > 4000
+            for Value in Binds
+        ]
+        Values = [
+            _encode_8i_bind_value(Value)
+            for Wanted in (False, True)
+            for (Value, IsLong) in zip(Binds, Long)
+            if IsLong is Wanted
+        ]
+        return _native_reexecute(Seq, Cursor, Values, False)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(Token)
+
+
 def encode_oci11_reexecute(Seq: int, Cursor: int, Binds: list | None = None) -> bytes:
     """A cached DML cursor's re-execute on a native 10g or 11g session (#2535)."""
     return _native_reexecute(

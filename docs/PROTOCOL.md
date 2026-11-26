@@ -6956,6 +6956,14 @@ at trailer offset +28 (`1` SELECT, `2` UPDATE, `3` DELETE, `4` INSERT, `5` CREAT
 - **trailer exec flag** (offset +4) is `0` for a query (execute deferred to the
   fetch) and `1` otherwise.
 
+**A cached cursor is re-executed by id (#2804).** OCI 9.2 executes a prepared
+INSERT on 8.1.7 once as this OALL8, then re-executes its cursor with function 4
+(`03 04 <seq> 01`, the cursor and the iterations, then the bind values behind
+`07`). That is its re-execute to 9.2 byte for byte (#2535), with the values as
+8i's execute writes them, a LONG-class one after the others. So the 8i dialect
+keeps a reusable DML's cursor open as 9i's native form does; DDL and a PL/SQL
+block close the cached ones with the next call.
+
 There is no describe or fetch. The response is an RPA, then the status. The RPA
 (`_O8I_RPA`) is:
 

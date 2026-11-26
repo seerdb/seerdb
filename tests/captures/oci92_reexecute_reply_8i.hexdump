@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Oracle 8.1.7's reply to that re-execute (#2804): one row inserted.
+# Captured 2026-11-26 through tcpdump on the 9i VM. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column
+# and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  04 01 00 00 00 00 00 00  00 00 00 01 00 00 00 02  |................|
+00000010  00 00 00 00 00 70 26 04  00 05 00 00 13 01 00 00  |.....p&.........|
+00000020  01 00 00 00 00 00 00 09  00 00 01 00 00 00 0d 00  |................|
+00000030  0d 01 00 04 26 70 00 05  00 00 01 13 00 01 00 00  |....&p..........|
+00000040  00 00 00 00 00 00 00 00  00 00                    |..........|
+0000004a
