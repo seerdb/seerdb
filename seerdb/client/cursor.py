@@ -1533,15 +1533,21 @@ def _check_object_bind_support(Connection, Bind, Batch=None) -> None:
                     'binding a SQL OBJECT value requires an Oracle 12.1+ server'
                 )
             if isinstance(V, DbRef):
-                # OCI 11.2's form serves it on the native session, and 9i's
-                # compact form as ojdbc14 binds one (SeerODBC #172).
-                if Native11 or (
-                    Dialect is not None and CAP_REF_BIND in Dialect.capabilities()
+                # OCI 11.2's form serves it on the native session, 9i's compact
+                # form as ojdbc14 binds one (SeerODBC #172), and a thin 10.2+
+                # session as JDBC thin 11.2 binds one to 10.2 (#2806).
+                Thin = (
+                    Dialect is None
+                    and getattr(Connection, 'field_version', 0) >= FIELD_VERSION_10_2
+                )
+                if (
+                    Native11
+                    or Thin
+                    or (Dialect is not None and CAP_REF_BIND in Dialect.capabilities())
                 ):
                     continue
                 raise NotSupportedError(
-                    'binding a REF value requires an Oracle 12.1+ server, '
-                    'or a 10g or 11g session with oall8=True'
+                    'binding a REF value is not supported on this session'
                 )
             if isinstance(V, Var) and getattr(V, 'is_array', False):
                 # OCI 11.2's form serves it on the native session, and a 10g

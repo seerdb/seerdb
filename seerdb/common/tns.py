@@ -24165,7 +24165,7 @@ def _encode_ref_oac(Ref: 'DbRef') -> bytes:
         Toid=Ref.type_oid,  # the referenced type's 16-byte OID
         Version=1,
         Charset=2,  # per capture
-        Oaccolid=_has_oac_col_id(),
+        Oaccolid=_ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_2,
     )
 
 
