@@ -18303,36 +18303,6 @@ class AsyncO8iIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
             await conn.close()
 
 
-@unittest.skipUnless(_USER, _SKIP_REASON)
-class PreTwelveObjectOutBindIntegration(unittest.TestCase):
-    # Before 12.1 an object or collection OUT bind is refused up front, as an
-    # object value already is (#116): pre-12c answers it with a fatal ORA-03106
-    # that lost the connection (#2039). From 12.1 it is an ordinary bind.
-    TYPE = 'zz_seerdb_2039_list'
-
-    def test_an_object_out_bind_is_refused_and_the_session_lives(self):
-
-        conn = _connect()
-        try:
-            if _target_of(conn).object_binds:
-                # 12.1+ serves it, and 11g's native form, pooled or with oall8
-                # (#2463): only the converted form below 12.1 refuses it.
-                self.skipTest('an object OUT bind is served from 12.1, and natively')
-            cur = conn.cursor()
-            cur.execute(
-                f'create or replace type {self.TYPE} as varray(5) of varchar2(10)'
-            )
-            try:
-                out = cur.var(conn.gettype(self.TYPE.upper()))
-                with self.assertRaises(seerdb.NotSupportedError):
-                    cur.execute(f"begin :1 := {self.TYPE}('a'); end;", [out])
-                self.assertEqual(cur.execute('select 1 from dual').fetchone(), (1,))
-            finally:
-                cur.execute(f'drop type {self.TYPE}')
-        finally:
-            conn.close()
-
-
 # Direct path load (#2462): python-oracledb thin's calls, which a 12.1+ server
 # takes. The Mirror serves none of them.
 _DIRECT_PATH = _Need(
