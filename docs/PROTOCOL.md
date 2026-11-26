@@ -7336,6 +7336,14 @@ a block (#801, #802).
   so the value is the LOB's text or bytes, as sqlplus reads it.
 - **ojdbc14 on 8.1.7 speaks TTI_ALL7 instead,** with the 9i bytes above.
 
+**9i's native form** (`oall8=True`) gets 8i's OUT cell from 9.2: a `ub4` length,
+the locator, a `ub2` indicator and no return code, the next bind's value
+straight after it (#2839). Read with a return code, the cell ran two bytes into
+what followed: a NUMBER OUT after it read as malformed, and the block's status
+was found only by scanning for it, until the scan stopped at a `04` in the
+RPA's SCN and read ORA-00001. The status is now the OER after the first RPA
+that reads whole.
+
 **An IN OUT LOB needs a locator to send.** Below 10g seerdb makes no temporary
 LOB on these forms, so a Var holding text or bytes has none: 9i answers
 ORA-24813, and 8i (which gets an empty locator) ORA-22275. A Var holding a LOB
