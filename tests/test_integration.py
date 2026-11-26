@@ -638,7 +638,7 @@ _STREAMED_LOB_BIND = _Need(
     '9i takes no bind over 4000 bytes into a LOB column (#2260)', min_fv=_FV
 )
 _NATIONAL_OUT_BIND = _Need(
-    'a national OUT bind is refused on fv2 (ORA-03120)', min_fv=_FV
+    "8i's national charset is WE8ISO8859P1, and it has no UNISTR", not_8i=True
 )
 _CHANGE_PASSWORD = _Need(
     'a pooled 11g session refuses changepassword (ORA-56609)', password_change=True
@@ -5992,12 +5992,12 @@ class BindIntegration(_IntegrationBase):
         # what says so. Without it the value came back as its raw UTF-16BE bytes
         # read one per character (#991).
         #
-        # 10g+ only: on fv2 (9i / 8i) the server refuses the bind descriptor
-        # outright with ORA-03120 "two-task conversion routine: integer
-        # overflow", before any value comes back. That is a tier limitation, not
-        # this decode -- the request bytes are identical either way.
+        # The value is built with UNISTR, not an N'' literal: the statement's
+        # text travels in the database charset, which on the 9i bed has no
+        # U+4E2D, so a literal arrives as '?' before the bind is involved
+        # (#2806). 9i serves the bind itself on every form.
         Var = self.cur.var(seerdb.DB_TYPE_NVARCHAR)
-        self.cur.execute("BEGIN :v := N'nat \u00fcn\u00ee \u4e2d'; END;", [Var])
+        self.cur.execute("BEGIN :v := UNISTR('nat \\00fcn\\00ee \\4e2d'); END;", [Var])
         self.assertEqual(Var.getvalue(), 'nat ünî 中')
 
     def test_out_bind_text_past_ascii(self):
