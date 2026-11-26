@@ -409,6 +409,8 @@ does: it sends that driver's capabilities, logs in as the compact form does, and
 then speaks the thin OALL8 that 10g and 11g take. Over the 9.2 bed it passes the
 integration suite, with these differences from the default compact form:
 - **`connection.transaction_in_progress`** answers, from each reply's call status.
+- **It enqueues and dequeues** on a RAW or an object queue (`connection.queue()`),
+  as JDBC thin 11.2 does to 9.2 (#2805).
 - **It binds PL/SQL associative arrays** (`arrayvar`).
 - **`cursor.parse()`** parses without running the statement.
 - **It makes no temporary LOBs**, so a LOB Var and a CLOB or BLOB OUT bind

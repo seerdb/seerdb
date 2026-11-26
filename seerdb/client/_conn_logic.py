@@ -179,6 +179,12 @@ _O7_XA_NAMES: list[tuple[bytes, bytes]] = [
 # The two zones a TIMESTAMP WITH LOCAL TIME ZONE value is shifted between (#2762):
 # it arrives in DBTIMEZONE and is handed out in SESSIONTIMEZONE, as OCI does.
 _LTZ_ZONES_SQL = 'SELECT DBTIMEZONE, SESSIONTIMEZONE FROM DUAL'
+# What connection.queue() says when it refuses a queue (_aq_refused).
+AQ_REFUSAL = (
+    'Advanced Queuing requires an Oracle 12.1+ server, or a RAW or object queue '
+    'on a 10g or 11g session or on 9i with thin_oall8=True; otherwise on 9i and '
+    '8i, call DBMS_AQ from PL/SQL'
+)
 # A statement that may change the session's zone, after which it is read again.
 _SETS_TIME_ZONE = re.compile(r'\bALTER\s+SESSION\b.*\bTIME_ZONE\b', re.I | re.S)
 _ZONE_OFFSET = re.compile(r'([+-]?)(\d{1,2}):(\d{2})')
@@ -1329,6 +1335,20 @@ class _ConnectionLogic:
         # Whether the SERVER predates 10.2, for what 9.2 itself lacks: its own
         # field version, which a thin OALL8 session to 9.2 runs above (#2768).
         return self._server_field_version() < FIELD_VERSION_10_2
+
+    def _aq_refused(self, payload_type) -> bool:
+        # Whether connection.queue() refuses a queue below 12.1. A 10g or 11g
+        # thin session takes a RAW or an object queue (#2697, #2702, #2708), and
+        # so does a thin OALL8 one to 9.2, in the form JDBC thin 11.2 sends 9.2
+        # (#2805); a JSON payload and the native forms are measured from 12.1
+        # only. Elsewhere on 9i and on 8i, DBMS_AQ from PL/SQL is the route.
+        from seerdb.common.datatypes import JSON
+
+        return self.field_version < FIELD_VERSION_12_1 and (
+            payload_type is JSON
+            or getattr(self, '_dialect', None) is not None
+            or (self._server_below_10_2() and not self._thin92)
+        )
 
     def _scrolls_server_side(self) -> bool:
         # Whether a scrollable cursor scrolls on the server (#181): on a session

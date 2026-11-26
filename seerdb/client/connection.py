@@ -453,7 +453,10 @@ def _decode_aq_deq(Packet: bytes, queue):
             return None
         _aq_raise(Packet)
     Message = decode_aq_deq_reply(
-        Packet, queue._connection.field_version, queue.payload_type is not None
+        Packet,
+        queue._connection.field_version,
+        queue.payload_type is not None,
+        queue._connection._server_below_10_2(),
     )
     if Message is None:
         return None
@@ -4628,20 +4631,10 @@ class OracleConnect(_ConnectionLogic):
         from seerdb.common.datatypes import JSON as _JSON
         from seerdb.common.exceptions import NotSupportedError
 
-        if self.field_version < FIELD_VERSION_12_1 and (
-            payload_type is _JSON
-            or self._dialect is not None
-            or self._server_below_10_2()
-        ):
-            # A 10g or 11g thin session takes a RAW or an object queue (#2697,
-            # #2702, #2708); a JSON payload and the native forms are measured
-            # from 12.1 only. 9.2 drops a seerdb session on the enqueue, though
-            # it answers JDBC thin's: there, DBMS_AQ from PL/SQL is the route.
-            raise NotSupportedError(
-                'Advanced Queuing requires an Oracle 12.1+ server, or a RAW or '
-                'object queue on a 10g or 11g session; on 9i and 8i, call DBMS_AQ '
-                'from PL/SQL'
-            )
+        if self._aq_refused(payload_type):
+            from seerdb.client._conn_logic import AQ_REFUSAL
+
+            raise NotSupportedError(AQ_REFUSAL)
         if payload_type is _JSON:
             return Queue(self, name, payload_type=None, is_json=True)
         return Queue(self, name, payload_type=payload_type)
@@ -4662,7 +4655,13 @@ class OracleConnect(_ConnectionLogic):
                 Packet += self._read_continuation(Short)
 
     def _aq_enq_one(self, queue, props) -> None:
-        Data = encode_aq_enq(self._next_seq(), self.field_version, queue, props)
+        Data = encode_aq_enq(
+            self._next_seq(),
+            self.field_version,
+            queue,
+            props,
+            self._server_below_10_2(),
+        )
         props.msgid = self._aq_request(Data, _decode_aq_enq)
 
     def _aq_deq_one(self, queue):
