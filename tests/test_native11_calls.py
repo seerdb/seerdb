@@ -1828,8 +1828,16 @@ class Native11EndToEndTest(_At11g):
         self.assertEqual(Conn._take_end_to_end(), {'module': 'M', 'action': None})
         self.assertEqual(Conn._take_end_to_end(), {})
 
-    def test_the_thin_form_still_refuses(self):
+    def test_the_thin_form_serves_them_from_10_2_without_dbop(self):
+        # Thin's form before 12.1, as JDBC thin 11.2 sends it (#2810).
+        from seerdb.common.tns_consts import FIELD_VERSION_9_2
+
         Conn = self._session(False)
+        Conn.module = 'M'
+        self.assertEqual(Conn._take_end_to_end(), {'module': 'M', 'action': None})
+        with self.assertRaises(NotSupportedError):
+            Conn.dbop = 'OP'
+        Conn.field_version = FIELD_VERSION_9_2
         with self.assertRaises(NotSupportedError):
             Conn.module = 'M'
 

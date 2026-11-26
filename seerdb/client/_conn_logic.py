@@ -655,15 +655,15 @@ class _ConnectionLogic:
 
     def _set_e2e(self, name: str, value) -> None:
         # Record a new end-to-end attribute value and mark it to flush before
-        # the next execute (oracledb sends only what changed). The
-        # SET_END_TO_END_ATTR piggyback (func 135) in thin's form is a 12c+
-        # message -- a pre-12c server closes the connection on it -- so gate it
-        # (#183). A native 10g or 11g session sends OCI's form, which has no dbop.
+        # the next execute (oracledb sends only what changed), in the
+        # SET_END_TO_END_ATTR piggyback (func 135, #183). From 10.2 the thin
+        # form has no dbop slot below 12.1, as JDBC thin 11.2 sends it (#2810),
+        # and a native 10g or 11g session sends OCI's form, which has none
+        # either. Below 10.2 it is refused.
         if self.field_version < FIELD_VERSION_12_1:
-            if not getattr(self, '_native11', False):
+            if not getattr(self, '_native11', False) and self._server_below_10_2():
                 raise NotSupportedError(
-                    'end-to-end tracing attributes require an Oracle 12.1+ server, '
-                    'or a 10g or 11g session with oall8=True'
+                    'end-to-end tracing attributes require an Oracle 10.2+ server'
                 )
             if name == 'dbop':
                 raise NotSupportedError('dbop requires an Oracle 12.1+ server')

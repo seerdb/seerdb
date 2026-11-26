@@ -2255,7 +2255,9 @@ _PIGGYBACK_HEAD: wire_schema.Schema = (
 # attribute slot, then the value of each one set. The execution context id and
 # sequence and the Kerberos forwarded ticket's key and target have slots and
 # are never sent.
-_E2E_ATTRS = ('client_identifier', 'module', 'action', 'client_info', 'dbop')
+# Before 12.1 (_PIG_END_TO_END_10), as JDBC thin 11.2 sends it to 10.2 (#2810),
+# there is no dbop slot, and each value is its bytes alone, its length in its
+# header; 12.1's frames each one as text.
 _E2E_SLOTS = (
     'client_identifier',
     'module',
@@ -2267,17 +2269,34 @@ _E2E_SLOTS = (
     'cidktgt',
     'dbop',
 )
-_PIG_END_TO_END: wire_schema.Schema = (
-    ('ptr', 'cidnam_present'),
-    ('ptr', 'cidser_present'),
-    ('n4', 'flags'),
-    *(
-        field
-        for slot in _E2E_SLOTS
-        for field in (('ptr', f'{slot}_changed'), ('n4', f'{slot}_length'))
-    ),
-    *(('when', f'{name}_length', (('value', name),)) for name in _E2E_ATTRS),
-)
+_E2E_ATTRS = ('client_identifier', 'module', 'action', 'client_info', 'dbop')
+
+
+def _pig_end_to_end(v12: bool) -> wire_schema.Schema:
+    slots = _E2E_SLOTS if v12 else _E2E_SLOTS[:-1]
+    names = _E2E_ATTRS if v12 else _E2E_ATTRS[:-1]
+    return (
+        ('ptr', 'cidnam_present'),
+        ('ptr', 'cidser_present'),
+        ('n4', 'flags'),
+        *(
+            field
+            for slot in slots
+            for field in (('ptr', f'{slot}_changed'), ('n4', f'{slot}_length'))
+        ),
+        *(
+            (
+                'when',
+                f'{name}_length',
+                (('value', name),) if v12 else (('bytes', name, f'{name}_length'),),
+            )
+            for name in names
+        ),
+    )
+
+
+_PIG_END_TO_END: wire_schema.Schema = _pig_end_to_end(True)
+_PIG_END_TO_END_10: wire_schema.Schema = _pig_end_to_end(False)
 # The application context (154, #1775): one namespace's entries set, or the
 # namespace cleared when there are none. The zero byte before the namespace
 # exists from field version 12.1; a server reading at 11.2 rejects it
@@ -3293,6 +3312,8 @@ _PIGGYBACK_HEAD_THIN = wire_schema.compile_encoder(_PIGGYBACK_HEAD, _THIN)
 _PIGGYBACK_HEAD_FROM_THIN = wire_schema.compile_decoder(_PIGGYBACK_HEAD, _THIN)
 _PIG_END_TO_END_THIN = wire_schema.compile_encoder(_PIG_END_TO_END, _THIN)
 _PIG_END_TO_END_FROM_THIN = wire_schema.compile_decoder(_PIG_END_TO_END, _THIN)
+_PIG_END_TO_END_10_THIN = wire_schema.compile_encoder(_PIG_END_TO_END_10, _THIN)
+_PIG_END_TO_END_10_FROM_THIN = wire_schema.compile_decoder(_PIG_END_TO_END_10, _THIN)
 _PIG_APP_CONTEXT_THIN = wire_schema.compile_encoder(_PIG_APP_CONTEXT, _THIN)
 _PIG_APP_CONTEXT_FROM_THIN = wire_schema.compile_decoder(_PIG_APP_CONTEXT, _THIN)
 _PIG_ALTER_SESSION_THIN = wire_schema.compile_encoder(_PIG_ALTER_SESSION, _THIN)
@@ -9398,9 +9419,14 @@ def encode_end_to_end_piggyback(Seq: int, FieldVersion: int, Attrs: dict) -> byt
         Fields[f'{Slot}_changed'] = Changed
         Fields[f'{Slot}_length'] = len(Value)
         Fields[Slot] = Value
-    return _piggyback_head(
-        TNS_FUNC_SET_END_TO_END_ATTR, Seq, FieldVersion
-    ) + _PIG_END_TO_END_THIN(Fields)
+    Encode = (
+        _PIG_END_TO_END_THIN
+        if FieldVersion >= FIELD_VERSION_12_1
+        else _PIG_END_TO_END_10_THIN
+    )
+    return _piggyback_head(TNS_FUNC_SET_END_TO_END_ATTR, Seq, FieldVersion) + Encode(
+        Fields
+    )
 
 
 # The single keyword under which the end-user security context OSON image is
@@ -9614,10 +9640,12 @@ def _decode_client_piggyback(body: bytes) -> tuple[int, Any, bytes] | None:
     _, rest = _PIGGYBACK_HEAD_FROM_THIN(body)
     carried: Any
     if func == TNS_FUNC_SET_END_TO_END_ATTR:
-        Fields, rest = _PIG_END_TO_END_FROM_THIN(rest)
+        V12 = _DECODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
+        Decode = _PIG_END_TO_END_FROM_THIN if V12 else _PIG_END_TO_END_10_FROM_THIN
+        Fields, rest = Decode(rest)
         carried = {
             name: Fields[name].decode('utf-8') if Fields[f'{name}_length'] else None
-            for name in _E2E_ATTRS
+            for name in (_E2E_ATTRS if V12 else _E2E_ATTRS[:-1])
             if Fields[f'{name}_changed']
         }
     elif func == TNS_FUNC_APP_CONTEXT:

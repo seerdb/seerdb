@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# JDBC thin 11.2's (ojdbc6) SET_END_TO_END_ATTR piggyback to Oracle 10.2.0.5,
+# client identifier PYOCLID, module PYOMOD, action PYOACT (#2810), the OALL8 behind it left out.
+# Captured 2026-11-26 through tools/capture_proxy.py: setEndToEndMetrics, then
+# a query. The TTC payload, without the packet's header, as `hexdump -C`
+# output; the offset column and the |ascii| gutter are ignored by
+# tests.replay.parse_hexdump.
+00000000  11 87 02 00 00 01 79 01  01 07 01 01 06 01 01 06  |......y.........|
+00000010  01 00 00 00 00 00 00 00  00 00 50 59 4f 43 4c 49  |..........PYOCLI|
+00000020  44 50 59 4f 4d 4f 44 50  59 4f 41 43 54           |DPYOMODPYOACT|
+0000002d

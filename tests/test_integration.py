@@ -326,8 +326,8 @@ class _Target(NamedTuple):
     # connection on the converted form's write (#964), not on the native
     # form's (oall8, #2518).
     lob_modify: bool = True
-    # Whether the session sends the end-to-end tracing attributes: 12.1+, and
-    # the native form on 10g and 11g.
+    # Whether the session sends the end-to-end tracing attributes: 12.1+, a
+    # thin 10g or 11g session (#2810), and the native form on 10g and 11g.
     end_to_end: bool = False
     # Whether the session binds a PL/SQL associative array: 12.1+, a 10g or
     # 11g thin session (#2706), and the native form on 10g and 11g.
@@ -423,7 +423,8 @@ def _target_of(conn) -> _Target:
         ),
         conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
-        or bool(getattr(conn, '_native11', False)),
+        or bool(getattr(conn, '_native11', False))
+        or (getattr(conn, '_dialect', None) is None and not conn._server_below_10_2()),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False))
         or (
@@ -717,7 +718,7 @@ _TEMP_LOB = _Need(
     temp_lobs=True,
 )
 _END_TO_END = _Need(
-    'end-to-end tracing requires 12c+, or the native form on 10g and 11g',
+    'end-to-end tracing requires a 10.2+ server',
     end_to_end=True,
 )
 _IMPLICIT_RESULTS = _Need('DBMS_SQL.RETURN_RESULT is 12c+', min_server=12)
@@ -9540,9 +9541,8 @@ class FetchFlowIntegration(_IntegrationBase):
     def test_end_to_end_tracing(self):
         # End-to-end application tracing (#183): set module / action /
         # client_identifier; the change flushes with the next execute and shows
-        # up in SYS_CONTEXT('USERENV', ...). 12c+ and the native form on 10g and
-        # 11g (thin's piggyback closes a pre-12c connection); elsewhere it must
-        # raise NotSupportedError instead.
+        # up in SYS_CONTEXT('USERENV', ...). From 10.2, in thin's form and the
+        # native one (#2810); elsewhere it must raise NotSupportedError instead.
         if not _target_of(self.conn).end_to_end:
             with self.assertRaises(seerdb.NotSupportedError):
                 self.conn.module = 'M'

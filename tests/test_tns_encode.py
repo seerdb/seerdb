@@ -6653,7 +6653,60 @@ class TestTheClientPiggybacksReadBack(unittest.TestCase):
         for fv in self._each_fv():
             with self.subTest(fv=fv):
                 data = tns.encode_end_to_end_piggyback(4, fv, attrs)
-                self.assertCarries(fv, data, TNS_FUNC_SET_END_TO_END_ATTR, attrs)
+                # Before 12.1 there is no dbop slot (#2810).
+                want = (
+                    attrs
+                    if fv >= tns.FIELD_VERSION_12_1
+                    else {k: v for k, v in attrs.items() if k != 'dbop'}
+                )
+                self.assertCarries(fv, data, TNS_FUNC_SET_END_TO_END_ATTR, want)
+
+    # JDBC thin 11.2's tracing piggyback to 10.2 (#2810): where JDBC also sets
+    # an execution context id, which seerdb never sends -- its flags 0x20 and
+    # 0x40, and the id's slot marked changed, at no length.
+    (JDBC_FLAGS, JDBC_ECID_SLOT) = (6, {'jdbc6_end_to_end_set_10g.hexdump': 16})
+
+    @staticmethod
+    def _capture(name):
+        sys.path.insert(0, os.path.dirname(__file__))
+        from replay import load_capture
+
+        return load_capture(name)
+
+    def test_10_2s_tracing_is_jdbc_thin_11_2s(self):
+        from seerdb.common import tns
+
+        for name, attrs in (
+            (
+                'jdbc6_end_to_end_set_10g.hexdump',
+                {
+                    'client_identifier': 'PYOCLID',
+                    'module': 'PYOMOD',
+                    'action': 'PYOACT',
+                },
+            ),
+            ('jdbc6_end_to_end_clear_10g.hexdump', {'client_identifier': None}),
+        ):
+            with self.subTest(name):
+                theirs = bytearray(self._capture(name))
+                ours = tns.encode_end_to_end_piggyback(
+                    theirs[2], tns.FIELD_VERSION_10_2, attrs
+                )
+                theirs[self.JDBC_FLAGS] &= ~0x60
+                if name in self.JDBC_ECID_SLOT:
+                    theirs[self.JDBC_ECID_SLOT[name]] = 0
+                self.assertEqual(ours, bytes(theirs))
+
+    def test_jdbc_thin_11_2s_tracing_is_read_at_10_2(self):
+        from seerdb.common import tns
+        from seerdb.common.tns_consts import TNS_FUNC_SET_END_TO_END_ATTR
+
+        self.assertCarries(
+            tns.FIELD_VERSION_10_2,
+            self._capture('jdbc6_end_to_end_set_10g.hexdump'),
+            TNS_FUNC_SET_END_TO_END_ATTR,
+            {'client_identifier': 'PYOCLID', 'module': 'PYOMOD', 'action': 'PYOACT'},
+        )
 
     def test_an_application_context_set_and_cleared(self):
         from seerdb.common import tns
