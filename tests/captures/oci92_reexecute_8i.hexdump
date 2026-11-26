@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# OCI 9.2's re-execute of that INSERT's cursor on Oracle 8.1.7 (#2804): the
+# function-4 call with cursor 1 and the bind value 2.
+# Captured 2026-11-26 through tcpdump on the 9i VM. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column
+# and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  03 04 09 01 00 00 00 01  00 00 00 00 00 00 00 07  |................|
+00000010  02 c1 03                                          |...|
+00000013
