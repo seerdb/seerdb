@@ -378,7 +378,9 @@ types fetched as `DbObject`s and bound IN and OUT, REF binds, the cursor cache, 
 `BINARY_DOUBLE`, a plain bind past 4000 bytes (declare a LONG / LONG RAW
 column's value `DB_TYPE_LONG` / `DB_TYPE_LONG_RAW`, and write a CLOB / BLOB
 through its locator; in a PL/SQL block a value past 32512 bytes goes as a
-temporary LOB), array DML with `RETURNING`, and
+temporary LOB), array DML with `RETURNING`, an open cursor bound IN to a
+REF CURSOR parameter (9.2 and 8.1.7 answer OCI 9.2's own ORA-01001, so it is
+refused up front), and
 `changepassword`. Its DB charset also can't store text it doesn't cover, so use
 `DB_TYPE_NVARCHAR` / `NCHAR` for full Unicode there rather than a plain `str`
 bind.

@@ -1792,6 +1792,20 @@ def pre10_dml_applied(Result: object, BatchErrors: bool) -> bool:
     return not Code or (BatchErrors and Code == ORA_ARRAY_DML_ERRORS)
 
 
+def refuse_pre10_cursor_in_bind(Connection) -> None:
+    """Refuse an open cursor bound IN when the server predates 10.2 (#2806).
+
+    8.1.7 and 9.2 answer OCI 9.2's own bind of one ORA-01001, whether the
+    client or a block opened the cursor, and seerdb's 9i forms each fail in
+    their own way. From 10.2 the bind is served.
+    """
+    if Connection is not None and Connection._server_below_10_2():
+        raise NotSupportedError(
+            'binding a cursor IN to a REF CURSOR parameter needs an Oracle 10.2+ '
+            'server: 8i and 9i answer it ORA-01001'
+        )
+
+
 def refuse_pre10_batch(Dialect, Head: str, ReturnBinds, BatchErrors: bool) -> None:
     """Refuse an executemany a pre-10g tier cannot run as array DML.
 
