@@ -32,6 +32,7 @@ from seerdb.client.dialect import (
     Fv2Dialect,
     Fv2Oall8Dialect,
     O8iDialect,
+    Oall8Dialect,
     Oci11Dialect,
 )
 from seerdb.client.enums import TransactionPriority
@@ -162,10 +163,11 @@ def certificate_names_host(PeerCert: dict | None, Host: str) -> bool:
     return False
 
 
-# The XA names a 9i login gives with xa=True (#2691): 9.2 begins a distributed
-# transaction only on a session that logged on with them, ORA-02048 otherwise.
-# The keys carry their NUL, as JDBC thin's XA connection sends them; 10g and
-# later take the names in the transaction switch instead (PROTOCOL.md §28). A
+# The XA names an 8i or 9i login gives with xa=True (#2691, #2807): 8.1.7 and
+# 9.2 begin a distributed transaction only on a session that logged on with
+# them, ORA-02048 otherwise. The keys carry their NUL, as JDBC thin's XA
+# connection and OCI 9.2 send them; 10g and later take the names in the
+# transaction switch instead (PROTOCOL.md §28). A
 # session that gave them keeps answering ORA-02091 after a refused commit until
 # it rolls back, so a plain session doesn't give them.
 _O7_XA_NAMES: list[tuple[bytes, bytes]] = [
@@ -465,7 +467,9 @@ class _ConnectionLogic:
             self._next_seq(),
             UserB,
             PwdField,
-            self._auth_info_pairs() + [(b'AUTH_ACL', b'8000')],
+            self._auth_info_pairs()
+            + (_O7_XA_NAMES if self.xa else [])
+            + [(b'AUTH_ACL', b'8000')],
         )
 
     def _o3_wants_proxy(self) -> bool:
@@ -1684,9 +1688,9 @@ def dialect_parses(Dialect) -> 'TypeGuard[Oci11Dialect]':
     return Dialect is not None and CAP_PARSE in Dialect.capabilities()
 
 
-def dialect_tpc(Dialect) -> 'TypeGuard[Oci11Dialect]':
+def dialect_tpc(Dialect) -> 'TypeGuard[Oall8Dialect]':
     """Whether a pre-12c dialect serves two-phase commit in its own form (the
-    native form on 10g and 11g, #131)."""
+    native form on 10g and 11g, #131; 8i's and 9.2's native one, #2807)."""
     from seerdb.client.dialect import CAP_TPC
 
     return Dialect is not None and CAP_TPC in Dialect.capabilities()

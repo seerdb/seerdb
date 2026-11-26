@@ -8924,19 +8924,23 @@ function messages carry it:
   `tpc_rollback` expects `ABORTED`.
 
 Use `autocommit=False` so the DML between `tpc_begin` and `tpc_end` is part of
-the branch. Sync + async. **seerdb serves it from 9.2 on** (#2691), in the
-thin form below, and in the native 10g and 11g form (`oall8=True`), which
-follows OCI 11.2. Verified on 9.2, 10.2, 11g, 21c and 23ai: two-phase commit,
-one-phase commit, rollback and read-only prepare. `tpc_begin` raises
-`NotSupportedError`, before any wire activity, on 8i and on a 9i session with
-`oall8=True`, whose switch hangs.
+the branch. Sync + async. **seerdb serves it on every server:**
+- from 9.2 on in the thin form below (#2691);
+- in the native 10g and 11g form (`oall8=True`), which follows OCI 11.2;
+- on 8i and on a native 9i session (`oall8=True`) in OCI 9.2's form (#2807,
+  below).
 
-**9.2 takes the XA names at login.** It begins a distributed transaction only on
-a session that logged on with `AUTH_INTERNALNAME` and `AUTH_EXTERNALNAME` in
-the OAUTH call, and answers ORA-02048 ("attempt to begin distributed
-transaction without logging on") otherwise. JDBC thin's keys carry their NUL
-(`AUTH_INTERNALNAME\0`, 18 bytes), and so do seerdb's (`seerdb`,
-`seerdb_1`). From 10g the names travel in the switch instead.
+Verified on 8.1.7, 9.2 (all three of its forms), 10.2, 11g, 21c and 23ai:
+two-phase commit, one-phase commit, rollback and read-only prepare.
+
+**8.1.7 and 9.2 take the XA names at login.** They begin a distributed
+transaction only on a session that logged on with `AUTH_INTERNALNAME` and
+`AUTH_EXTERNALNAME` in the OAUTH call, and answer ORA-02048 ("attempt to begin
+distributed transaction without logging on") otherwise. JDBC thin's keys carry
+their NUL (`AUTH_INTERNALNAME\0`, 18 bytes), and so do OCI 9.2's and seerdb's
+(`seerdb`, `seerdb_1`). OCI 9.2 sends them, after the session's other pairs,
+when the program set `OCI_ATTR_INTERNAL_NAME` and `OCI_ATTR_EXTERNAL_NAME` on
+the server handle. From 10g the names travel in the switch instead.
 
 **Such a session behaves differently in two ways:**
 - Its status reports the cursor options as a compressed integer, `01 08`,
@@ -8946,9 +8950,9 @@ transaction without logging on") otherwise. JDBC thin's keys carry their NUL
   session moves on.
 
 So seerdb gives the names only to a connection opened with `xa=True`, as JDBC
-gives them only to its XA connection. `tpc_begin` on a 9i session without it
-raises NotSupportedError, naming the option. SeerODBC measured the names and
-the status width first.
+gives them only to its XA connection. `tpc_begin` on an 8i or 9i session
+without it raises NotSupportedError before any wire activity, naming the
+option. SeerODBC measured the names and the status width first.
 
 **Before 12c, in thin's encoding (measured 2026-11-15).** The reference is
 Oracle's JDBC thin 11.2 driver (ojdbc6) with native XA
@@ -8980,9 +8984,40 @@ JDBC's own XA flags, as captured:
 - prepare: state 0, returning 1 (`REQUIRES_COMMIT`);
 - commit after prepare: state 2, returning 5 (`FORGOTTEN`).
 
-**8.1.7 has no native form in any reference client.** ojdbc14 (9.0.2) has no
-native XA. Against 8.1.7 its XA runs as PL/SQL blocks on `SYS.JAVA_XA`, read
-back from `v$sqlarea`:
+**8i and 9.2's native form, as OCI 9.2 sends them (#2807, measured
+2026-11-26).** The reference is an OCI 9.2 program on the 9i VM (x86-64
+Linux), captured against 8.1.7 and 9.2.0.4: `OCITransStart` (new, timeout 60),
+an INSERT, `OCITransDetach`, then `OCITransPrepare` and `OCITransCommit`
+(two-phase), `OCITransRollback`, or `OCITransCommit` alone (one-phase), and a
+read-only prepare. Each worked on both. OCI uses the same two functions:
+- **the fields** are 10.2's switch (no names) and 9.2's change of state (no
+  `flags`), on both servers;
+- **8.1.7's widths:** every integer a little-endian `ub4`, the operation too,
+  and each pointer one byte (`01` or `00`). Nothing follows the switch's
+  timeout or the change of state's state. A start is 169 bytes of body;
+- **9.2's widths**, a 64-bit OCI client's: the operation a `ub8`, the
+  pointers eight bytes (OCI's own addresses), the other integers `ub4`, and
+  four zero bytes after the switch's timeout and after the change of state's
+  state, as in 11g's wide form. A start is 212 bytes of body;
+- **the replies** are those above: the RPA, the application value (`ub4`), the
+  context length (`ub2`) and the context, or the RPA and the state (`ub4`);
+  then the status, 8i's or 9.2's native one. The context is 152 bytes on 8.1.7
+  and 168 on 9.2;
+- **the states** are JDBC's: prepare state 0, commit after a prepare 2, a
+  one-phase commit 4, a rollback 3. They return 1 (`REQUIRES_COMMIT`), 5
+  (`FORGOTTEN`), 2 (`COMMITTED`) and 3 (`ABORTED`), and a read-only prepare
+  returns 4 (`READ_ONLY`, ORA-24767 to OCI);
+- **a refusal** (ORA-02048 on a session without the names) is the status
+  alone, with no RPA.
+
+OCI's first start in a session sends a null return-context pointer, and the
+server returns the context anyway; its later starts set all three pointers,
+which seerdb always does. On 9.2 a close of the cursors the last statements
+left open rides ahead of a start or a detach, as it does ahead of any call.
+
+**Before OCI 9.2, 8.1.7 had no native form in a reference client.** ojdbc14
+(9.0.2) has no native XA. Against 8.1.7 its XA runs as PL/SQL blocks on
+`SYS.JAVA_XA`, read back from `v$sqlarea`:
 - `begin :1 := JAVA_XA.xa_start_new(:2,:3,:4,:5,:6); end;`, with format id,
   gtrid (RAW), bqual (RAW), timeout and flag;
 - `xa_end_new(formatid, gtrid, bqual, flag)`;

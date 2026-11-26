@@ -332,9 +332,6 @@ class _Target(NamedTuple):
     # Whether the session binds a PL/SQL associative array: 12.1+, a 10g or
     # 11g thin session (#2706), and the native form on 10g and 11g.
     assoc_arrays: bool = False
-    # Whether the session runs two-phase commit: 9.2 and later in the thin form,
-    # and the native form on 10g and 11g (#2691).
-    tpc: bool = False
     # Whether the session binds a REF: 12.1+, and the native form on 10g and 11g.
     ref_binds: bool = False
     # Whether a CLOB or BLOB comes back from an OUT bind or a RETURNING: where
@@ -401,19 +398,6 @@ def _dialect_binds_refs(conn) -> bool:
     return Dialect is not None and CAP_REF_BIND in Dialect.capabilities()
 
 
-def _session_runs_tpc(conn) -> bool:
-    # Two-phase commit: the thin form on 9.2 and later, and the native form on
-    # 10g and 11g; not 8i, nor 9i's native OALL8 form (#2691).
-    from seerdb.client.dialect import CAP_TPC, Fv2Dialect
-
-    Dialect = getattr(conn, '_dialect', None)
-    return (
-        Dialect is None
-        or isinstance(Dialect, Fv2Dialect)
-        or CAP_TPC in Dialect.capabilities()
-    )
-
-
 def _target_of(conn) -> _Target:
     from seerdb.client._conn_logic import temp_lobs_available
 
@@ -447,7 +431,6 @@ def _target_of(conn) -> _Target:
             and conn.field_version >= FIELD_VERSION_10_2
         )
         or _dialect_binds_arrays(conn),
-        _session_runs_tpc(conn),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False))
         or _dialect_binds_refs(conn),
@@ -505,8 +488,6 @@ class _Need(NamedTuple):
     end_to_end: bool = False
     # Whether it binds a PL/SQL associative array.
     assoc_arrays: bool = False
-    # Whether it runs two-phase commit.
-    tpc: bool = False
     # Whether it binds a REF.
     ref_binds: bool = False
     # Whether a CLOB or BLOB comes back from an OUT bind.
@@ -537,8 +518,6 @@ class _Need(NamedTuple):
         if self.end_to_end and not target.end_to_end:
             return True
         if self.assoc_arrays and not target.assoc_arrays:
-            return True
-        if self.tpc and not target.tpc:
             return True
         if self.ref_binds and not target.ref_binds:
             return True
@@ -7859,14 +7838,15 @@ class PingKilledSessionIntegration(_ThrottleRetry, unittest.TestCase):
                 pass
 
 
-# Two-phase commit (#131, #2457): a 12.1+ server, and no Mirror, which doesn't
-# serve XA (docs/MIRROR.md, "Not served").
-_TPC = _Need(
-    'two-phase commit needs a 12.1+ server or the native form on 10g and 11g, '
-    'and the Mirror does not serve XA',
-    tpc=True,
-    not_mirror=('*',),
-)
+# Two-phase commit (#131, #2457), which every Oracle session runs (#2691,
+# #2807), but not the Mirror (docs/MIRROR.md, "Not served").
+_TPC = _Need('the Mirror does not serve XA', not_mirror=('*',))
+# The tables the TPC tests write to, with room in each block for several
+# branches at once. 8.1.7's tables start with one transaction slot a block, and
+# a prepared branch keeps its slot: a second session's INSERT into the same
+# block waited for it, then failed (ORA-01591 to OCI 9.2 too, #2807). The
+# Mirror-over-PG refuses the clause, and its setUp runs before the skip.
+_TPC_INITRANS = '' if os.environ.get('SEERDB_TEST_MIRROR') else 'INITRANS 4'
 _TPC_FORMAT = 0x5EED
 
 
@@ -8051,7 +8031,8 @@ class TpcIntegration(_ThrottleRetry, unittest.TestCase):
                 cur.execute(f'DROP TABLE {self.TABLE}')
             except DatabaseError:
                 pass  # not left over from an earlier run
-            cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER)')
+            # Room in each block for several branches (_TPC_INITRANS).
+            cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER) {_TPC_INITRANS}')
 
     def tearDown(self):
         # A branch a failed test left prepared is rolled back by its XID while
@@ -8084,12 +8065,10 @@ class TpcIntegration(_ThrottleRetry, unittest.TestCase):
         return xid
 
     @_requires(_TPC)
-    def test_9i_two_phase_commit_needs_the_xa_option(self):
-        # 9.2 needs the XA names at login (#2691), which only xa=True gives: a
-        # plain session would answer ORA-02048, so it is refused before any
-        # wire activity, naming the option.
-        from seerdb.client.dialect import Fv2Dialect
-
+    def test_pre10_two_phase_commit_needs_the_xa_option(self):
+        # 8.1.7 and 9.2 need the XA names at login (#2691, #2807), which only
+        # xa=True gives: a plain session would answer ORA-02048, so it is
+        # refused before any wire activity, naming the option.
         with seerdb.connect(
             host=_HOST,
             port=_PORT,
@@ -8098,8 +8077,8 @@ class TpcIntegration(_ThrottleRetry, unittest.TestCase):
             service_name=_SERVICE,
             **_FV_KW,
         ) as conn:
-            if not isinstance(getattr(conn, '_dialect', None), Fv2Dialect):
-                self.skipTest('only a 9i session takes the XA names at login')
+            if not conn._server_below_10_2():
+                self.skipTest('only 8i and 9i take the XA names at login')
             with self.assertRaisesRegex(seerdb.NotSupportedError, 'xa=True'):
                 conn.tpc_begin(_tpc_xid('plain'))
 
@@ -14452,7 +14431,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 await Cur.execute(f'DROP TABLE {table}')
             except DatabaseError:
                 pass  # not left over from an earlier run
-            await Cur.execute(f'CREATE TABLE {table} (n NUMBER)')
+            await Cur.execute(f'CREATE TABLE {table} (n NUMBER) {_TPC_INITRANS}')
         Settler = await seerdb.connect_async(**Kwargs)
         try:
             for xid, n in ((keep, 1), (drop, 2)):

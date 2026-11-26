@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# The server's reply to it: REQUIRES_COMMIT, Oracle 9.2.0.4 (#2807).
+# Captured 2026-11-26 from an OCI 9.2 program (OCITransStart, OCITransDetach, OCITransPrepare,
+# OCITransCommit and OCITransRollback, with XIDs of format 2807, gtrid
+# 'gtrid' and a letter, bqual 'bq' and the same letter) run on the 9i VM
+# (x86-64 Linux), under tcpdump.
+# The TTC payload, without the packet's header, as `hexdump -C` output; the
+# offset column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  08 01 00 00 00 09 01 00  00 00                    |..........|
+0000000a

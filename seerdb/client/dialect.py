@@ -142,6 +142,8 @@ from seerdb.common.tns import (
     encode_oci11_scroll_fetch,
     encode_oci11_tpc_change_state,
     encode_oci11_tpc_switch,
+    encode_pre10_tpc_change_state,
+    encode_pre10_tpc_switch,
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
@@ -1227,7 +1229,8 @@ class Oall8Dialect:
     def capabilities(self) -> frozenset[str]:
         # 8i does query / DML / PL/SQL / LOB and drives its own COMMIT / ROLLBACK
         # (no modern TTI_COMMIT); no array DML. It binds objects, collections,
-        # REFs and associative arrays as OCI 9.2 does (SeerODBC #172).
+        # REFs and associative arrays as OCI 9.2 does (SeerODBC #172), and runs
+        # two-phase commit as OCI 9.2 does (#2807).
         return frozenset(
             {
                 CAP_QUERY,
@@ -1238,8 +1241,46 @@ class Oall8Dialect:
                 CAP_OBJECT_BIND,
                 CAP_REF_BIND,
                 CAP_ARRAY_BIND,
+                CAP_TPC,
             }
         )
+
+    # --- two-phase commit (#2807), as OCI 9.2's OCITrans* calls send it to
+    # 8.1.7 and to 9.2 (encode_pre10_tpc_switch): at 8i's widths, or at the
+    # native 9.2 ones (Fv2Oall8Dialect). The return parameters are read as
+    # 11g's native ones are, the status behind them as the tier's.
+    _tpc_o8i = True
+
+    def _tpc_call(self, message: bytes):
+        yield Send(message)
+        received = yield RECV
+        if received is False:
+            raise connection_closed(f'{self._wire} two-phase commit call')
+        return received[1]
+
+    def tpc_switch(self, operation, xid, flags, timeout, context):
+        # Start or detach a branch; returns the server's context.
+        reply = yield from self._tpc_call(
+            self._closing()
+            + encode_pre10_tpc_switch(
+                self._next_seq(), operation, xid, flags, timeout, context, self._tpc_o8i
+            )
+        )
+        (returned, rest) = decode_oci11_tpc_context(reply)
+        _raise_ora(*self._terminal_error(rest))
+        return returned
+
+    def tpc_change_state(self, operation, state, xid, context):
+        # Prepare, commit or roll back a branch; returns its new state.
+        reply = yield from self._tpc_call(
+            self._closing()
+            + encode_pre10_tpc_change_state(
+                self._next_seq(), operation, state, xid, context, self._tpc_o8i
+            )
+        )
+        (new_state, rest) = decode_oci11_tpc_state(reply)
+        _raise_ora(*self._terminal_error(rest))
+        return new_state
 
     def _encode_query(self, sql_text: bytes, bind: list | None) -> bytes:
         # The OALL8 SELECT execute. 8i sends the 32-bit form; the 9i OALL8 dialect
@@ -1539,6 +1580,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
 
     # --- the 9.2 hooks for the shared call sequences in Oall8Dialect (#798)
     _wire = '9i OALL8'
+    _tpc_o8i = False
 
     def _sql_text(self, sql: str) -> bytes:
         # UTF-8, the session's negotiated charset (#797).
@@ -1605,6 +1647,7 @@ class Fv2Oall8Dialect(Oall8Dialect):
                 CAP_REF_BIND,
                 CAP_ARRAY_BIND,
                 CAP_SCROLL,
+                CAP_TPC,
             }
         )
 
