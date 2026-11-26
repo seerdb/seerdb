@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Oracle 8.1.7's reply to OCI 9.2's LOB write on a CLOB (#2804): the locator
+# the write updated, the amount written (9), then the status.
+# Captured 2026-11-26 through tcpdump on the 9i VM. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column
+# and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  08 00 54 00 01 02 0c 00  00 00 01 00 00 00 01 00  |..T.............|
+00000010  00 00 14 f9 57 00 04 1d  c0 00 04 1d bf 00 02 00  |....W...........|
+00000020  02 00 1f 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000030  00 00 00 00 00 00 36 3a  dc 00 00 00 07 00 27 00  |......6:......'.|
+00000040  00 0a f8 00 80 04 dd 02  8f 10 00 00 00 00 04 1d  |................|
+00000050  bf 01 40 01 13 00 00 09  00 00 00 04 01 00 00 00  |..@.............|
+00000060  00 00 00 00 00 00 00 00  00 00 00 00 20 00 00 00  |............ ...|
+00000070  bf 1d 04 00 05 00 00 13  01 00 00 00 00 00 00 00  |................|
+00000080  00 00 0d 00 00 01 00 00  00 00 00 00 00 00 00 00  |................|
+00000090  00 00 00 00 00 00 00                              |.......|
+00000097

@@ -446,9 +446,11 @@ The flag is ignored on other tiers.
 tier. It runs connect (`O3LOGON`), SELECT, single-row DML / DDL, PL/SQL blocks
 with IN / OUT binds, REF CURSOR OUT binds and `CURSOR()` columns, object and
 collection columns and binds, IN and OUT, as `DbObject`s, REF columns and binds,
-PL/SQL associative-array binds (`arrayvar`) in a block, CLOB / BLOB and
-native BFILE reads, CLOB / BLOB OUT binds and `RETURNING` (their value is the
-text or bytes, as a fetched LOB's is: 8i serves no LOB object calls, and makes
+PL/SQL associative-array binds (`arrayvar`) in a block, CLOB / BLOB columns as
+LOB objects with their calls (read, write, trim, size, open and close, and a
+BFILE's `fileexists()`, as OCI 9.2 makes them; `fetch_lobs=False` reads the
+content at fetch time, #2804), native BFILE reads, CLOB / BLOB OUT binds and
+`RETURNING` (their value is the text or bytes: 8i makes
 no temporary LOB, so an IN OUT LOB Var holding text and a block value past
 32512 bytes are refused), LONG / LONG RAW, ROWID / UROWID, AQ on a RAW or an object
 queue as OCI 9.2 enqueues and dequeues (no dequeue condition, which 8.1.7 lacks;

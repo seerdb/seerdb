@@ -151,10 +151,6 @@ def _fv2_skip_reason(test_method_name: str) -> str | None:
 #     fixed, so the 8i suite stays green *and* honest (milestone #25).
 _8I_UNSUPPORTED = (
     # Genuine 8i limitations (8.1.7 predates the feature).
-    (
-        'methods_on_a_missing_directory',
-        '8i has no LOB object calls, fileexists() included (#2804)',
-    ),
     ('timestamp', 'TIMESTAMP is a 9i+ type; Oracle 8i has only DATE'),
     ('interval', 'INTERVAL is a 9i+ type; Oracle 8i lacks it'),
     ('multilevel', 'a collection of collections is a 9i+ type; Oracle 8i lacks it'),
@@ -180,11 +176,9 @@ _8I_UNSUPPORTED = (
     ('error_offset', 'the 8i error reply carries no offset (#719)'),
     # 8i reads objects and collections (SeerODBC #168); these tests' SQL needs
     # what 8.1.7 lacks.
-    (
-        'lob_attribute',
-        "8.1.7's SQL has no TO_CLOB / TO_BLOB, and 8i serves no LOB object's calls",
-    ),
+    ('lob_attribute', "8.1.7's SQL has no TO_CLOB / TO_BLOB"),
     ('large_object_image', "8.1.7's SQL has no TO_CLOB / TO_BLOB"),
+    ('a_lob_call_in_a', "8.1.7's SQL has no TO_CLOB / TO_BLOB"),
     (
         'collection_value_from_a_one_element_constructor',
         "8.1.7 takes no N'' literal into a VARCHAR2 element (ORA-12704)",
@@ -648,7 +642,6 @@ _SERVER_SCROLL = _Need(
     "server-side scroll: 9i's ALL7 form and 8i use the buffered scroll (#2809)",
     server_scroll=True,
 )
-_LOBOPS = _Need('the 8i LOB object has no LOBOPS calls (9i: #2259)', not_8i=True)
 _OER_WARN_BYTE = _Need('the 8i OER warn byte is not located (9i: #2262)', not_8i=True)
 _BLOCK_IOV = _Need(
     'the 8i block reply carries no IOV directions (9i: #2264)', not_8i=True
@@ -662,12 +655,11 @@ _PRE10_RETURNING = _Need(
 _FV = FIELD_VERSION_11_2
 _EDITIONS = _Need('editions need 11g or later', min_fv=_FV)
 # 10g closes the connection on the converted form's persistent-LOB write (#964),
-# not on the native form's (oall8, #2518), and 8i's dialect serves no LOB
-# object calls; 9i writes through its own LOBOPS form (#2259).
+# not on the native form's (oall8, #2518); 9i writes through its own LOBOPS form
+# (#2259), and 8i through the same at the 8i codec's widths (#2804).
 _LOB_MODIFY = _Need(
-    'modifying a LOB: 10g closes the connection without oall8, 8i has no LOB calls',
+    'modifying a LOB: 10g closes the connection without oall8',
     lob_modify=True,
-    not_8i=True,
 )
 _FV = FIELD_VERSION_12_1
 _INVISIBLE_COLUMNS = _Need('INVISIBLE columns are 12.1+', min_fv=_FV)
@@ -764,11 +756,6 @@ _INTERVAL = _Need('INTERVAL is a 9i+ type; Oracle 8i lacks it', not_8i=True)
 _CHAR_LENGTH = _Need('Oracle 8i has no USER_TAB_COLUMNS.CHAR_LENGTH', not_8i=True)
 _8I_DESCRIBE_SPANS_PACKETS = _Need('a describe outgrows a packet on 8i', only_8i=True)
 _ONLY_8I = _Need('not an Oracle 8i server', only_8i=True)
-# The BFILE classes are not _IntegrationBase's, whose name table gates the
-# missing-directory case, so a BFILE that exists is gated here.
-_8I_LOB_CALLS = _Need(
-    '8i has no LOB object calls, fileexists() included (#2804)', not_8i=True
-)
 _TEMPORAL_GRID = _Need(
     "the temporal grid outruns 8.1.7's SQL (ORA-00905, the USERENV parameter)",
     not_8i=True,
@@ -9046,15 +9033,13 @@ class TypeHandlerIntegration(_IntegrationBase):
 
         self._fill()
         Sql = f'SELECT c, b, d FROM {self.TABLE} WHERE id = 1'
-        # 8i reads every LOB's content as it fetches, LOB objects or not.
-        KeepsLobs = not _conn_is_8i(self.conn)
         for Handler in (None, _clob_as_text, None):
             with self.subTest(handler=Handler):
                 Cur = self.conn.cursor()
                 Cur.outputtypehandler = Handler
                 Cur.execute(Sql)
                 (C, B, D) = Cur.fetchone()
-                if Handler is None and KeepsLobs:
+                if Handler is None:
                     self.assertIsInstance(C, LOB)
                     self.assertIsInstance(B, LOB)
                     (C, B) = (C.read(), B.read())
@@ -10061,7 +10046,6 @@ class LOBReadLengthIntegration(_IntegrationBase):
                 self.assertEqual(self._read_all(fv), rows)
 
 
-@_requires(_LOBOPS)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class LOBObjectIntegration(_IntegrationBase):
     """The LOB OBJECT a fetch returns by default (#964).
@@ -10185,8 +10169,15 @@ class LOBObjectIntegration(_IntegrationBase):
         lob.write('éa', 6)
         self.assertEqual(lob.read(), 'café éa')
         self.assertEqual(lob.size(), 7)
+        # 8.1.7's SQL takes no LIKE on a CLOB (ORA-00932): its own DBMS_LOB reads
+        # the stored text there (#2804).
+        where = (
+            'DBMS_LOB.SUBSTR(c, 4000, 1) = :1'
+            if _conn_is_8i(self.conn)
+            else 'c LIKE :1'
+        )
         self.cur.execute(
-            f'SELECT COUNT(*) FROM {self.TABLE} WHERE c LIKE :1', ['café éa']
+            f'SELECT COUNT(*) FROM {self.TABLE} WHERE {where}', ['café éa']
         )
         self.assertEqual(self.cur.fetchone(), (1,))
 
@@ -17169,7 +17160,6 @@ class BFILEIntegration(_ThrottleRetry, unittest.TestCase):
         self.assertEqual(Lob.directory_name, self.dir)
         self.assertEqual(Lob.filename, _BFILE_TEST_FILE)
 
-    @_requires(_8I_LOB_CALLS)
     def test_bfile_fileexists_against_a_real_directory(self):
         # The server's own answer for a directory that DOES exist: True for the
         # file that is there, False for one that is not -- no error either way,
@@ -17221,7 +17211,6 @@ class AsyncBFILEIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(Lob.is_file)
                 self.assertEqual(await Lob.aread(), _BFILE_TEST_CONTENT)
 
-    @_requires(_8I_LOB_CALLS)
     async def test_async_bfile_fileexists(self):
         # Sync/async parity for the BFILE round-trip (#1109).
         Dir = os.environ['SEERDB_TEST_BFILE_DIR']
@@ -18206,11 +18195,20 @@ class O8iDmlIntegration(_ThrottleRetry, unittest.TestCase):
         )
         self.cur.execute(f'insert into {self.TABLE} values (3, NULL, NULL)')
         self.conn.commit()
-        self.cur.execute(f'select id, c, b from {self.TABLE} order by id')
-        rows = self.cur.fetchall()
+        # The content at fetch time (fetch_lobs=False); by default the LOB
+        # objects, which 8i serves (#2804), read to the same.
+        self.conn.fetch_lobs = False
+        try:
+            self.cur.execute(f'select id, c, b from {self.TABLE} order by id')
+            rows = self.cur.fetchall()
+        finally:
+            self.conn.fetch_lobs = True
         self.assertEqual(rows[0], (1, 'hello-clob', b'\xde\xad\xbe\xef\x00\xca\xfe'))
         self.assertEqual((rows[1][0], len(rows[1][1]), rows[1][2]), (2, 4000, b'\x00'))
         self.assertEqual(rows[2], (3, None, None))
+        self.cur.execute(f'select id, c, b from {self.TABLE} order by id')
+        objects = [(i, c and c.read(), b and b.read()) for (i, c, b) in self.cur]
+        self.assertEqual(objects, rows)
 
     def test_bfile_read(self):
         # 8i BFILE read (#401) over the native FILE_OPEN -> GETLEN -> READ ->
@@ -18334,9 +18332,15 @@ class AsyncO8iIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCase):
                 'begin return a * 3; end;'
             )
             self.assertEqual(await cur.callfunc('zz_seerdb_af', int, [11]), 33)
-            # LOB read
+            # LOB read: a LOB object by default, which 8i serves (#2804), and the
+            # content at fetch time with fetch_lobs=False
+            await cur.execute(f'select id, c from {self.TABLE}')
+            ((ident, lob),) = await cur.fetchall()
+            self.assertEqual((ident, await lob.aread()), (7, 'async-clob'))
+            conn.fetch_lobs = False
             await cur.execute(f'select id, c from {self.TABLE}')
             self.assertEqual(await cur.fetchall(), [(7, 'async-clob')])
+            conn.fetch_lobs = True
             # BFILE read (#401): native FILE_OPEN -> GETLEN -> READ -> FILE_CLOSE,
             # using the instance's own bdump directory + alert log as the fixture
             # (mirrors the sync O8iDmlIntegration.test_bfile_read).

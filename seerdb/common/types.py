@@ -475,11 +475,13 @@ def fv2_lob_payload(
     CLOB's text in the session's charset (fv2_lob_charset) -- not the 10g+
     UTF-16 -- counted in characters. Sent in the column's database charset, a
     non-ASCII character was invalid UTF-8 to the server, which then found fewer
-    characters than the amount (ORA-22993, #2383)."""
+    characters than the amount (ORA-22993, #2383). An 8i session's text is
+    the single-byte database charset its whole session speaks (#2804): sent
+    as UTF-8, `é`'s two bytes outran the amount and 8.1.7 ended the session."""
     if is_blob:
         return (cast(bytes, Data), len(Data))
     Text = cast(str, Data)
-    Charset = fv2_lob_charset(charset)
+    Charset = charset if charset == ISO_LATIN_1_CHARSET else fv2_lob_charset(charset)
     Bytes = Text.encode(_CHARSET_PYTHON_NAME[Charset])
     if Charset == AL16UTF16_CHARSET:
         # UTF-16's characters are its code units: a character past the BMP is
