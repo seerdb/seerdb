@@ -18900,6 +18900,16 @@ def decode_8i_warn_flags(Data: bytes) -> int:
     return Status['warnings'] if Status else 0
 
 
+def decode_8i_error_position(Data: bytes) -> int:
+    """Where in the statement an 8i error is (#2804), 0 for a reply without a
+    status: its `position`, the 0-based offset DatabaseError.offset reports.
+    8.1.7 puts 7 there for `SELECT nosuchcol FROM dual` and 14 for `SELECT 1
+    FROM nosuchtable`, the offsets OCI 9.2 reports from those replies
+    (oci92_error_offset_reply_8i.hexdump)."""
+    Status = _o8i_status_or_none(Data)
+    return Status['position'] if Status else 0
+
+
 def decode_8i_dml_rowid(Data: bytes) -> str | None:
     """The rowid of the row an 8i DML touched, from its status, or None.
 

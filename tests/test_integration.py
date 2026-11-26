@@ -173,7 +173,6 @@ _8I_UNSUPPORTED = (
     ('mixed_batch', 'executemany (array DML) is not supported on Oracle 8i'),
     ('pipeline', 'the pipeline test uses array DML, unsupported on Oracle 8i'),
     ('batcherror', 'executemany (array DML) is not supported on Oracle 8i'),
-    ('error_offset', 'the 8i error reply carries no offset (#719)'),
     # 8i reads objects and collections (SeerODBC #168); these tests' SQL needs
     # what 8.1.7 lacks.
     ('lob_attribute', "8.1.7's SQL has no TO_CLOB / TO_BLOB"),

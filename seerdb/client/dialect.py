@@ -46,6 +46,7 @@ from seerdb.common.tns import (
     decode_8i_dcb_describe,
     decode_8i_dml_response,
     decode_8i_dml_rowid,
+    decode_8i_error_position,
     decode_8i_exec_response,
     decode_8i_terminal_error,
     decode_8i_warn_flags,
@@ -985,8 +986,9 @@ class Oall8Dialect:
         return decode_8i_terminal_error(reply)
 
     def _error_offset(self, reply: bytes) -> int:
-        # Where in the statement an error is: 8i's status carries none (#719).
-        return 0
+        # Where in the statement an error is: 8i's status's position (#2804),
+        # where OCI 9.2 reads it from 8.1.7.
+        return decode_8i_error_position(reply)
 
     def _fetch_ended(self, terminal: bytes) -> bool:
         return _8i_fetch_ended(terminal)
