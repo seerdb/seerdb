@@ -18350,13 +18350,33 @@ def _o9i_oall8_oer(Terminal: bytes) -> bytes:
     # post-row tail) or from the OER itself; a caller with a leading TTI_IOV /
     # TTI_RXD strips those first.
     Rest = Terminal
-    if Rest[:1] == bytes([TTI_RPA]):
+
+    def _after_rpa(At: int) -> bytes:
+        # The OER straight after an RPA that starts at `At` and reads whole.
         try:
-            (_, After) = _O8I_RPA_FROM_O9I(Rest)
+            (_, After) = _O8I_RPA_FROM_O9I(Rest[At:])
         except (IndexError, DataError):
-            After = b''
+            return b''
         if After[:1] == bytes([TTI_OER]) and len(After) >= 5 and not any(After[2:5]):
             return After
+        return b''
+
+    if Rest[:1] == bytes([TTI_RPA]):
+        After = _after_rpa(0)
+        if After:
+            return After
+    # A block's reply opens with its bind prompt and OUT values, the RPA behind
+    # them: the OER is the one after the first RPA that reads whole. Scanning
+    # for a bare 0x04 alone took the RPA's own value bytes for the status once
+    # its first value (the SCN, it grows) held a 04 with zeros after it:
+    # `c8 e5 04 03 00 00 00 00` read as ORA-00001 for every RETURNING over the
+    # native form (#2839).
+    At = Rest.find(bytes([TTI_RPA]), 1)
+    while At >= 0:
+        After = _after_rpa(At)
+        if After:
+            return After
+        At = Rest.find(bytes([TTI_RPA]), At + 1)
     # No (or an unexpected) RPA: scan for the first 0x04 that begins a real OER head
     # (its leading call-type field is small, so the three bytes after it are zero).
     At = Rest.find(bytes([TTI_OER]))
@@ -18535,13 +18555,15 @@ def decode_9i_oall8_block_cursor(
 
 
 # A LOB's OUT value on a native 9i session: the locator's length as a ub4, the
-# locator as a value (none for a NULL, its length 0), then the indicator and the
-# return code.
+# locator as a value (none for a NULL, its length 0), then the indicator, a ub2
+# and no return code: 9.2 sends `00 00` and the next bind's value straight
+# after it (#2839). Read with a return code, the cell ran two bytes into
+# whatever followed -- a NUMBER OUT read as `malformed Oracle NUMBER`, and a
+# block's status was found by its fallback scan alone.
 _O9I_OUT_LOB: wire_schema.Schema = (
     ('n4', 'length'),
     ('when', 'length', (('value', 'locator'),)),
     ('n2', 'indicator'),
-    ('n2', 'return_code'),
 )
 _O9I_OUT_LOB_FROM_O9I = wire_schema.compile_decoder(_O9I_OUT_LOB, _O9I)
 
