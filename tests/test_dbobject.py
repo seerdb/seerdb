@@ -56,6 +56,7 @@ from seerdb.common.tns import (
 from seerdb.common.tns_consts import (
     AL16UTF16_CHARSET,
     AL32UTF8_CHARSET,
+    FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     TNS_TYPE_ADT,
@@ -588,6 +589,36 @@ class TestRefBindEncode(unittest.TestCase):
         # cannot build the bind OAC.
         with self.assertRaises(NotSupportedError):
             _encode_ref_oac(DbRef(self._LOCATOR, 'PERSON_T'))
+
+
+class TestTenTwoRefBindEncode(unittest.TestCase):
+    # A REF bound on a thin 10.2 session (#2806), against JDBC thin 11.2's
+    # (ojdbc6) INSERT of one into 10.2.0.5, captured through
+    # tools/capture_proxy.py: the 12c descriptor without the trailing oaccolid,
+    # which 10.2, 11.2 and 9.2 answered with a fatal ORA-03106.
+    _OID = bytes.fromhex('612edd782eff086ae060a8c096006ea1')
+    _LOCATOR = bytes.fromhex(
+        '00280209612edd782f05086ae060a8c096006ea1'
+        '612edd782f04086ae060a8c096006ea10040626a0000'
+    )
+    _CAP_OAC = bytes.fromhex(
+        '6f030000020fa00000011010612edd782eff086ae060a8c096006ea1010101020000'
+    )
+    _CAP_VAL = bytes.fromhex(
+        '2a00280209612edd782f05086ae060a8c096006ea1'
+        '612edd782f04086ae060a8c096006ea10040626a0000'
+    )
+
+    def tearDown(self):
+        _ENCODE_FIELD_VERSION.set(6)
+
+    def test_oac_and_value_match_jdbc_thin_11_2s_at_10_2(self):
+        ref = DbRef(self._LOCATOR, 'PYORACLE_REF6_T', 'PYO', self._OID)
+        for fv in (FIELD_VERSION_10_2, FIELD_VERSION_11_2):
+            with self.subTest(fv=fv):
+                _ENCODE_FIELD_VERSION.set(fv)
+                self.assertEqual(_encode_ref_oac(ref), self._CAP_OAC)
+                self.assertEqual(_encode_ref_bind_value(ref), self._CAP_VAL)
 
 
 class TestPreTwelveObjectBindRefusal(unittest.TestCase):

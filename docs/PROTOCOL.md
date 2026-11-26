@@ -2269,7 +2269,9 @@ a fixed flag byte (`TNS_BIND_USE_INDICATORS = 1`), `ContFlags` as a `ub8`, an
 only — a trailing `oaccolid` `ub4`. A 12.1 session sent the `oaccolid` answers
 `ORA-03106`; one sent the 11g layout, `ORA-03120` (#1144). The hand-built OACs
 (LOB, object, REF) follow the same rule, except that below 12.1 the LOB one
-keeps the trailing field it has always carried.
+keeps the trailing field it has always carried. Below 12.1 the REF one drops it
+as the object one does: JDBC thin 11.2 sends 10.2 none, and 10.2, 11.2 and 9.2
+(the thin OALL8 form) answered it with a fatal ORA-03106 (#2806).
 
 **An object bind on 10g and 11g thin sessions** (#2704) uses 12c's object
 descriptor without the trailing `oaccolid`, as JDBC thin 11.2 sends it. With

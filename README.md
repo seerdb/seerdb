@@ -409,8 +409,9 @@ integration suite, with these differences from the default compact form:
 - **`connection.transaction_in_progress`** answers, from each reply's call status.
 - **It binds PL/SQL associative arrays** (`arrayvar`).
 - **`cursor.parse()`** parses without running the statement.
-- **It makes no temporary LOBs**, so a LOB Var, a CLOB or BLOB OUT bind and a REF
-  bind aren't supported there yet; the compact form binds all three.
+- **It makes no temporary LOBs**, so a LOB Var and a CLOB or BLOB OUT bind
+  aren't supported there yet; the compact form binds both. A REF binds as on
+  thin 10g (#2806).
 - **Validated on 9.2.0.4 only.** The other servers ignore the option.
 
 **Experimental: 11g's native form on a dedicated session** (the same

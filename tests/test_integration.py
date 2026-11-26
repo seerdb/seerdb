@@ -325,7 +325,8 @@ class _Target(NamedTuple):
     # Whether the session binds a PL/SQL associative array: 12.1+, a 10g or
     # 11g thin session (#2706), and the native form on 10g and 11g.
     assoc_arrays: bool = False
-    # Whether the session binds a REF: 12.1+, and the native form on 10g and 11g.
+    # Whether the session binds a REF: a thin 10.2+ one (#2806), the native forms
+    # and the pre-10g dialects.
     ref_binds: bool = False
     # Whether a CLOB or BLOB comes back from an OUT bind or a RETURNING: where
     # a LOB Var binds (temp_lobs), and on 8i and 9i's compact form, which bind
@@ -428,7 +429,11 @@ def _target_of(conn) -> _Target:
         or _dialect_binds_arrays(conn),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False))
-        or _dialect_binds_refs(conn),
+        or _dialect_binds_refs(conn)
+        or (
+            getattr(conn, '_dialect', None) is None
+            and conn.field_version >= FIELD_VERSION_10_2
+        ),
         temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
         conn.field_version,
         conn._scrolls_server_side(),
@@ -667,7 +672,7 @@ _LOB_MODIFY = _Need(
 _FV = FIELD_VERSION_12_1
 _INVISIBLE_COLUMNS = _Need('INVISIBLE columns are 12.1+', min_fv=_FV)
 _REF_BIND = _Need(
-    "REF bind needs a 12.1+ server, the native form on 10g and 11g, or 9i's compact form",
+    'a REF bind needs a thin 10.2+ session, a native form, or a pre-10g dialect',
     ref_binds=True,
 )
 _ROWS_RETURNING = _Need(
