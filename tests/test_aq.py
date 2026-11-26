@@ -168,6 +168,179 @@ class TestNinePointTwoOverThinOall8(unittest.TestCase):
         self.assertEqual(msg['enq_time'][:7], bytes.fromhex('787e0b1a0f2533'))
 
 
+class _NativeConn(_FakeConn):
+    # A 10g or 11g session in OCI 11.2's native form (oall8=True, or pooled).
+    _native11 = True
+
+    def __init__(self, field_version):
+        self.field_version = field_version
+
+
+def _native_capture(name):
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from replay import load_capture
+
+    return bytes(load_capture(name))
+
+
+class TestTheNativeForm(unittest.TestCase):
+    # A native session to 10g or 11g (#2805) enqueues and dequeues as OCI 11.2
+    # does: thin's messages at OCI's widths. Each difference from OCI's own
+    # bytes below is one a live 10g took, OCI's replayed with it.
+
+    def _props(self):
+        props = MessageProperties(payload=b'hello AQ')
+        (props.priority, props.expiration, props.correlation) = (7, 3600, 'CORR1')
+        return props
+
+    def test_the_enqueue_is_oci_11_2s(self):
+        from seerdb.common.oci import OCI_INDICATOR
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        theirs = _native_capture('oci11_aq_enqueue_10g.hexdump')
+        q = Queue(_NativeConn(FIELD_VERSION_10_2), 'PYO_AQ_OCI')
+        ours = encode_aq_enq(
+            theirs[2], FIELD_VERSION_10_2, q, self._props(), False, True
+        )
+        want = bytearray(theirs)
+        # OCI's lengths of the queue name and the correlation are three bytes a
+        # character; seerdb's are the values' own.
+        self.assertEqual((want[11], want[27]), (30, 15))
+        (want[11], want[27]) = (10, 5)
+        # The byte ahead of the keyword pairs: OCI's 0x16, seerdb's thin 0x0E.
+        self.assertEqual(want[61], 0x16)
+        want[61] = 0x0E
+        # OCI's user properties, a ub4 1 and a 36-byte item with 28 bytes after
+        # it; seerdb's none, then the CSN, the DSN and the flags.
+        at = want.index(bytes.fromhex('24000000240022020800'))
+        self.assertEqual(want[at - 4 : at], b'\x01\x00\x00\x00')
+        want[at - 4 : at + 41 + 28] = bytes(16)
+        # OCI sets the pointer after the enqueue flags; seerdb leaves it unset.
+        slot = bytes.fromhex('1000000000000000') + OCI_INDICATOR
+        self.assertEqual(want.count(slot), 1)
+        want[want.index(slot) + 8 : want.index(slot) + 16] = bytes(8)
+        self.assertEqual(ours, bytes(want))
+
+    def test_10g_and_11g_take_the_same_enqueue(self):
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        q = Queue(_NativeConn(FIELD_VERSION_10_2), 'Q')
+        self.assertEqual(
+            encode_aq_enq(1, FIELD_VERSION_10_2, q, self._props(), False, True),
+            encode_aq_enq(1, FIELD_VERSION_11_2, q, self._props(), False, True),
+        )
+
+    def _dequeue(self, capture, field_version, wide):
+        from seerdb.common.oci import OCI_INDICATOR
+
+        theirs = _native_capture(capture)
+        q = Queue(_NativeConn(field_version), 'PYO_AQ_OCI')
+        (q.deqoptions.wait, q.deqoptions.correlation) = (5, 'CORR1')
+        ours = encode_aq_deq(theirs[2], field_version, q, True)
+        want = bytearray(theirs)
+        n = 8 if wide else 4  # 11.2's lengths here are ub8
+        consumer = 3 + 8 + n + 4 * 8
+        correlation = consumer + 8 + 4 * 5 + (4 if wide else 0) + 8 + n + 8
+        # The lengths three bytes a character again: the queue name's, and the
+        # correlation's, whose pointer is just ahead of it.
+        self.assertEqual(want[11], 30)
+        want[11] = 10
+        self.assertEqual(want[correlation - 8 : correlation], OCI_INDICATOR)
+        self.assertEqual(want[correlation], 15)
+        want[correlation] = 5
+        # OCI sets the consumer's pointer, with a length of 0; seerdb, with no
+        # consumer, leaves it unset.
+        self.assertNotEqual(want[consumer : consumer + 8], bytes(8))
+        want[consumer : consumer + 8] = bytes(8)
+        self.assertEqual(ours, bytes(want))
+
+    def test_the_dequeue_is_oci_11_2s_at_10_2s_widths(self):
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        self._dequeue('oci11_aq_dequeue_10g.hexdump', FIELD_VERSION_10_2, False)
+
+    def test_the_dequeue_is_oci_11_2s_at_11_2s_widths(self):
+        self._dequeue('oci11_aq_dequeue_11g.hexdump', FIELD_VERSION_11_2, True)
+
+    def test_a_dequeue_reply_reads_back(self):
+        q = Queue(_NativeConn(FIELD_VERSION_11_2), 'PYO_AQ_OCI')
+        reply = _native_capture('oci11_aq_dequeue_reply_11g.hexdump')
+        got = _decode_aq_deq(reply, q)
+        self.assertEqual(
+            (got.priority, got.delay, got.expiration, got.correlation, got.payload),
+            (7, 0, 3600, 'CORR1', b'hello AQ'),
+        )
+        self.assertEqual(len(got.msgid), 16)
+
+    def test_an_expiration_of_never_reads_back_as_minus_one(self):
+        # OCI writes it as its ub4 two's complement, `ff ff ff ff`.
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        q = Queue(_NativeConn(FIELD_VERSION_10_2), 'PYO_AQ_OCI')
+        reply = _native_capture('oci11_aq_dequeue_reply_10g.hexdump')
+        got = _decode_aq_deq(reply, q)
+        self.assertEqual((got.expiration, got.payload), (-1, b'hello AQ'))
+        out = encode_aq_enq(1, FIELD_VERSION_10_2, q, MessageProperties(payload=b'x'))
+        native = encode_aq_enq(
+            1, FIELD_VERSION_10_2, q, MessageProperties(payload=b'x'), False, True
+        )
+        self.assertNotIn(b'\xff\xff\xff\xff', out)
+        self.assertEqual(native[23:27], b'\xff\xff\xff\xff')
+
+    def _object_type(self):
+        from seerdb.common.dbobject import DbObjectType
+        from seerdb.common.tns_consts import TNS_TYPE_NUMBER, TNS_TYPE_VARCHAR
+
+        enq = _native_capture('oci11_aq_object_enqueue_11g.hexdump')
+        at = enq.index(b'PYO_AQ_OCIO') + len('PYO_AQ_OCIO')
+        return (
+            DbObjectType(
+                'PYO',
+                'PYO_AQ_OCI_O',
+                enq[at : at + 16],
+                1,
+                [
+                    {'name': 'N', 'data_type': TNS_TYPE_NUMBER},
+                    {'name': 'S', 'data_type': TNS_TYPE_VARCHAR},
+                ],
+            ),
+            enq,
+            at + 16,
+        )
+
+    def test_an_object_payload_is_oci_11_2s(self):
+        # The cell a native object bind carries: the constructed toid, no
+        # object OID or snapshot, version 0, the image's length, the TOP_LEVEL
+        # flags and the image.
+        (typ, theirs, payload) = self._object_type()
+        q = Queue(_NativeConn(FIELD_VERSION_11_2), 'PYO_AQ_OCIO', payload_type=typ)
+        obj = typ.newobject()
+        (obj.N, obj.S) = (9, 'nine')
+        ours = encode_aq_enq(
+            1, FIELD_VERSION_11_2, q, MessageProperties(payload=obj), False, True
+        )
+        self.assertTrue(ours.endswith(theirs[payload:]))
+
+    def test_an_object_payload_reads_back(self):
+        (typ, _, _) = self._object_type()
+        q = Queue(_NativeConn(FIELD_VERSION_11_2), 'PYO_AQ_OCIO', payload_type=typ)
+        reply = _native_capture('oci11_aq_object_dequeue_reply_11g.hexdump')
+        got = _decode_aq_deq(reply, q)
+        self.assertEqual((got.payload.N, got.payload.S), (9, 'nine'))
+
+    def test_an_empty_queue_is_no_message(self):
+        # The native form's status carries the error: ORA-25228, no message.
+        q = Queue(_NativeConn(FIELD_VERSION_11_2), 'PYO_AQ_SEER')
+        reply = _native_capture('native_aq_empty_dequeue_reply_11g.hexdump')
+        self.assertIsNone(_decode_aq_deq(reply, q))
+        (code, message) = _aq_error_info(reply, True)
+        self.assertEqual(code, 25228)
+        self.assertTrue(message.startswith('ORA-25228: timeout or end-of-fetch'))
+
+
 class TestTheQueueNameBefore12c(unittest.TestCase):
     # 11g reads the queue name in the data section as it stands; a length
     # byte in front made it read the payload a byte off, ORA-00600 [kpoaqeq:

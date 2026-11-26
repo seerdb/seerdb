@@ -3558,7 +3558,11 @@ class AsyncOracleConnect(_ConnectionLogic):
     ) -> _Decoded:
         # As OracleConnect._aq_request: decode the reply, reading on while the
         # decode runs past the bytes received (#1845).
-        await self.send(TNS_DATA, Data)
+        self._native11_sending = True  # built in the native form when native
+        try:
+            await self.send(TNS_DATA, Data)
+        finally:
+            self._native11_sending = False
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
             raise OperationalError('connection closed during AQ operation')
@@ -3579,14 +3583,19 @@ class AsyncOracleConnect(_ConnectionLogic):
             queue,
             props,
             self._server_below_10_2(),
+            self._native11,
         )
-        props.msgid = await self._aq_request(Data, _decode_aq_enq)
+        props.msgid = await self._aq_request(
+            Data, lambda Reply: _decode_aq_enq(Reply, self._native11)
+        )
 
     async def _aq_deq_one(self, queue):
         from seerdb.client.connection import _decode_aq_deq
         from seerdb.common.tns import encode_aq_deq
 
-        Data = encode_aq_deq(self._next_seq(), self.field_version, queue)
+        Data = encode_aq_deq(
+            self._next_seq(), self.field_version, queue, self._native11
+        )
         return await self._aq_request(Data, lambda Reply: _decode_aq_deq(Reply, queue))
 
     async def _aq_enq_many(self, queue, props_list) -> None:

@@ -1338,15 +1338,17 @@ class _ConnectionLogic:
 
     def _aq_refused(self, payload_type) -> bool:
         # Whether connection.queue() refuses a queue below 12.1. A 10g or 11g
-        # thin session takes a RAW or an object queue (#2697, #2702, #2708), and
-        # so does a thin OALL8 one to 9.2, in the form JDBC thin 11.2 sends 9.2
-        # (#2805); a JSON payload and the native forms are measured from 12.1
-        # only. Elsewhere on 9i and on 8i, DBMS_AQ from PL/SQL is the route.
+        # session takes a RAW or an object queue, thin (#2697, #2702, #2708) or
+        # in OCI 11.2's native form, dedicated or pooled (#2805); so does a thin
+        # OALL8 one to 9.2, in the form JDBC thin 11.2 sends 9.2 (#2805). A JSON
+        # payload is measured from 12.1 only. On 9i's other forms and on 8i,
+        # DBMS_AQ from PL/SQL is the route.
         from seerdb.common.datatypes import JSON
 
+        Native = bool(getattr(self, '_native11', False))
         return self.field_version < FIELD_VERSION_12_1 and (
             payload_type is JSON
-            or getattr(self, '_dialect', None) is not None
+            or (getattr(self, '_dialect', None) is not None and not Native)
             or (self._server_below_10_2() and not self._thin92)
         )
 

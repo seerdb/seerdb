@@ -9220,14 +9220,42 @@ Each option is a field of those records.
 type's OID, and the payload is the type's pickled image, as from 12c. seerdb's
 12c form enqueues and dequeues it on 11g XE and 10.2.0.5 unchanged.
 
+**10g and 11g in the native form** (#2805). The reference is OCI 11.2's own
+`OCIAQEnq` / `OCIAQDeq`, captured on 10.2.0.5 and 11.2.0.2 XE. They are the same
+function codes, 121 and 122, with thin's field lists at OCI's fixed widths (ub4
+and ub2 little-endian, 8-byte pointers), the data section's strings counted, as
+from 12c. Sent on a native session, thin's compact form gets no answer at all.
+- **The enqueue** is the same to 10g and 11g. The message version is a ub2. In
+  place of the output acknowledgement's byte come 12 bytes no field is known
+  for, all zero. An object payload is the cell a native object bind carries
+  (§4.1.4): the constructed toid, no object OID or snapshot, version 0, the
+  image's length, the TOP_LEVEL flags and the image.
+- **The dequeue** goes to 10g at 10.2's widths. To 11g, five lengths are ub8 at
+  11.2's widths: the queue name's, the message id's, the correlation's, the
+  condition's and the extensions' count. 4 more bytes follow the wait there,
+  and 2 the version, all zero.
+- **The properties**, both ways, write each extension's keyword as a ub2, and
+  the dequeue's message count and recipients' count as ub2s. A negative
+  priority, delay, expiration or wait is its ub4 two's complement: an
+  expiration of -1 is `ff ff ff ff`.
+- **The reply** to a dequeue is thin's at those widths, a RAW payload's frame
+  the object cell's. An error, ORA-25228 for an empty queue included, comes in
+  the native status (§36).
+
+OCI writes a string's length as three bytes a character (30 for a 10-character
+queue name), sets the consumer's pointer with a length of 0, and sends its user
+properties (a ub4 1, a 36-byte item and 28 bytes after it) where seerdb sends
+none and the CSN, DSN and flags. Replayed with seerdb's values in their place,
+10g takes OCI's enqueue unchanged otherwise.
+
 **What seerdb takes:**
-- RAW and object queues on a 10g or 11g thin session, and on 9i with
-  `thin_oall8=True`;
+- RAW and object queues on a 10g or 11g session, thin or native (`oall8=True`,
+  and a pooled 11g one), and on 9i with `thin_oall8=True`;
 - on 9i's other forms and on 8i, `connection.queue()` raises
   NotSupportedError, naming the `DBMS_AQ` route.
 
-JSON payloads (no JSON type before 21c), array enqueue and dequeue, and the
-native forms are not measured, and are refused.
+JSON payloads (no JSON type before 21c) and array enqueue and dequeue are not
+measured, and are refused.
 
 ## 30. DRCP / implicit connection pooling (#130)
 

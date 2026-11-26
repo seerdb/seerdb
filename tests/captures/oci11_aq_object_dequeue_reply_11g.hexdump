@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Oracle 11.2.0.2 XE's reply to OCI 11.2's AQ dequeue (#2805): the object
+# (9, 'nine') enqueued in oci11_aq_object_enqueue_11g.hexdump.
+# Captured 2026-11-26 through tools/capture_proxy.py. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column
+# and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  08 01 00 00 00 00 00 00  00 00 00 ff ff ff ff 00  |................|
+00000010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 01  |................|
+00000020  00 00 00 07 78 7e 0b 1a  13 2f 15 00 00 00 00 04  |....x~.../......|
+00000030  00 00 00 16 00 00 00 00  00 00 00 00 40 00 00 00  |............@...|
+00000040  00 00 00 00 00 00 41 00  00 00 00 00 00 00 00 00  |......A.........|
+00000050  42 00 00 00 00 00 00 00  00 00 45 00 00 00 00 00  |B.........E.....|
+00000060  00 00 00 00 00 00 00 00  00 00 00 00 00 00 24 00  |..............$.|
+00000070  00 00 24 00 22 02 08 61  32 85 69 48 9c 1b 57 e0  |..$."..a2.iH..W.|
+00000080  60 a8 c0 96 00 a6 38 00  00 00 00 00 00 00 00 00  |`.....8.........|
+00000090  00 00 00 00 01 00 01 00  00 00 00 00 00 00 00 00  |................|
+000000a0  00 0b 00 00 00 01 00 0b  84 01 0b 02 c1 0a 04 6e  |...............n|
+000000b0  69 6e 65 61 32 85 69 48  a3 1b 57 e0 60 a8 c0 96  |inea2.iH..W.`...|
+000000c0  00 a6 38 09 02 00 00 00  13 00                    |..8.......|
+000000ca

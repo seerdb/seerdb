@@ -435,7 +435,8 @@ what it adds on 11g, the temporary LOBs and the LOB Var binds, and writes to a
 LOB, on which 10g closes the converted form's connection. Validated on 10.2.0.5
 only. Object, collection and associative-array binds and a REF CURSOR bound IN
 need no flag on 10g or 11g: the converted form binds them too (#2704, #2706,
-#2806).
+#2806). Both native forms, and a pooled 11g session, enqueue and dequeue on a
+RAW or an object queue (`connection.queue()`), as OCI 11.2 does (#2805).
 
 The flag is ignored on other tiers.
 
@@ -605,7 +606,8 @@ columns, REF CURSOR OUT binds and an open cursor bound IN to a PL/SQL block,
 `CURSOR()` columns, BFILE columns and a fetched BFILE bound IN, object and
 collection columns (XMLType among them) and an object or a collection bound IN,
 OUT and IN OUT, server-side scrollable cursors, a
-DML's RETURNING, an array DML's too, `ping()`, `cursor.parse()` and
+DML's RETURNING, an array DML's too, AQ on a RAW or an object queue, `ping()`,
+`cursor.parse()` and
 application contexts; `changepassword()` is refused with `NotSupportedError`,
 because the server refuses a password change on a DRCP session (ORA-56609). A
 descriptor parameter seerdb does not act on yet (`SDU`, `SECURITY`, …) is

@@ -335,14 +335,14 @@ def _decode_tpc_context(Packet: bytes) -> bytes:
     return Context
 
 
-def _decode_aq_enq(Packet: bytes) -> bytes:
+def _decode_aq_enq(Packet: bytes, Native: bool = False) -> bytes:
     # The message id an AQ enqueue's return gave the message (#128).
     from seerdb.common.tns import decode_aq_enq_reply
 
     if not Packet:
         raise OperationalError('empty AQ enqueue response')
     if Packet[0] != TTI_RPA:
-        _aq_raise(Packet)
+        _aq_raise(Packet, Native)
     return decode_aq_enq_reply(Packet)
 
 
@@ -367,20 +367,31 @@ def _parse_refuse_code(Packet: bytes) -> int | None:
     return None
 
 
-def _aq_error_info(Packet: bytes) -> tuple[int, str | None]:
+def _aq_error_info(Packet: bytes, Native: bool = False) -> tuple[int, str | None]:
     # The ORA code and message of an AQ error (TTI_OER) reply, read by the codec
-    # as every other error is, its whole message included (#2474).
+    # as every other error is, its whole message included (#2474); a native
+    # session's in the native form's status (#2805).
+    if Native:
+        from seerdb.common.exceptions import DataError
+        from seerdb.common.tns import decode_oci11_status
+
+        try:
+            Status = decode_oci11_status(Packet, Executed=False)
+        except DataError:
+            # Not a native status: the caller says the response was unexpected.
+            return (0, None)
+        return (Status['error_code'], Status['message'])
     return decode_error_reply(Packet)
 
 
-def _aq_oer_code(Packet: bytes) -> int:
-    return _aq_error_info(Packet)[0]
+def _aq_oer_code(Packet: bytes, Native: bool = False) -> int:
+    return _aq_error_info(Packet, Native)[0]
 
 
-def _aq_raise(Packet: bytes) -> None:
+def _aq_raise(Packet: bytes, Native: bool = False) -> None:
     from seerdb.common.exceptions import from_ora_code
 
-    (Code, Msg) = _aq_error_info(Packet)
+    (Code, Msg) = _aq_error_info(Packet, Native)
     if Code:
         raise from_ora_code(Code)(Msg or f'ORA-{Code:05d}', code=Code)
     raise DatabaseError(f'unexpected AQ response 0x{Packet[:1].hex()}')
@@ -445,18 +456,20 @@ def _decode_aq_deq(Packet: bytes, queue):
 
     if not Packet:
         return None
+    Native = bool(getattr(queue._connection, '_native11', False))
     if Packet[0] == TTI_OER:
-        if _aq_oer_code(Packet) in (
+        if _aq_oer_code(Packet, Native) in (
             ORA_DEQUEUE_TIMEOUT,
             ORA_LISTEN_TIMEOUT,
         ):  # no message available
             return None
-        _aq_raise(Packet)
+        _aq_raise(Packet, Native)
     Message = decode_aq_deq_reply(
         Packet,
         queue._connection.field_version,
         queue.payload_type is not None,
         queue._connection._server_below_10_2(),
+        Native,
     )
     if Message is None:
         return None
@@ -4642,8 +4655,12 @@ class OracleConnect(_ConnectionLogic):
     def _aq_request(self, Data: bytes, Decode: Callable[[bytes], _Decoded]) -> _Decoded:
         # Send an AQ call and decode its reply -- read on while the decode runs
         # past the bytes received, as a dequeued payload's reply spans packets
-        # (#1845).
-        self.send(TNS_DATA, Data)
+        # (#1845). A native session's is built in its form (#2805).
+        self._native11_sending = True
+        try:
+            self.send(TNS_DATA, Data)
+        finally:
+            self._native11_sending = False
         Received = self._next_data_packet(b'', b'')
         if Received is False:
             raise OperationalError('connection closed during AQ operation')
@@ -4661,11 +4678,16 @@ class OracleConnect(_ConnectionLogic):
             queue,
             props,
             self._server_below_10_2(),
+            self._native11,
         )
-        props.msgid = self._aq_request(Data, _decode_aq_enq)
+        props.msgid = self._aq_request(
+            Data, lambda Reply: _decode_aq_enq(Reply, self._native11)
+        )
 
     def _aq_deq_one(self, queue):
-        Data = encode_aq_deq(self._next_seq(), self.field_version, queue)
+        Data = encode_aq_deq(
+            self._next_seq(), self.field_version, queue, self._native11
+        )
         return self._aq_request(Data, lambda Reply: _decode_aq_deq(Reply, queue))
 
     def _aq_enq_many(self, queue, props_list) -> None:
