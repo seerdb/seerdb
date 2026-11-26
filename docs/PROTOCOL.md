@@ -7112,6 +7112,11 @@ read from its first packet alone, it failed about one call in two. `decode_8i_bl
 cursor's `_assign_out_binds` decodes each against its `Var`'s type. `callfunc`
 is the same shape with the return value as the first (`:1`) OUT bind.
 
+The prompt's masks are `cursor.bind_directions` too (#2804), as on 9i (#2264):
+one per bind, `0x10` OUT, `0x20` IN, `0x30` IN OUT, a block whose binds are all
+IN included. 8.1.7 answers OCI 9.2's `BEGIN :r := 'got ' || :g; END;` with
+`0b 05 02 …`, the masks `10 20`, then the value (`oci92_block_reply_8i.hexdump`).
+
 An **IN OUT** bind (#363) is a `Var` whose value is set: it sends its input value
 **inline** in the request (not the `fd 01` placeholder) and its updated value
 comes back in the reply's RXD, both in the same single round trip. Its prompt
