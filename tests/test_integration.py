@@ -638,7 +638,6 @@ _SERVER_SCROLL = _Need(
     "server-side scroll: 9i's ALL7 form and 8i use the buffered scroll (#2809)",
     server_scroll=True,
 )
-_OER_WARN_BYTE = _Need('the 8i OER warn byte is not located (9i: #2262)', not_8i=True)
 _BLOCK_IOV = _Need(
     'the 8i block reply carries no IOV directions (9i: #2264)', not_8i=True
 )
@@ -11853,7 +11852,6 @@ class PartialBatchRowcountIntegration(_IntegrationBase):
         self.assertEqual(self.cur.rowcount, 0)
 
 
-@_requires(_OER_WARN_BYTE)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class CursorWarningIntegration(_IntegrationBase):
     """`cursor.warning` for a PL/SQL object created with compilation errors.

@@ -48,6 +48,7 @@ from seerdb.common.tns import (
     decode_8i_dml_rowid,
     decode_8i_exec_response,
     decode_8i_terminal_error,
+    decode_8i_warn_flags,
     decode_9i_oall8_batch_errors,
     decode_9i_oall8_bind_directions,
     decode_9i_oall8_block_cursor,
@@ -1344,7 +1345,21 @@ class Oall8Dialect:
             return (0, ORA_ARRAY_DML_ERRORS, 0, (0, None), [], None, None, failed, None)
         _raise_ora(err_code, message)
         rowid = decode_8i_dml_rowid(received[1])  # the touched row (#1079)
-        return (0, 0, 0, (row_count, None), [], None, rowid, [], None)
+        # The warning a CREATE that compiled with errors carries (cursor.warning,
+        # #2804), as 9i's forms report it; 8i's status has no error offset (#719).
+        return (
+            0,
+            0,
+            0,
+            (row_count, None),
+            [],
+            None,
+            rowid,
+            [],
+            None,
+            0,
+            decode_8i_warn_flags(received[1]),
+        )
 
     def execute_block(self, sql: str, bind: list | None = None):
         # 8i anonymous PL/SQL block (#361/#362, §19.13-14): the same OALL8 as DML

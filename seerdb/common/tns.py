@@ -18868,6 +18868,16 @@ def decode_8i_dml_response(Data: bytes) -> tuple[int, int, str | None]:
     return (0 if Code else Status['rows'], Code, Message)
 
 
+def decode_8i_warn_flags(Data: bytes) -> int:
+    """An 8i status's warning flags (#2804), 0 for a reply without one: bit
+    0x20 for a CREATE whose object compiled with errors, which the call
+    otherwise reports as a success -- cursor.warning. 8.1.7 sets 0x21 there for
+    a broken procedure and 0 for the same one compiled clean, as 9.2 does
+    (oci92_create_*_reply_8i.hexdump)."""
+    Status = _o8i_status_or_none(Data)
+    return Status['warnings'] if Status else 0
+
+
 def decode_8i_dml_rowid(Data: bytes) -> str | None:
     """The rowid of the row an 8i DML touched, from its status, or None.
 

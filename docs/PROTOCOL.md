@@ -6964,6 +6964,12 @@ INSERT on 8.1.7 once as this OALL8, then re-executes its cursor with function 4
 keeps a reusable DML's cursor open as 9i's native form does; DDL and a PL/SQL
 block close the cached ones with the next call.
 
+**The warning flags (#2804).** A CREATE whose object compiles with errors
+succeeds, and only the status's warning byte (`_O8I_STATUS`'s `warnings`) says
+otherwise: 8.1.7 sets 0x21 there for OCI 9.2's broken procedure and 0 for the
+same one compiled clean, as 9.2 does (#2262). seerdb surfaces it as
+`cursor.warning`.
+
 There is no describe or fetch. The response is an RPA, then the status. The RPA
 (`_O8I_RPA`) is:
 

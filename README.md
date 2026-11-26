@@ -454,7 +454,8 @@ content at fetch time, #2804), native BFILE reads, CLOB / BLOB OUT binds and
 no temporary LOB, so an IN OUT LOB Var holding text and a block value past
 32512 bytes are refused), LONG / LONG RAW, ROWID / UROWID, AQ on a RAW or an object
 queue as OCI 9.2 enqueues and dequeues (no dequeue condition, which 8.1.7 lacks;
-#2805), and transactions — sync and async. It caches a reusable DML's cursor and
+#2805), `cursor.warning` for an object that compiled with errors, and
+transactions — sync and async. It caches a reusable DML's cursor and
 re-executes it by id, as OCI 9.2 does (#2804), and
 runs no array DML: `executemany()` is refused. 8i has no `SYS_REFCURSOR`: declare a package's `REF CURSOR` type. On top of the 9i gaps above it predates
 `TIMESTAMP` and `INTERVAL` (only `DATE`), the AL16UTF16 national charset
