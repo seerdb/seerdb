@@ -19396,7 +19396,8 @@ _AQ_RAW = _Need('AQ of a RAW message needs no Mirror', not_mirror=('*',))
 class AqRawIntegration(_IntegrationBase):
     """A RAW message enqueued and dequeued, as Oracle's own clients do it from
     11g on (#2697). 11g reads the queue name without the length byte 12c's
-    form writes."""
+    form writes. A native session to 10g or 11g (oall8=True, or pooled 11g)
+    sends them as OCI 11.2 does (#2805)."""
 
     QUEUE = 'PYO_AQ_RAW_IT'
     # Not TABLE: the base class drops that with DROP TABLE, which an AQ queue
@@ -19407,7 +19408,7 @@ class AqRawIntegration(_IntegrationBase):
         super().setUp()
         if self.conn._aq_refused(None):
             self.skipTest(
-                'AQ needs 12.1+, a thin 10g or 11g session, or thin_oall8=True on 9i'
+                'AQ needs 12.1+, a 10g or 11g session, or thin_oall8=True on 9i'
             )
         self._drop_queue()
         try:

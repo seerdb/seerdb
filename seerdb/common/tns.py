@@ -17405,6 +17405,8 @@ _OCI11_OBJECT_BIND_SIZE = 2000
 # binds carry 3 (sqlplus binds no object).
 _OCI11_OBJECT_BIND_FLAGS = 0
 _O9I_OBJECT_CELL_OCI = wire_schema.compile_encoder(_O9I_OBJECT_CELL, _OCI)
+# An object queue's payload in the native form is this cell too, both ways (#2805).
+_O9I_OBJECT_CELL_FROM_OCI = wire_schema.compile_decoder(_O9I_OBJECT_CELL, _OCI)
 # And on 8i, as OCI 9.2 binds one to 8.1.7 (SeerODBC #168/#172): 9i's
 # descriptor at the 8i codec's widths -- a scalar's 25 bytes with the type's OID
 # and version filled in, 42 in all -- with OCI's size and flags; the value the
@@ -24287,8 +24289,10 @@ def _aq_msg_props_values(Props, FieldVersion: int, Pre102: bool = False) -> dict
     }
 
 
-def _aq_write_payload(Queue, Props) -> bytes:
-    # The payload bytes: JSON (OSON), a SQL object image, or RAW bytes.
+def _aq_write_payload(Queue, Props, Native: bool = False) -> bytes:
+    # The payload bytes: JSON (OSON), a SQL object image, or RAW bytes. The
+    # native form's object is the cell its object binds carry, as OCI 11.2
+    # enqueues one (#2805).
     if Queue.is_json:
         # JSON payload (#150): the OSON image wrapped in the AQ JSON descriptor
         # (fixed 18-byte prefix + ub2 image length + 22 zero bytes + the image
@@ -24310,6 +24314,8 @@ def _aq_write_payload(Queue, Props) -> bytes:
             + _bytes_with_length(Oson)
         )
     if Queue.payload_type is not None:
+        if Native:
+            return _oci11_object_bind_value(Props.payload)
         return _encode_object_bind_value(Props.payload)
     Payload = Props.payload if Props.payload is not None else b''
     if isinstance(Payload, str):
@@ -24325,6 +24331,7 @@ def _aq_write_payload(Queue, Props) -> bytes:
 # session, #2805) has no enqueue transaction id and none of the four fields
 # after the extensions, as JDBC thin 11.2 writes them to 9.2 and 9.2 returns
 # them; its enqueue time is a longer value whose first 7 bytes are the DATE.
+# The native form (OCI 11.2 to 10g and 11g, #2805) writes the keyword a ub2.
 _AQ_MSG_PROPS: wire_schema.Schema = (
     ('n4', 'priority'),
     ('n4', 'delay'),
@@ -24347,7 +24354,7 @@ _AQ_MSG_PROPS: wire_schema.Schema = (
                 'each',
                 'extensions',
                 'num_extensions',
-                (*_aq_string('text'), *_aq_string('binary'), ('n4', 'keyword')),
+                (*_aq_string('text'), *_aq_string('binary'), ('n2', 'keyword')),
             ),
         ),
     ),
@@ -24429,6 +24436,9 @@ _AQ_PAYLOAD_IMAGE: wire_schema.Schema = (
 )
 _AQ_PAYLOAD_IMAGE_THIN = wire_schema.compile_encoder(_AQ_PAYLOAD_IMAGE, _THIN)
 _AQ_PAYLOAD_IMAGE_FROM_THIN = wire_schema.compile_decoder(_AQ_PAYLOAD_IMAGE, _THIN)
+_AQ_PAYLOAD_IMAGE_FROM_OCI_WIDE = wire_schema.compile_decoder(
+    _AQ_PAYLOAD_IMAGE, _OCI_WIDE
+)
 
 # An enqueue's return: the message id the server gave it.
 _AQ_ENQ_REPLY: wire_schema.Schema = (
@@ -24439,14 +24449,16 @@ _AQ_ENQ_REPLY_THIN = wire_schema.compile_encoder(_AQ_ENQ_REPLY, _THIN)
 _AQ_ENQ_REPLY_FROM_THIN = wire_schema.compile_decoder(_AQ_ENQ_REPLY, _THIN)
 
 # A dequeue's return: whether a message came, then its properties and
-# recipients; the payload, then its message id.
+# recipients; the payload, then its message id. The native form writes the
+# first and the recipients' count each a ub2 (#2805).
 _AQ_DEQ_HEAD: wire_schema.Schema = (
     ('const', bytes([TTI_RPA])),
-    ('n4', 'num_bytes'),
-    ('when', 'num_bytes', (*_AQ_MSG_PROPS, ('n4', 'num_recipients'))),
+    ('n2', 'num_bytes'),
+    ('when', 'num_bytes', (*_AQ_MSG_PROPS, ('n2', 'num_recipients'))),
 )
 _AQ_DEQ_HEAD_THIN = wire_schema.compile_encoder(_AQ_DEQ_HEAD, _THIN)
 _AQ_DEQ_HEAD_FROM_THIN = wire_schema.compile_decoder(_AQ_DEQ_HEAD, _THIN)
+_AQ_DEQ_HEAD_FROM_OCI_WIDE = wire_schema.compile_decoder(_AQ_DEQ_HEAD, _OCI_WIDE)
 
 # An array operation's return: the count of messages, then each one's
 # properties (when present, behind a byte python-oracledb passes over), its
@@ -24492,6 +24504,9 @@ def _aq_text(name: str) -> wire_schema.Schema:
 # python-oracledb's AqEnqMessage, AqDeqMessage and AqArrayMessage. Each pointer
 # says whether its value is in the data section that follows; the payload, an
 # object image, OSON in its descriptor or RAW bytes, follows the enqueue's.
+# The native form (#2805) is OCI 11.2's, the same to 10g and 11g: these fields
+# at OCI's widths, the message version a ub2, and in place of the output
+# acknowledgement's byte 12 zero bytes no field is known for.
 _AQ_ENQ: wire_schema.Schema = (
     ('ptr', 'queue_name_present'),
     ('n4', 'queue_name_length'),
@@ -24504,7 +24519,7 @@ _AQ_ENQ: wire_schema.Schema = (
     ('n4', 'sequence_deviation'),
     ('ptr', 'toid_present'),
     ('n4', 'toid_length'),
-    ('n4', 'message_version'),
+    ('n2', 'message_version'),
     ('ptr', 'payload_present'),
     ('ptr', 'raw_payload_present'),
     ('n4', 'raw_payload_length'),
@@ -24519,7 +24534,8 @@ _AQ_ENQ: wire_schema.Schema = (
     ('n4', 'source_seq_length'),
     ('ptr', 'max_seq_present'),
     ('n4', 'max_seq_length'),
-    ('u8', 'output_ack_length'),
+    ('only', 'thin', (('u8', 'output_ack_length'),)),
+    ('only', 'oci', (('pad', 12),)),
     # 9.2 takes none of the sender fields (#2805), as JDBC thin 11.2 sends it.
     *_aq_10_2_only('has_sender'),
     (
@@ -24542,9 +24558,14 @@ _AQ_ENQ: wire_schema.Schema = (
 )
 _AQ_ENQ_THIN = wire_schema.compile_encoder(_AQ_ENQ, _THIN)
 _AQ_ENQ_FROM_THIN = wire_schema.compile_decoder(_AQ_ENQ, _THIN)
+_AQ_ENQ_OCI_WIDE = wire_schema.compile_encoder(_AQ_ENQ, _OCI_WIDE)
+_AQ_ENQ_FROM_OCI_WIDE = wire_schema.compile_decoder(_AQ_ENQ, _OCI_WIDE)
+# The native form's dequeue (#2805) is OCI 11.2's: these fields at 10.2's widths
+# to 10g (_OCI), and to 11g at 11.2's (_OCI_WIDE), where five of the lengths are
+# ub8 and 4 bytes follow the wait and 2 the version, no field known for them.
 _AQ_DEQ: wire_schema.Schema = (
     ('ptr', 'queue_name_present'),
-    ('n4', 'queue_name_length'),
+    ('wn4', 'queue_name_length'),
     ('ptr', 'props_present'),
     ('ptr', 'props_length_present'),
     ('ptr', 'recipients_present'),
@@ -24555,21 +24576,24 @@ _AQ_DEQ: wire_schema.Schema = (
     ('n4', 'navigation'),
     ('n4', 'visibility'),
     ('n4', 'wait'),
+    ('derive', 'native_11_2', lambda v: v.get('native_11_2', False)),
+    ('when', 'native_11_2', (('pad', 4),)),
     ('ptr', 'msgid_present'),
-    ('n4', 'msgid_length'),
+    ('wn4', 'msgid_length'),
     ('ptr', 'correlation_present'),
-    ('n4', 'correlation_length'),
+    ('wn4', 'correlation_length'),
     ('ptr', 'toid_present'),
     ('n4', 'toid_length'),
-    ('n4', 'message_version'),
+    ('n2', 'message_version'),
+    ('when', 'native_11_2', (('pad', 2),)),
     ('ptr', 'payload_present'),
     ('ptr', 'out_msgid_present'),
     ('n4', 'out_msgid_length'),
     ('n4', 'deq_flags'),
     ('ptr', 'condition_present'),
-    ('n4', 'condition_length'),
+    ('wn4', 'condition_length'),
     ('ptr', 'extensions_present'),
-    ('n4', 'extensions_count'),
+    ('wn4', 'extensions_count'),
     ('when', 'has_json_flag', (('ptr', 'json_payload'),)),
     ('when', 'has_shard', (('n4', 'shard'),)),
     *_aq_text('queue_name'),
@@ -24581,6 +24605,10 @@ _AQ_DEQ: wire_schema.Schema = (
 )
 _AQ_DEQ_THIN = wire_schema.compile_encoder(_AQ_DEQ, _THIN)
 _AQ_DEQ_FROM_THIN = wire_schema.compile_decoder(_AQ_DEQ, _THIN)
+_AQ_DEQ_OCI = wire_schema.compile_encoder(_AQ_DEQ, _OCI)
+_AQ_DEQ_FROM_OCI = wire_schema.compile_decoder(_AQ_DEQ, _OCI)
+_AQ_DEQ_OCI_WIDE = wire_schema.compile_encoder(_AQ_DEQ, _OCI_WIDE)
+_AQ_DEQ_FROM_OCI_WIDE = wire_schema.compile_decoder(_AQ_DEQ, _OCI_WIDE)
 # An array operation: its input (a dequeue's count of messages), its flags,
 # output and operation, the shard from 21.1 and an enqueue's count. A
 # dequeue's messages follow, each the queue, placeholder properties and the
@@ -24692,6 +24720,7 @@ _AQ_DEQ_FIXED = {
     'extensions_count': 0,
     'json_payload': False,
     'shard': -1,
+    'native_11_2': False,
 }
 _AQ_ARRAY_DEQ_FIXED = {
     'num_recipients': 0,
@@ -24707,10 +24736,31 @@ _AQ_ARRAY_DEQ_FIXED = {
 }
 
 
-def _aq_texts(FieldVersion: int) -> dict:
-    # Which form a request's data-section strings take (_aq_text).
-    Bare = FieldVersion < FIELD_VERSION_12_1
+def _aq_texts(FieldVersion: int, Native: bool = False) -> dict:
+    # Which form a request's data-section strings take (_aq_text): the native
+    # form counts them, as OCI 11.2 does (#2805).
+    Bare = FieldVersion < FIELD_VERSION_12_1 and not Native
     return {'texts_bare': Bare, 'texts_counted': not Bare}
+
+
+# The fields of the AQ messages that may be negative: OCI writes them as their
+# ub4 two's complement (an expiration of -1 as `ff ff ff ff`), and the native
+# form's codec packs only what is not (#2805).
+_AQ_SIGNED = ('priority', 'delay', 'expiration', 'wait')
+
+
+def _aq_unsigned(Values: dict) -> dict:
+    return {
+        **Values,
+        **{Name: Values[Name] & 0xFFFFFFFF for Name in _AQ_SIGNED if Name in Values},
+    }
+
+
+def _aq_signed(Values: dict) -> dict:
+    for Name in _AQ_SIGNED:
+        if Values.get(Name, 0) >= 0x80000000:
+            Values[Name] -= 0x100000000
+    return Values
 
 
 def _aq_delivery_flags(Mode: int, Either: bool) -> int:
@@ -24733,13 +24783,24 @@ def decode_aq_message_props(
     )
 
 
-def decode_aq_payload(Data: bytes, IsObject: bool) -> tuple[object, bytes]:
+def decode_aq_payload(
+    Data: bytes, IsObject: bool, Native: bool = False
+) -> tuple[object, bytes]:
     """A message's payload (#128): an object queue's object image, as a column
     of that type reads, or a RAW or JSON queue's image past its header; None
-    for none. The caller makes the object or the JSON value of it."""
+    for none. The caller makes the object or the JSON value of it. ``Native``
+    reads the native form's (#2805)."""
+    if IsObject and Native:
+        from seerdb.common.dbobject import ObjectImage
+
+        (Cell, Rest) = _O9I_OBJECT_CELL_FROM_OCI(Data)
+        if not Cell['image_length']:
+            return (None, Rest)
+        return (ObjectImage(b'', None, None, None, bytes(Cell['image'])), Rest)
     if IsObject:
         return _read_object_column(Data, {})
-    (Values, Rest) = _AQ_PAYLOAD_IMAGE_FROM_THIN(Data)
+    Decode = _AQ_PAYLOAD_IMAGE_FROM_OCI_WIDE if Native else _AQ_PAYLOAD_IMAGE_FROM_THIN
+    (Values, Rest) = Decode(Data)
     if not Values['image_length']:
         return (None, Rest)
     return (Values['image'][4 : Values['image_length']], Rest)
@@ -24751,16 +24812,24 @@ def decode_aq_enq_reply(Data: bytes) -> bytes:
 
 
 def decode_aq_deq_reply(
-    Data: bytes, FieldVersion: int, IsObject: bool, Pre102: bool = False
+    Data: bytes,
+    FieldVersion: int,
+    IsObject: bool,
+    Pre102: bool = False,
+    Native: bool = False,
 ) -> dict | None:
     """A dequeue's return (#128): the message's properties, with its
     ``payload`` (as decode_aq_payload reads it) and ``msgid``; None when no
-    message came. ``Pre102`` reads a 9.2 server's (#2805)."""
+    message came. ``Pre102`` reads a 9.2 server's, ``Native`` the native
+    form's (#2805)."""
     Given = {'has_shard': FieldVersion >= FIELD_VERSION_21_1, **_aq_pre_10_2(Pre102)}
-    (Message, Rest) = _AQ_DEQ_HEAD_FROM_THIN(Data, Given)
+    Decode = _AQ_DEQ_HEAD_FROM_OCI_WIDE if Native else _AQ_DEQ_HEAD_FROM_THIN
+    (Message, Rest) = Decode(Data, Given)
     if not Message['num_bytes']:
         return None
-    (Message['payload'], Rest) = decode_aq_payload(Rest, IsObject)
+    if Native:
+        _aq_signed(Message)
+    (Message['payload'], Rest) = decode_aq_payload(Rest, IsObject, Native)
     Message['msgid'] = bytes(Rest[:TNS_AQ_MESSAGE_ID_LENGTH])
     return Message
 
@@ -24795,10 +24864,16 @@ def _aq_text_option(Value: str | None) -> bytes | None:
 
 
 def encode_aq_enq(
-    Seq: int, FieldVersion: int, Queue, Props, Pre102: bool = False
+    Seq: int,
+    FieldVersion: int,
+    Queue,
+    Props,
+    Pre102: bool = False,
+    Native: bool = False,
 ) -> bytes:
     """An enqueue (TNS_FUNC_AQ_ENQ, #128): _AQ_ENQ after the function header,
-    then the payload. ``Pre102`` writes it as a 9.2 server reads it (#2805)."""
+    then the payload. ``Pre102`` writes it as a 9.2 server reads it, ``Native``
+    in the native form of a 10g or 11g session (#2805)."""
     QName = Queue.name.encode('utf-8')
     Object = Queue.payload_type is not None
     Raw = not Queue.is_json and not Object
@@ -24806,7 +24881,7 @@ def encode_aq_enq(
     Values = {
         **_AQ_ENQ_FIXED,
         **_aq_msg_props_values(Props, FieldVersion, Pre102),
-        **_aq_texts(FieldVersion),
+        **_aq_texts(FieldVersion, Native),
         'queue_name_length': len(QName),
         'queue_name': QName,
         'recipients_present': Recipients is not None,
@@ -24822,22 +24897,23 @@ def encode_aq_enq(
         'json_payload': bool(Queue.is_json),
         'payload_toid': Queue.payload_toid,
     }
+    Body = _AQ_ENQ_OCI_WIDE(_aq_unsigned(Values)) if Native else _AQ_ENQ_THIN(Values)
     return (
         _fun_header(TNS_FUNC_AQ_ENQ, Seq, FieldVersion)
-        + _AQ_ENQ_THIN(Values)
-        + _aq_write_payload(Queue, Props)
+        + Body
+        + _aq_write_payload(Queue, Props, Native)
     )
 
 
-def encode_aq_deq(Seq: int, FieldVersion: int, Queue) -> bytes:
+def encode_aq_deq(Seq: int, FieldVersion: int, Queue, Native: bool = False) -> bytes:
     """A dequeue (TNS_FUNC_AQ_DEQ, #128): _AQ_DEQ after the function
-    header."""
+    header; ``Native`` in the native form of a 10g or 11g session (#2805)."""
     Opts = Queue.deqoptions
     QName = Queue.name.encode('utf-8')
     MsgId = bytes(Opts.msgid[:16]).ljust(16, b'\x00') if Opts.msgid else None
     Values = {
         **_AQ_DEQ_FIXED,
-        **_aq_texts(FieldVersion),
+        **_aq_texts(FieldVersion, Native),
         'queue_name_length': len(QName),
         'queue_name': QName,
         **_aq_present('consumer', _aq_text_option(Opts.consumer_name)),
@@ -24853,7 +24929,13 @@ def encode_aq_deq(Seq: int, FieldVersion: int, Queue) -> bytes:
         'has_shard': FieldVersion >= FIELD_VERSION_21_1,
         'payload_toid': Queue.payload_toid,
     }
-    return _fun_header(TNS_FUNC_AQ_DEQ, Seq, FieldVersion) + _AQ_DEQ_THIN(Values)
+    if not Native:
+        Body = _AQ_DEQ_THIN(Values)
+    elif FieldVersion >= FIELD_VERSION_11_2:
+        Body = _AQ_DEQ_OCI_WIDE({**_aq_unsigned(Values), 'native_11_2': True})
+    else:
+        Body = _AQ_DEQ_OCI(_aq_unsigned(Values))
+    return _fun_header(TNS_FUNC_AQ_DEQ, Seq, FieldVersion) + Body
 
 
 def _aq_array_deq_item(Queue, Props, FieldVersion: int) -> dict:
