@@ -4018,6 +4018,44 @@ TTI_PFN | FunctionID | SeqNum | 1 | CursorCount(SB4) | Cursors(SB4[])
 
 These are prepended to the next TTI_FUN/TTI_ALL8 message to avoid extra round trips.
 
+### 7.1 The end-to-end tracing attributes (func 135, #183)
+
+`connection.client_identifier`, `module`, `action`, `clientinfo` and `dbop`
+travel as a piggyback (`11 87 <seq>`) ahead of the next call, carrying only
+what changed. Its body in thin's form:
+- two pointers no field is sent for;
+- the flags naming the attributes this flush changes: client identifier
+  `0x01`, module `0x08`, action `0x10`, client info `0x100`, dbop `0x200`;
+- a (changed pointer, length) header per slot: client identifier, module,
+  action, execution context id, its sequence, client info, the Kerberos
+  forwarded ticket's key and target, and from 12.1 dbop;
+- the value of each attribute set.
+
+A module goes with the action, as Oracle's `SET_MODULE` sets both; a module
+alone is ORA-03137. An empty value is a zero length and no bytes (#2784).
+
+**Before 12.1** (measured 2026-11-26 from JDBC thin 11.2, `ojdbc6`, on
+10.2.0.5) there are two differences, and seerdb sends this form to 10.2 and
+11g:
+- there is no dbop slot;
+- each value is its bytes alone, its length being in its header, where 12.1
+  frames each as text with a length byte.
+
+Sent 12.1's framing, 10.2 and 11g close the connection. JDBC also sets flags
+`0x20` and `0x40` and marks the execution context id's slot changed, at no
+length; seerdb sends no execution context id. The native 10g and 11g form
+(`oall8=True`) carries the same fields at OCI's widths, with no dbop slot.
+
+**9.2 and 8.1.7** have no module, action or client info that a client sets on
+the wire. 8.1.7 has no client identifier either: `SYS_CONTEXT('USERENV',
+'CLIENT_IDENTIFIER')` is ORA-02003 there. The client identifier on 9.2:
+- OCI 9.2 sends `OCI_ATTR_CLIENT_IDENTIFIER` as a native func-135 piggyback,
+  much shorter than 10.2's;
+- ojdbc14 (JDBC thin 9.2) runs `begin dbms_session.set_identifier(:1); end;`;
+- JDBC thin 11.2 sends 9.2 nothing.
+
+seerdb refuses the attributes below 10.2.
+
 ## 8. Transaction Control
 
 Transaction operations are simple TTI_FUN messages:

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# JDBC thin 11.2's (ojdbc6) SET_END_TO_END_ATTR piggyback to Oracle 10.2.0.5,
+# the client identifier cleared (#2810), the OALL8 behind it left out.
+# Captured 2026-11-26 through tools/capture_proxy.py: setEndToEndMetrics, then
+# a query. The TTC payload, without the packet's header, as `hexdump -C`
+# output; the offset column and the |ascii| gutter are ignored by
+# tests.replay.parse_hexdump.
+00000000  11 87 06 00 00 01 41 01  00 00 00 00 00 00 00 00  |......A.........|
+00000010  00 00 00 00 00 00 00                              |.......|
+00000017
