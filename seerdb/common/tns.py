@@ -2935,7 +2935,8 @@ _O7_LOBOPS: wire_schema.Schema = (
 # short amount if the request asked for one -- a GET_LENGTH's length, OPEN's
 # mode -- and IS_OPEN's answer, 1 or 0, in the null-LOB field it set. CLOSE
 # asks for neither and gets neither. The status follows. A 9.2 server answers a
-# 9.2 client the same, but IS_OPEN in a single byte (#798, native_9i_lob_ops.pcap).
+# 9.2 client the same, but IS_OPEN in a single byte (#798, native_9i_lob_ops.pcap),
+# as 8.1.7 answers OCI 9.2 (#2804, oci92_lob_is_open_reply_8i.hexdump).
 _O7_LOBOPS_REPLY: wire_schema.Schema = (
     ('const', bytes([TTI_RPA])),
     ('be2', 'locator_length'),
@@ -2946,7 +2947,7 @@ _O7_LOBOPS_REPLY: wire_schema.Schema = (
         'null_lob_present',
         (
             ('only', 'thin', (('n4', 'flag'),)),
-            ('only', 'o8i', (('n4', 'flag'),)),
+            ('only', 'o8i', (('u8', 'flag'),)),
             ('only', 'o9i', (('u8', 'flag'),)),
         ),
     ),
@@ -16241,12 +16242,14 @@ def encode_o7_lobop(
     Offset: int = 0,
     Amount: int = 0,
     Data: bytes | None = None,
+    O8i: bool = False,
 ) -> bytes:
     """A 9i TTI_LOBOPS request for `Operation` on `Locator` (#2259), with its
     source offset (READ and WRITE) and short amount (a READ's or WRITE's count,
     TRIM's new length, OPEN's mode, 0 for the sizes), and a WRITE's data behind
-    it as TTI_LOB content."""
-    Out = _encode_o7_lobop(Seq, Locator, Operation, Offset, Amount)
+    it as TTI_LOB content. ``O8i`` writes it at the 8i codec's widths, as OCI
+    9.2 sends each of these calls to 8.1.7 (#2804)."""
+    Out = _encode_o7_lobop(Seq, Locator, Operation, Offset, Amount, O8i)
     if Data is not None:
         Out += bytes([TTI_LOB]) + _o7_lob_value(Data)
     return Out
@@ -16285,7 +16288,7 @@ def _o7_lobops_reply(
 
 
 def decode_fv2_lob_value(
-    Packet: bytes, Operation: int = TNS_LOB_OP_GET_LENGTH
+    Packet: bytes, Operation: int = TNS_LOB_OP_GET_LENGTH, O8i: bool = False
 ) -> tuple[int, bytes | None]:
     """A 9i LOB operation's reply value and the locator it echoes (#2259):
     the length for GET_LENGTH, the chunk size, the amount a WRITE wrote,
@@ -16293,8 +16296,8 @@ def decode_fv2_lob_value(
     locator is the one later calls use -- a write updates it -- as its body,
     without its ub2 length, which LOB._refresh puts back on. Returned with
     it, the locator was prefixed twice and the next call answered
-    ORA-22275."""
-    Reply = _o7_lobops_reply(Packet, Operation)
+    ORA-22275. ``O8i`` reads 8.1.7's (#2804)."""
+    Reply = _o7_lobops_reply(Packet, Operation, O8i)
     if Reply is None:
         return (0, None)
     return (Reply.get('short_amount', Reply.get('flag', 0)), Reply['locator'])
@@ -16601,13 +16604,13 @@ def _encode_8i_bind_value(Value: object) -> bytes:
     return encode_token_rxd(Value)
 
 
-def encode_8i_lob_read(Seq: int, Locator: bytes, Amount: int) -> bytes:
+def encode_8i_lob_read(Seq: int, Locator: bytes, Amount: int, Offset: int = 1) -> bytes:
     # 8i CLOB/BLOB/BFILE READ (`_O7_LOBOPS` at the 8i codec's widths, #2284):
-    # unlike 9i's GETLEN + READ pair, 8i reads the value in one call from offset
-    # 1, whose reply is the shared `0e fe <chunks> 00` LOB content
-    # (decode_fv2_lob_chunks). `Amount` is chars for a CLOB, bytes for a BLOB /
-    # BFILE.
-    return _encode_o7_lobop(Seq, Locator, TNS_LOB_OP_READ, 1, Amount, O8i=True)
+    # unlike 9i's GETLEN + READ pair, 8i reads the value in one call from
+    # `Offset` (1-based; a LOB object's read gives its own, #2804), whose reply
+    # is the shared `0e fe <chunks> 00` LOB content (decode_fv2_lob_chunks).
+    # `Amount` is chars for a CLOB, bytes for a BLOB / BFILE.
+    return _encode_o7_lobop(Seq, Locator, TNS_LOB_OP_READ, Offset, Amount, O8i=True)
 
 
 def encode_o8i_bfile_open(Seq: int, Locator: bytes) -> bytes:

@@ -7145,6 +7145,22 @@ the column charset (WE8ISO8859P1), BLOB stays bytes (`decode_fv2_lob`). Encoder:
 `encode_8i_lob_read`; driver: `_lob_read_8i` / `_resolve_8i_lobs`. BFILE is a
 follow-up.
 
+**A LOB object's calls (#2804).** 8.1.7 serves them all. OCI 9.2's
+`OCILobIsOpen`, `Open`, `Write`, `GetLength`, `Read`, `Trim`, `Close` and
+`FileExists`, captured against 8.1.7, are the 9i compact form's `TTI_LOBOPS`
+(#2259) at the 8i codec's widths, byte for byte what `encode_o7_lobop` writes
+with `O8i`; a write's data follows as TTI_LOB content, as on 9i. A READ takes
+the object's own offset and amount. The replies are 9i's at those widths, but
+IS_OPEN's and FILE_EXISTS's answer is one byte, as 9.2 gives a 9.2 client: read
+as a ub4, it took the status's first bytes along. So a fetched CLOB or BLOB is
+a LOB object on 8i too, as on every other tier, and `fetch_lobs=False` reads its
+content at fetch time.
+
+A CLOB's text is the single-byte database charset the whole 8i session speaks
+(WE8ISO8859P1 on the bed), both ways. Written as UTF-8, as a 9i session's is,
+`é`'s two bytes outran an amount counted in characters, and 8.1.7 ended the
+session at the next call (TNS-12572).
+
 ### 19.16 Oracle 8i LONG / LONG RAW read — the fetch long-size field (#377)
 
 A LONG (TNS type 8) or LONG RAW (type 24) value rides in the RXD as an ordinary
@@ -7308,9 +7324,8 @@ a block (#801, #802).
   answered.
 - **The OUT cell** is a `ub4` length, the locator, then a `ub2` indicator, with
   none of a row's return code. A NULL is `00000000 ffff`.
-- **The content is read with 8i's single READ** (§19.15) before the next call.
-  8i serves no LOB object calls, so the value is the LOB's text or bytes, as a
-  fetched LOB's is.
+- **The content is read with 8i's single READ** (§19.15) before the next call,
+  so the value is the LOB's text or bytes, as sqlplus reads it.
 - **ojdbc14 on 8.1.7 speaks TTI_ALL7 instead,** with the 9i bytes above.
 
 **An IN OUT LOB needs a locator to send.** Below 10g seerdb makes no temporary

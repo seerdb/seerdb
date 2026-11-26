@@ -916,8 +916,9 @@ class Oall8Dialect:
         next call."""
         self._finished(cursor)
 
-    # 8i reads every LOB's content at fetch time whatever fetch_lobs says: its
-    # dialect serves no LOB object calls (#2259).
+    # The connection's fetch_lobs, set per statement: whether a fetched LOB stays
+    # an object, which 8i and 9i's native form serve calls on (#2804, #798), or
+    # is read at fetch time.
     keep_lobs = False
 
     def flush_cursors(self, cache: dict):
@@ -1409,9 +1410,8 @@ class Oall8Dialect:
                     (cursor_id, columns) = out_values[i]
                     rows = yield from self._read_cursor(cursor_id, columns)
                     out_values[i] = _cursor_marker(cursor_id, columns, rows)
-            # And each CLOB's or BLOB's content by its locator, as sqlplus does:
-            # 8i serves no LOB object's calls, so the value is its text or bytes,
-            # as a fetched one's is (SeerODBC #167).
+            # And each CLOB's or BLOB's content by its locator, as sqlplus does,
+            # so the value is its text or bytes (SeerODBC #167).
             for i, (lob_type, _csfrm) in lobs.items():
                 if out_values[i] is not None:
                     content = yield from self.lob_read(out_values[i].raw)
@@ -1539,6 +1539,76 @@ class O8iDialect(Oall8Dialect):
             and dbtype_for_oracle_type(col.get('data_type') or 0, col.get('csfrm') or 1)
             is None
         ]
+
+    # --- LOB objects (#2804): 8.1.7 serves a LOB's calls as OCI 9.2 makes
+    # them, the 9i compact form's TTI_LOBOPS at the 8i codec's widths
+    # (the oci92_lob_*_8i captures), so a fetched LOB stays an object unless the
+    # connection reads LOB content at fetch time.
+
+    def capabilities(self) -> frozenset[str]:
+        return super().capabilities() | {CAP_LOB_OBJECT}
+
+    def resolve_lobs(self, rows: list, columns: list):
+        if self.keep_lobs:
+            return
+        yield from super().resolve_lobs(rows, columns)
+
+    def lob_read(self, locator: bytes, offset: int = 1, amount: int | None = None):
+        # A LOB's content from `offset` (1-based), in one READ asking for all of
+        # it unless `amount` says less; an empty LOB is answered without content.
+        yield Send(
+            encode_8i_lob_read(
+                self._next_seq(),
+                locator,
+                (1 << 30) if amount is None else amount,
+                offset,
+            )
+        )
+        data = b''
+        while True:
+            received = yield RECV
+            if received is False:
+                raise connection_closed('8i LOB read')
+            data += received[1]
+            if data[0] != TTI_LOB:
+                if data[:1] == bytes([TTI_OER]):
+                    _raise_ora(*decode_8i_terminal_error(data))
+                return b''
+            (content, complete) = decode_fv2_lob_chunks(data)
+            if complete:
+                return content
+
+    def lob_operation(
+        self,
+        locator: bytes,
+        operation: int,
+        amount: int = 0,
+        offset: int = 0,
+        data: bytes | None = None,
+    ):
+        # One LOB call: its reply value -- a size, the amount a write wrote,
+        # OPEN's mode, IS_OPEN's 1 or 0 -- and the locator it echoes. An error
+        # (ORA-22920 for a row not locked) is an 8i status alone, raised.
+        yield Send(
+            encode_o7_lobop(
+                self._next_seq(),
+                locator,
+                operation,
+                Offset=offset,
+                Amount=amount,
+                Data=data,
+                O8i=True,
+            )
+        )
+        resp = yield RECV
+        if resp is False:
+            raise connection_closed('8i LOB call')
+        if resp[1][:1] == bytes([TTI_OER]):
+            _raise_ora(*decode_8i_terminal_error(resp[1]))
+        (value, updated) = decode_fv2_lob_value(resp[1], operation, True)
+        if updated is None:
+            raise InternalError(f'unexpected 8i LOB call reply: {resp[1][:8].hex()!r}')
+        return (value, updated)
 
 
 class Fv2Oall8Dialect(Oall8Dialect):
@@ -2070,7 +2140,8 @@ def lob_object_charset(dialect: object, charset: int | None) -> int:
     pooled 11g session (#2466), the 9i session's otherwise (#2383)."""
     from seerdb.common.types import fv2_lob_charset
 
-    if isinstance(dialect, Oci11Dialect):
+    if isinstance(dialect, (Oci11Dialect, O8iDialect)):
+        # 8i's: the session's single-byte charset, as its fetch reads (#2804).
         return dialect._clob_charset({'charset': charset})
     return fv2_lob_charset(charset)
 
