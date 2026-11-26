@@ -682,6 +682,36 @@ class TestPreTenReturningWrap(unittest.TestCase):
             ':seerdb_rowcount := SQL%ROWCOUNT; END;',
         )
 
+    def test_a_quoted_bind_is_renamed_in_the_block(self):
+        # 9.2 answers ORA-01006 for `:"name"` inside a block (#2806).
+        # Each spelling gets one fresh unquoted name, case kept apart, clear of
+        # the names in use; text in a literal or a comment stays as it is.
+        from seerdb.common.sqltext import wrap_returning_in_block
+
+        SQL, Name = wrap_returning_in_block(
+            'INSERT INTO t (a, b, c) VALUES (:"desc", :"Desc", :seerdb_q2) '
+            '/* :"desc" */ RETURNING \':"out"\', id INTO :x, :"out"'
+        )
+        self.assertEqual(Name, 'seerdb_rowcount')
+        self.assertEqual(
+            SQL,
+            'BEGIN INSERT INTO t (a, b, c) VALUES (:seerdb_q1, :seerdb_q2_, '
+            ':seerdb_q2) /* :"desc" */ RETURNING \':"out"\', id INTO :x, '
+            ':seerdb_q3; :seerdb_rowcount := SQL%ROWCOUNT; END;',
+        )
+
+    def test_a_repeated_quoted_bind_keeps_one_name(self):
+        from seerdb.common.sqltext import wrap_returning_in_block
+
+        SQL, _ = wrap_returning_in_block(
+            'UPDATE t SET a = :"v" WHERE b = :"v" RETURNING id INTO :"o"'
+        )
+        self.assertEqual(
+            SQL,
+            'BEGIN UPDATE t SET a = :seerdb_q1 WHERE b = :seerdb_q1 '
+            'RETURNING id INTO :seerdb_q2; :seerdb_rowcount := SQL%ROWCOUNT; END;',
+        )
+
     def test_trailing_semicolon_would_close_the_block_early(self):
         from seerdb.common.sqltext import wrap_returning_in_block
 
@@ -772,29 +802,22 @@ class TestPreTenReturningWrap(unittest.TestCase):
         with self.assertRaises(NotSupportedError):
             _check_returning_support(Conn, frozenset({1}))
 
-    def test_a_quoted_bind_name_is_refused_below_10g(self):
+    def test_a_quoted_bind_name_goes_through_the_rewrite_below_10g(self):
+        # The rewrite renames it (#2806), so it is no longer refused.
         import types
 
         from seerdb.client.cursor import _check_returning_support
         from seerdb.client.dialect import Fv2Dialect
-        from seerdb.common.exceptions import NotSupportedError
         from seerdb.common.tns_consts import FIELD_VERSION_9_2
 
         Conn = types.SimpleNamespace(
             field_version=FIELD_VERSION_9_2, _dialect=Fv2Dialect()
         )
-        # Plain names go through the rewrite.
-        _check_returning_support(
-            Conn, frozenset({1}), 'INSERT INTO t (a) VALUES (:a) RETURNING id INTO :o'
-        )
-        # A quoted one cannot: the server rejects it inside the block the rewrite
-        # needs, so say that rather than surfacing a bare ORA-01006.
-        with self.assertRaises(NotSupportedError):
-            _check_returning_support(
-                Conn,
-                frozenset({1}),
-                'INSERT INTO t (a) VALUES (:"desc") RETURNING id INTO :"out"',
-            )
+        for SQL in (
+            'INSERT INTO t (a) VALUES (:a) RETURNING id INTO :o',
+            'INSERT INTO t (a) VALUES (:"desc") RETURNING id INTO :"out"',
+        ):
+            _check_returning_support(Conn, frozenset({1}), SQL)
 
     def test_a_pre10_batch_runs_only_as_plain_dml_on_9i(self):
         # 9i runs a plain DML batch as array DML (#2245), batch errors included

@@ -297,9 +297,9 @@ reports the rows the statement touched.
 Two limits follow from running as a block. Multi-row `RETURNING` into scalar
 binds raises `ORA-01422`, exactly as on a current server, and there is no
 `BULK COLLECT` or `executemany()` with `RETURNING`: 9i has array DML, but not
-for a block, and 8i has none. A *quoted* bind name (`:"my bind"`) is refused
-with `NotSupportedError`: the server rejects a quoted placeholder inside a
-PL/SQL block even though plain pre-10g DML accepts one. Use an unquoted name.
+for a block, and 8i has none. A *quoted* bind name (`:"my bind"`) works too:
+the server rejects a quoted placeholder inside a PL/SQL block, so the driver
+gives it an unquoted name of its own in the block.
 
 **Oracle 8i.** The same rewrite serves `RETURNING ... INTO` here too. It also
 settles an older failure mode: sent in the native form, a *failing* RETURNING
