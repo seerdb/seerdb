@@ -181,9 +181,9 @@ _O7_XA_NAMES: list[tuple[bytes, bytes]] = [
 _LTZ_ZONES_SQL = 'SELECT DBTIMEZONE, SESSIONTIMEZONE FROM DUAL'
 # What connection.queue() says when it refuses a queue (_aq_refused).
 AQ_REFUSAL = (
-    'Advanced Queuing requires an Oracle 12.1+ server, or a RAW or object queue '
-    'on a 10g or 11g session or on 9i with thin_oall8=True; otherwise on 9i and '
-    '8i, call DBMS_AQ from PL/SQL'
+    'Advanced Queuing below Oracle 12.1 takes a RAW or an object queue, and on '
+    '9i not in the default form: connect with oall8=True or thin_oall8=True, '
+    'or call DBMS_AQ from PL/SQL'
 )
 # A statement that may change the session's zone, after which it is read again.
 _SETS_TIME_ZONE = re.compile(r'\bALTER\s+SESSION\b.*\bTIME_ZONE\b', re.I | re.S)
@@ -1339,18 +1339,32 @@ class _ConnectionLogic:
     def _aq_refused(self, payload_type) -> bool:
         # Whether connection.queue() refuses a queue below 12.1. A 10g or 11g
         # session takes a RAW or an object queue, thin (#2697, #2702, #2708) or
-        # in OCI 11.2's native form, dedicated or pooled (#2805); so does a thin
-        # OALL8 one to 9.2, in the form JDBC thin 11.2 sends 9.2 (#2805). A JSON
-        # payload is measured from 12.1 only. On 9i's other forms and on 8i,
-        # DBMS_AQ from PL/SQL is the route.
+        # in OCI 11.2's native form, dedicated or pooled (#2805); so do a thin
+        # OALL8 one to 9.2, in the form JDBC thin 11.2 sends 9.2, a native one
+        # to 9.2 (`oall8`) and an 8i one, in OCI 9.2's (#2805). A JSON payload
+        # is measured from 12.1 only. On 9i's compact form, DBMS_AQ from PL/SQL
+        # is the route.
         from seerdb.common.datatypes import JSON
 
-        Native = bool(getattr(self, '_native11', False))
+        Native = bool(self._aq_form())
         return self.field_version < FIELD_VERSION_12_1 and (
             payload_type is JSON
             or (getattr(self, '_dialect', None) is not None and not Native)
-            or (self._server_below_10_2() and not self._thin92)
+            or (self._server_below_10_2() and not self._thin92 and not Native)
         )
+
+    def _aq_form(self) -> str:
+        # The native form a session's AQ calls take (encode_aq_enq's `Form`):
+        # OCI 11.2's on a native 10g or 11g session, OCI 9.2's on a native 9.2
+        # one and on 8i; none on a thin session, whose calls are thin's.
+        if getattr(self, '_native11', False):
+            return 'oci'
+        Dialect = getattr(self, '_dialect', None)
+        if isinstance(Dialect, O8iDialect):
+            return 'o8i'
+        if isinstance(Dialect, Fv2Oall8Dialect):
+            return 'o9i'
+        return ''
 
     def _scrolls_server_side(self) -> bool:
         # Whether a scrollable cursor scrolls on the server (#181): on a session

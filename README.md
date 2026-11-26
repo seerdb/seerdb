@@ -393,6 +393,8 @@ does, with these differences:
 - **No cursor cache**, as on 8i, so a repeated statement is parsed again.
 - **It binds PL/SQL associative arrays** (`arrayvar`) in a block, as OCI 9.2
   does; the compact form refuses them.
+- **It enqueues and dequeues** on a RAW or an object queue (`connection.queue()`),
+  as OCI 9.2 does; the compact form refuses AQ (#2805).
 - **Only the 8-byte O3LOGON key.** The 16-byte variant native sqlplus gets is not
   supported.
 - **9.2's own answers can differ.** A bare `CONNECT BY LEVEL` on `dual` returns
@@ -448,8 +450,9 @@ PL/SQL associative-array binds (`arrayvar`) in a block, CLOB / BLOB and
 native BFILE reads, CLOB / BLOB OUT binds and `RETURNING` (their value is the
 text or bytes, as a fetched LOB's is: 8i serves no LOB object calls, and makes
 no temporary LOB, so an IN OUT LOB Var holding text and a block value past
-32512 bytes are refused), LONG / LONG RAW, ROWID / UROWID, and transactions — sync and
-async. It keeps no cursor cache, so a repeated statement is parsed again, and
+32512 bytes are refused), LONG / LONG RAW, ROWID / UROWID, AQ on a RAW or an object
+queue as OCI 9.2 enqueues and dequeues (no dequeue condition, which 8.1.7 lacks;
+#2805), and transactions — sync and async. It keeps no cursor cache, so a repeated statement is parsed again, and
 runs no array DML: `executemany()` is refused. 8i has no `SYS_REFCURSOR`: declare a package's `REF CURSOR` type. On top of the 9i gaps above it predates
 `TIMESTAMP` and `INTERVAL` (only `DATE`), the AL16UTF16 national charset
 (`WE8ISO8859P1` only), and returns a single row for `CONNECT BY LEVEL`. Oracle

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Oracle 8.1.7's reply to OCI 9.2's AQ dequeue (#2805) from an empty queue
+# with no wait: ORA-25228.
+# Captured 2026-11-26 through tcpdump on the 9i VM. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column
+# and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  04 01 00 00 00 8c 62 00  00 00 00 00 00 00 00 00  |......b.........|
+00000010  00 40 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |.@..............|
+00000020  00 00 00 00 00 00 00 0b  00 00 01 00 00 00 00 00  |................|
+00000030  00 00 00 00 00 00 00 00  00 00 00 00 51 4f 52 41  |............QORA|
+00000040  2d 32 35 32 32 38 3a 20  74 69 6d 65 6f 75 74 20  |-25228: timeout |
+00000050  6f 72 20 65 6e 64 2d 6f  66 2d 66 65 74 63 68 20  |or end-of-fetch |
+00000060  64 75 72 69 6e 67 20 6d  65 73 73 61 67 65 20 64  |during message d|
+00000070  65 71 75 65 75 65 20 66  72 6f 6d 20 53 59 53 54  |equeue from SYST|
+00000080  45 4d 2e 50 59 4f 5f 41  51 5f 4f 43 49 0a        |EM.PYO_AQ_OCI.|
+0000008e
