@@ -19344,13 +19344,10 @@ class JsonTableIntegration(_IntegrationBase):
         self.assertEqual(self.cur.fetchall(), [(1, 1), (1, 2)])
 
 
-# Advanced Queuing of a RAW message: 12.1 and later, and a 10g or 11g thin
-# session (#2697, #2702); the Mirror serves no AQ.
-_AQ_RAW = _Need(
-    'AQ of a RAW message needs 10g or later, and no Mirror',
-    min_server=10,
-    not_mirror=('*',),
-)
+# Advanced Queuing of a RAW message: 12.1 and later, a 10g or 11g thin
+# session (#2697, #2702), and a thin OALL8 one to 9.2 (#2805); the Mirror
+# serves no AQ. Which sessions take one, the session itself says (setUp).
+_AQ_RAW = _Need('AQ of a RAW message needs no Mirror', not_mirror=('*',))
 
 
 @unittest.skipUnless(_USER, _SKIP_REASON)
@@ -19367,8 +19364,10 @@ class AqRawIntegration(_IntegrationBase):
 
     def setUp(self):
         super().setUp()
-        if getattr(self.conn, '_dialect', None) is not None:
-            self.skipTest('AQ is not served on a pre-12c native-form session')
+        if self.conn._aq_refused(None):
+            self.skipTest(
+                'AQ needs 12.1+, a thin 10g or 11g session, or thin_oall8=True on 9i'
+            )
         self._drop_queue()
         try:
             self.cur.execute(

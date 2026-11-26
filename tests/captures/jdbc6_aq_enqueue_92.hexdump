@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# JDBC thin 11.2's (ojdbc6) AQ enqueue (func 121) to Oracle 9.2.0.4 (#2805):
+# RAW queue PYO_AQ_J6, payload 'hello AQ', priority 7, expiration 3600,
+# correlation 'CORR1'; the close-cursors piggyback ahead of it left out.
+# Captured 2026-11-26 through tools/capture_proxy.py. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column
+# and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  03 79 04 01 01 09 01 07  00 02 0e 10 01 05 05 43  |.y.............C|
+00000010  4f 52 52 31 00 00 00 00  01 04 0e 00 00 01 40 00  |ORR1..........@.|
+00000020  00 01 41 00 01 01 01 00  01 42 00 00 01 45 00 00  |..A......B...E..|
+00000030  01 02 00 00 00 01 01 10  01 01 00 01 01 08 00 00  |................|
+00000040  00 00 00 00 00 00 00 00  00 00 50 59 4f 5f 41 51  |..........PYO_AQ|
+00000050  5f 4a 36 00 00 00 00 00  00 00 00 00 00 00 00 00  |_J6.............|
+00000060  00 00 17 68 65 6c 6c 6f  20 41 51                 |...hello AQ|
+0000006b

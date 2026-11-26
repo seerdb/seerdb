@@ -9161,15 +9161,23 @@ byte for byte the same as on 11g, and seerdb's 11g code works there unchanged:
 - a RAW round trip;
 - dequeues by correlation, by condition, and by a subscriber's name.
 
-**9.2: a native form, not served to seerdb.** JDBC thin 11.2's native AQ works
-on 9.2.0.4. Its dequeue is 10g's, and its enqueue is shorter:
-- one field fewer in the message properties before the four keyword pairs;
-- nothing after the pairs;
-- nine empty bytes in the tail where 10g has seventeen.
+**9.2 over thin OALL8** (#2805). JDBC thin 11.2's native AQ works on 9.2.0.4,
+and so does seerdb's with `thin_oall8=True`, the session that logs in as ojdbc6
+does (#2768). A compact or `oall8` session is closed on the enqueue, even one
+carrying JDBC's exact bytes: the difference is in the session, not the message.
+The dequeue request is 10g's. What the messages lack, against 10g's:
+- **the message properties**, both ways: the enqueue transaction id, and the
+  four fields after the keyword pairs (user properties, CSN, DSN, flags);
+- **the enqueue's sender fields**: correlation, name and address (each a
+  pointer and a length) and the two charset pointers, eight fields.
 
-But 9.2 closes a seerdb session, thin or `oall8`, on the enqueue, even one that
-carries JDBC's exact bytes. So the difference is in the session JDBC
-negotiates, not in the message.
+Sent 10g's enqueue, 9.2 answers ORA-03120 and keeps the session.
+
+In 9.2's dequeue reply the enqueue time is a 49-byte value whose first 7 bytes
+are the DATE, the rest opaque to the client, where 10g's is the DATE alone.
+JDBC writes no expiration of -1 as `81 01`, but as `04 ff ff ff ff`; 9.2
+takes seerdb's `81 01` too. seerdb also asks for the message id back (a pointer
+and a length of 16, where JDBC sends zeros), which 9.2 returns.
 
 **9.2 and 8.1.7 take AQ from PL/SQL.** `DBMS_AQ.ENQUEUE` and `DEQUEUE` work from
 plain blocks with RAW binds. 8.1.7 has no native form in any reference client,
@@ -9189,9 +9197,10 @@ type's OID, and the payload is the type's pickled image, as from 12c. seerdb's
 12c form enqueues and dequeues it on 11g XE and 10.2.0.5 unchanged.
 
 **What seerdb takes:**
-- RAW and object queues on a 10g or 11g thin session;
-- on 9i and 8i, `connection.queue()` raises NotSupportedError, naming the
-  `DBMS_AQ` route.
+- RAW and object queues on a 10g or 11g thin session, and on 9i with
+  `thin_oall8=True`;
+- on 9i's other forms and on 8i, `connection.queue()` raises
+  NotSupportedError, naming the `DBMS_AQ` route.
 
 JSON payloads (no JSON type before 21c), array enqueue and dequeue, and the
 native forms are not measured, and are refused.

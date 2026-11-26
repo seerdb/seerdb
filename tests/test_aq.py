@@ -48,6 +48,9 @@ from seerdb.common.tns_consts import (
 class _FakeConn:
     field_version = 16
 
+    def _server_below_10_2(self):
+        return False
+
 
 class _FakeQueue:
     payload_type = None
@@ -103,6 +106,66 @@ class TestEncode(unittest.TestCase):
             (image, rest) = _THIN.read_value(out[at + 2 + 22 :])
             self.assertEqual((len(image), rest), (length, b''))
             self.assertEqual(decode_oson(image), value)
+
+
+class TestNinePointTwoOverThinOall8(unittest.TestCase):
+    # A thin OALL8 session to 9.2 (#2805) enqueues and dequeues as JDBC thin
+    # 11.2 (ojdbc6) does to 9.2.0.4: the properties without the enqueue
+    # transaction id and the four fields after the extensions, and the enqueue
+    # without the sender fields. The session runs at 10.2; the server is 9.2.
+
+    @staticmethod
+    def _capture(name):
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(__file__))
+        from replay import load_capture
+
+        return bytes(load_capture(name))
+
+    def test_the_enqueue_is_jdbc_thin_11_2s(self):
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        theirs = self._capture('jdbc6_aq_enqueue_92.hexdump')
+        q = Queue(_FakeConn(), 'PYO_AQ_J6')
+        props = MessageProperties(payload=b'hello AQ')
+        props.priority = 7
+        props.expiration = 3600
+        props.correlation = 'CORR1'
+        ours = encode_aq_enq(theirs[2], FIELD_VERSION_10_2, q, props, True)
+        # seerdb asks for the message id back, which JDBC does not: its
+        # pointer and length after the payload's (`01 01 08`), where JDBC
+        # writes two zeros.
+        jdbc_slot = b'\x01\x01\x08\x00\x00'
+        self.assertEqual(theirs.count(jdbc_slot), 1)
+        self.assertEqual(ours, theirs.replace(jdbc_slot, b'\x01\x01\x08\x01\x01\x10'))
+
+    def test_10_2_keeps_the_fields_9_2_drops(self):
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        q = Queue(_FakeConn(), 'PYO_AQ_J6')
+        props = MessageProperties(payload=b'hello AQ')
+        to_92 = encode_aq_enq(1, FIELD_VERSION_10_2, q, props, True)
+        to_102 = encode_aq_enq(1, FIELD_VERSION_10_2, q, props)
+        # One transaction id, four property fields and eight sender fields,
+        # each a single zero byte here.
+        self.assertEqual(len(to_102) - len(to_92), 13)
+
+    def test_9_2s_dequeue_reply_reads_back(self):
+        from seerdb.common.tns import decode_aq_deq_reply
+        from seerdb.common.tns_consts import FIELD_VERSION_10_2
+
+        reply = self._capture('jdbc6_aq_dequeue_reply_92.hexdump')
+        msg = decode_aq_deq_reply(reply, FIELD_VERSION_10_2, False, True)
+        self.assertEqual(
+            (msg['priority'], msg['delay'], msg['expiration'], msg['correlation']),
+            (7, 0, 3600, b'CORR1'),
+        )
+        self.assertEqual(msg['payload'], b'hello AQ')
+        # 9.2's enqueue time is a longer value; its first 7 bytes are the
+        # DATE (2026-11-26 14:36:50).
+        self.assertEqual(msg['enq_time'][:7], bytes.fromhex('787e0b1a0f2533'))
 
 
 class TestTheQueueNameBefore12c(unittest.TestCase):
@@ -327,6 +390,10 @@ class TestDecode(unittest.TestCase):
             'flags': 0,
             'has_shard': 1,
             'shard': 0,
+            # 10.2's form: the transaction id and the four fields 9.2 lacks
+            # (#2805).
+            'has_txn_id': 1,
+            'has_props_tail': 1,
         }
         values.update(extra)
         return values

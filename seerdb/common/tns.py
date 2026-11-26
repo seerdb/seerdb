@@ -10039,6 +10039,7 @@ def decode_notification(
     Given = {
         'is_change': Namespace != SUBSCR_NAMESPACE_AQ,
         'has_shard': FieldVersion >= FIELD_VERSION_21_1,
+        **_aq_pre_10_2(False),
     }
     Token = _DECODE_FIELD_VERSION.set(FieldVersion)
     try:
@@ -24193,7 +24194,25 @@ def _aq_string_values(Name: str, Value) -> dict:
     return {f'{Name}_length': len(Value), Name: bytes(Value)}
 
 
-def _aq_msg_props_values(Props, FieldVersion: int) -> dict:
+def _aq_pre_10_2(Pre102: bool) -> dict:
+    # What a 9.2 server's AQ messages leave out (#2805): the properties'
+    # enqueue transaction id and their last four fields, and the enqueue's
+    # sender fields. A decoder derives the three from `pre_10_2`, which a
+    # caller that gives nothing leaves at 10.2's form (_aq_10_2_only).
+    return {
+        'pre_10_2': Pre102,
+        'has_txn_id': not Pre102,
+        'has_props_tail': not Pre102,
+        'has_sender': not Pre102,
+    }
+
+
+def _aq_10_2_only(Name: str) -> wire_schema.Schema:
+    # A `when` key that is true unless the message is 9.2's (_aq_pre_10_2).
+    return (('derive', Name, lambda v: not v.get('pre_10_2', False)),)
+
+
+def _aq_msg_props_values(Props, FieldVersion: int, Pre102: bool = False) -> dict:
     # A message's properties as a request carries them (_AQ_MSG_PROPS), the
     # values python-oracledb's write_msg_props gives: no attempts and no
     # enqueue time; four extensions behind the byte 0x0E -- the agent's name,
@@ -24227,6 +24246,7 @@ def _aq_msg_props_values(Props, FieldVersion: int) -> dict:
         'flags': 0,
         'has_shard': FieldVersion >= FIELD_VERSION_21_1,
         'shard': 0xFFFFFFFF,
+        **_aq_pre_10_2(Pre102),
     }
 
 
@@ -24264,7 +24284,10 @@ def _aq_write_payload(Queue, Props) -> bytes:
 # return them (#128), python-oracledb's AqBaseMessage order. The enqueue time
 # is there when its flag is set. The extensions are each a text, a binary
 # value and a keyword, behind a byte python-oracledb passes over (0x16 in a
-# live 21c dequeue). The shard id is 21c's.
+# live 21c dequeue). The shard id is 21c's. A 9.2 server (a thin OALL8
+# session, #2805) has no enqueue transaction id and none of the four fields
+# after the extensions, as JDBC thin 11.2 writes them to 9.2 and 9.2 returns
+# them; its enqueue time is a longer value whose first 7 bytes are the DATE.
 _AQ_MSG_PROPS: wire_schema.Schema = (
     ('n4', 'priority'),
     ('n4', 'delay'),
@@ -24275,7 +24298,8 @@ _AQ_MSG_PROPS: wire_schema.Schema = (
     ('n4', 'state'),
     ('n4', 'has_enq_time'),
     ('when', 'has_enq_time', (('value', 'enq_time'),)),
-    *_aq_string('enq_txn_id'),
+    *_aq_10_2_only('has_txn_id'),
+    ('when', 'has_txn_id', _aq_string('enq_txn_id')),
     ('n4', 'num_extensions'),
     (
         'when',
@@ -24290,10 +24314,12 @@ _AQ_MSG_PROPS: wire_schema.Schema = (
             ),
         ),
     ),
-    ('n4', 'user_properties'),
-    ('n4', 'csn'),
-    ('n4', 'dsn'),
-    ('n4', 'flags'),
+    *_aq_10_2_only('has_props_tail'),
+    (
+        'when',
+        'has_props_tail',
+        (('n4', 'user_properties'), ('n4', 'csn'), ('n4', 'dsn'), ('n4', 'flags')),
+    ),
     ('when', 'has_shard', (('n4', 'shard'),)),
 )
 _AQ_MSG_PROPS_THIN = wire_schema.compile_encoder(_AQ_MSG_PROPS, _THIN)
@@ -24457,14 +24483,22 @@ _AQ_ENQ: wire_schema.Schema = (
     ('ptr', 'max_seq_present'),
     ('n4', 'max_seq_length'),
     ('u8', 'output_ack_length'),
-    ('ptr', 'sender_correlation_present'),
-    ('n4', 'sender_correlation_length'),
-    ('ptr', 'sender_name_present'),
-    ('n4', 'sender_name_length'),
-    ('ptr', 'sender_address_present'),
-    ('n4', 'sender_address_length'),
-    ('ptr', 'sender_charset_present'),
-    ('ptr', 'sender_ncharset_present'),
+    # 9.2 takes none of the sender fields (#2805), as JDBC thin 11.2 sends it.
+    *_aq_10_2_only('has_sender'),
+    (
+        'when',
+        'has_sender',
+        (
+            ('ptr', 'sender_correlation_present'),
+            ('n4', 'sender_correlation_length'),
+            ('ptr', 'sender_name_present'),
+            ('n4', 'sender_name_length'),
+            ('ptr', 'sender_address_present'),
+            ('n4', 'sender_address_length'),
+            ('ptr', 'sender_charset_present'),
+            ('ptr', 'sender_ncharset_present'),
+        ),
+    ),
     ('when', 'has_json_flag', (('ptr', 'json_payload'),)),
     *_aq_text('queue_name'),
     ('bytes', 'payload_toid', 16),
@@ -24652,10 +24686,13 @@ def _aq_delivery_flags(Mode: int, Either: bool) -> int:
     return 0
 
 
-def decode_aq_message_props(Data: bytes, FieldVersion: int) -> tuple[dict, bytes]:
-    """A message's properties (#128), and what follows them."""
+def decode_aq_message_props(
+    Data: bytes, FieldVersion: int, Pre102: bool = False
+) -> tuple[dict, bytes]:
+    """A message's properties (#128), and what follows them; ``Pre102`` for a
+    9.2 server's (#2805)."""
     return _AQ_MSG_PROPS_FROM_THIN(
-        Data, {'has_shard': FieldVersion >= FIELD_VERSION_21_1}
+        Data, {'has_shard': FieldVersion >= FIELD_VERSION_21_1, **_aq_pre_10_2(Pre102)}
     )
 
 
@@ -24676,11 +24713,13 @@ def decode_aq_enq_reply(Data: bytes) -> bytes:
     return _AQ_ENQ_REPLY_FROM_THIN(Data)[0]['msgid']
 
 
-def decode_aq_deq_reply(Data: bytes, FieldVersion: int, IsObject: bool) -> dict | None:
+def decode_aq_deq_reply(
+    Data: bytes, FieldVersion: int, IsObject: bool, Pre102: bool = False
+) -> dict | None:
     """A dequeue's return (#128): the message's properties, with its
     ``payload`` (as decode_aq_payload reads it) and ``msgid``; None when no
-    message came."""
-    Given = {'has_shard': FieldVersion >= FIELD_VERSION_21_1}
+    message came. ``Pre102`` reads a 9.2 server's (#2805)."""
+    Given = {'has_shard': FieldVersion >= FIELD_VERSION_21_1, **_aq_pre_10_2(Pre102)}
     (Message, Rest) = _AQ_DEQ_HEAD_FROM_THIN(Data, Given)
     if not Message['num_bytes']:
         return None
@@ -24693,7 +24732,7 @@ def decode_aq_array_reply(Data: bytes, FieldVersion: int, IsObject: bool) -> lis
     """An array enqueue's or dequeue's return (#128): per message, its
     properties when they came (``has_props``), its ``payload`` when it came
     (``has_payload``), and its ``msgid``."""
-    Given = {'has_shard': FieldVersion >= FIELD_VERSION_21_1}
+    Given = {'has_shard': FieldVersion >= FIELD_VERSION_21_1, **_aq_pre_10_2(False)}
     (Count, Rest) = _AQ_ARRAY_COUNT_FROM_THIN(Data)
     Out = []
     for _ in range(Count['num_iters']):
@@ -24718,16 +24757,18 @@ def _aq_text_option(Value: str | None) -> bytes | None:
     return Value.encode('utf-8') if Value else None
 
 
-def encode_aq_enq(Seq: int, FieldVersion: int, Queue, Props) -> bytes:
+def encode_aq_enq(
+    Seq: int, FieldVersion: int, Queue, Props, Pre102: bool = False
+) -> bytes:
     """An enqueue (TNS_FUNC_AQ_ENQ, #128): _AQ_ENQ after the function header,
-    then the payload."""
+    then the payload. ``Pre102`` writes it as a 9.2 server reads it (#2805)."""
     QName = Queue.name.encode('utf-8')
     Object = Queue.payload_type is not None
     Raw = not Queue.is_json and not Object
     Recipients = Props.recipients
     Values = {
         **_AQ_ENQ_FIXED,
-        **_aq_msg_props_values(Props, FieldVersion),
+        **_aq_msg_props_values(Props, FieldVersion, Pre102),
         **_aq_texts(FieldVersion),
         'queue_name_length': len(QName),
         'queue_name': QName,
