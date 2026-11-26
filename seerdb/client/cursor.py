@@ -1468,16 +1468,8 @@ def _check_returning_support(Connection, ReturnBinds, Operation: str = '') -> No
             'statement runs as a PL/SQL block there and its INTO targets are '
             'scalar binds. Return a single row, or read the rows with a SELECT.'
         )
-    # A quoted placeholder survives plain pre-10g DML but not the block the
-    # rewrite needs: the server answers ORA-01006 for `:"name"` inside a block,
-    # measured on 9i. Say so, rather than let that surface as a bare ORA.
-    if Operation and any(Quoted for _Name, Quoted in bind_placeholders(Operation)):
-        raise NotSupportedError(
-            'RETURNING ... INTO with a quoted bind name is not supported below '
-            '10g: the statement has to run as a PL/SQL block there, and the '
-            'server rejects a quoted placeholder inside one (ORA-01006). '
-            'Use an unquoted bind name.'
-        )
+    # A quoted placeholder (`:"name"`) is answered ORA-01006 inside a block,
+    # though plain pre-10g DML takes it; the rewrite renames it (#2806).
 
 
 def _check_object_bind_support(Connection, Bind, Batch=None) -> None:

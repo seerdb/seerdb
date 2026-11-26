@@ -131,13 +131,6 @@ _FV2_UNSUPPORTED = (
     # (#2245) is a plain TTI_ALL7 batch, and the rewrite is one block a row.
     ('array_returning', 'an array DML RETURNING is not supported before 10g'),
     ('executemany_returning', 'an array DML RETURNING is not supported before 10g'),
-    # The rewrite runs the statement as a PL/SQL block, and the server rejects
-    # a quoted placeholder inside one (ORA-01006) even though plain pre-10g DML
-    # accepts it. Measured on 9i; the driver refuses it with a clear message.
-    (
-        'quoted_bind_in_returning_into',
-        'a quoted bind cannot ride the pre-10g block rewrite',
-    ),
     # The pre-10 error reply carries the code and text but no position.
 )
 

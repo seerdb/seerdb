@@ -277,6 +277,11 @@ def wrap_returning_in_block(SQL: str) -> tuple[str, str]:
     rather than the rows the DML touched. Without it a wrapped statement would
     report a plausible but wrong ``cursor.rowcount``.
 
+    A quoted placeholder (`:"name"`) is renamed to a fresh unquoted one, the
+    same name for each spelling: 9.2 takes it in plain DML but answers
+    ORA-01006 for it inside a block (#2806). The binds travel by position, so
+    the name the server sees is the block's own.
+
     Returns the wrapped SQL and the name of the appended rowcount placeholder;
     the caller appends a matching OUT bind, and must strip both back out before
     handing results to the user.
@@ -287,9 +292,27 @@ def wrap_returning_in_block(SQL: str) -> tuple[str, str]:
     # The appended placeholder must not collide with one the statement already
     # uses; bind names are matched case-insensitively.
     Taken = {Name.lower() for Name in extract_bind_names(SQL)}
-    Name = 'seerdb_rowcount'
-    while Name in Taken:
-        Name += '_'
+
+    def fresh(Base: str) -> str:
+        Name = Base
+        while Name in Taken:
+            Name += '_'
+        Taken.add(Name)
+        return Name
+
+    Renamed: dict[str, str] = {}
+    Parts = []
+    for T in sql_tokens(Statement):
+        Text = Statement[T.start : T.end]
+        Quoted = _NAMED_BIND_RE.fullmatch(Text) if T.kind == 'bind' else None
+        if Quoted is not None and Quoted.group(1) is not None:
+            Key = Quoted.group(1)
+            if Key not in Renamed:
+                Renamed[Key] = fresh(f'seerdb_q{len(Renamed) + 1}')
+            Text = ':' + Renamed[Key]
+        Parts.append(Text)
+    Statement = ''.join(Parts)
+    Name = fresh('seerdb_rowcount')
     return f'BEGIN {Statement}; :{Name} := SQL%ROWCOUNT; END;', Name
 
 
