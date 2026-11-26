@@ -172,6 +172,9 @@ class _NativeConn(_FakeConn):
     # A 10g or 11g session in OCI 11.2's native form (oall8=True, or pooled).
     _native11 = True
 
+    def _aq_form(self):
+        return 'oci'
+
     def __init__(self, field_version):
         self.field_version = field_version
 
@@ -203,7 +206,7 @@ class TestTheNativeForm(unittest.TestCase):
         theirs = _native_capture('oci11_aq_enqueue_10g.hexdump')
         q = Queue(_NativeConn(FIELD_VERSION_10_2), 'PYO_AQ_OCI')
         ours = encode_aq_enq(
-            theirs[2], FIELD_VERSION_10_2, q, self._props(), False, True
+            theirs[2], FIELD_VERSION_10_2, q, self._props(), False, 'oci'
         )
         want = bytearray(theirs)
         # OCI's lengths of the queue name and the correlation are three bytes a
@@ -229,8 +232,8 @@ class TestTheNativeForm(unittest.TestCase):
 
         q = Queue(_NativeConn(FIELD_VERSION_10_2), 'Q')
         self.assertEqual(
-            encode_aq_enq(1, FIELD_VERSION_10_2, q, self._props(), False, True),
-            encode_aq_enq(1, FIELD_VERSION_11_2, q, self._props(), False, True),
+            encode_aq_enq(1, FIELD_VERSION_10_2, q, self._props(), False, 'oci'),
+            encode_aq_enq(1, FIELD_VERSION_11_2, q, self._props(), False, 'oci'),
         )
 
     def _dequeue(self, capture, field_version, wide):
@@ -239,7 +242,7 @@ class TestTheNativeForm(unittest.TestCase):
         theirs = _native_capture(capture)
         q = Queue(_NativeConn(field_version), 'PYO_AQ_OCI')
         (q.deqoptions.wait, q.deqoptions.correlation) = (5, 'CORR1')
-        ours = encode_aq_deq(theirs[2], field_version, q, True)
+        ours = encode_aq_deq(theirs[2], field_version, q, 'oci')
         want = bytearray(theirs)
         n = 8 if wide else 4  # 11.2's lengths here are ub8
         consumer = 3 + 8 + n + 4 * 8
@@ -285,7 +288,7 @@ class TestTheNativeForm(unittest.TestCase):
         self.assertEqual((got.expiration, got.payload), (-1, b'hello AQ'))
         out = encode_aq_enq(1, FIELD_VERSION_10_2, q, MessageProperties(payload=b'x'))
         native = encode_aq_enq(
-            1, FIELD_VERSION_10_2, q, MessageProperties(payload=b'x'), False, True
+            1, FIELD_VERSION_10_2, q, MessageProperties(payload=b'x'), False, 'oci'
         )
         self.assertNotIn(b'\xff\xff\xff\xff', out)
         self.assertEqual(native[23:27], b'\xff\xff\xff\xff')
@@ -320,7 +323,7 @@ class TestTheNativeForm(unittest.TestCase):
         obj = typ.newobject()
         (obj.N, obj.S) = (9, 'nine')
         ours = encode_aq_enq(
-            1, FIELD_VERSION_11_2, q, MessageProperties(payload=obj), False, True
+            1, FIELD_VERSION_11_2, q, MessageProperties(payload=obj), False, 'oci'
         )
         self.assertTrue(ours.endswith(theirs[payload:]))
 
@@ -336,9 +339,131 @@ class TestTheNativeForm(unittest.TestCase):
         q = Queue(_NativeConn(FIELD_VERSION_11_2), 'PYO_AQ_SEER')
         reply = _native_capture('native_aq_empty_dequeue_reply_11g.hexdump')
         self.assertIsNone(_decode_aq_deq(reply, q))
-        (code, message) = _aq_error_info(reply, True)
+        (code, message) = _aq_error_info(reply, 'oci')
         self.assertEqual(code, 25228)
         self.assertTrue(message.startswith('ORA-25228: timeout or end-of-fetch'))
+
+
+class _Oci92Conn(_FakeConn):
+    # A native 9.2 session (oall8=True) or an 8i one, speaking OCI 9.2's form.
+    field_version = 2
+
+    def __init__(self, form):
+        self.form = form
+
+    def _server_below_10_2(self):
+        return True
+
+    def _aq_form(self):
+        return self.form
+
+
+class TestOci92sForm(unittest.TestCase):
+    # A native session to 9.2 and an 8i one (#2805) enqueue and dequeue as OCI
+    # 9.2 does: 9.2's fields (the thin OALL8 session's) at the 9i codec's
+    # widths, and at the 8i codec's with none after the enqueue's flags and no
+    # condition or extensions on the dequeue. OCI 9.2 writes a set pointer as an
+    # address, where seerdb writes the indicator, and a string's length as its
+    # own.
+
+    @staticmethod
+    def _pointers(want: bytearray, ours: bytes) -> bytearray:
+        # OCI's addresses where seerdb writes the indicator, each one set.
+        from seerdb.common.oci import OCI_INDICATOR
+
+        at = 0
+        while at + 8 <= len(ours):
+            if ours[at : at + 8] == OCI_INDICATOR:
+                assert want[at : at + 8] != bytes(8), at
+                want[at : at + 8] = OCI_INDICATOR
+                at += 8
+            else:
+                at += 1
+        return want
+
+    def _enqueue(self, form, capture):
+        theirs = _native_capture(capture)
+        q = Queue(_Oci92Conn(form), 'PYO_AQ_OCI')
+        props = MessageProperties(payload=b'hello AQ')
+        (props.priority, props.expiration, props.correlation) = (7, 3600, 'CORR1')
+        ours = encode_aq_enq(theirs[2], 2, q, props, True, form)
+        want = bytearray(theirs)
+        # The byte ahead of the keyword pairs: OCI's 0x16, seerdb's thin 0x0E.
+        at = want.index(b'\x04\x00\x00\x00\x16') + 4
+        want[at] = 0x0E
+        return (ours, want)
+
+    def test_the_enqueue_is_oci_9_2s_to_9_2(self):
+        (ours, want) = self._enqueue('o9i', 'oci92_aq_enqueue_9i.hexdump')
+        self.assertEqual(ours, bytes(self._pointers(want, ours)))
+
+    def test_the_enqueue_is_oci_9_2s_to_8_1_7(self):
+        # 8i's pointers are a byte, as seerdb's.
+        (ours, want) = self._enqueue('o8i', 'oci92_aq_enqueue_8i.hexdump')
+        self.assertEqual(ours, bytes(want))
+
+    def _dequeue(self, form, capture):
+        theirs = _native_capture(capture)
+        q = Queue(_Oci92Conn(form), 'PYO_AQ_OCI')
+        (q.deqoptions.wait, q.deqoptions.correlation) = (5, 'CORR1')
+        return (encode_aq_deq(theirs[2], 2, q, form), bytearray(theirs))
+
+    def test_the_dequeue_is_oci_9_2s_to_9_2(self):
+        # The wide form, as OCI 11.2's to 11g. OCI 9.2 leaves the properties'
+        # and the recipients' pointers unset and sets the consumer's with a
+        # length of 0, where seerdb sets the first two and not the third.
+        from seerdb.common.oci import OCI_INDICATOR
+
+        (ours, want) = self._dequeue('o9i', 'oci92_aq_dequeue_9i.hexdump')
+        (props, recipients, consumer) = (19, 35, 51)
+        self.assertEqual(want[props : props + 8], bytes(8))
+        self.assertEqual(want[recipients : recipients + 8], bytes(8))
+        want[props : props + 8] = OCI_INDICATOR
+        want[recipients : recipients + 8] = OCI_INDICATOR
+        want[consumer : consumer + 8] = bytes(8)
+        self.assertEqual(ours, bytes(self._pointers(want, ours)))
+
+    def test_the_dequeue_is_oci_9_2s_to_8_1_7(self):
+        (ours, want) = self._dequeue('o8i', 'oci92_aq_dequeue_8i.hexdump')
+        (props, recipients, consumer) = (8, 10, 12)
+        self.assertEqual((want[props], want[recipients], want[consumer]), (0, 0, 1))
+        (want[props], want[recipients], want[consumer]) = (1, 1, 0)
+        self.assertEqual(ours, bytes(want))
+
+    def test_8_1_7_takes_no_condition(self):
+        from seerdb.common.exceptions import NotSupportedError
+
+        q = Queue(_Oci92Conn('o8i'), 'Q')
+        q.deqoptions.condition = 'tab.priority = 5'
+        with self.assertRaises(NotSupportedError):
+            encode_aq_deq(1, 2, q, 'o8i')
+        self.assertIn(b'tab.priority = 5', encode_aq_deq(1, 2, q, 'o9i'))
+
+    def test_a_dequeue_reply_reads_back(self):
+        for form in ('o9i', 'o8i'):
+            with self.subTest(form=form):
+                q = Queue(_Oci92Conn(form), 'PYO_AQ_OCI')
+                reply = _native_capture(f'oci92_aq_dequeue_reply_{form[1]}i.hexdump')
+                got = _decode_aq_deq(reply, q)
+                self.assertEqual(
+                    (got.priority, got.expiration, got.correlation, got.payload),
+                    (7, 3600, 'CORR1', b'hello AQ'),
+                )
+
+    def test_an_empty_queue_is_no_message(self):
+        for form, capture in (
+            ('o9i', 'native92_aq_empty_dequeue_reply_9i.hexdump'),
+            ('o8i', 'oci92_aq_empty_dequeue_reply_8i.hexdump'),
+        ):
+            with self.subTest(form=form):
+                q = Queue(_Oci92Conn(form), 'PYO_AQ_OCI')
+                reply = _native_capture(capture)
+                self.assertIsNone(_decode_aq_deq(reply, q))
+                (code, message) = _aq_error_info(reply, form)
+                self.assertEqual(code, 25228)
+                self.assertTrue(
+                    message.startswith('ORA-25228: timeout or end-of-fetch')
+                )
 
 
 class TestTheQueueNameBefore12c(unittest.TestCase):

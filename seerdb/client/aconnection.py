@@ -3583,10 +3583,10 @@ class AsyncOracleConnect(_ConnectionLogic):
             queue,
             props,
             self._server_below_10_2(),
-            self._native11,
+            self._aq_form(),
         )
         props.msgid = await self._aq_request(
-            Data, lambda Reply: _decode_aq_enq(Reply, self._native11)
+            Data, lambda Reply: _decode_aq_enq(Reply, self._aq_form())
         )
 
     async def _aq_deq_one(self, queue):
@@ -3594,7 +3594,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         from seerdb.common.tns import encode_aq_deq
 
         Data = encode_aq_deq(
-            self._next_seq(), self.field_version, queue, self._native11
+            self._next_seq(), self.field_version, queue, self._aq_form()
         )
         return await self._aq_request(Data, lambda Reply: _decode_aq_deq(Reply, queue))
 

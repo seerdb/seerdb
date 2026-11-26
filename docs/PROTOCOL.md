@@ -9189,6 +9189,7 @@ byte for byte the same as on 11g, and seerdb's 11g code works there unchanged:
 and so does seerdb's with `thin_oall8=True`, the session that logs in as ojdbc6
 does (#2768). A compact or `oall8` session is closed on the enqueue, even one
 carrying JDBC's exact bytes: the difference is in the session, not the message.
+An `oall8` session takes OCI 9.2's form instead (below).
 The dequeue request is 10g's. What the messages lack, against 10g's:
 - **the message properties**, both ways: the enqueue transaction id, and the
   four fields after the keyword pairs (user properties, CSN, DSN, flags);
@@ -9203,9 +9204,29 @@ JDBC writes no expiration of -1 as `81 01`, but as `04 ff ff ff ff`; 9.2
 takes seerdb's `81 01` too. seerdb also asks for the message id back (a pointer
 and a length of 16, where JDBC sends zeros), which 9.2 returns.
 
-**9.2 and 8.1.7 take AQ from PL/SQL.** `DBMS_AQ.ENQUEUE` and `DEQUEUE` work from
-plain blocks with RAW binds. 8.1.7 has no native form in any reference client,
-since the 8i-era JDBC has no native AQ API. Measured with seerdb on both:
+**9.2 and 8.1.7 in OCI 9.2's form** (#2805). OCI 9.2's `OCIAQEnq` and
+`OCIAQDeq`, captured on the 9i VM against 9.2.0.4 and 8.1.7, are the same calls
+again, in the native forms seerdb speaks to those servers:
+- **to 9.2**, on a native session (`oall8=True`): the 9.2 fields above (no
+  enqueue transaction id, no fields after the keyword pairs, no sender fields)
+  at the 9i codec's widths. The enqueue is OCI 11.2's otherwise, its 12 zero
+  bytes included; the dequeue is OCI 11.2's wide one, as to 11g, ub8 lengths
+  and all;
+- **to 8.1.7**, as an 8i session speaks: those fields at the 8i codec's widths
+  (a pointer one byte, the counts ub4s), the enqueue with nothing after its
+  flags, the dequeue with no condition or extensions. 8.1.7's `DBMS_AQ` has no
+  dequeue condition either, so seerdb refuses one there before it is sent.
+
+Each reply is 9.2's thin one at those widths, its enqueue time the 49-byte
+value; an error comes in the form's own status. OCI 9.2 writes a set pointer as
+an address, a string's length as its own, no user properties, and on the
+dequeue leaves the properties' and recipients' pointers unset and sets the
+consumer's. 9i's compact form takes neither this nor JDBC's form: 9.2 answers
+OCI 9.2's enqueue there with ORA-03120.
+
+**`DBMS_AQ` from PL/SQL** works on 9.2 and 8.1.7 too, and is the route on 9i's
+compact form. `DBMS_AQ.ENQUEUE` and `DEQUEUE` work from plain blocks with RAW
+binds. Measured with seerdb on both:
 ```
 DECLARE eo DBMS_AQ.ENQUEUE_OPTIONS_T; mp DBMS_AQ.MESSAGE_PROPERTIES_T; m RAW(16);
 BEGIN mp.correlation := 'corr-1'; DBMS_AQ.ENQUEUE('Q', eo, mp, :p, m); :m := m; END;
@@ -9250,9 +9271,10 @@ none and the CSN, DSN and flags. Replayed with seerdb's values in their place,
 
 **What seerdb takes:**
 - RAW and object queues on a 10g or 11g session, thin or native (`oall8=True`,
-  and a pooled 11g one), and on 9i with `thin_oall8=True`;
-- on 9i's other forms and on 8i, `connection.queue()` raises
-  NotSupportedError, naming the `DBMS_AQ` route.
+  and a pooled 11g one), on 9i with `oall8=True` or `thin_oall8=True`, and on
+  8i;
+- on 9i's compact form, the default, `connection.queue()` raises
+  NotSupportedError, naming the other forms and the `DBMS_AQ` route.
 
 JSON payloads (no JSON type before 21c) and array enqueue and dequeue are not
 measured, and are refused.

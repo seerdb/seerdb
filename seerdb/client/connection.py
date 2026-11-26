@@ -335,14 +335,14 @@ def _decode_tpc_context(Packet: bytes) -> bytes:
     return Context
 
 
-def _decode_aq_enq(Packet: bytes, Native: bool = False) -> bytes:
+def _decode_aq_enq(Packet: bytes, Form: str = '') -> bytes:
     # The message id an AQ enqueue's return gave the message (#128).
     from seerdb.common.tns import decode_aq_enq_reply
 
     if not Packet:
         raise OperationalError('empty AQ enqueue response')
     if Packet[0] != TTI_RPA:
-        _aq_raise(Packet, Native)
+        _aq_raise(Packet, Form)
     return decode_aq_enq_reply(Packet)
 
 
@@ -367,11 +367,11 @@ def _parse_refuse_code(Packet: bytes) -> int | None:
     return None
 
 
-def _aq_error_info(Packet: bytes, Native: bool = False) -> tuple[int, str | None]:
+def _aq_error_info(Packet: bytes, Form: str = '') -> tuple[int, str | None]:
     # The ORA code and message of an AQ error (TTI_OER) reply, read by the codec
     # as every other error is, its whole message included (#2474); a native
-    # session's in the native form's status (#2805).
-    if Native:
+    # session's in its form's status (#2805).
+    if Form == 'oci':
         from seerdb.common.exceptions import DataError
         from seerdb.common.tns import decode_oci11_status
 
@@ -381,17 +381,30 @@ def _aq_error_info(Packet: bytes, Native: bool = False) -> tuple[int, str | None
             # Not a native status: the caller says the response was unexpected.
             return (0, None)
         return (Status['error_code'], Status['message'])
+    if Form == 'o9i':
+        from seerdb.common.tns import _o9i_oall8_status_fields
+
+        Fields = _o9i_oall8_status_fields(Packet)
+        return (Fields['code'], Fields['message_text']) if Fields else (0, None)
+    if Form == 'o8i':
+        from seerdb.common.tns import _o8i_status_strict
+
+        Fields = _o8i_status_strict(Packet)
+        if not Fields:
+            return (0, None)
+        Text = bytes(Fields.get('message') or b'').rstrip(b'\x00\n')
+        return (Fields['code'], Text.decode('latin-1', 'replace') or None)
     return decode_error_reply(Packet)
 
 
-def _aq_oer_code(Packet: bytes, Native: bool = False) -> int:
-    return _aq_error_info(Packet, Native)[0]
+def _aq_oer_code(Packet: bytes, Form: str = '') -> int:
+    return _aq_error_info(Packet, Form)[0]
 
 
-def _aq_raise(Packet: bytes, Native: bool = False) -> None:
+def _aq_raise(Packet: bytes, Form: str = '') -> None:
     from seerdb.common.exceptions import from_ora_code
 
-    (Code, Msg) = _aq_error_info(Packet, Native)
+    (Code, Msg) = _aq_error_info(Packet, Form)
     if Code:
         raise from_ora_code(Code)(Msg or f'ORA-{Code:05d}', code=Code)
     raise DatabaseError(f'unexpected AQ response 0x{Packet[:1].hex()}')
@@ -456,20 +469,21 @@ def _decode_aq_deq(Packet: bytes, queue):
 
     if not Packet:
         return None
-    Native = bool(getattr(queue._connection, '_native11', False))
+    Conn = queue._connection
+    Form = Conn._aq_form() if hasattr(Conn, '_aq_form') else ''
     if Packet[0] == TTI_OER:
-        if _aq_oer_code(Packet, Native) in (
+        if _aq_oer_code(Packet, Form) in (
             ORA_DEQUEUE_TIMEOUT,
             ORA_LISTEN_TIMEOUT,
         ):  # no message available
             return None
-        _aq_raise(Packet, Native)
+        _aq_raise(Packet, Form)
     Message = decode_aq_deq_reply(
         Packet,
-        queue._connection.field_version,
+        Conn.field_version,
         queue.payload_type is not None,
-        queue._connection._server_below_10_2(),
-        Native,
+        Conn._server_below_10_2(),
+        Form,
     )
     if Message is None:
         return None
@@ -4678,15 +4692,15 @@ class OracleConnect(_ConnectionLogic):
             queue,
             props,
             self._server_below_10_2(),
-            self._native11,
+            self._aq_form(),
         )
         props.msgid = self._aq_request(
-            Data, lambda Reply: _decode_aq_enq(Reply, self._native11)
+            Data, lambda Reply: _decode_aq_enq(Reply, self._aq_form())
         )
 
     def _aq_deq_one(self, queue):
         Data = encode_aq_deq(
-            self._next_seq(), self.field_version, queue, self._native11
+            self._next_seq(), self.field_version, queue, self._aq_form()
         )
         return self._aq_request(Data, lambda Reply: _decode_aq_deq(Reply, queue))
 
