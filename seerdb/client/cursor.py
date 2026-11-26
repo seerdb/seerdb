@@ -6,7 +6,11 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
-from seerdb.client._conn_logic import plsql_inline_limit, temp_lobs_available
+from seerdb.client._conn_logic import (
+    plsql_inline_limit,
+    refuse_pre10_cursor_in_bind,
+    temp_lobs_available,
+)
 from seerdb.client._cursor_logic import _CursorLogic, _touched_rowid
 from seerdb.client.typehandlers import apply_fetch_plan, lob_columns
 from seerdb.common.datatypes import (
@@ -179,6 +183,7 @@ class Cursor(_CursorLogic):
             if not isinstance(Value, Cursor):
                 Out.append(Value)
                 continue
+            refuse_pre10_cursor_in_bind(self._connection)
             CursorId = Value._scroll_cursor_id if Value._scroll_active else 0
             if not CursorId:
                 raise NotSupportedError(

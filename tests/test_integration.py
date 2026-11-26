@@ -12342,6 +12342,56 @@ class RefCursorInBindIntegration(_IntegrationBase):
                 pass
 
 
+@unittest.skipUnless(_USER, _SKIP_REASON)
+class PreTenTwoRefCursorInRefusalIntegration(_IntegrationBase):
+    """Below 10.2 an open cursor bound IN is refused up front (#2806).
+
+    8.1.7 and 9.2 answer OCI 9.2's own bind of one ORA-01001; seerdb's 9i
+    forms failed in three ways of their own, one with a hint that misled.
+    """
+
+    SQL = "SELECT level, 'String ' || level FROM dual CONNECT BY level <= 5"
+    BLOCK = (
+        'declare type rc is ref cursor; c rc := :1; n number; v varchar2(40); '
+        'begin fetch c into n, v; close c; end;'
+    )
+
+    def setUp(self):
+        super().setUp()
+        if not self.conn._server_below_10_2():
+            self.skipTest('10.2+ serves an open cursor bound IN')
+
+    def test_the_bind_is_refused_and_the_session_lives(self):
+        rc = self.conn.cursor(scrollable=True)
+        rc.execute(self.SQL)
+        with self.assertRaises(seerdb.NotSupportedError) as ctx:
+            self.cur.execute(self.BLOCK, [rc])
+        self.assertIn('10.2+', str(ctx.exception))
+        self.cur.execute('SELECT 1 FROM dual')
+        self.assertEqual(self.cur.fetchall(), [(1,)])
+
+    def test_an_async_session_refuses_it_too(self):
+        async def run() -> None:
+            conn = await seerdb.connect_async(
+                host=_HOST,
+                port=_PORT,
+                user=_USER,
+                password=_PASSWORD,
+                service_name=_SERVICE,
+                **_FV_KW,
+            )
+            try:
+                rc = conn.cursor(scrollable=True)
+                await rc.execute(self.SQL)
+                with self.assertRaises(seerdb.NotSupportedError) as ctx:
+                    await conn.cursor().execute(self.BLOCK, [rc])
+                self.assertIn('10.2+', str(ctx.exception))
+            finally:
+                await conn.close()
+
+        asyncio.run(run())
+
+
 @_requires(_OBJECT_BIND)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class ObjectBlockBindIntegration(_IntegrationBase):
