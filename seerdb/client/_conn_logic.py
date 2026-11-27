@@ -1694,15 +1694,49 @@ class _ConnectionLogic:
         itself -- 9i's LOBOPS form, persistent-LOB writes included (#2259)."""
         return dialect_lob_objects(self._lob_dialect())
 
+    def _create_temp_request(self, is_blob: bool, csfrm: int) -> bytes:
+        # A CREATE_TEMP: on a thin OALL8 session to 9.2, JDBC thin 11.2's form
+        # there, in the database's charset -- its national one for an NCLOB
+        # (#2803); else the thin form for the session's field version.
+        from seerdb.common.tns import encode_dictionary, encode_thin92_create_temp
+        from seerdb.common.tns_consts import AL32UTF8_CHARSET
+
+        if self._thin92:
+            Lobs = self._thin92_lobs
+            Charset = getattr(
+                Lobs, '_db_ncharset' if csfrm == 2 else '_db_charset', None
+            )
+            return encode_thin92_create_temp(
+                self._next_seq(), is_blob, csfrm, Charset or AL32UTF8_CHARSET
+            )
+        return encode_dictionary(
+            self._make_dict(
+                DictionaryType.lobops, create_temp=True, is_blob=is_blob, csfrm=csfrm
+            )
+        )
+
+    def _temp_lobs_by_lob_object(self) -> bool:
+        # Whether a temporary LOB is written through the LOB object's write:
+        # on a pooled 11g session, in its own form (#2466), and on a thin OALL8
+        # session to 9.2, in 9.2's (#2803).
+        return dialect_temp_lobs(self._dialect) or self._thin92
+
     def _created_temp_lob(self, Packet: bytes) -> bytes:
         # The new temporary LOB's locator from a CREATE_TEMP's reply, raising
         # the server's error. Below 12.1 the reply's own form (#2803), its
         # status checked; from 12.1 the locator the reply leads with.
         from seerdb.common.exceptions import InternalError
-        from seerdb.common.tns import decode_create_temp_reply, decode_lobops_locator
+        from seerdb.common.tns import (
+            decode_create_temp_reply,
+            decode_lobops_locator,
+            decode_thin92_create_temp,
+        )
         from seerdb.common.tns_consts import FIELD_VERSION_12_1
 
-        if self.field_version >= FIELD_VERSION_12_1:
+        if self._thin92:
+            (Locator, Status) = decode_thin92_create_temp(Packet)
+            self._raise_lobops_error(Status)
+        elif self.field_version >= FIELD_VERSION_12_1:
             Locator = decode_lobops_locator(Packet)
         else:
             (Locator, Status) = decode_create_temp_reply(Packet)
@@ -1828,15 +1862,16 @@ def plsql_inline_limit(Conn) -> int:
 
 def temp_lobs_available(Conn) -> bool:
     """Whether the connection can make a temporary LOB to bind: 12c+, a thin
-    session to a 10.2+ server, in JDBC thin 11.2's form (#2803), or a dialect
-    that makes one itself."""
+    session to a 10.2+ server, or a thin OALL8 one to 9.2, each in JDBC thin
+    11.2's form there (#2803), or a dialect that makes one itself."""
     from seerdb.common.tns_consts import FIELD_VERSION_10_2, FIELD_VERSION_12_1
 
     Dialect = getattr(Conn, '_dialect', None)
     FieldVersion = getattr(Conn, 'field_version', 0)
     if FieldVersion >= FIELD_VERSION_12_1 or dialect_temp_lobs(Dialect):
         return True
-    # A thin OALL8 session to 9.2 runs at 10.2 too; its server is 9.2's.
+    if getattr(Conn, '_thin92', False):
+        return True
     Below = getattr(Conn, '_server_below_10_2', None)
     return (
         Dialect is None

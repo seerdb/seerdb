@@ -415,9 +415,10 @@ integration suite, with these differences from the default compact form:
   as JDBC thin 11.2 does to 9.2 (#2805).
 - **It binds PL/SQL associative arrays** (`arrayvar`).
 - **`cursor.parse()`** parses without running the statement.
-- **It makes no temporary LOBs**, so a LOB Var and a CLOB or BLOB OUT bind
-  aren't supported there yet; the compact form binds both. A REF binds as on
-  thin 10g (#2806).
+- **It makes temporary LOBs** (`createlob()`, a large value bound into PL/SQL)
+  and binds LOBs IN, OUT and IN OUT, LOB Vars included, in 9.2's own LOBOPS
+  form, as JDBC thin 11.2 makes them there (#2803). A REF binds as on thin 10g
+  (#2806).
 - **Validated on 9.2.0.4 only.** The other servers ignore the option.
 
 **Experimental: 11g's native form on a dedicated session** (the same

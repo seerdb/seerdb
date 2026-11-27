@@ -14,7 +14,6 @@ import unittest
 
 import seerdb
 from seerdb.common.datatypes import TempLob, Var
-from seerdb.common.exceptions import NotSupportedError
 from seerdb.common.tns import (
     _ENCODE_FIELD_VERSION,
     _ENCODE_SERVER_FIELD_VERSION,
@@ -69,11 +68,14 @@ class TestTheLobBindBelow121(_AtFieldVersion):
         oac = self._oac(Var(seerdb.DB_TYPE_NCLOB), FIELD_VERSION_10_2)
         self.assertEqual(oac[11:15], b'\x02\x07\xd0\x02')
 
-    def test_a_thin_oall8_session_to_9i_has_none(self):
-        # It runs at 10.2 but its server makes no temporary LOB (#2768), so a
-        # LOB Var is still refused there rather than bound unbacked.
-        with self.assertRaises(NotSupportedError):
-            self._oac(Var(seerdb.DB_TYPE_CLOB), FIELD_VERSION_10_2, server=2)
+    def test_a_thin_oall8_session_to_9i_sends_the_same(self):
+        # It runs at 10.2 and makes temporary LOBs in 9.2's form (#2803). JDBC
+        # thin 11.2 declares the database's charset there; 9.2 converts from
+        # AL32UTF8, as for a text bind (#2768).
+        (clob, _) = _oacs('jdbc6_lob_bind_out_10g.hexdump')
+        self.assertEqual(
+            self._oac(Var(seerdb.DB_TYPE_CLOB), FIELD_VERSION_10_2, server=2), clob
+        )
 
 
 if __name__ == '__main__':

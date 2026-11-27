@@ -2630,12 +2630,7 @@ class AsyncOracleConnect(_ConnectionLogic):
                 bytes, await self._drive(self._dialect.create_temp_lob(is_blob, csfrm))
             )
 
-        Data = encode_dictionary(
-            self._make_dict(
-                DictionaryType.lobops, create_temp=True, is_blob=is_blob, csfrm=csfrm
-            )
-        )
-        await self.send(TNS_DATA, Data)
+        await self.send(TNS_DATA, self._create_temp_request(is_blob, csfrm))
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
             raise connection_closed('CREATE_TEMP')
@@ -2645,9 +2640,9 @@ class AsyncOracleConnect(_ConnectionLogic):
         self, Locator: bytes, Data: str | bytes, is_blob: bool = False
     ) -> None:
         """Async port of the sync `write_temp_lob` (#91)."""
-        if dialect_temp_lobs(self._dialect):
-            # Through the LOB object's write, a pooled 11g session's own form
-            # (#2466): the text in UTF-16, counted in its code units.
+        if self._temp_lobs_by_lob_object():
+            # Through the LOB object's write: a pooled 11g session's own form
+            # (#2466), a thin OALL8 session's to 9.2 (#2803).
             await self.lob_write(prefixed_locator(Locator), Data, is_blob=is_blob)
             return
         from seerdb.common.tns_consts import TNS_LOB_OP_WRITE

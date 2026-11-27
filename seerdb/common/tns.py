@@ -8594,6 +8594,11 @@ def _read_lob_column_parts(
         )
     if isinstance(Locator, list):  # 0x00 / 0xFF DALC → empty / null
         return (None, Tail, Image, Behind)
+    if Image is None and len(Locator) > 2 and not any(Locator[2:]):
+        # An empty locator, its length and zeros, is a NULL: 9.2 answers a
+        # RETURNING of a NULL LOB so (`01 56 56 00 54` and 84 zeros, #2803). A
+        # real one carries its flags.
+        return (None, Tail, None, Behind)
     return (bytes(Locator), Tail, Image, Behind)
 
 
@@ -16274,6 +16279,81 @@ def decode_o7_create_temp(Data: bytes) -> bytes:
     return Head[0]
 
 
+# A CREATE_TEMP on a thin OALL8 session to 9.2 (#2803). JDBC thin 11.2 sends
+# 9.2.0.4 _O7_LOBOPS's fields with the SCN array's pointer and one slot set to
+# 1 behind the duration; ojdbc14's form above, without them, makes 9.2 close
+# the connection there. ojdbc6 offers the locator 40 bytes, 10.2's size, and
+# 9.2 writes only 38 of its 84 into them, behind the length it was sent.
+# Bound framed with its own length (`00 26`), that cut locator drops the
+# connection on a block that copies it. So the space is ojdbc14's 86 bytes
+# (_O7_EMPTY_LOCATOR), and the locator comes back whole, framed as any other.
+# A BLOB's charset is 1, as ojdbc6 sends it.
+_O7_LOBOPS_CREATE_TEMP: wire_schema.Schema = (*_O7_LOBOPS, ('n4', 'scn'))
+_O7_LOBOPS_CREATE_TEMP_THIN = wire_schema.compile_encoder(_O7_LOBOPS_CREATE_TEMP, _THIN)
+# Its reply: the RPA, the new locator (a ub2 length and the body, 38 bytes of
+# it set and the rest zero), then the charset, the SCN slot (1) and a word: 0,
+# and 64 when ojdbc6's 40 bytes cut the locator short. A prefix: the status
+# follows.
+_THIN92_CREATE_TEMP_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('be2', 'locator_length'),
+    ('bytes', 'locator', 'locator_length'),
+    ('n2', 'charset'),
+    ('n4', 'scn'),
+    ('n4', 'flag'),
+)
+_THIN92_CREATE_TEMP_REPLY_FROM_THIN = wire_schema.compile_decoder(
+    _THIN92_CREATE_TEMP_REPLY, _THIN
+)
+
+
+def encode_thin92_create_temp(
+    Seq: int, is_blob: bool, csfrm: int, charset: int
+) -> bytes:
+    """A temporary CLOB, NCLOB (``csfrm`` 2) or BLOB on a thin OALL8 session to
+    9.2 (#2803), in the session's database ``charset`` -- its national one for
+    an NCLOB."""
+    return _O7_LOBOPS_CREATE_TEMP_THIN(
+        {
+            'seq': Seq,
+            'token_number': None,
+            'source_present': True,
+            'source_length': len(_O7_EMPTY_LOCATOR),
+            'dest_present': False,
+            'dest_length': _OCI11_LOB_DURATION_SESSION,
+            'short_source_offset': 0 if is_blob else csfrm,
+            'short_dest_offset': TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB,
+            'charset_present': True,
+            'short_amount_present': True,
+            'null_lob_present': True,
+            'operation': TNS_LOB_OP_CREATE_TEMP,
+            'scn_present': True,
+            'scn_length': 1,
+            'locator': _O7_EMPTY_LOCATOR,
+            'charset': 1 if is_blob else charset,
+            'short_amount': _OCI11_LOB_DURATION_SESSION,
+            'scn': 1,
+        }
+    )
+
+
+def decode_thin92_create_temp(Data: bytes) -> tuple[bytes | None, bytes]:
+    """The new temporary LOB's locator from a thin OALL8 session's CREATE_TEMP
+    reply (#2803), bare, and the status behind the reply. A failed call's
+    reply is its status alone: (None, the status). A reply cut short raises
+    Truncated."""
+    if Data[:1] != bytes([TTI_RPA]):
+        return (None, Data)
+    try:
+        (Reply, Rest) = _THIN92_CREATE_TEMP_REPLY_FROM_THIN(Data)
+    except IndexError as Exc:
+        raise Truncated(f'9.2 CREATE_TEMP: {Exc}') from Exc
+    Locator = bytes(Reply['locator'])
+    if len(Locator) != Reply['locator_length']:
+        raise Truncated('9.2 CREATE_TEMP: the reply ends inside its locator')
+    return (Locator, bytes(Rest))
+
+
 def encode_o7_lob_getlen(Seq: int, Locator: bytes) -> bytes:
     # GETLEN: ask the server for the LOB's length, which comes back in the
     # short amount -- see decode_fv2_lob_getlen.
@@ -23724,12 +23804,13 @@ def encode_token_oac(Token: object) -> bytes:
             # #902.
             return _encode_lob_bind_oac(DT == TNS_TYPE_BLOB)
         if DT in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and (
-            _encode_server_field_version() >= FIELD_VERSION_10_2
+            _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_10_2
         ):
-            # Below 12.1, JDBC thin 11.2's LOB OAC (#2803), from 10.2 on, where
-            # the promotion has a temporary LOB to make. A thin OALL8 session to
-            # 9.2 runs at 10.2 but makes none, so its CLOB / BLOB Var keeps
-            # raising below rather than emitting a bind it cannot back.
+            # Below 12.1, JDBC thin 11.2's LOB OAC (#2803), on every thin session
+            # from 10.2's field version, where the promotion has a temporary LOB
+            # to make: a thin OALL8 one to 9.2 included. JDBC thin 11.2 declares
+            # the database's charset to 9.2 (`01 1f`); 9.2 takes AL32UTF8 there
+            # as for a text bind (#2768), measured with values IN and OUT.
             return _pre12_lob_bind_oac(
                 DT == TNS_TYPE_BLOB, getattr(Token.dbtype, 'csfrm', _CSFRM_DB)
             )
