@@ -6970,6 +6970,12 @@ otherwise: 8.1.7 sets 0x21 there for OCI 9.2's broken procedure and 0 for the
 same one compiled clean, as 9.2 does (#2262). seerdb surfaces it as
 `cursor.warning`.
 
+**The error offset (#2804).** The status's `position` is where in the statement
+an error is, 0-based: 8.1.7 puts 7 there for `SELECT nosuchcol FROM dual` and
+14 for `SELECT 1 FROM nosuchtable`, the offsets OCI 9.2 reports from those
+replies (`OCI_ATTR_PARSE_ERROR_OFFSET`). seerdb surfaces it as
+`DatabaseError.offset`.
+
 There is no describe or fetch. The response is an RPA, then the status. The RPA
 (`_O8I_RPA`) is:
 
