@@ -23570,6 +23570,26 @@ def _encode_lob_bind_oac(is_blob: bool, csfrm: int = _CSFRM_DB) -> bytes:
     )
 
 
+# A LOB bind's buffer below 12.1, as JDBC thin 11.2 declares one (#2803).
+_PRE12_LOB_BIND_BUFFER_SIZE = 4000
+
+
+def _pre12_lob_bind_oac(is_blob: bool, csfrm: int = _CSFRM_DB) -> bytes:
+    """The CLOB / BLOB bind OAC below 12.1, IN and OUT alike, as JDBC thin 11.2
+    sends 10.2 and 11.2 (#2803): the older OAC layout, a buffer of 4000, no LOB
+    cont-flag, and the session's charset with form 1 -- for a BLOB too
+    (`70 03 00 00 02 0f a0 00 00 00 00 02 03 69 01 00`, a BLOB's with 0x71). An
+    NCLOB takes the national charset and form 2, as its other binds do there."""
+    Charset = AL16UTF16_CHARSET if csfrm == _CSFRM_NCHAR and not is_blob else 0
+    return encode_token_raw(
+        TNS_TYPE_BLOB if is_blob else TNS_TYPE_CLOB,
+        _PRE12_LOB_BIND_BUFFER_SIZE,
+        0,
+        Charset or AL32UTF8_CHARSET,
+        0,
+    )
+
+
 # The OAC a REF CURSOR bind carries, IN or OUT alike -- the reference client
 # sends the same one for both, and only the value after it differs (#1047).
 # Buffer 4 and charset 0, not 1 and the DB charset: a cursor id is a number, not
@@ -23701,9 +23721,18 @@ def encode_token_oac(Token: object) -> bytes:
             # ORA-03120). A non-NULL IN value is promoted to a temp LOB before
             # encoding (Cursor._promote_lob_var_binds), so this OAC pairs either
             # with that locator or with a NULL value (a pure OUT / NULL bind).
-            # 11g has no CREATE_TEMP for the promotion, so a CLOB / BLOB Var there
-            # keeps raising below rather than emitting a bind it cannot back. #902.
+            # #902.
             return _encode_lob_bind_oac(DT == TNS_TYPE_BLOB)
+        if DT in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and (
+            _encode_server_field_version() >= FIELD_VERSION_10_2
+        ):
+            # Below 12.1, JDBC thin 11.2's LOB OAC (#2803), from 10.2 on, where
+            # the promotion has a temporary LOB to make. A thin OALL8 session to
+            # 9.2 runs at 10.2 but makes none, so its CLOB / BLOB Var keeps
+            # raising below rather than emitting a bind it cannot back.
+            return _pre12_lob_bind_oac(
+                DT == TNS_TYPE_BLOB, getattr(Token.dbtype, 'csfrm', _CSFRM_DB)
+            )
         if DT == TNS_TYPE_JSON:
             # The same OAC a JSON value binds with; only the Var path was
             # missing, so setinputsizes(DB_TYPE_JSON) raised (#902).
@@ -23755,18 +23784,11 @@ def encode_token_oac(Token: object) -> bytes:
         # temp LOB as NULL -- ORA-01400 on a NOT NULL column, and a silent NULL
         # otherwise (#903).
         if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
-            # Below 12.1 there is no temporary LOB, so this is a fetched one bound
-            # back: the older OAC layout, the same buffer and no cont-flag. The
+            # Below 12.1, a temporary LOB (#2803) or a fetched one bound back:
+            # JDBC thin 11.2's OAC, the older layout without the cont-flag. The
             # 12c layout broke the session there (ORA-03106); measured on 11g.
-            Csfrm = getattr(Token, 'csfrm', _CSFRM_DB)
-            return encode_token_raw(
-                TNS_TYPE_BLOB if Token.is_blob else TNS_TYPE_CLOB,
-                _LOB_BIND_BUFFER_SIZE,
-                0,
-                0
-                if Token.is_blob
-                else (AL16UTF16_CHARSET if Csfrm == 2 else AL32UTF8_CHARSET),
-                0,
+            return _pre12_lob_bind_oac(
+                Token.is_blob, getattr(Token, 'csfrm', _CSFRM_DB)
             )
         return _encode_lob_bind_oac(Token.is_blob, getattr(Token, 'csfrm', _CSFRM_DB))
     if Token is None:
