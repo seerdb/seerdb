@@ -423,11 +423,11 @@ integration suite, with these differences from the default compact form:
 **Experimental: 11g's native form on a dedicated session** (the same
 `oall8=True`). A pooled 11g session always speaks OCI 11.2's native form, the
 only one 11g's pool serves (#2466); with the flag a dedicated 11g session does
-too, in place of the converted form. It runs temporary LOBs (`createlob()`, and
-a large value bound into PL/SQL) and LOB Var binds, which the converted form
-below 12.1 does not: **on 11g, use `oall8=True` for those**.
-The converted form stays the default; its own way to make a temporary LOB below
-12.1 has no reference to build from (#2463). The native form keeps no cursor
+too, in place of the converted form. It runs LOB OUT binds and NULL LOB Var
+binds, which the converted form below 12.1 does not yet: **on 11g, use
+`oall8=True` for those**. The converted form makes temporary LOBs on 10g and
+11g (`createlob()`, a large value bound into PL/SQL, a LOB Var bound IN), in
+JDBC thin 11.2's form (#2803), and stays the default. The native form keeps no cursor
 cache, as a pooled session doesn't, so a repeated statement is parsed again:
 about 0.3 ms an execute on the 11g bed.
 

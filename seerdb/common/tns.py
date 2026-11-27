@@ -2448,6 +2448,27 @@ _LOBOPS_REQUEST: wire_schema.Schema = (
     ('when', 'charset_present', (('n2', 'charset'),)),
     _LOBOPS_READ[-1],
 )
+# A CREATE_TEMP below 12.1 (#2803), as JDBC thin 11.2 sends 10.2 and 11.2
+# alike and OCI 11.2 sends in its own widths (#2466): a READ's fields with
+# the SCN array's pointer and its one slot, and the amount's pointer, then the
+# charset, the SCN slot and the duration (10) again as the amount.
+_LOBOPS_CREATE_TEMP: wire_schema.Schema = (
+    *_LOBOPS_READ[:-1],
+    ('n2', 'charset'),
+    ('n4', 'scn'),
+    ('n8', 'amount'),
+)
+# Its reply: the new locator, the charset, the SCN slot -- a value that varies
+# from call to call, and is at times negative (`81 02`) -- and an amount of 1.
+# A prefix: the status follows.
+_CREATE_TEMP_REPLY_PRE12: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('be2', 'locator_length'),
+    ('bytes', 'locator', 'locator_length'),
+    ('n2', 'charset'),
+    ('n4', 'scn'),
+    ('n8', 'amount'),
+)
 # Its reply: the content as LOB_DATA, then the return parameters -- the
 # locator echoed and the amount read, in the LOB's own units -- then the
 # status (#405, #413, #903).
@@ -3303,6 +3324,10 @@ _LOBOPS_HEAD_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_HEAD, _THIN)
 _LOBOPS_HEAD_THIN = wire_schema.compile_encoder(_LOBOPS_HEAD, _THIN)
 _LOBOPS_REQUEST_THIN = wire_schema.compile_encoder(_LOBOPS_REQUEST, _THIN)
 _LOBOPS_REQUEST_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_REQUEST, _THIN)
+_LOBOPS_CREATE_TEMP_THIN = wire_schema.compile_encoder(_LOBOPS_CREATE_TEMP, _THIN)
+_CREATE_TEMP_REPLY_PRE12_FROM_THIN = wire_schema.compile_decoder(
+    _CREATE_TEMP_REPLY_PRE12, _THIN
+)
 _LOBOPS_READ_FROM_OCI = wire_schema.compile_decoder(_LOBOPS_READ, _OCI)
 _LOBOPS_READ_FROM_OCI_WIDE = wire_schema.compile_decoder(_LOBOPS_READ, _OCI_WIDE)
 _LOB_READ_REPLY_THIN = wire_schema.compile_encoder(_LOB_READ_REPLY, _THIN)
@@ -7764,6 +7789,21 @@ def decode_lobops_locator(Packet: bytes) -> bytes | None:
     if Head is None or not Head[0]:
         return None
     return Head[0]
+
+
+def decode_create_temp_reply(Packet: bytes) -> tuple[bytes | None, bytes]:
+    """A CREATE_TEMP's reply below 12.1 (#2803, _CREATE_TEMP_REPLY_PRE12): (the
+    new locator, bare, the status behind it). A failed call's reply is its
+    status alone: (None, the status). A reply cut short raises Truncated."""
+    if Packet[:1] != bytes([TTI_RPA]):
+        return (None, Packet)
+    try:
+        (Reply, Rest) = _CREATE_TEMP_REPLY_PRE12_FROM_THIN(Packet)
+    except IndexError as Exc:
+        raise Truncated(f'CREATE_TEMP: {Exc}') from Exc
+    if len(Reply['locator']) != Reply['locator_length']:
+        raise Truncated('CREATE_TEMP: the reply ends inside its locator')
+    return (bytes(Reply['locator']), bytes(Rest))
 
 
 def decode_lobops_value(Packet: bytes) -> int | None:
@@ -19463,6 +19503,21 @@ _LOBOPS_REQUEST_FIXED: dict[str, Any] = {
 # A CREATE_TEMP's empty locator, and the session duration it asks for.
 _CREATE_TEMP_LOCATOR_LENGTH = 40
 _LOB_DURATION_SESSION = 10
+# What JDBC thin 11.2's CREATE_TEMP sets beyond those fields, to 10.2 and 11.2
+# alike (#2803; _LOBOPS_CREATE_TEMP): the SCN array's pointer and one slot,
+# set to 1, and the amount's pointer, with the duration as the amount. Its
+# empty locator is OCI's (_OCI11_EMPTY_LOCATOR: the length 84, then zeros) cut
+# to the 40 bytes the source length gives. A BLOB's charset is 1, not the
+# session's.
+_CREATE_TEMP_PRE12_FIELDS: dict[str, Any] = {
+    'scn_present': True,
+    'scn_length': 1,
+    'amount_present': True,
+    'locator': (84).to_bytes(2, 'big') + bytes(_CREATE_TEMP_LOCATOR_LENGTH - 2),
+    'scn': 1,
+    'amount': _LOB_DURATION_SESSION,
+}
+_CREATE_TEMP_PRE12_BLOB_CHARSET = 1
 
 
 def _lobops_write_data(Data: bytes, FieldVersion: int) -> bytes:
@@ -19504,14 +19559,17 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     }
     if Dictionary.get('create_temp'):
         # CREATE_TEMP (op 0x0110, #91): allocate a session-duration temporary
-        # LOB; the server returns the new locator in the response RPA. 12c+ only;
-        # 11g rejects CREATE_TEMP.
-        Fields.update(
-            _create_temp_fields(
-                bool(Dictionary.get('is_blob')), Dictionary.get('csfrm', _CSFRM_DB)
-            )
-        )
-        return _LOBOPS_REQUEST_THIN(Fields)
+        # LOB; the server returns the new locator in the response RPA.
+        IsBlob = bool(Dictionary.get('is_blob'))
+        Fields.update(_create_temp_fields(IsBlob, Dictionary.get('csfrm', _CSFRM_DB)))
+        if FieldVersion >= FIELD_VERSION_12_1:
+            return _LOBOPS_REQUEST_THIN(Fields)
+        # Below 12.1, JDBC thin 11.2's form (#2803), the one 10.2 and 11.2
+        # take: python-oracledb's 12.1 one is refused there.
+        Fields.update(_CREATE_TEMP_PRE12_FIELDS)
+        if IsBlob:
+            Fields['charset'] = _CREATE_TEMP_PRE12_BLOB_CHARSET
+        return _LOBOPS_CREATE_TEMP_THIN(Fields)
     Locator = Dictionary['locator']
     Operation = Dictionary.get('operation', TNS_LOB_OP_READ)
     if Operation == TNS_LOB_OP_WRITE:
@@ -21969,12 +22027,7 @@ def decode_oci11_lobop(
 _OCI11_LOB_DURATION_SESSION = 10
 _OCI11_TEMP_LOCATOR_LENGTH = 86
 _OCI11_EMPTY_LOCATOR = prefixed_locator(bytes(_OCI11_TEMP_LOCATOR_LENGTH - 2))
-_OCI11_LOBOPS_CREATE_TEMP: wire_schema.Schema = (
-    *_LOBOPS_READ[:-1],
-    ('n2', 'charset'),
-    ('n4', 'scn'),
-    ('n8', 'amount'),
-)
+_OCI11_LOBOPS_CREATE_TEMP = _LOBOPS_CREATE_TEMP
 _OCI11_LOBOPS_CREATE_TEMP_OCI_WIDE = wire_schema.compile_encoder(
     _OCI11_LOBOPS_CREATE_TEMP, _OCI_WIDE
 )

@@ -3367,7 +3367,8 @@ class OracleConnect(_ConnectionLogic):
         can be written, read, trimmed and bound as a parameter -- which is the
         point: a statement that needs a genuine LOB argument (a large value into
         ``sys.xmltype()``, say) cannot take the same data as a plain string, the
-        server refuses it (ORA-01461). 12.1+ only."""
+        server refuses it (ORA-01461). 12.1+, or a thin session to a 10.2+
+        server (#2803)."""
 
         from seerdb.common.lob import LOB
         from seerdb.common.tns_consts import TNS_TYPE_BLOB
@@ -3401,9 +3402,9 @@ class OracleConnect(_ConnectionLogic):
         # Create a session-duration temporary LOB on the server (TTI_LOBOPS
         # CREATE_TEMP, #91) and return its locator. Used to bind a large LOB
         # value into a PL/SQL locator parameter, where the streamed-LONG bind
-        # path fails with ORA-01460. 12c+ only — 11g rejects CREATE_TEMP — so
-        # callers gate on field_version. The response is a single TTI_RPA token
-        # carrying the new locator: 0x08, ub2 length, then the locator bytes.
+        # path fails with ORA-01460. Callers gate on temp_lobs_available. The
+        # response is a TTI_RPA token carrying the new locator: 0x08, ub2
+        # length, then the locator bytes (_created_temp_lob).
         if dialect_temp_lobs(self._dialect):
             # A pooled 11g session makes its own (#2466).
             return cast(
@@ -3419,13 +3420,7 @@ class OracleConnect(_ConnectionLogic):
         Received = self._next_data_packet(b'', b'')
         if Received is False:
             raise connection_closed('CREATE_TEMP')
-        (_, Packet) = Received
-        Locator = decode_lobops_locator(Packet)
-        if Locator is None:
-            raise InternalError(
-                f'unexpected CREATE_TEMP response: {Packet[:8].hex() if Packet else None!r}'
-            )
-        return Locator
+        return self._created_temp_lob(Received[1])
 
     def lob_write(
         self,
@@ -3490,8 +3485,8 @@ class OracleConnect(_ConnectionLogic):
         # #91), starting at offset 1. CLOB content goes on the wire as UTF-16BE;
         # BLOB content is raw bytes. The server answers with TTI_RPA (updated
         # locator + bytes written) followed by TTI_OER (call status); we walk to
-        # the OER and raise on a real error. 12c+ only (paired with
-        # create_temp_lob). The encoder chunks payloads > 0xFC bytes itself.
+        # the OER and raise on a real error. Paired with create_temp_lob. The
+        # encoder chunks payloads > 0xFC bytes itself.
         if dialect_temp_lobs(self._dialect):
             # Through the LOB object's write, a pooled 11g session's own form
             # (#2466): the text in UTF-16, counted in its code units.
@@ -3504,19 +3499,22 @@ class OracleConnect(_ConnectionLogic):
             DictionaryType.lobops,
             locator=Locator,
             data=Payload,
+            # Its length in the LOB's units, which 10g needs (#2803).
+            amount=len(Payload) if is_blob else len(Payload) // 2,
             operation=TNS_LOB_OP_WRITE,
         )
         self.send(TNS_DATA, encode_dictionary(Dict))
-        self._confirm_lobops()
+        self._confirm_lobops(Amount=self.field_version < FIELD_VERSION_12_1)
 
-    def _confirm_lobops(self) -> None:
+    def _confirm_lobops(self, Amount: bool = False) -> None:
         # Drain a TTI_LOBOPS response that carries no content (WRITE / temp /
         # BFILE open-close ops): receive the RPA + OER packet and raise on a
-        # non-zero ORA error.
+        # non-zero ORA error. `Amount`: the request sent one, which the reply
+        # echoes (#2803).
         Received = self._next_data_packet(b'', b'')
         if Received is False:
             raise connection_closed('LOBOPS')
-        self._raise_lobops_error(Received[1])
+        self._raise_lobops_error(Received[1], Amount)
 
     def lob_operation(
         self, Locator: bytes, Operation: int, Amount: int = 0

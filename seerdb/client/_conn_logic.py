@@ -649,10 +649,10 @@ class _ConnectionLogic:
                 f'not {lob_type!r}'
             )
         if not temp_lobs_available(self):
-            # The temp LOB it sits on is a CREATE_TEMP, which 11g's converted
-            # form refuses (#91); a pooled 11g session makes its own (#2466).
+            # The temp LOB it sits on is a CREATE_TEMP: thin from 10.2 (#2803),
+            # and a pooled 11g session makes its own (#2466).
             raise NotSupportedError(
-                'createlob() requires an Oracle 12.1+ server (it makes a server '
+                'createlob() requires an Oracle 10.2+ server (it makes a server '
                 'temporary LOB, which older servers refuse)'
             )
         return (tns_type, lob_type.csfrm)
@@ -1694,6 +1694,25 @@ class _ConnectionLogic:
         itself -- 9i's LOBOPS form, persistent-LOB writes included (#2259)."""
         return dialect_lob_objects(self._lob_dialect())
 
+    def _created_temp_lob(self, Packet: bytes) -> bytes:
+        # The new temporary LOB's locator from a CREATE_TEMP's reply, raising
+        # the server's error. Below 12.1 the reply's own form (#2803), its
+        # status checked; from 12.1 the locator the reply leads with.
+        from seerdb.common.exceptions import InternalError
+        from seerdb.common.tns import decode_create_temp_reply, decode_lobops_locator
+        from seerdb.common.tns_consts import FIELD_VERSION_12_1
+
+        if self.field_version >= FIELD_VERSION_12_1:
+            Locator = decode_lobops_locator(Packet)
+        else:
+            (Locator, Status) = decode_create_temp_reply(Packet)
+            self._raise_lobops_error(Status)
+        if Locator is None:
+            raise InternalError(
+                f'unexpected CREATE_TEMP response: {Packet[:8].hex() if Packet else None!r}'
+            )
+        return Locator
+
     def _raise_lobops_error(self, Packet: bytes, Amount: bool = False) -> None:
         # Decode the OER trailing a content-free LOBOPS response and raise on a
         # real ORA error. decode_lobops_oer skips the RPA's binary locator and
@@ -1808,12 +1827,22 @@ def plsql_inline_limit(Conn) -> int:
 
 
 def temp_lobs_available(Conn) -> bool:
-    """Whether the connection can make a temporary LOB to bind: 12c+, or a
-    dialect that makes one itself."""
-    from seerdb.common.tns_consts import FIELD_VERSION_12_1
+    """Whether the connection can make a temporary LOB to bind: 12c+, a thin
+    session to a 10.2+ server, in JDBC thin 11.2's form (#2803), or a dialect
+    that makes one itself."""
+    from seerdb.common.tns_consts import FIELD_VERSION_10_2, FIELD_VERSION_12_1
 
-    return getattr(Conn, 'field_version', 0) >= FIELD_VERSION_12_1 or (
-        dialect_temp_lobs(getattr(Conn, '_dialect', None))
+    Dialect = getattr(Conn, '_dialect', None)
+    FieldVersion = getattr(Conn, 'field_version', 0)
+    if FieldVersion >= FIELD_VERSION_12_1 or dialect_temp_lobs(Dialect):
+        return True
+    # A thin OALL8 session to 9.2 runs at 10.2 too; its server is 9.2's.
+    Below = getattr(Conn, '_server_below_10_2', None)
+    return (
+        Dialect is None
+        and FieldVersion >= FIELD_VERSION_10_2
+        and Below is not None
+        and not Below()
     )
 
 

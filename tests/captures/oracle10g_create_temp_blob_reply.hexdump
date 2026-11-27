@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# Oracle 10.2.0.5's reply to JDBC thin 11.2's CREATE_TEMP of a BLOB (#2803): the
+# new locator, the charset (1), the SCN slot (`81 4d`, negative), the amount 1, the status.
+# Captured 2026-11-27 through tools/capture_proxy.py. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column
+# and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  08 00 26 00 01 01 08 00  03 00 01 00 00 fb 36 91  |..&...........6.|
+00000010  00 00 00 00 02 00 00 00  0a 00 00 00 01 00 00 00  |................|
+00000020  00 f8 30 84 21 d2 6a 98  2c 01 01 81 4d 01 01 04  |..0.!.j.,...M...|
+00000030  01 01 01 08 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+00000040  00 00 00 00 00 00 00 05  00 01 01 00 00 00 00     |...............|
+0000004f
