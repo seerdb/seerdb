@@ -16240,12 +16240,17 @@ def _encode_o7_lobop(
     return (_O7_LOBOPS_O8I if O8i else _O7_LOBOPS_THIN)(Values)
 
 
-def encode_o7_create_temp(Seq: int, is_blob: bool, csfrm: int, charset: int) -> bytes:
+def encode_o7_create_temp(
+    Seq: int, is_blob: bool, csfrm: int, charset: int, O8i: bool = False
+) -> bytes:
     """A 9i CREATE_TEMP (SeerODBC #169), as ojdbc14 sends 9.2.0.4: an empty
     86-byte locator as the source, the session duration (10) in the
     destination length and the amount, the charset form and the LOB type in
     the two offsets, and the charset after the locator. The reply is the RPA
-    with the new locator (decode_o7_create_temp)."""
+    with the new locator (decode_o7_create_temp).
+
+    ``O8i``: the same fields at the 8i codec's widths, as OCI 9.2's
+    OCILobCreateTemporary sends 8.1.7 (#2803), a BLOB's charset 0."""
     Values = {
         'seq': Seq,
         'token_number': None,
@@ -16262,10 +16267,10 @@ def encode_o7_create_temp(Seq: int, is_blob: bool, csfrm: int, charset: int) -> 
         'scn_present': False,
         'scn_length': 0,
         'locator': _O7_EMPTY_LOCATOR,
-        'charset': charset,
+        'charset': 0 if O8i and is_blob else charset,
         'short_amount': _OCI11_LOB_DURATION_SESSION,
     }
-    return _O7_LOBOPS_THIN(Values)
+    return (_O7_LOBOPS_O8I if O8i else _O7_LOBOPS_THIN)(Values)
 
 
 def decode_o7_create_temp(Data: bytes) -> bytes:
@@ -16636,7 +16641,14 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
         Typ = cast(Any, _oci11_object_type(Value))
         return _o8i_typed_bind_oac(TNS_TYPE_ADT, Typ.oid, Typ.version)
     Flag = 0x03
-    if isinstance(Value, Var):
+    if isinstance(Value, TempLob):
+        # A temporary LOB bound by its locator (#2803), IN, OUT or IN OUT, as
+        # OCI 9.2 binds one to 8.1.7: flag 0, a size of 32, a CLOB's charset and
+        # form, none for a BLOB.
+        DType = TNS_TYPE_BLOB if Value.is_blob else TNS_TYPE_CLOB
+        Flag, MaxSize = 0x00, 0x20
+        (Charset, Csform) = (0, 0) if Value.is_blob else (31, Value.csfrm)
+    elif isinstance(Value, Var):
         DType = Value.dbtype.tns_type
         if DType in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
             # A CLOB / BLOB is bound by its locator, as sqlplus 9.2 binds one to
@@ -16754,12 +16766,15 @@ def _encode_8i_bind_value(Value: object) -> bytes:
         return _oci11_object_bind_value(Value, _O9I_OBJECT_CELL_O8I)
     if _is_oci11_array_var(Value):
         return _encode_pre10_array_value(Value, _encode_8i_bind_value)
+    if isinstance(Value, TempLob):
+        # A temporary LOB's locator, as its CREATE_TEMP framed it (#2803).
+        return _encode_8i_lob_locator(prefixed_locator(Value.locator))
     if isinstance(Value, Var) and Value.dbtype.tns_type in (
         TNS_TYPE_CLOB,
         TNS_TYPE_BLOB,
     ):
-        # A LOB goes as its locator, an OUT one's empty; 8i makes no temporary
-        # LOB, so text or bytes the Var holds have no locator to go as.
+        # A LOB goes as its locator, an OUT one's empty; text or bytes the Var
+        # holds went as a temporary LOB before here (#2803).
         Held = Value._value if Value.has_value else None
         if isinstance(Held, LOB):
             return _encode_8i_lob_locator(bytes(Held.raw))

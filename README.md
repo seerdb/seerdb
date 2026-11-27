@@ -448,10 +448,10 @@ collection columns and binds, IN and OUT, as `DbObject`s, REF columns and binds,
 PL/SQL associative-array binds (`arrayvar`) in a block, CLOB / BLOB columns as
 LOB objects with their calls (read, write, trim, size, open and close, and a
 BFILE's `fileexists()`, as OCI 9.2 makes them; `fetch_lobs=False` reads the
-content at fetch time, #2804), native BFILE reads, CLOB / BLOB OUT binds and
-`RETURNING` (their value is the text or bytes: 8i makes
-no temporary LOB, so an IN OUT LOB Var holding text and a block value past
-32512 bytes are refused), LONG / LONG RAW, ROWID / UROWID, AQ on a RAW or an object
+content at fetch time, #2804), native BFILE reads, temporary LOBs (`createlob()`,
+a block value past 32512 bytes, a LOB Var holding text or bytes), as OCI 9.2
+makes them on 8.1.7 (#2803), CLOB / BLOB OUT binds and `RETURNING` (their value
+is the text or bytes), LONG / LONG RAW, ROWID / UROWID, AQ on a RAW or an object
 queue as OCI 9.2 enqueues and dequeues (no dequeue condition, which 8.1.7 lacks;
 #2805), `cursor.warning` for an object that compiled with errors,
 `cursor.bind_directions` for a block, `DatabaseError.offset` (#2804), and

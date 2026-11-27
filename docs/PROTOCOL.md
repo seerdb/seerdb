@@ -7246,6 +7246,21 @@ A CLOB's text is the single-byte database charset the whole 8i session speaks
 `é`'s two bytes outran an amount counted in characters, and 8.1.7 ended the
 session at the next call (TNS-12572).
 
+**A temporary LOB (#2803).** OCI 9.2's `OCILobCreateTemporary`, captured
+against 8.1.7, is 9i's `CREATE_TEMP` (`encode_o7_create_temp`, ojdbc14's form
+to 9.2) at the 8i codec's widths, with a BLOB's charset 0. A CLOB's is the
+database charset, WE8ISO8859P1, which the session speaks (OCI 9.2 sent 1, its
+own US7ASCII with no NLS_LANG set). The reply is the RPA with the 86-byte
+locator (`decode_o7_create_temp`). It is written and read with the LOB
+object's calls above. Bound by its locator, IN, OUT or IN OUT, it goes as OCI
+9.2 binds one to 8.1.7: the 25-byte 8i descriptor with flag 0, a size of 32
+and a CLOB's charset and form (none for a BLOB), then a `ub4` 86, a length
+byte and the locator with its `ub2`. So `createlob()`, a block value past
+32512 bytes and a LOB Var holding text or bytes all go as one, as on every
+later tier. An OUT or IN OUT LOB still comes back as its text or bytes
+(SeerODBC #167). 8.1.7's PL/SQL takes no VARCHAR2 for a CLOB parameter
+(PLS-00306), so a short string meant for one has to be a LOB too.
+
 ### 19.16 Oracle 8i LONG / LONG RAW read — the fetch long-size field (#377)
 
 A LONG (TNS type 8) or LONG RAW (type 24) value rides in the RXD as an ordinary

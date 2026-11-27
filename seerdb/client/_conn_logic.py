@@ -1461,6 +1461,9 @@ class _ConnectionLogic:
         # modern (10g->23ai) keeps _dialect None and takes the TTI_ALL8 path.
         if is_8i:
             self._dialect = O8iDialect(self._next_seq)
+            # A temporary LOB is made in the database's charset (#2803).
+            self._dialect._db_charset = getattr(self, '_server_charset', None)
+            self._dialect._db_ncharset = getattr(self, '_server_ncharset', None)
         elif getattr(self, '_native11', False):
             # A pooled 11g session speaks the native form throughout (#2466),
             # as a dedicated 11g or 10g one does with `oall8` (#2463, #2518).
