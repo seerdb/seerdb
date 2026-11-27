@@ -5008,10 +5008,23 @@ OAC (`_encode_lob_bind_oac`, type `0x70` / `0x71`, cont-flag `0x02000000`, the
 server rejects with ORA-03120), and its value rides as the temp-LOB locator
 (`Cursor._promote_lob_var_binds`). A NULL such Var (a pure OUT bind, or a NULL
 IN) is not promoted and keeps the OAC with a NULL value. This is what closed the
-last of the six declared-type bind encoders (#902). On a thin 10g or 11g
-session a declared LOB Var with a value binds IN this way; the OAC itself has
-not been measured below 12.1, so a NULL such Var, and so a LOB OUT bind, raises
-`NotSupportedError` there (#2803).
+last of the six declared-type bind encoders (#902).
+
+**Below 12.1** a LOB binds with the OAC JDBC thin 11.2 sends 10.2 and 11.2
+(`_pre12_lob_bind_oac`, #2803), for a declared LOB Var, a temporary LOB and
+a fetched LOB alike, IN and OUT:
+
+```
+70 03 00 00 02 0f a0 00 00 00 00 02 03 69 01 00   # a CLOB; 71 for a BLOB
+```
+
+That is the older OAC layout: flags 3, a buffer of 4000, no LOB cont-flag, and
+the session's charset with form 1, for a BLOB too. An NCLOB takes AL16UTF16
+and form 2, as its other binds do there (not captured). A LOB OUT value comes
+back in 12.1's shape: a `ub4` length, then the locator with its `ub2`, as a
+value. The converted form gets this from 10.2. A thin OALL8 session to 9.2
+runs at 10.2's field version but makes no temporary LOB to back a LOB Var, so
+there a LOB Var still raises `NotSupportedError`.
 
 ### 14.5 Temp-LOB WRITE (the Mirror, server side, #412)
 

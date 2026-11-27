@@ -418,16 +418,7 @@ def _target_of(conn) -> _Target:
             getattr(conn, '_dialect', None) is None
             and conn.field_version >= FIELD_VERSION_10_2
         ),
-        # A thin 10g or 11g session makes a temporary LOB (#2803) but binds no
-        # LOB OUT yet.
-        (
-            temp_lobs_available(conn)
-            and (
-                conn.field_version >= FIELD_VERSION_12_1
-                or getattr(conn, '_dialect', None) is not None
-            )
-        )
-        or _dialect_binds_lob_outs(conn),
+        temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
         conn.field_version,
         conn._scrolls_server_side(),
     )
@@ -662,11 +653,6 @@ _LOB_VAR_BIND = _Need(
 )
 _LOB_OUT_BIND = _Need(
     'a LOB OUT bind needs a session that binds a LOB Var, or 8i or 9i (SeerODBC #167)',
-    lob_out=True,
-)
-_NULL_LOB_VAR_BIND = _Need(
-    'a NULL LOB Var binds with the LOB bind OAC, which a thin session below 12.1 '
-    'does not send yet (#2803)',
     lob_out=True,
 )
 _REFCURSOR_IN_BIND = _Need(
@@ -8664,7 +8650,6 @@ class CreateLobIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [(1, 1, 1), (2, 50000, 40000), (3, 3, 2)])
 
-    @_requires(_NULL_LOB_VAR_BIND)
     def test_a_declared_null_lob_in_an_executemany(self):
         # A NULL row keeps the LOB bind with a NULL value, among rows that go
         # as temporary LOBs (#902); a pooled 11g session sends it as OCI 11.2
