@@ -4982,8 +4982,34 @@ The reply (`_CREATE_TEMP_REPLY_PRE12`) is the new locator, the charset, the SCN
 slot and an amount of 1, then the status. The SCN slot varies from call to
 call and is at times negative (`81 02`, `81 4d`), so it is read as a signed
 `ub4`. A `WRITE` into the temporary LOB carries its amount, as one into a
-persistent LOB does there (§14.2). A thin OALL8 session to 9.2 runs at 10.2's
-field version, but its server is 9.2's and makes none.
+persistent LOB does there (§14.2).
+
+**On a thin OALL8 session to 9.2** (`thin_oall8=True`), JDBC thin 11.2 makes
+the temporary LOB in 9i's own LOBOPS form, the compact dialect's
+(`_O7_LOBOPS`), with the SCN array's pointer and its one slot set to 1 behind
+the duration (`_O7_LOBOPS_CREATE_TEMP`, `encode_thin92_create_temp`). The CLOB's
+charset is the database's; a BLOB's is 1. ojdbc14's form, which the compact
+dialect sends, has no SCN slot, and there 9.2 closes the connection on it.
+The writes, reads and other LOB calls go in the compact form too, through the
+session's compact dialect, CLOB text in the database charset.
+
+seerdb departs from ojdbc6 in one field, the locator's space:
+
+- **ojdbc6 offers 40 bytes**, 10.2's size, and 9.2 writes 38 of its 84-byte
+  locator into them, behind the `00 54` it was sent. The reply's last word is
+  then 64; it is 0 when the locator fits.
+- **Framed with its own length** (`00 26`) as every other bare locator is, that
+  cut locator drops the connection on a block that copies it (a PL/SQL local
+  assigned from an IN OUT CLOB). Kept verbatim, as ojdbc6 binds it, it works.
+- **seerdb offers ojdbc14's 86 bytes** (`_O7_EMPTY_LOCATOR`), so the locator
+  comes back whole, 84 bytes behind `00 54`. It then frames like any other.
+
+The reply (`_THIN92_CREATE_TEMP_REPLY`) is the locator, the charset, the SCN
+slot (1) and that word, then the status in 9.2's form. A LOB binds with the
+10.2 descriptor below; JDBC thin 11.2 declares the database's charset in it to
+9.2 (`01 1f`), and 9.2 converts from AL32UTF8 there as for a text bind (#2768).
+9.2 answers a RETURNING of a NULL LOB with an empty locator (`00 54` and
+zeros), which reads as `None`.
 
 An earlier attempt on 11g's converted form (#2463) sent OCI 11.2's fields with
 an 86-byte empty locator and an SCN slot of 0. That locator was answered, but
@@ -4997,8 +5023,8 @@ the `WRITE` into it, sent without its amount, ended the server process with
 form every later LOBOPS call on it expects (without it the server answers
 ORA-22275). Bound as a parameter it becomes the `TempLob` marker above, which
 takes the bare locator and writes its own `ub2`. A `LOB` that a query returned
-is not rebound this way; its bind has not been measured. Also 12.1+, or a thin
-session to a 10.2+ server.
+is not rebound this way; its bind has not been measured. Also 12.1+, a thin
+session to a 10.2+ server, or a thin OALL8 one to 9.2.
 
 A bind **declared** a CLOB / BLOB — `cursor.var(DB_TYPE_CLOB)` or
 `setinputsizes(DB_TYPE_BLOB)` — promotes the same way, on any statement and any
@@ -5022,9 +5048,9 @@ That is the older OAC layout: flags 3, a buffer of 4000, no LOB cont-flag, and
 the session's charset with form 1, for a BLOB too. An NCLOB takes AL16UTF16
 and form 2, as its other binds do there (not captured). A LOB OUT value comes
 back in 12.1's shape: a `ub4` length, then the locator with its `ub2`, as a
-value. The converted form gets this from 10.2. A thin OALL8 session to 9.2
-runs at 10.2's field version but makes no temporary LOB to back a LOB Var, so
-there a LOB Var still raises `NotSupportedError`.
+value. The converted form gets this from 10.2, and a thin OALL8 session to 9.2
+too, which runs at 10.2's field version and makes its temporary LOBs in 9.2's
+form (above).
 
 ### 14.5 Temp-LOB WRITE (the Mirror, server side, #412)
 

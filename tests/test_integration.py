@@ -388,7 +388,9 @@ def _target_of(conn) -> _Target:
         conn.server_version >> 24,
         os.environ.get('SEERDB_TEST_MIRROR', ''),
         temp_lobs_available(conn),
-        getattr(conn, '_dialect', None) is not None,
+        # A thin OALL8 session to 9.2 wraps a RETURNING as the compact one does.
+        getattr(conn, '_dialect', None) is not None
+        or bool(getattr(conn, '_thin92', False)),
         bool(getattr(conn, '_native11', False))
         and getattr(conn, 'server_type', None) == 'pooled',
         conn.field_version >= FIELD_VERSION_12_1
