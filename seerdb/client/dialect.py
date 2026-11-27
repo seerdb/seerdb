@@ -1561,6 +1561,10 @@ class O8iDialect(Oall8Dialect):
     type so the login tier stays detectable and the 9i OALL8 dialect distinct."""
 
     _close_on_fetch = True
+    # The database's charset and its national one, from the login (#2803): a
+    # temporary LOB is made in the one its type has.
+    _db_charset: int | None = None
+    _db_ncharset: int | None = None
     # A reusable DML's cursor stays open and is re-executed by id (#2804), as
     # OCI 9.2 keeps a statement handle's on 8.1.7; DDL and a PL/SQL block close
     # them all, as on 9i's native form (#2535).
@@ -1590,7 +1594,32 @@ class O8iDialect(Oall8Dialect):
     # connection reads LOB content at fetch time.
 
     def capabilities(self) -> frozenset[str]:
-        return super().capabilities() | {CAP_LOB_OBJECT}
+        return super().capabilities() | {CAP_LOB_OBJECT, CAP_TEMP_LOB}
+
+    def create_temp_lob(self, is_blob: bool, csfrm: int = 1):
+        # A temporary CLOB, NCLOB (csfrm 2) or BLOB of the session's duration,
+        # as OCI 9.2's OCILobCreateTemporary makes one on 8.1.7 (#2803): 9i's
+        # CREATE_TEMP at the 8i codec's widths, in the database's charset -- its
+        # national one for an NCLOB. Returns the bare locator; an error is an 8i
+        # status alone, raised.
+        from seerdb.common.tns import decode_o7_create_temp, encode_o7_create_temp
+
+        charset = self._db_ncharset if csfrm == 2 else self._db_charset
+        yield Send(
+            encode_o7_create_temp(
+                self._next_seq(),
+                is_blob,
+                0 if is_blob else csfrm,
+                charset or AL32UTF8_CHARSET,
+                O8i=True,
+            )
+        )
+        resp = yield RECV
+        if resp is False:
+            raise connection_closed('8i CREATE_TEMP')
+        if resp[1][:1] == bytes([TTI_OER]):
+            _raise_ora(*decode_8i_terminal_error(resp[1]))
+        return decode_o7_create_temp(resp[1])
 
     def resolve_lobs(self, rows: list, columns: list):
         if self.keep_lobs:

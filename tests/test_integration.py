@@ -178,6 +178,21 @@ _8I_UNSUPPORTED = (
     ('lob_attribute', "8.1.7's SQL has no TO_CLOB / TO_BLOB"),
     ('large_object_image', "8.1.7's SQL has no TO_CLOB / TO_BLOB"),
     ('a_lob_call_in_a', "8.1.7's SQL has no TO_CLOB / TO_BLOB"),
+    # 8i makes temporary LOBs (#2803); these tests' SQL and text need what
+    # 8.1.7 lacks.
+    (
+        'fetch_lobs_false_materialises_an_out_bind',
+        "8.1.7's SQL has no TO_CLOB / TO_BLOB",
+    ),
+    (
+        'small_bind_unaffected',
+        "8.1.7's PL/SQL takes no VARCHAR2 for a CLOB parameter (PLS-00306)",
+    ),
+    (
+        'repeated_mixed_sizes_stay_synced',
+        "8.1.7's PL/SQL takes no VARCHAR2 for a CLOB parameter (PLS-00306)",
+    ),
+    ('createlob_binds_as_a_lob', "8i's national charset is WE8ISO8859P1"),
     (
         'collection_value_from_a_one_element_constructor',
         "8.1.7 takes no N'' literal into a VARCHAR2 element (ORA-12704)",
@@ -10257,7 +10272,7 @@ class LOBOutBindIntegration(_IntegrationBase):
         Var = self.cur.var(seerdb.DB_TYPE_CLOB)
         Var.setvalue(0, 'small')
         self.cur.execute("BEGIN DBMS_LOB.WRITEAPPEND(:d, 3, 'END'); END;", [Var])
-        self.assertEqual(Var.getvalue().read(), 'smallEND')
+        self.assertEqual(_lob_content(self.conn, Var.getvalue()), 'smallEND')
 
     @_requires(_LOB_VAR_BIND)
     def test_inout_clob_var_over_the_promotion_threshold(self):
@@ -10277,7 +10292,7 @@ class LOBOutBindIntegration(_IntegrationBase):
             END;""",
             [Var],
         )
-        Value = Var.getvalue().read()
+        Value = _lob_content(self.conn, Var.getvalue())
         self.assertEqual(len(Value), 50005)
         self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
 
@@ -10296,7 +10311,9 @@ class LOBOutBindIntegration(_IntegrationBase):
             END;""",
             [Var],
         )
-        self.assertEqual(Var.getvalue().read(), b'L' * 52345 + b'Q' * 6)
+        self.assertEqual(
+            _lob_content(self.conn, Var.getvalue()), b'L' * 52345 + b'Q' * 6
+        )
 
     @_requires(_LOB_VAR_BIND)
     def test_fetch_lobs_false_materialises_an_out_bind(self):
@@ -15903,7 +15920,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                 END;""",
                 [Var],
             )
-            self.assertEqual(await Var.getvalue().aread(), 'A' * 50000 + 'B' * 5)
+            # 8i hands back the text itself (SeerODBC #167).
+            Value = Var.getvalue()
+            if not isinstance(Value, str):
+                Value = await Value.aread()
+            self.assertEqual(Value, 'A' * 50000 + 'B' * 5)
         finally:
             await Conn.close()
 
