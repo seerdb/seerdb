@@ -358,25 +358,10 @@ class LOB:
         return self._connection
 
     def _require_mutable(self):
-        # Writing a PERSISTENT LOB locator is 11g and up. Measured on every
-        # tier: the ub2-prefixed locator form a temp LOB uses is answered
-        # ORA-22275 everywhere, and the bare form that 11g / 21c / 23ai accept
-        # makes 10g DROP THE CONNECTION outright -- taking the row lock with it,
-        # so the next statement then fails ORA-00054. Refusing up front is the
-        # only honest option until 10g's form is found (#964).
-        from seerdb.common.exceptions import NotSupportedError
-        from seerdb.common.tns_consts import FIELD_VERSION_11_2
-
-        conn = self._require_connection()
-        native = getattr(conn, 'dialect_serves_lobs', None)
-        if native is not None and native():
-            return conn  # 9i writes through its own LOBOPS form (#2259)
-        if getattr(conn, 'field_version', FIELD_VERSION_11_2) < FIELD_VERSION_11_2:
-            raise NotSupportedError(
-                'modifying a LOB needs Oracle 11g or later; on 10g the server '
-                'closes the connection on a persistent-LOB write'
-            )
-        return conn
+        # Every tier writes a PERSISTENT LOB locator: 9i and 8i through their
+        # own LOBOPS form (#2259, #2804), 10g and 11g with the WRITE's amount
+        # that 10g needs (#2803), 12c+ without it (#964).
+        return self._require_connection()
 
     def _charset(self) -> dict:
         # A 9i LOB's column charset for the connection's read and write, which

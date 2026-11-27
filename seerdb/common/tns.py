@@ -7784,7 +7784,9 @@ def decode_lobops_value(Packet: bytes) -> int | None:
     return Value
 
 
-def decode_lobops_oer(Packet: bytes, FieldVersion: int) -> tuple[int, str | None]:
+def decode_lobops_oer(
+    Packet: bytes, FieldVersion: int, Amount: bool = False
+) -> tuple[int, str | None]:
     # Pull the (error code, message) out of a content-free TTI_LOBOPS response
     # (WRITE / temp ops): TTI_RPA (updated locator + amount) optionally followed
     # by a trailing charset, then TTI_OER. The RPA's locator is binary and may
@@ -7793,6 +7795,11 @@ def decode_lobops_oer(Packet: bytes, FieldVersion: int) -> tuple[int, str | None
     # locator. The OER call status is NOT fixed (1 for a standalone op, 5 right
     # after a PL/SQL call), so match the token + a valid ub4 length only, never
     # a specific status value.
+    #
+    # `Amount`: the request sent an amount, which the reply echoes after the
+    # locator, as a WRITE below 12.1 does (#2803). It is skipped too: a WRITE of
+    # 4 units answers `01 04 04 ...`, and the scan took the amount's 04 for the
+    # status.
     _DECODE_FIELD_VERSION.set(FieldVersion)
     Pos = 0
     if Packet and Packet[0] == TTI_RPA and len(Packet) >= 3:
@@ -7800,6 +7807,8 @@ def decode_lobops_oer(Packet: bytes, FieldVersion: int) -> tuple[int, str | None
         # OER to find.
         Head = _decode_lob_reply_head(Packet)
         Packet = Head[1] if Head is not None else b''
+        if Amount and Packet and Packet[0] != TTI_OER:
+            Packet = _ThinCodec.read_n8(Packet)[1]
     while Pos < len(Packet) - 1:
         if Packet[Pos] == TTI_OER and 1 <= Packet[Pos + 1] <= 4:
             Result = decode_token_oer(Packet[Pos:], (None, None, []))
@@ -19496,9 +19505,13 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
     if Operation == TNS_LOB_OP_WRITE:
         # WRITE (op 0x0040, #91): push `data` into the LOB at `source_offset`.
         # Reverse-engineered from python-oracledb on 21c (small + 60 KB CLOB
-        # writes, byte-for-byte). Unlike a READ it sends no amount, and its data
-        # follows as a LOB_DATA message. CLOB data must already be UTF-16BE; BLOB
-        # data is raw bytes.
+        # writes, byte-for-byte). Its data follows as a LOB_DATA message. CLOB
+        # data must already be UTF-16BE; BLOB data is raw bytes.
+        #
+        # From 12.1 it sends no amount. Below, it sends the `amount` the caller
+        # gives (characters for a CLOB, bytes for a BLOB), as JDBC thin 11.2
+        # does to 10.2 and 11.2 alike (#2803). 10.2 closes the connection on a
+        # WRITE without it; 11.2 takes either.
         #
         # A TEMP locator rides ub2-length-prefixed with the length counting the
         # prefix; a PERSISTENT (column) locator rides bare with its own length,
@@ -19514,6 +19527,8 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
                 'locator': Locator,
             }
         )
+        if FieldVersion < FIELD_VERSION_12_1 and 'amount' in Dictionary:
+            Fields.update({'amount_present': True, 'amount': Dictionary['amount']})
         return _LOBOPS_REQUEST_THIN(Fields) + _lobops_write_data(Dictionary['data'])
     if Operation in (
         TNS_LOB_OP_FILE_OPEN,

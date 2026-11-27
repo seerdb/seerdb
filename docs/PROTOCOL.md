@@ -1350,9 +1350,9 @@ The rest is as to 11g:
 - `TTI_PING`, the logoff and the password change;
 - the rows, the bit vector included.
 
-Only per-database identifiers differ: LOB locators and type OIDs. 10g closes
-the connection on the converted form's persistent-LOB write (#964), but not
-on this one's.
+Only per-database identifiers differ: LOB locators and type OIDs. Both forms
+write to a persistent LOB, the converted one with the amount 10g needs
+(§14.2, #2803).
 
 ### 4.2 Data Type Negotiation (TTI_DTY)
 
@@ -4676,10 +4676,10 @@ TTI_FUN | TTI_LOBOPS | SeqNum |
   ub1 scn_array_length       # 0
   ub8 source_offset          # 1-based offset into the LOB
   ub8 dest_offset            # 0 for plain reads
-  ub1 amount_pointer_flag    # 1 if amount is sent at end (READ), 0 for WRITE
+  ub1 amount_pointer_flag    # 1 if amount is sent at end (READ; a WRITE below 12.1)
   ub16be 0, 0, 0             # three reserved array-LOB slots
   [ locator ]                # see locator framing below
-  [ ub8  amount ]            # READ: amount to read (no trailing data)
+  [ ub8  amount ]            # READ: amount to read; WRITE below 12.1: amount written
   [ 0x0E + chunked-bytes ]   # WRITE: marker + payload (see §14.2)
 ```
 
@@ -4728,6 +4728,12 @@ bytes; otherwise a `0xFE` marker followed by repeated `<sb4 chunk_len><chunk>`
 (chunks `<= 0x7FFF` bytes) terminated by a zero-length chunk. CLOB data is
 UTF-16BE on the wire; BLOB data is raw. `source_offset` is the 1-based write
 position (1 = overwrite from start).
+
+Below 12.1 the WRITE also sends its amount: the amount pointer set, and the
+number of characters (a CLOB) or bytes (a BLOB) written behind the locator,
+ahead of the `0x0E` data. JDBC thin 11.2 sends 10.2 and 11.2 that form, the
+same bytes to both (#2803). 10.2 closes the connection on a WRITE without the
+amount, which is what 12.1+ clients send; 11.2 takes either.
 | `0x0020`  | TRIM              | Truncate the LOB                     |
 | `0x0040`  | WRITE             | Write content into the LOB           |
 | `0x0100`  | FILE_OPEN         | Open a BFILE                         |
