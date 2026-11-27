@@ -7213,18 +7213,22 @@ content size — both a present and an `EMPTY_CLOB()`/`EMPTY_BLOB()` cell carry
 with **no locator DALC**. Calling `decode_dalc` on a NULL cell (there is no
 locator) eats the indicator's first byte and desyncs every following row, so the
 decoder keys on `num_bytes == 0` → `None`, else reads the locator. Reading an
-**empty** LOB's content then returns a bare **`0x08`** piggyback with no `TTI_LOB`
-(`0x0e`) block — `_lob_read_8i` treats a non-`TTI_LOB` reply as empty (`''`/`b''`)
-rather than waiting for a zero-length chunk that never comes.
+**empty** LOB's content then returns no `TTI_LOB` (`0x0e`) block, the RPA
+(`0x08`) and the status alone, so there is no zero-length chunk to wait for:
+it reads as empty (`''`/`b''`).
 
 Unlike 9i's GETLEN + READ pair, 8i reads the whole value in **one** `TTI_LOBOPS`
 (`0x60`) READ from offset 1 (§19.17's request, `_O7_LOBOPS` at 8i's widths), its
 short amount the chars for a CLOB, bytes for a BLOB — pass a large value to read
-it all. The reply is the **shared `0e fe <chunks> 00`** content
-form (`decode_fv2_lob_chunks`), possibly spanning packets; CLOB text decodes with
-the column charset (WE8ISO8859P1), BLOB stays bytes (`decode_fv2_lob`). Encoder:
-`encode_8i_lob_read`; driver: `_lob_read_8i` / `_resolve_8i_lobs`. BFILE is a
-follow-up.
+it all. The reply is the **shared `0e fe <chunks> 00`** content form, then the
+RPA (the locator echoed and the amount read, `_O7_LOBOPS_REPLY` at 8i's
+widths), then the 8i status (`decode_8i_lob_read`). It spans packets split at
+no fixed point, so the read reads on to the status, not to the zero-length
+chunk: a read that stopped there left the RPA or the status, when they came in
+a later packet, for the next call to read as its own reply (#2850). CLOB text
+decodes with the column charset (WE8ISO8859P1), BLOB stays bytes. Encoder:
+`encode_8i_lob_read`; reader: `Oall8Dialect._read_8i_lob_reply`, which the
+fetch-time read, the LOB object's read and the BFILE read share.
 
 **A LOB object's calls (#2804).** 8.1.7 serves them all. OCI 9.2's
 `OCILobIsOpen`, `Open`, `Write`, `GetLength`, `Read`, `Trim`, `Close` and

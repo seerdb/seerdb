@@ -48,6 +48,7 @@ from seerdb.common.tns import (
     decode_8i_dml_rowid,
     decode_8i_error_position,
     decode_8i_exec_response,
+    decode_8i_lob_read,
     decode_8i_terminal_error,
     decode_8i_warn_flags,
     decode_9i_oall8_batch_errors,
@@ -1494,19 +1495,23 @@ class Oall8Dialect:
         # reads the whole value at once, unlike 9i's GETLEN + READ). The reply is
         # the shared `0e fe <chunks> 00` form, which may span packets.
         yield Send(encode_8i_lob_read(self._next_seq(), locator, 1 << 30))
+        return (yield from self._read_8i_lob_reply())
+
+    def _read_8i_lob_reply(self):
+        # An 8i READ's content, its reply read on to the status behind it
+        # (decode_8i_lob_read, #2850): 8i splits a long reply at no fixed point,
+        # and one left at the chunks' end was the next call's to misread. An
+        # empty LOB (EMPTY_CLOB / EMPTY_BLOB) has no content block, the RPA and
+        # the status alone (#387); an error is the status alone, raised.
         data = b''
         while True:
             received = yield RECV
             if received is False:
                 raise connection_closed('8i LOB read')
             data += received[1]
-            # An empty LOB (EMPTY_CLOB / EMPTY_BLOB) has no TTI_LOB (0x0e) content
-            # block — the server replies with a bare 0x08 piggyback — so there is
-            # no zero-length chunk to wait for; report it empty (#387).
-            if data[0] != TTI_LOB:
-                return b''
-            (content, complete) = decode_fv2_lob_chunks(data)
-            if complete:
+            (content, status) = decode_8i_lob_read(data)
+            if status is not None:
+                _raise_ora(*decode_8i_terminal_error(status))
                 return content
 
     def bfile_read(self, locator: bytes):
@@ -1544,18 +1549,8 @@ class Oall8Dialect:
             yield RECV  # drain FILE_CLOSE RPA + OER
 
     def read_lob_content(self):
-        # Accumulate an 8i TTI_LOBOPS READ reply until decode_fv2_lob_chunks reports
-        # the zero-length terminator (used by the BFILE read, where the amount is
-        # known non-zero, so no empty-LOB shortcut is needed).
-        data = b''
-        while True:
-            received = yield RECV
-            if received is False:
-                raise connection_closed('8i LOB READ')
-            data += received[1]
-            (content, complete) = decode_fv2_lob_chunks(data)
-            if complete:
-                return content
+        # An 8i READ's content, for the BFILE read (_read_8i_lob_reply).
+        return (yield from self._read_8i_lob_reply())
 
 
 class O8iDialect(Oall8Dialect):
@@ -1613,19 +1608,7 @@ class O8iDialect(Oall8Dialect):
                 offset,
             )
         )
-        data = b''
-        while True:
-            received = yield RECV
-            if received is False:
-                raise connection_closed('8i LOB read')
-            data += received[1]
-            if data[0] != TTI_LOB:
-                if data[:1] == bytes([TTI_OER]):
-                    _raise_ora(*decode_8i_terminal_error(data))
-                return b''
-            (content, complete) = decode_fv2_lob_chunks(data)
-            if complete:
-                return content
+        return (yield from self._read_8i_lob_reply())
 
     def lob_operation(
         self,
