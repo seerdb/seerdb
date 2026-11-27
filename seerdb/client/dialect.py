@@ -152,6 +152,7 @@ from seerdb.common.tns import (
     encode_tokens_rxd,
     exec_oac_signature,
     has_long_class_bind,
+    o7_lob_markers,
     o8i_block_complete,
     o8i_stmt_type,
     o8i_terminal_complete,
@@ -502,7 +503,9 @@ class Fv2Dialect:
         # 9i SELECT: the four-call TTI_ALL7 sequence (parse, describe, execute +
         # fetch, close). `fetch` is ignored — the exec loop drains the cursor
         # itself. Returns the same tuple shape as a normal execute response so the
-        # cursor / _drain_cursor machinery is unchanged.
+        # cursor / _drain_cursor machinery is unchanged. A fetched LOB binds by
+        # its locator (#2803).
+        bind = o7_lob_markers(bind)
         cursor = yield from self._shared_cursor()
         yield Send(encode_o7_parse(0, sql, bind, Cursor=cursor))
         resp = yield RECV  # parse RPA ack — or an OER
@@ -579,7 +582,10 @@ class Fv2Dialect:
         # applies the good rows and lists the failures (#2247).
         # The connection's cursor cache (#2261), keyed and kept as on 10g+:
         # DDL flushes it, a cacheable DML is parsed into a cursor of its own
-        # and then re-executed by its id.
+        # and then re-executed by its id. A fetched LOB binds by its locator
+        # (#2803).
+        bind = o7_lob_markers(bind)
+        batch = [o7_lob_markers(row) for row in batch] if batch else batch
         key = None if cache is None else _fv2_cache_key(sql, bind, batch, batcherrors)
         if cache is not None and not is_reusable_dml(sql):
             yield from self.flush_cursors(cache)
@@ -666,7 +672,8 @@ class Fv2Dialect:
         # record the cursor's _assign_out_binds decodes into the Var objects.
         from seerdb.common.datatypes import Var
 
-        bind = bind or []
+        # A fetched LOB binds by its locator (#2803).
+        bind = o7_lob_markers(bind) or []
         # What the caller's binds suggest: every plain value and every Var holding
         # one is an input, every Var an output. The server's bind prompt says
         # which each bind really is, and replaces this guess below.

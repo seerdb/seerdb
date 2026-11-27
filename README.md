@@ -450,7 +450,8 @@ LOB objects with their calls (read, write, trim, size, open and close, and a
 BFILE's `fileexists()`, as OCI 9.2 makes them; `fetch_lobs=False` reads the
 content at fetch time, #2804), native BFILE reads, temporary LOBs (`createlob()`,
 a block value past 32512 bytes, a LOB Var holding text or bytes), as OCI 9.2
-makes them on 8.1.7 (#2803), CLOB / BLOB OUT binds and `RETURNING` (their value
+makes them on 8.1.7 (#2803), a fetched CLOB, BLOB or BFILE bound back IN by its
+locator (#2803), CLOB / BLOB OUT binds and `RETURNING` (their value
 is the text or bytes), LONG / LONG RAW, ROWID / UROWID, AQ on a RAW or an object
 queue as OCI 9.2 enqueues and dequeues (no dequeue condition, which 8.1.7 lacks;
 #2805), `cursor.warning` for an object that compiled with errors,
