@@ -304,10 +304,6 @@ class _Target(NamedTuple):
     # a 10g or 11g thin session (#2704), and 11g's native form, pooled or
     # dedicated with oall8 (#2463).
     object_binds: bool = False
-    # Whether the session writes to a persistent LOB: 10g closes the
-    # connection on the converted form's write (#964), not on the native
-    # form's (oall8, #2518).
-    lob_modify: bool = True
     # Whether the session sends the end-to-end tracing attributes: 12.1+, a
     # thin 10g or 11g session (#2810), and the native form on 10g and 11g.
     end_to_end: bool = False
@@ -405,7 +401,6 @@ def _target_of(conn) -> _Target:
             getattr(conn, '_dialect', None) is None
             and conn.field_version >= FIELD_VERSION_10_2
         ),
-        conn.server_version >> 24 != 10 or bool(getattr(conn, '_native11', False)),
         conn.field_version >= FIELD_VERSION_12_1
         or bool(getattr(conn, '_native11', False))
         or (getattr(conn, '_dialect', None) is None and not conn._server_below_10_2()),
@@ -471,8 +466,6 @@ class _Need(NamedTuple):
     refcursor_in: bool = False
     # Whether it binds an object or a collection.
     object_binds: bool = False
-    # Whether it writes to a persistent LOB.
-    lob_modify: bool = False
     # Whether it sends the end-to-end tracing attributes.
     end_to_end: bool = False
     # Whether it binds a PL/SQL associative array.
@@ -501,8 +494,6 @@ class _Need(NamedTuple):
         if self.refcursor_in and not target.refcursor_in:
             return True
         if self.object_binds and not target.object_binds:
-            return True
-        if self.lob_modify and not target.lob_modify:
             return True
         if self.end_to_end and not target.end_to_end:
             return True
@@ -645,13 +636,6 @@ _PRE10_RETURNING = _Need(
 )
 _FV = FIELD_VERSION_11_2
 _EDITIONS = _Need('editions need 11g or later', min_fv=_FV)
-# 10g closes the connection on the converted form's persistent-LOB write (#964),
-# not on the native form's (oall8, #2518); 9i writes through its own LOBOPS form
-# (#2259), and 8i through the same at the 8i codec's widths (#2804).
-_LOB_MODIFY = _Need(
-    'modifying a LOB: 10g closes the connection without oall8',
-    lob_modify=True,
-)
 _FV = FIELD_VERSION_12_1
 _INVISIBLE_COLUMNS = _Need('INVISIBLE columns are 12.1+', min_fv=_FV)
 _REF_BIND = _Need(
@@ -10141,14 +10125,14 @@ class LOBObjectIntegration(_IntegrationBase):
         with self.assertRaises(Exception):
             lob.read(1, 0)
 
-    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
+    @_requires(_mirror_lacks('serving LOB writes on a column locator'))
     def test_write_applies_and_the_size_follows(self):
         lob = self._fetch_lob()
         lob.write('WORLD', 7)
         self.assertEqual(lob.read(), 'hello WORLD')
         self.assertEqual(lob.size(), 11)
 
-    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
+    @_requires(_mirror_lacks('serving LOB writes on a column locator'))
     def test_non_ascii_text_reads_and_writes_as_itself(self):
         # The text is the session's, whatever the database charset: on a 9i
         # WE8ISO8859P1 database 'é' read back as 'Ã©', and writing it failed with
@@ -10171,14 +10155,14 @@ class LOBObjectIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchone(), (1,))
 
-    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
+    @_requires(_mirror_lacks('serving LOB writes on a column locator'))
     def test_write_past_the_end_extends_the_lob(self):
         lob = self._fetch_lob()
         lob.write('!', 12)
         self.assertEqual(lob.read(), 'hello world!')
         self.assertEqual(lob.size(), 12)
 
-    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
+    @_requires(_mirror_lacks('serving LOB writes on a column locator'))
     def test_trim_shortens_it(self):
         lob = self._fetch_lob()
         lob.trim(5)
@@ -10193,7 +10177,7 @@ class LOBObjectIntegration(_IntegrationBase):
         lob.close()
         self.assertFalse(lob.isopen())
 
-    @_requires(_LOB_MODIFY, _mirror_lacks('serving LOB writes on a column locator'))
+    @_requires(_mirror_lacks('serving LOB writes on a column locator'))
     def test_writing_the_wrong_python_type_is_a_type_error(self):
         lob = self._fetch_lob()
         self.assertRaises(TypeError, lob.write, 1000, 1)

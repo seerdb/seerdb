@@ -3467,6 +3467,8 @@ class OracleConnect(_ConnectionLogic):
             DictionaryType.lobops,
             locator=Locator,
             data=Payload,
+            # Its length in the LOB's units, which 10g needs (#2803).
+            amount=len(Payload) if is_blob else len(Payload) // 2,
             operation=TNS_LOB_OP_WRITE,
             source_offset=offset,
             locator_prefixed=False,
@@ -3475,7 +3477,10 @@ class OracleConnect(_ConnectionLogic):
         Received = self._next_data_packet(b'', b'')
         if Received is False:
             raise connection_closed('LOBOPS')
-        self._raise_lobops_error(Received[1])
+        # Below 12.1 the reply echoes the amount the WRITE sent (#2803).
+        self._raise_lobops_error(
+            Received[1], Amount=self.field_version < FIELD_VERSION_12_1
+        )
         return decode_lobops_locator(Received[1])
 
     def write_temp_lob(

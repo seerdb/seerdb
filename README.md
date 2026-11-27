@@ -433,9 +433,8 @@ about 0.3 ms an execute on the 11g bed.
 
 **Experimental: the native form on 10g** (the same `oall8=True`). OCI 11.2's
 native form at 10.2's widths, in place of the converted form (#2518). It adds
-what it adds on 11g, the temporary LOBs and the LOB Var binds, and writes to a
-LOB, on which 10g closes the converted form's connection. Validated on 10.2.0.5
-only. Object, collection and associative-array binds and a REF CURSOR bound IN
+what it adds on 11g, the temporary LOBs and the LOB Var binds. Validated on
+10.2.0.5 only. Object, collection and associative-array binds and a REF CURSOR bound IN
 need no flag on 10g or 11g: the converted form binds them too (#2704, #2706,
 #2806). Both native forms, and a pooled 11g session, enqueue and dequeue on a
 RAW or an object queue (`connection.queue()`), as OCI 11.2 does (#2805).

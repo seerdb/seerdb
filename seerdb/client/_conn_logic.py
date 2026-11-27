@@ -1694,16 +1694,17 @@ class _ConnectionLogic:
         itself -- 9i's LOBOPS form, persistent-LOB writes included (#2259)."""
         return dialect_lob_objects(self._lob_dialect())
 
-    def _raise_lobops_error(self, Packet: bytes) -> None:
+    def _raise_lobops_error(self, Packet: bytes, Amount: bool = False) -> None:
         # Decode the OER trailing a content-free LOBOPS response and raise on a
         # real ORA error. decode_lobops_oer skips the RPA's binary locator and
         # matches the OER regardless of call status (which is 5, not 1,
         # immediately after a PL/SQL execute — the case that desynced the temp
-        # LOB write following a temp-LOB-bind exec).
+        # LOB write following a temp-LOB-bind exec). `Amount`: the request sent
+        # one, which the reply echoes after the locator (#2803).
         from seerdb.common.exceptions import from_ora_code
         from seerdb.common.tns import decode_lobops_oer
 
-        (ErrCode, Message) = decode_lobops_oer(Packet, self.field_version)
+        (ErrCode, Message) = decode_lobops_oer(Packet, self.field_version, Amount)
         if ErrCode and ErrCode not in (0, ORA_NO_DATA_FOUND):
             raise from_ora_code(ErrCode)(Message or f'ORA-{ErrCode:05d}', code=ErrCode)
 
