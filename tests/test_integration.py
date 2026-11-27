@@ -8244,33 +8244,40 @@ class MixedPrecisionBatchIntegration(_IntegrationBase):
         self.assertEqual([r[0] for r in self.cur.fetchall()], values)
 
 
-@_requires(
-    _Need(
-        'binding a fetched LOB needs the 10g+ bind (8i and 9i: not measured)',
-        min_fv=FIELD_VERSION_10_2,
-    ),
-)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class FetchedLobBindIntegration(_IntegrationBase):
     """A CLOB or BLOB a query returned, bound back IN by its locator."""
 
-    def test_a_fetched_clob_and_blob_bind_back(self):
-        # Bound by its locator, as python-oracledb binds one: the temp-LOB bind's
-        # OAC and the LOB framing, a persistent locator's 114 bytes as much as a
-        # temporary one's 40. It raised `Unknown OAC token` before anything was
-        # sent; below 12.1 it takes the older OAC layout.
+    def _fetched(self):
         self.cur.execute(f'CREATE TABLE {self.TABLE} (n NUMBER, c CLOB, b BLOB)')
         self.cur.execute(
             f"INSERT INTO {self.TABLE} VALUES (1, 'hello', HEXTORAW('0102'))"
         )
         self.conn.commit()
         self.cur.execute(f'SELECT c, b FROM {self.TABLE}')
-        (Clob, Blob) = self.cur.fetchone()
+        return self.cur.fetchone()
+
+    def test_a_fetched_clob_and_blob_bind_back(self):
+        # Bound by its locator, as python-oracledb binds one: the temp-LOB bind's
+        # OAC and the LOB framing, a persistent locator's 114 bytes as much as a
+        # temporary one's 40. It raised `Unknown OAC token` before anything was
+        # sent; below 12.1 it takes the older OAC layout, on 8i the form OCI 9.2
+        # binds one to 8.1.7 in, and on 9i's compact form ojdbc14's (#2803).
+        (Clob, Blob) = self._fetched()
         self.cur.execute(
             'SELECT DBMS_LOB.GETLENGTH(:1), DBMS_LOB.GETLENGTH(:2) FROM dual',
             [Clob, Blob],
         )
         self.assertEqual(self.cur.fetchone(), (5, 2))
+        self.cur.execute(f'INSERT INTO {self.TABLE} VALUES (2, :1, :2)', [Clob, Blob])
+        self.cur.execute(
+            f'SELECT n, DBMS_LOB.GETLENGTH(c), DBMS_LOB.GETLENGTH(b) '
+            f'FROM {self.TABLE} ORDER BY n'
+        )
+        self.assertEqual(self.cur.fetchall(), [(1, 5, 2), (2, 5, 2)])
+
+    def test_a_fetched_clob_and_blob_bind_back_in_an_executemany(self):
+        (Clob, Blob) = self._fetched()
         self.cur.executemany(
             f'INSERT INTO {self.TABLE} VALUES (:1, :2, :3)',
             [(2, Clob, Blob), (3, Clob, Blob)],
@@ -8318,7 +8325,6 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
         (Lob,) = self.cur.fetchone()
         return Lob
 
-    @_requires(_Need('a BFILE bind needs the 10g+ bind', min_fv=FIELD_VERSION_10_2))
     def test_a_fetched_bfile_binds_back(self):
         # Bound by its locator with the BFILE OAC -- type 114, the type's buffer
         # of 4000, no LOB cont-flag -- as python-oracledb binds one. It raised
@@ -8336,10 +8342,7 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
             Back.getfilename(), ('PYO_MISSING_DIR', 'pyo_missing_file.txt')
         )
 
-    @_requires(
-        _postgres_cannot("run DBMS_LOB's file routines"),
-        _Need('a BFILE bind needs the 10g+ bind', min_fv=FIELD_VERSION_10_2),
-    )
+    @_requires(_postgres_cannot("run DBMS_LOB's file routines"))
     def test_a_fetched_bfile_binds_into_a_block(self):
         Lob = self._fetched_bfile()
         Out = self.cur.var(str)

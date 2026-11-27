@@ -5022,9 +5022,27 @@ the `WRITE` into it, sent without its amount, ended the server process with
 **with** the `ub2` it came framed in from the CREATE_TEMP reply, which is the
 form every later LOBOPS call on it expects (without it the server answers
 ORA-22275). Bound as a parameter it becomes the `TempLob` marker above, which
-takes the bare locator and writes its own `ub2`. A `LOB` that a query returned
-is not rebound this way; its bind has not been measured. Also 12.1+, a thin
+takes the bare locator and writes its own `ub2`. Also 12.1+, a thin
 session to a 10.2+ server, or a thin OALL8 one to 9.2.
+
+**A LOB a query returned binds back by its locator** on every tier: a CLOB or
+BLOB as a temporary one does, a BFILE with its own type (`BfileBind`). Below
+10g (#2803) each form binds it as its reference client does, each captured:
+
+- **8i**, as OCI 9.2 binds one to 8.1.7. A CLOB or BLOB has the temporary
+  LOB's 25-byte descriptor (§19.15). A BFILE's has type 114 with no charset,
+  and its locator goes at the start of a 255-byte buffer, padded with zeros:
+  a `ub4` 255, then one chunk of the 255 bytes (`fe ff ... 00`).
+- **9i's compact form**, as JDBC thin's ojdbc14 binds one to 9.2. A CLOB or
+  BLOB goes as a temporary LOB does there, declared at 3876. A BFILE is type
+  114 at 530, charset 31 and form 1, its locator with its `ub2` as the value.
+  `o7_lob_markers` turns the LOB objects into those markers.
+
+Two checks every DML runs over its binds take a dialect's LOB object as it is:
+the LONG-class one, which a locator bound in place never is, and the cursor
+cache's signature, which stands it as its marker. Through the thin OAC
+encoder both raised `Unknown OAC token` on a single-row DML on 8i and on the
+native forms of 9i, 10g and 11g, which an array DML passed.
 
 A bind **declared** a CLOB / BLOB — `cursor.var(DB_TYPE_CLOB)` or
 `setinputsizes(DB_TYPE_BLOB)` — promotes the same way, on any statement and any

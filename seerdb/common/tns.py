@@ -15371,10 +15371,14 @@ def _long_bind_positions(Oac: list, MaxStringSize: int) -> frozenset:
     # them LONG-class binds, whose values the server reads after the row's
     # others (docs/PROTOCOL.md 5.4). Read off the OAC actually sent, so the two
     # can never disagree. An associative-array bind (#122) is never LONG-class,
-    # whatever its element size. Matches python-oracledb.
+    # whatever its element size. Matches python-oracledb. Nor is a fetched LOB
+    # a dialect's session binds by its locator in its own form (#2803): it rides
+    # in place, and the thin OAC has no form for it.
+    from seerdb.common.lob import LOB
+
     Out = set()
     for Index, Token in enumerate(Oac):
-        if isinstance(Token, Var) and Token.is_array:
+        if isinstance(Token, Var) and Token.is_array or isinstance(Token, LOB):
             continue
         (DataType, MaxLen, *_rest) = decode_oac_fields(encode_token_oac(Token))
         if DataType in _PREFETCHED_IMAGE_TYPES:
@@ -15753,8 +15757,32 @@ def _o7_oac(
 
 # The size ojdbc14 declares a LOB bound by its locator at, on 9.2.
 _O7_LOB_BIND_SIZE = 0x0F24
+# A BFILE bound by its locator (#2803), as ojdbc14 declares one to 9.2.
+_O7_BFILE_BIND_SIZE = 530
 # The empty 86-byte locator a 9i CREATE_TEMP names as its source.
 _O7_EMPTY_LOCATOR = b'\x00\x54' + bytes(84)
+
+
+def o7_lob_markers(Binds: list | None) -> list | None:
+    """A 9i compact session's binds with each fetched LOB as the marker that
+    binds it by its locator (#2803), as ojdbc14 binds one to 9.2: a CLOB or
+    BLOB as a temporary one (TempLob, its own ub2 stripped, which the marker
+    writes), a BFILE as BfileBind, its locator whole."""
+    from seerdb.common.lob import LOB
+
+    if not Binds:
+        return Binds
+    Out: list = []
+    for V in Binds:
+        if isinstance(V, LOB) and V.data_type == TNS_TYPE_BFILE:
+            Out.append(BfileBind(bytes(V.raw)))
+        elif isinstance(V, LOB) and V.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
+            Raw = bytes(V.raw)
+            Bare = Raw[2:] if is_prefixed_locator(Raw) else Raw
+            Out.append(TempLob(Bare, V.data_type == TNS_TYPE_BLOB, csfrm=V._csfrm))
+        else:
+            Out.append(V)
+    return Out
 
 
 def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
@@ -15840,6 +15868,11 @@ def _o7_bind_oac(Value: object, Statement: bool = False) -> bytes:
             _O7_LOB_BIND_SIZE,
             1 if Value.is_blob else Value.csfrm,
         )
+    if isinstance(Value, BfileBind):
+        # A fetched BFILE bound back by its locator (#2803), declared as ojdbc14
+        # declares one to 9.2: its type at 530. A fetched CLOB or BLOB binds as
+        # a temporary one does (o7_lob_markers).
+        return _oac(TNS_TYPE_BFILE, _O7_BFILE_BIND_SIZE, 1)
     if isinstance(Value, Var):
         VType = Value.dbtype.tns_type
         Vcsfrm = getattr(Value.dbtype, 'csfrm', 1)
@@ -16640,6 +16673,8 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
         # descriptor at 8i's widths, naming the type (SeerODBC #168/#172).
         Typ = cast(Any, _oci11_object_type(Value))
         return _o8i_typed_bind_oac(TNS_TYPE_ADT, Typ.oid, Typ.version)
+    from seerdb.common.lob import LOB
+
     Flag = 0x03
     if isinstance(Value, TempLob):
         # A temporary LOB bound by its locator (#2803), IN, OUT or IN OUT, as
@@ -16648,6 +16683,13 @@ def _encode_8i_bind_oac(Value: object) -> bytes:
         DType = TNS_TYPE_BLOB if Value.is_blob else TNS_TYPE_CLOB
         Flag, MaxSize = 0x00, 0x20
         (Charset, Csform) = (0, 0) if Value.is_blob else (31, Value.csfrm)
+    elif isinstance(Value, LOB):
+        # A fetched LOB bound back by its locator (#2803), as OCI 9.2 binds
+        # one to 8.1.7: a CLOB or BLOB as a temporary one, a BFILE its own
+        # type with no charset.
+        DType = Value.data_type
+        Flag, MaxSize = 0x00, 0x20
+        (Charset, Csform) = (31, Value._csfrm) if DType == TNS_TYPE_CLOB else (0, 0)
     elif isinstance(Value, Var):
         DType = Value.dbtype.tns_type
         if DType in (TNS_TYPE_CLOB, TNS_TYPE_BLOB):
@@ -16732,6 +16774,9 @@ _O8I_LOB_OUT_CELL: wire_schema.Schema = (
 )
 _O8I_LOB_OUT_CELL_FROM_O8I = wire_schema.compile_decoder(_O8I_LOB_OUT_CELL, _O8I)
 _O8I_EMPTY_LOCATOR = b'\x00\x54' + bytes(84)
+# The buffer a BFILE's locator is bound in on 8i (#2803), as OCI 9.2 binds one
+# to 8.1.7: the locator, then zeros.
+_O8I_BFILE_BIND_SPACE = 255
 
 
 def _pre10_lob_out(LobType: int, Csfrm: int, Cell: dict) -> object:
@@ -16766,6 +16811,16 @@ def _encode_8i_bind_value(Value: object) -> bytes:
         return _oci11_object_bind_value(Value, _O9I_OBJECT_CELL_O8I)
     if _is_oci11_array_var(Value):
         return _encode_pre10_array_value(Value, _encode_8i_bind_value)
+    if isinstance(Value, LOB) and Value.data_type == TNS_TYPE_BFILE:
+        # A fetched BFILE, as OCI 9.2 binds one to 8.1.7 (#2803): its locator,
+        # its ub2 length in front, at the start of a 255-byte buffer.
+        Space = bytes(Value.raw).ljust(_O8I_BFILE_BIND_SPACE, b'\x00')
+        # One chunk of the 255 bytes, then the empty one that ends them.
+        Chunked = bytes([TNS_LONG_LENGTH_INDICATOR, len(Space)]) + Space + b'\x00'
+        return len(Space).to_bytes(4, 'little') + Chunked
+    if isinstance(Value, LOB):
+        # A fetched CLOB or BLOB, as a temporary one (#2803).
+        return _encode_8i_lob_locator(bytes(Value.raw))
     if isinstance(Value, TempLob):
         # A temporary LOB's locator, as its CREATE_TEMP framed it (#2803).
         return _encode_8i_lob_locator(prefixed_locator(Value.locator))
@@ -23399,12 +23454,31 @@ def exec_oac_signature(Bind: list, Batch: list) -> bytes:
     # commonly a longer string than the first call sized for — overflows that
     # frozen buffer and the server rejects the value as a streamed LONG
     # (ORA-01461). Keying the cache on this signature turns such a call into a
-    # cache miss, forcing a re-parse with a correctly-sized OAC.
+    # cache miss, forcing a re-parse with a correctly-sized OAC. A fetched LOB
+    # a dialect's session binds in its own form stands as the marker it binds
+    # by (#2803), which the thin OAC has a form for.
     if not Bind:
         return b''
+    Rows = [_signature_row(Row) for Row in ([Bind] + Batch if Batch else [Bind])]
     if Batch:
-        return encode_tokens_oac(_oac_rep_row([Bind] + Batch), b'')
-    return encode_tokens_oac(Bind, b'')
+        return encode_tokens_oac(_oac_rep_row(Rows), b'')
+    return encode_tokens_oac(Rows[0], b'')
+
+
+def _signature_row(Row: list) -> list:
+    # exec_oac_signature's row: a LOB object as the marker of its type.
+    from seerdb.common.lob import LOB
+
+    return [
+        (
+            BfileBind(b'')
+            if V.data_type == TNS_TYPE_BFILE
+            else TempLob(b'', V.data_type == TNS_TYPE_BLOB, csfrm=V._csfrm)
+        )
+        if isinstance(V, LOB)
+        else V
+        for V in Row
+    ]
 
 
 # The declared types whose wire width differs from the one the value's own Python
