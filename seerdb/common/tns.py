@@ -2439,8 +2439,8 @@ _LOBOPS_READ: wire_schema.Schema = (
 # locator, the session duration (10) in the destination length, the charset
 # form in the source offset (1 a CLOB, 2 an NCLOB, 0 a BLOB), the LOB type in
 # the destination offset, then the charset and no amount (#1066). A WRITE has
-# no amount; its data follows as a LOB_DATA message of its own, in 32 KiB
-# chunks with ub4 lengths (_lobops_write_data), not a field here. The locator
+# an amount below 12.1 only (#2803); its data follows as a LOB_DATA message of
+# its own (_lobops_write_data), not a field here. The locator
 # is the field as sent: a temp LOB's with its ub2 length, counted in the
 # source length, a column LOB's raw.
 _LOBOPS_REQUEST: wire_schema.Schema = (
@@ -5522,8 +5522,9 @@ _THIN_LOB_LOC_FLAGS_LITTLE_ENDIAN = 0x40
 
 def _decode_lobops_chunked(data: bytes) -> bytes:
     # The WRITE payload after the 0x0E marker: a single <ub1 len><bytes> when the
-    # data is <= 0xFC bytes, else a 0xFE marker then <sb4 len><chunk> repeated
-    # until a zero-length terminator (§14.2). Inverse of the client encoder.
+    # data is <= 0xFC bytes, else a 0xFE marker then <len><chunk> repeated
+    # until a zero-length terminator (§14.2). Inverse of the client encoder:
+    # the length a ub4 from 12.1, a byte below (_chunk_length, #2844).
     if not data:
         return b''
     if data[0] != TNS_LONG_LENGTH_INDICATOR:
@@ -5537,7 +5538,9 @@ def _decode_lobops_chunked(data: bytes) -> bytes:
     # value -- which is how a WRITE spanning TNS packets lost everything after
     # its first packet without a word (#848, #849).
     while True:
-        chunk_len, rest = decode_ub4(rest)
+        if not rest:
+            raise Truncated('LOB write chunk: no length byte')
+        chunk_len, rest = _chunk_length(rest)
         if chunk_len == 0:
             return bytes(out)
         if len(rest) < chunk_len:
@@ -19462,15 +19465,24 @@ _CREATE_TEMP_LOCATOR_LENGTH = 40
 _LOB_DURATION_SESSION = 10
 
 
-def _lobops_write_data(Data: bytes) -> bytes:
+def _lobops_write_data(Data: bytes, FieldVersion: int) -> bytes:
     # A WRITE's data, the LOB_DATA message behind the request (#91, §14.2):
     # TTI_LOB, then the data with its length while it is at most 252 bytes,
-    # else 0xFE and chunks of up to 32 KiB, each with a ub4 length, ending at a
-    # zero one. Read back by _decode_lobops_chunked.
+    # else 0xFE and chunks ending at an empty one. Read back by
+    # _decode_lobops_chunked.
+    #
+    # From 12.1 a chunk is up to 32 KiB with a ub4 length. Below, it is up to
+    # 252 bytes with a one-byte length, as JDBC thin 11.2 sends 10.2 and 11.2
+    # (#2844): those servers read the ub4 form's `02 7f ff` as a 2-byte chunk.
     Out = bytes([TTI_LOB])
     if len(Data) <= TNS_MAX_SHORT_LENGTH:
         return Out + bytes([len(Data)]) + Data
     Out += bytes([TNS_LONG_LENGTH_INDICATOR])
+    if FieldVersion < FIELD_VERSION_12_1:
+        for K in range(0, len(Data), TNS_MAX_SHORT_LENGTH):
+            Chunk = Data[K : K + TNS_MAX_SHORT_LENGTH]
+            Out += bytes([len(Chunk)]) + Chunk
+        return Out + b'\x00'
     for K in range(0, len(Data), 0x7FFF):
         Chunk = Data[K : K + 0x7FFF]
         Out += encode_sb4(len(Chunk)) + Chunk
@@ -19529,7 +19541,9 @@ def encode_dictionary_lobops(Dictionary: dict) -> bytes:
         )
         if FieldVersion < FIELD_VERSION_12_1 and 'amount' in Dictionary:
             Fields.update({'amount_present': True, 'amount': Dictionary['amount']})
-        return _LOBOPS_REQUEST_THIN(Fields) + _lobops_write_data(Dictionary['data'])
+        return _LOBOPS_REQUEST_THIN(Fields) + _lobops_write_data(
+            Dictionary['data'], FieldVersion
+        )
     if Operation in (
         TNS_LOB_OP_FILE_OPEN,
         TNS_LOB_OP_FILE_CLOSE,

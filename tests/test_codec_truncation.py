@@ -25,6 +25,7 @@ from seerdb.common.tns import (
     decode_ub4,
     encode_sb4,
 )
+from seerdb.common.tns_consts import FIELD_VERSION_12_1
 
 
 @pytest.mark.parametrize(
@@ -74,8 +75,15 @@ def test_complete_fields_decode_exactly_as_before() -> None:
     assert decode_dalc(bytes([0xFF])) == ([], b'')
     assert decode_dalc(bytes([0])) == ([], b'')
     assert decode_chr(bytes([2]) + b'hi') == (b'hi', b'')
-    payload = bytes([0xFE]) + encode_sb4(3) + b'AAA' + encode_sb4(2) + b'BB'
-    assert _decode_lobops_chunked(payload + encode_sb4(0)) == b'AAABB'
+    # A chunk's length is a ub4 from 12.1 and a byte below (#2844).
+    token = _DECODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+    try:
+        payload = bytes([0xFE]) + encode_sb4(3) + b'AAA' + encode_sb4(2) + b'BB'
+        assert _decode_lobops_chunked(payload + encode_sb4(0)) == b'AAABB'
+    finally:
+        _DECODE_FIELD_VERSION.reset(token)
+    narrow = bytes([0xFE, 3]) + b'AAA' + bytes([2]) + b'BB' + bytes([0])
+    assert _decode_lobops_chunked(narrow) == b'AAABB'
     assert _decode_lobops_chunked(bytes([3]) + b'xyz') == b'xyz'
 
 
