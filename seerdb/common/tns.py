@@ -16486,6 +16486,45 @@ def decode_fv2_lob_chunks(Data: bytes) -> tuple[bytes, bool]:
     return (Content, False)
 
 
+def decode_8i_lob_read(Data: bytes) -> tuple[bytes, bytes | None]:
+    """An 8i READ's reply (#2850), as 8.1.7 answers OCI 9.2: the content's
+    chunks (decode_fv2_lob_chunks), then the RPA -- the locator echoed and the
+    amount read (`_O7_LOBOPS_REPLY` at the 8i codec's widths) -- then the 8i
+    status. Returns (the content, the status), the status None until the whole
+    reply has arrived: 8i splits a long reply into packets at no fixed point,
+    and a read that stopped at the chunks' end left the rest for the next call
+    to read as its own reply. An empty LOB's reply has no content, the RPA and
+    the status alone; a failed read's, the status alone."""
+    Content = b''
+    Status = Data
+    if Data[:1] == bytes([TTI_LOB]):
+        if len(Data) < 2:
+            return (b'', None)
+        Pos = 2 if Data[1] == TNS_LONG_LENGTH_INDICATOR else 1
+        while True:
+            if Pos >= len(Data):
+                return (Content, None)
+            ChunkLen = Data[Pos]
+            if ChunkLen == 0:
+                break
+            if Pos + 1 + ChunkLen > len(Data):
+                return (Content, None)
+            Content += Data[Pos + 1 : Pos + 1 + ChunkLen]
+            Pos += 1 + ChunkLen
+        Status = Data[Pos + 1 :]
+    if Status[:1] == bytes([TTI_RPA]):
+        try:
+            (_, Status) = _O7_LOBOPS_REPLY_FROM_O8I(
+                Status, {'short_amount_present': True, 'null_lob_present': False}
+            )
+        except (IndexError, Truncated):
+            return (Content, None)
+        Status = bytes(Status)
+    if not Status or not o8i_terminal_complete(Status):
+        return (Content, None)
+    return (Content, Status)
+
+
 def decode_fv2_lob_getlen(Packet: bytes) -> int:
     # A GET_LENGTH reply's length, in chars for CLOB/NCLOB and bytes for BLOB,
     # from `_O7_LOBOPS_REPLY`. 0 on an unexpected shape (e.g. an empty LOB) so
