@@ -1406,8 +1406,12 @@ class Oall8Dialect:
             self._finished(decode_8i_cursor_id(packet))
         _raise_ora(err_code, message)
         # Values come back only for the binds the block writes; the prompt says
-        # which, as on 9i (#1242), with the count in 8i's encoding.
+        # which, as on 9i (#1242), with the count in 8i's encoding. Its masks are
+        # cursor.bind_directions too (#2804), as on 9i (#2264).
         out_positions = _o8i_out_positions(packet, bind, out_positions)
+        directions = decode_fv2_bind_directions(packet, O8i=True)
+        if directions is not None and len(directions) != len(bind):
+            directions = None
         # A REF CURSOR's cell is the opened cursor's describe and id (#2710).
         cursors = frozenset(
             i for (i, pos) in enumerate(out_positions) if _is_cursor_var(bind[pos])
@@ -1446,7 +1450,15 @@ class Oall8Dialect:
                     out_values[i] = decode_fv2_lob(
                         lob_type, content, self._clob_charset({})
                     )
-            record = {'out_positions': out_positions, 'out_values': out_values}
+            record = {
+                'out_positions': out_positions,
+                'out_values': out_values,
+                'directions': directions,
+            }
+            return (0, 0, 0, (None, None), [record], None, None, [], None)
+        if directions:
+            # A block whose binds are all IN still says so (cursor.bind_directions).
+            record = {'out_positions': [], 'out_values': [], 'directions': directions}
             return (0, 0, 0, (None, None), [record], None, None, [], None)
         return (0, 0, 0, (0, None), [], None, None, [], None)
 

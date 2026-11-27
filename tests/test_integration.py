@@ -638,9 +638,6 @@ _SERVER_SCROLL = _Need(
     "server-side scroll: 9i's ALL7 form and 8i use the buffered scroll (#2809)",
     server_scroll=True,
 )
-_BLOCK_IOV = _Need(
-    'the 8i block reply carries no IOV directions (9i: #2264)', not_8i=True
-)
 _PRE10_PARSE_REFUSAL = _Need(
     '10g+ sends a real parse; this is the pre-10g refusal', below_fv=_FV, protocol=True
 )
@@ -8403,7 +8400,6 @@ class BFileMissingDirectoryIntegration(_IntegrationBase):
             Conn.close()
 
 
-@_requires(_BLOCK_IOV)
 @unittest.skipUnless(_USER, _SKIP_REASON)
 class BindDirectionIntegration(_IntegrationBase):
     """``cursor.bind_directions``: what the server said each bind was (#1064)."""
