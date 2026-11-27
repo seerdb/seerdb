@@ -10046,8 +10046,10 @@ class LOBObjectIntegration(_IntegrationBase):
     def setUp(self):
         super().setUp()
         self.conn.autocommit = False
-        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB)')
-        self.cur.execute(f"INSERT INTO {self.TABLE} VALUES (1, 'hello world')")
+        self.cur.execute(f'CREATE TABLE {self.TABLE} (id NUMBER, c CLOB, b BLOB)')
+        self.cur.execute(
+            f"INSERT INTO {self.TABLE} VALUES (1, 'hello world', EMPTY_BLOB())"
+        )
 
     def tearDown(self):
         # The row is deliberately left LOCKED for the duration of each test (a
@@ -10161,6 +10163,23 @@ class LOBObjectIntegration(_IntegrationBase):
         lob.write('!', 12)
         self.assertEqual(lob.read(), 'hello world!')
         self.assertEqual(lob.size(), 12)
+
+    @_requires(_mirror_lacks('serving LOB writes on a column locator'))
+    def test_a_write_past_one_chunk_reads_back_whole(self):
+        # Past 252 bytes the data goes chunked, in 252-byte chunks below 12.1
+        # (#2844): sent in the 12.1 form, 11.2 answered ORA-22993 or closed the
+        # connection, and 10.2 ORA-22993.
+        text = ''.join(chr(65 + k % 26) for k in range(3000))
+        lob = self._fetch_lob()
+        lob.write(text, 1)
+        self.assertEqual(lob.size(), 3000)
+        self.assertEqual(lob.read(), text)
+        data = bytes(k % 251 for k in range(70000))
+        self.cur.execute(f'SELECT b FROM {self.TABLE} FOR UPDATE')
+        (blob,) = self.cur.fetchone()
+        blob.write(data, 1)
+        self.assertEqual(blob.size(), 70000)
+        self.assertEqual(blob.read(), data)
 
     @_requires(_mirror_lacks('serving LOB writes on a column locator'))
     def test_trim_shortens_it(self):

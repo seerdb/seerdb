@@ -4700,10 +4700,17 @@ form by default and opts into the prefix per call (`locator_prefixed`).
 | `0x0002`  | READ              | Read content from the LOB            |
 | `0x0020`  | TRIM              | Shorten the LOB to `amount`          |
 | `0x0040`  | WRITE             | Write at `source_offset`             |
+| `0x0100`  | FILE_OPEN         | Open a BFILE                         |
+| `0x0110`  | CREATE_TEMP       | Allocate a temporary LOB             |
+| `0x0111`  | FREE_TEMP         | Release a temporary LOB              |
+| `0x0200`  | FILE_CLOSE        | Close a BFILE                        |
+| `0x0400`  | FILE_ISOPEN       | Test whether a BFILE is open         |
+| `0x0800`  | FILE_EXISTS       | Test whether a BFILE exists          |
 | `0x4000`  | GET_CHUNK_SIZE    | The server's chunk size              |
 | `0x8000`  | OPEN              | Open; `amount` carries the MODE      |
 | `0x10000` | CLOSE             | Close                                |
 | `0x11000` | IS_OPEN           | Is the LOB open? (§14.4c)            |
+| `0x80000` | ARRAY             | Array-style operation                |
 
 **CREATE_TEMP body** (no source locator): a field block captured from
 python-oracledb (21c, then all three kinds on 23ai, #1066). It is a fixed
@@ -4724,29 +4731,20 @@ returns the new locator in the response RPA.
 
 **WRITE payload.** After the locator the request appends a `0x0E` marker then a
 chunked-bytes field: when the data is `<= 0xFC` bytes, a `ub1` length + the
-bytes; otherwise a `0xFE` marker followed by repeated `<sb4 chunk_len><chunk>`
-(chunks `<= 0x7FFF` bytes) terminated by a zero-length chunk. CLOB data is
-UTF-16BE on the wire; BLOB data is raw. `source_offset` is the 1-based write
-position (1 = overwrite from start).
+bytes; otherwise a `0xFE` marker followed by repeated `<chunk_len><chunk>`
+terminated by a zero-length chunk. From 12.1 a chunk is up to `0x7FFF` bytes
+behind an `sb4` length. Below 12.1 it is up to 252 bytes behind a `ub1`
+length, as JDBC thin 11.2 sends 10.2 and 11.2 (#2844): 600 bytes go as
+`fe fc <252> fc <252> 60 <96> 00`. Those servers read the 12.1 form's
+`02 7f ff` as a 2-byte chunk; 11.2 then answers ORA-22993 or closes the
+connection. CLOB data is UTF-16BE on the wire; BLOB data is raw.
+`source_offset` is the 1-based write position (1 = overwrite from start).
 
 Below 12.1 the WRITE also sends its amount: the amount pointer set, and the
 number of characters (a CLOB) or bytes (a BLOB) written behind the locator,
 ahead of the `0x0E` data. JDBC thin 11.2 sends 10.2 and 11.2 that form, the
 same bytes to both (#2803). 10.2 closes the connection on a WRITE without the
 amount, which is what 12.1+ clients send; 11.2 takes either.
-| `0x0020`  | TRIM              | Truncate the LOB                     |
-| `0x0040`  | WRITE             | Write content into the LOB           |
-| `0x0100`  | FILE_OPEN         | Open a BFILE                         |
-| `0x0200`  | FILE_CLOSE        | Close a BFILE                        |
-| `0x0400`  | FILE_ISOPEN       | Test whether a BFILE is open         |
-| `0x0800`  | FILE_EXISTS       | Test whether a BFILE exists          |
-| `0x4000`  | GET_CHUNK_SIZE    | Server-preferred chunk size          |
-| `0x0110`  | CREATE_TEMP       | Allocate a temporary LOB             |
-| `0x0111`  | FREE_TEMP         | Release a temporary LOB              |
-| `0x8000`  | OPEN              | Open the LOB                         |
-| `0x10000` | CLOSE             | Close the LOB                        |
-| `0x11000` | IS_OPEN           | Test whether the LOB is open         |
-| `0x80000` | ARRAY             | Array-style operation                |
 
 **Serving a BFILE (the Mirror, #1102).** Measured against 23ai, a BFILE column
 differs from a CLOB / BLOB in three ways, and each one costs a desync:

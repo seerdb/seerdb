@@ -79,10 +79,16 @@ class CreateTempEncode(unittest.TestCase):
 
 
 class WriteEncode(unittest.TestCase):
-    def _write(self, data):
-        return encode_dictionary_lobops(
-            {'seq': 4, 'operation': TNS_LOB_OP_WRITE, 'locator': LOCATOR, 'data': data}
-        )
+    def _write(self, data, field_version=None):
+        Dictionary = {
+            'seq': 4,
+            'operation': TNS_LOB_OP_WRITE,
+            'locator': LOCATOR,
+            'data': data,
+        }
+        if field_version is not None:
+            Dictionary['field_version'] = field_version
+        return encode_dictionary_lobops(Dictionary)
 
     def test_short_inline(self):
         # "HI" UTF-16BE -> 0x0E marker + ub1 length 4 + data, locator ub2-prefixed.
@@ -95,9 +101,11 @@ class WriteEncode(unittest.TestCase):
         )
 
     def test_chunked_large(self):
-        # > 0xFC bytes -> 0x0E + 0xFE + (<sb4 chunklen><chunk>)... + 0x00.
+        # > 0xFC bytes -> 0x0E + 0xFE + (<sb4 chunklen><chunk>)... + 0x00, as
+        # python-oracledb writes 21c; below 12.1 the chunks are 252-byte ones
+        # (test_lob_write_chunks).
         Data = ('Z' * 60000).encode('utf-16-be')  # 120000 bytes
-        Out = self._write(Data)
+        Out = self._write(Data, FIELD_VERSION_12_1)
         Tail = Out[Out.index(LOCATOR) + len(LOCATOR) :]
         self.assertEqual(Tail[:2].hex(), '0efe')
         i, chunks = 2, []
