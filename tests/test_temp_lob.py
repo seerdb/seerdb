@@ -26,7 +26,11 @@ from seerdb.common.tns import (
     encode_token_oac,
     encode_token_rxd,
 )
-from seerdb.common.tns_consts import FIELD_VERSION_12_1, TNS_LOB_OP_WRITE
+from seerdb.common.tns_consts import (
+    FIELD_VERSION_10_2,
+    FIELD_VERSION_12_1,
+    TNS_LOB_OP_WRITE,
+)
 
 
 class _FieldVersionIsolated(unittest.TestCase):
@@ -47,11 +51,16 @@ class _FieldVersionIsolated(unittest.TestCase):
 LOCATOR = bytes.fromhex(
     '0001820880010002e31e00000129000000010369000a000000010000a62b6539000000010000'
 )
+# python-oracledb's form, which it sends from 12.1 (21c and 23ai captured);
+# below 12.1, JDBC thin 11.2's (test_10g_temp_lob).
+_21C = 16
 
 
 class CreateTempEncode(unittest.TestCase):
     def test_clob_body(self):
-        Body = encode_dictionary_lobops({'seq': 3, 'create_temp': True})[3:]
+        Body = encode_dictionary_lobops(
+            {'seq': 3, 'create_temp': True, 'field_version': _21C}
+        )[3:]
         # type 0x70 (CLOB), trailing sb4 0x0369; captured verbatim.
         self.assertEqual(
             Body.hex(),
@@ -60,7 +69,7 @@ class CreateTempEncode(unittest.TestCase):
 
     def test_blob_body(self):
         Body = encode_dictionary_lobops(
-            {'seq': 3, 'create_temp': True, 'is_blob': True}
+            {'seq': 3, 'create_temp': True, 'is_blob': True, 'field_version': _21C}
         )[3:]
         # type 0x71 (BLOB) — one byte shorter type spec than CLOB.
         self.assertEqual(
@@ -68,7 +77,9 @@ class CreateTempEncode(unittest.TestCase):
         )
 
     def test_nclob_body(self):
-        Body = encode_dictionary_lobops({'seq': 3, 'create_temp': True, 'csfrm': 2})[3:]
+        Body = encode_dictionary_lobops(
+            {'seq': 3, 'create_temp': True, 'csfrm': 2, 'field_version': _21C}
+        )[3:]
         # An NCLOB is a CLOB (type 0x70) with form 01 02 and the NATIONAL charset
         # 2000 (AL16UTF16) in the trailing sb4; captured from python-oracledb
         # against 23ai (#1066). Sending the CLOB body made a CLOB.
@@ -182,9 +193,10 @@ class CreateLobForm(unittest.TestCase):
             with self.assertRaises(seerdb.ProgrammingError):
                 _StubLogic(FIELD_VERSION_12_1)._createlob_form(Typ)
 
-    def test_an_11g_server_is_refused(self):
+    def test_a_server_below_10_2_is_refused(self):
+        # A thin 10g or 11g session makes one in JDBC thin 11.2's form (#2803).
         with self.assertRaises(seerdb.NotSupportedError):
-            _StubLogic(FIELD_VERSION_12_1 - 1)._createlob_form(seerdb.DB_TYPE_CLOB)
+            _StubLogic(FIELD_VERSION_10_2 - 1)._createlob_form(seerdb.DB_TYPE_CLOB)
 
 
 class BindTempLobs(unittest.TestCase):

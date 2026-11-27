@@ -4964,21 +4964,31 @@ conversion"). seerdb handles it the way python-oracledb does, on 12c+:
 `Cursor.execute` / `AsyncCursor.execute` do this transparently: a PL/SQL block
 (detected by `_is_plsql`) with an over-limit str/bytes bind has that bind
 promoted to a `TempLob` marker before encoding. Plain DML keeps the
-streamed-LONG path. **11g is excluded** — it rejects this `CREATE_TEMP` outright
-(immediate FIN, no error packet), there is no thin reference to crack it
-against, and a large PL/SQL LOB bind there keeps its prior ORA-01460 behaviour;
-the feature is gated on `field_version >= 12.1`. On 11g the native form serves
-temporary LOBs (`oall8=True`, §4.1.4).
+streamed-LONG path. The feature needs a server that makes a temporary LOB:
+12.1+, and from 10.2 in the form below.
 
-Measured on 11g's converted form for #2463, and left there: the fields OCI 11.2's
-native `CREATE_TEMP` carries (`_OCI11_LOBOPS_CREATE_TEMP`), written at thin's
-widths, **are** answered with a real 38-byte temporary locator. Where the 12c
-body above has a 40-byte zero locator space, it has OCI's 86-byte empty locator,
-an SCN slot of 0, and the session duration (10) again as a ub8 amount. But the
-converted form's `WRITE` into that locator ends the server process with
-`ORA-03137 [12333] [120]`, where a `WRITE` into a fetched LOB works. Every guess
-past that point costs a server process, so the converted form gets no
-temporary LOB below 12.1.
+**Below 12.1** 10.2 and 11.2 refuse the `CREATE_TEMP` above outright
+(immediate FIN, no error packet). JDBC thin 11.2 (`ojdbc6`) sends both the
+same one instead (#2803), the shape OCI 11.2 sends in its own widths
+(`_LOBOPS_CREATE_TEMP`, which `_OCI11_LOBOPS_CREATE_TEMP` reuses):
+
+- the SCN array's pointer set and its length 1, and the amount's pointer set;
+- the empty locator is OCI's (`00 54`, then zeros) cut to the 40 bytes the
+  source length gives;
+- behind it the charset (873 for a CLOB, **1** for a BLOB, 2000 for an
+  NCLOB), the SCN slot (1) and the duration (10) again as the amount.
+
+The reply (`_CREATE_TEMP_REPLY_PRE12`) is the new locator, the charset, the SCN
+slot and an amount of 1, then the status. The SCN slot varies from call to
+call and is at times negative (`81 02`, `81 4d`), so it is read as a signed
+`ub4`. A `WRITE` into the temporary LOB carries its amount, as one into a
+persistent LOB does there (§14.2). A thin OALL8 session to 9.2 runs at 10.2's
+field version, but its server is 9.2's and makes none.
+
+An earlier attempt on 11g's converted form (#2463) sent OCI 11.2's fields with
+an 86-byte empty locator and an SCN slot of 0. That locator was answered, but
+the `WRITE` into it, sent without its amount, ended the server process with
+`ORA-03137 [12333] [120]`.
 
 `Connection.createlob(lob_type, data=None)` / `AsyncConnection.createlob`
 (#1066) hand this temp LOB to the caller as a `LOB` object for
@@ -4987,7 +4997,8 @@ temporary LOB below 12.1.
 form every later LOBOPS call on it expects (without it the server answers
 ORA-22275). Bound as a parameter it becomes the `TempLob` marker above, which
 takes the bare locator and writes its own `ub2`. A `LOB` that a query returned
-is not rebound this way; its bind has not been measured. Also 12.1+ only.
+is not rebound this way; its bind has not been measured. Also 12.1+, or a thin
+session to a 10.2+ server.
 
 A bind **declared** a CLOB / BLOB — `cursor.var(DB_TYPE_CLOB)` or
 `setinputsizes(DB_TYPE_BLOB)` — promotes the same way, on any statement and any
@@ -4997,8 +5008,10 @@ OAC (`_encode_lob_bind_oac`, type `0x70` / `0x71`, cont-flag `0x02000000`, the
 server rejects with ORA-03120), and its value rides as the temp-LOB locator
 (`Cursor._promote_lob_var_binds`). A NULL such Var (a pure OUT bind, or a NULL
 IN) is not promoted and keeps the OAC with a NULL value. This is what closed the
-last of the six declared-type bind encoders (#902); 11g, with no `CREATE_TEMP`,
-raises `NotSupportedError` for a declared LOB Var as before.
+last of the six declared-type bind encoders (#902). On a thin 10g or 11g
+session a declared LOB Var with a value binds IN this way; the OAC itself has
+not been measured below 12.1, so a NULL such Var, and so a LOB OUT bind, raises
+`NotSupportedError` there (#2803).
 
 ### 14.5 Temp-LOB WRITE (the Mirror, server side, #412)
 
@@ -8366,8 +8379,8 @@ Captured with the reference thin client against a live 23ai, for a type
   each such attribute: `TTI_LOBOPS` CREATE_TEMP, then a WRITE with the content,
   one pair per attribute in image order. It then sends the execute with those
   locators in the image. seerdb does the same on a copy of the bound object, so
-  the caller's object keeps the `str` it was given. CREATE_TEMP needs 12.1+, as an
-  object bind does anyway.
+  the caller's object keeps the `str` it was given. CREATE_TEMP needs 12.1+ or a thin session
+  to a 10.2+ server (#2803), as an object bind does.
 - **NCLOB.** It shares CLOB's wire type. The national form comes from the
   attribute's type name, and a temp NCLOB is created with charset form 2.
 

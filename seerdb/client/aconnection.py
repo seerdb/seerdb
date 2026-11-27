@@ -2594,7 +2594,7 @@ class AsyncOracleConnect(_ConnectionLogic):
 
     async def createlob(self, lob_type, data=None):
         """Async port of the sync ``createlob`` (#1066): a new temporary LOB of
-        ``lob_type``, optionally holding ``data``. 12.1+ only."""
+        ``lob_type``, optionally holding ``data``. 12.1+, or thin from 10.2."""
 
         from seerdb.common.lob import LOB
         from seerdb.common.tns_consts import TNS_TYPE_BLOB
@@ -2623,7 +2623,7 @@ class AsyncOracleConnect(_ConnectionLogic):
 
     async def create_temp_lob(self, is_blob: bool = False, *, csfrm: int = 1) -> bytes:
         """Async port of the sync `create_temp_lob` (#91). Allocates a
-        session-duration temporary LOB and returns its locator. 12c+ only."""
+        session-duration temporary LOB and returns its locator."""
         if dialect_temp_lobs(self._dialect):
             # A pooled 11g session makes its own (#2466).
             return cast(
@@ -2639,13 +2639,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
             raise connection_closed('CREATE_TEMP')
-        (_, Packet) = Received
-        Locator = decode_lobops_locator(Packet)
-        if Locator is None:
-            raise InternalError(
-                f'unexpected CREATE_TEMP response: {Packet[:8].hex() if Packet else None!r}'
-            )
-        return Locator
+        return self._created_temp_lob(Received[1])
 
     async def write_temp_lob(
         self, Locator: bytes, Data: str | bytes, is_blob: bool = False
@@ -2663,19 +2657,21 @@ class AsyncOracleConnect(_ConnectionLogic):
             DictionaryType.lobops,
             locator=Locator,
             data=Payload,
+            # Its length in the LOB's units, which 10g needs (#2803).
+            amount=len(Payload) if is_blob else len(Payload) // 2,
             operation=TNS_LOB_OP_WRITE,
         )
         await self.send(TNS_DATA, encode_dictionary(Dict))
-        await self._confirm_lobops()
+        await self._confirm_lobops(Amount=self.field_version < FIELD_VERSION_12_1)
 
-    async def _confirm_lobops(self) -> None:
+    async def _confirm_lobops(self, Amount: bool = False) -> None:
         """Async port of the sync `_confirm_lobops`: receive a content-free
         LOBOPS response (WRITE / temp / BFILE open-close) and raise on a
         non-zero OER."""
         Received = await self._next_data_packet(b'', b'')
         if Received is False:
             raise connection_closed('LOBOPS')
-        self._raise_lobops_error(Received[1])
+        self._raise_lobops_error(Received[1], Amount)
 
     async def lob_write(
         self,

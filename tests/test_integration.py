@@ -418,7 +418,16 @@ def _target_of(conn) -> _Target:
             getattr(conn, '_dialect', None) is None
             and conn.field_version >= FIELD_VERSION_10_2
         ),
-        temp_lobs_available(conn) or _dialect_binds_lob_outs(conn),
+        # A thin 10g or 11g session makes a temporary LOB (#2803) but binds no
+        # LOB OUT yet.
+        (
+            temp_lobs_available(conn)
+            and (
+                conn.field_version >= FIELD_VERSION_12_1
+                or getattr(conn, '_dialect', None) is not None
+            )
+        )
+        or _dialect_binds_lob_outs(conn),
         conn.field_version,
         conn._scrolls_server_side(),
     )
@@ -655,6 +664,11 @@ _LOB_OUT_BIND = _Need(
     'a LOB OUT bind needs a session that binds a LOB Var, or 8i or 9i (SeerODBC #167)',
     lob_out=True,
 )
+_NULL_LOB_VAR_BIND = _Need(
+    'a NULL LOB Var binds with the LOB bind OAC, which a thin session below 12.1 '
+    'does not send yet (#2803)',
+    lob_out=True,
+)
 _REFCURSOR_IN_BIND = _Need(
     'a REF CURSOR IN bind needs a 10.2+ server',
     refcursor_in=True,
@@ -680,7 +694,7 @@ _TIME_ZONE_SYNC = _Need(
     'a login sets the session time zone from 9.2 (AUTH_ALTER_SESSION)', not_8i=True
 )
 _TEMP_LOB = _Need(
-    'a temporary LOB needs a 12c+ server (CREATE_TEMP), or the native form',
+    'a temporary LOB needs a 10.2+ server (CREATE_TEMP), or the native form',
     temp_lobs=True,
 )
 _END_TO_END = _Need(
@@ -8650,6 +8664,7 @@ class CreateLobIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [(1, 1, 1), (2, 50000, 40000), (3, 3, 2)])
 
+    @_requires(_NULL_LOB_VAR_BIND)
     def test_a_declared_null_lob_in_an_executemany(self):
         # A NULL row keeps the LOB bind with a NULL value, among rows that go
         # as temporary LOBs (#902); a pooled 11g session sends it as OCI 11.2
@@ -15905,7 +15920,7 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
         finally:
             await Conn.close()
 
-    @_requires(_LOB_VAR_BIND)
+    @_requires(_LOB_OUT_BIND)
     async def test_returning_a_clob(self):
         # The async twin of LOBReturningIntegration (#985): the read that
         # materialises a returned LOB is awaited. 12.1+ only, like the sync class.
@@ -15924,7 +15939,11 @@ class AsyncConnectionIntegration(_ThrottleRetry, unittest.IsolatedAsyncioTestCas
                     f'INSERT INTO {Table} (n, c) VALUES (1, :a) RETURNING c INTO :b',
                     ['async returned clob', Var],
                 )
-                Values = [await V.aread() for V in Var.getvalue()]
+                # 8i hands back the text itself (SeerODBC #167), as the sync
+                # class reads it (_lob_content).
+                Values = [
+                    V if isinstance(V, str) else await V.aread() for V in Var.getvalue()
+                ]
                 self.assertEqual(Values, ['async returned clob'])
                 await Conn.rollback()
             finally:
