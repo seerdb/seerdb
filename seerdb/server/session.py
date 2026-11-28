@@ -126,6 +126,7 @@ from seerdb.common.tns import (
     encode_lobops_is_open,
     encode_lobops_length,
     encode_lobops_open_ack,
+    encode_lobops_write_ack,
     encode_login_refusal_oci,
     encode_logoff_status_oci,
     encode_logoff_status_thin,
@@ -3742,7 +3743,9 @@ def _answer_lobops(
         return lobs, current_lob, current_object_lob
     if request.kind == 'create_temp':
         locator = temp_lobs.mint(request.is_blob)
-        stream.write_packet(TNS_DATA, encode_create_temp_response(locator))
+        stream.write_packet(
+            TNS_DATA, encode_create_temp_response(locator, is_blob=request.is_blob)
+        )
         return lobs, current_lob, current_object_lob
     if request.kind == 'write':
         # A write to a COLUMN LOB extends what the Mirror served under that
@@ -3772,7 +3775,10 @@ def _answer_lobops(
             temp_lobs.append(request.locator, request.payload)
         # Verbatim: the locator is echoed exactly as the client sent it, prefix
         # and all. encode_lobops_ack would add a second length (#903/#887).
-        stream.write_packet(TNS_DATA, encode_lobops_echo(request.locator))
+        # Below 12.1 the amount written follows it (#2847).
+        stream.write_packet(
+            TNS_DATA, encode_lobops_write_ack(request.locator, request.amount)
+        )
         return lobs, current_lob, current_object_lob
     if request.kind == 'free_temp':
         # Release the temp LOB now rather than at session end.

@@ -5025,6 +5025,15 @@ call and is at times negative (`81 02`, `81 4d`), so it is read as a signed
 `ub4`. A `WRITE` into the temporary LOB carries its amount, as one into a
 persistent LOB does there (§14.2).
 
+**The Mirror answers a client below 12.1 so too** (#2847). It reads this
+request through `_LOBOPS_CREATE_TEMP`, and answers with
+`_CREATE_TEMP_REPLY_PRE12`: the session's charset for a CLOB, 1 for a BLOB,
+an SCN slot of 0 and an amount of 1. It echoes a `WRITE`'s amount behind the
+locator, as 10.2 and 11.2.0.2 do (`08 00 26 <locator> 01 04 04 …` for 4 bytes,
+`encode_lobops_write_ack`). The 12.1 forms it wrote before made JDBC thin 11.2
+hang at its first `CREATE_TEMP`. Without the echo, ojdbc6 read the status as
+the amount and failed with *"Protocol violation: [0]"*.
+
 **On a thin OALL8 session to 9.2** (`thin_oall8=True`), JDBC thin 11.2 makes
 the temporary LOB in 9i's own LOBOPS form, the compact dialect's
 (`_O7_LOBOPS`), with the SCN array's pointer and its one slot set to 1 behind

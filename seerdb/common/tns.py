@@ -3324,7 +3324,12 @@ _LOBOPS_HEAD_THIN = wire_schema.compile_encoder(_LOBOPS_HEAD, _THIN)
 _LOBOPS_REQUEST_THIN = wire_schema.compile_encoder(_LOBOPS_REQUEST, _THIN)
 _LOBOPS_REQUEST_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_REQUEST, _THIN)
 _LOBOPS_CREATE_TEMP_THIN = wire_schema.compile_encoder(_LOBOPS_CREATE_TEMP, _THIN)
+# The Mirror's halves (#2847): it reads the request and writes the reply.
+_LOBOPS_CREATE_TEMP_FROM_THIN = wire_schema.compile_decoder(_LOBOPS_CREATE_TEMP, _THIN)
 _CREATE_TEMP_REPLY_PRE12_FROM_THIN = wire_schema.compile_decoder(
+    _CREATE_TEMP_REPLY_PRE12, _THIN
+)
+_CREATE_TEMP_REPLY_PRE12_THIN = wire_schema.compile_encoder(
     _CREATE_TEMP_REPLY_PRE12, _THIN
 )
 _LOBOPS_READ_FROM_OCI = wire_schema.compile_decoder(_LOBOPS_READ, _OCI)
@@ -5624,8 +5629,17 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
     # that were never a prefix, and the client read past the echo (DPY-5002).
     (head, _) = _LOBOPS_HEAD_FROM_THIN(body)
     operation = head['operation']
+    # A CREATE_TEMP below 12.1 has its own shape, the SCN slot and the amount
+    # behind the charset: read as the 12.1 one, its SCN slot was taken for the
+    # amount and its last field left unread (#2847).
+    decoder = (
+        _LOBOPS_CREATE_TEMP_FROM_THIN
+        if operation == TNS_LOB_OP_CREATE_TEMP
+        and _DECODE_FIELD_VERSION.get() < FIELD_VERSION_12_1
+        else _LOBOPS_REQUEST_FROM_THIN
+    )
     try:
-        (fields, rest) = _LOBOPS_REQUEST_FROM_THIN(body)
+        (fields, rest) = decoder(body)
         if len(fields['locator']) < fields['source_length']:
             raise Truncated(
                 f'LOB call: a {fields["source_length"]}-byte locator, '
@@ -5660,11 +5674,14 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
         # -- 42 bytes where the client expects 40.
         if rest[:1] == bytes([TTI_LOB]):
             rest = rest[1:]
+        # Below 12.1 the request also carries the amount written, which the
+        # reply echoes (encode_lobops_write_ack, #2847).
         return LobOpsRequest(
             kind='write',
             locator=locator,
             payload=_decode_lobops_chunked(rest),
             offset=max(fields['source_offset'], 1),
+            amount=amount,
         )
     if operation in _LOBOPS_FILE_KINDS:
         # A BFILE call: the locator carries the directory and file name, so the
@@ -5726,9 +5743,15 @@ def parse_lobops_request(body: bytes) -> LobOpsRequest:
 _CREATE_TEMP_FLAGS = 0x70
 
 
-def encode_create_temp_response(locator: bytes) -> bytes:
+def encode_create_temp_response(locator: bytes, *, is_blob: bool = False) -> bytes:
     """The CREATE_TEMP reply (#412): the minted locator, its character set and a
     flags byte, closed by a status OER.
+
+    Below 12.1 the reply has 10.2's and 11.2's own shape (#2847): the locator,
+    the charset as an ``n2`` -- the session's for a CLOB, 1 for a BLOB --, the
+    SCN slot (any value; those servers send a different one each call, at
+    times negative) and an amount of 1, then the status. JDBC thin 11.2 reads
+    it so, and seerdb's client too (``decode_create_temp_reply``).
 
     Shape read off a live 23ai::
 
@@ -5742,6 +5765,16 @@ def encode_create_temp_response(locator: bytes) -> bytes:
     one (#846). Same defect as the auth challenge that had no terminating OER
     (#830).
     """
+    if _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1:
+        return _CREATE_TEMP_REPLY_PRE12_THIN(
+            {
+                'locator_length': len(locator),
+                'locator': locator,
+                'charset': 1 if is_blob else AL32UTF8_CHARSET,
+                'scn': 0,
+                'amount': 1,
+            }
+        ) + _encode_oer(1, 0, 0, b'')
     return _CREATE_TEMP_RESPONSE_THIN(
         {
             'locator_length': len(locator),
@@ -5864,6 +5897,27 @@ def encode_lobops_echo(locator_field: bytes) -> bytes:
     kind of client, which is what left ``lob.open()`` failing with
     ``DPY-5002: read integer of … too large`` (#903/#887)."""
     return bytes([TTI_RPA]) + locator_field + _encode_oer(1, 0, 0, b'')
+
+
+# A WRITE's reply: the locator echoed as sent, then below 12.1 the amount
+# written, as 10.2 and 11.2.0.2 answer JDBC thin 11.2 (`08 00 26 <locator>
+# 01 0e 04 ...`, 14 characters written). Without it ojdbc6 read the status as
+# the amount and failed with "Protocol violation: [0]" (#2847).
+_LOBOPS_WRITE_ACK: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('raw', 'locator'),
+    ('when', 'amount_present', (('n8', 'amount'),)),
+)
+_LOBOPS_WRITE_ACK_THIN = wire_schema.compile_encoder(_LOBOPS_WRITE_ACK, _THIN)
+
+
+def encode_lobops_write_ack(locator_field: bytes, amount: int) -> bytes:
+    """The Mirror's reply to a WRITE: :func:`encode_lobops_echo`'s, with the
+    request's ``amount`` echoed below 12.1, where the request carries one."""
+    below_12_1 = _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1
+    return _LOBOPS_WRITE_ACK_THIN(
+        {'locator': locator_field, 'amount_present': below_12_1, 'amount': amount}
+    ) + _encode_oer(1, 0, 0, b'')
 
 
 def encode_lobops_length(locator: bytes, length: int) -> bytes:
