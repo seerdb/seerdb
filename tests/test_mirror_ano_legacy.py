@@ -63,14 +63,20 @@ def test_the_mirrors_groups_are_the_ones_26ai_sends() -> None:
         assert group.bits == bits
 
 
-def test_the_group_follows_the_offered_checksums() -> None:
-    offer = ano.offered_algorithm_ids(
-        ano.decode_container(_JDBC6_REQUEST), ano.SERVICE_DATA_INTEGRITY
-    )
-    assert offer == [0, 1, 3]
-    assert ano.dh_group_for(offer) is ano.DH_GROUP_LEGACY
-    assert ano.dh_group_for([0, 1, 3, 4, 5, 6]) is ano.DH_GROUP_14
-    assert ano.dh_group_for([0, 5]) is ano.DH_GROUP_14
+def test_the_group_follows_the_requests_version() -> None:
+    # ojdbc6 stamps 0x0A200000 and gets the 1024-bit group. seerdb stamps
+    # 0x0B200200 and gets the 2048-bit one even with SHA1 alone offered (#2865),
+    # so the checksums don't decide it.
+    jdbc6 = ano.decode_container(_JDBC6_REQUEST)
+    assert jdbc6['version'] == 0x0A200000
+    assert ano.dh_group_for(jdbc6['version']) is ano.DH_GROUP_LEGACY
+    sha1 = ano.decode_container(_capture('seerdb_ano_request_sha1.hexdump'))
+    assert sha1['version'] == 0x0B200200
+    assert ano.offered_algorithm_ids(sha1, ano.SERVICE_DATA_INTEGRITY) == [0, 3]
+    real = _services(_capture('oracle26ai_ano_reply_seerdb_sha1.hexdump'))
+    assert real[ano.SERVICE_DATA_INTEGRITY][1] == (ano.SP_UB1, 3)
+    assert real[ano.SERVICE_DATA_INTEGRITY][5][1] == ano.DH_GROUP_14.prime
+    assert ano.dh_group_for(sha1['version']) is ano.DH_GROUP_14
 
 
 def test_the_reply_matches_26ais_but_for_the_key_and_checksum() -> None:
@@ -152,7 +158,9 @@ def test_the_mirror_answers_ojdbc6s_offer_as_26ai_does() -> None:
     assert reply[ano.SERVICE_AUTH][1] == (ano.SP_STATUS, 0xFBFF)
     assert reply[ano.SERVICE_ENCRYPTION][1] == (ano.SP_UB1, 17)
     integrity = reply[ano.SERVICE_DATA_INTEGRITY]
-    assert integrity[1] == (ano.SP_UB1, 0)
+    # SHA1, as 26ai agrees with it where SHA1 is allowed (#2865); the packet
+    # after the negotiation carries a SHA1 MAC the client checks.
+    assert integrity[1] == (ano.SP_UB1, 3)
     assert integrity[4][1] == ano.DH_GROUP_LEGACY.generator
     assert integrity[5][1] == ano.DH_GROUP_LEGACY.prime
     assert data.endswith(b'under the agreed keys')

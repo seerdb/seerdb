@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# seerdb's ANO request with its checksums narrowed to SHA1 (#2865), stamped
+# 0x0B200200: AES-256 and the other ciphers, and SHA1 alone for integrity.
+# Captured 2026-11-28 through tools/capture_proxy.py. The ANO container,
+# without the packet's header and data flags, as `hexdump -C` output; the
+# offset column and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  de ad be ef 00 93 0b 20  02 00 00 04 00 00 04 00  |....... ........|
+00000010  03 00 00 00 00 00 04 00  05 0b 20 02 00 00 08 00  |.......... .....|
+00000020  01 00 00 10 1c 66 ec 28  ea 00 12 00 01 de ad be  |.....f.(........|
+00000030  ef 00 03 00 00 00 04 00  04 00 01 00 02 00 03 00  |................|
+00000040  01 00 03 00 00 00 00 00  04 00 05 0b 20 02 00 00  |............ ...|
+00000050  02 00 03 e0 e1 00 02 00  06 fc ff 00 02 00 03 00  |................|
+00000060  00 00 00 00 04 00 05 0b  20 02 00 00 09 00 01 00  |........ .......|
+00000070  01 08 0a 06 02 0f 10 11  00 01 00 02 01 00 03 00  |................|
+00000080  02 00 00 00 00 00 04 00  05 0b 20 02 00 00 02 00  |.......... .....|
+00000090  01 00 03                                          |...|
+00000093

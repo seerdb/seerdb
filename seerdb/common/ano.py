@@ -433,9 +433,9 @@ DH_PRIME = bytes.fromhex(
 DH_GROUP_BITS = len(DH_PRIME) * 8  # 2048; both bit-length fields carry this
 DH_GENERATOR = (2).to_bytes(len(DH_PRIME), 'big')  # generator 2, prime-padded
 
-# The 1024-bit group the 26ai bed sends a client that offers no SHA-2 checksum,
-# JDBC thin 11.2 (ojdbc6) among them, which fails on the 2048-bit one (#2858).
-# Oracle's own: neither the generator nor the prime is a published group.
+# The 1024-bit group the 26ai bed sends JDBC thin 11.2 (ojdbc6), whose request
+# is stamped 0x0A200000 and which fails on the 2048-bit group (#2858). Oracle's
+# own: neither the generator nor the prime is a published group.
 DH_LEGACY_GENERATOR = bytes.fromhex(
     '9fa2293098fd74b8d1b4cbf404dbf01c3f18e37445572a0d807fc21c54c0628d'
     'd3ad3349d1545b03e1c3c63dfbcf7aada4de2cd56767b24ca6bab01f2244f2e5'
@@ -465,15 +465,16 @@ class DhGroup:
 
 DH_GROUP_14 = DhGroup(DH_GENERATOR, DH_PRIME)
 DH_GROUP_LEGACY = DhGroup(DH_LEGACY_GENERATOR, DH_LEGACY_PRIME)
-_SHA2_INTEGRITY_IDS = frozenset(
-    INTEGRITY_ALGO_IDS[Name] for Name in ('SHA256', 'SHA384', 'SHA512')
-)
 
 
-def dh_group_for(OfferedIntegrity: list[int]) -> DhGroup:
-    """The group a real server sends for a client's offered checksums: the
-    2048-bit one when it offers a SHA-2 checksum, else the 1024-bit one (#2858)."""
-    if _SHA2_INTEGRITY_IDS.intersection(OfferedIntegrity):
+def dh_group_for(RequestVersion: int) -> DhGroup:
+    """The group a real server sends for the version a client's ANO request is
+    stamped with: the 2048-bit one from 11.2.0.2 (``0x0B200200``, seerdb and
+    python-oracledb), the 1024-bit one below it (JDBC thin 11.2's ``0x0A200000``).
+
+    The checksums don't decide it: 26ai sends seerdb the 2048-bit group with its
+    offer narrowed to SHA1 (#2865), which #2858 took for the rule."""
+    if RequestVersion >= VERSION_11_2_0_2:
         return DH_GROUP_14
     return DH_GROUP_LEGACY
 
