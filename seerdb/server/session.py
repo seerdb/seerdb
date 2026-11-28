@@ -151,6 +151,7 @@ from seerdb.common.tns import (
     encode_sync_piggyback,
     encode_token_result,
     encode_version_banner_oci,
+    encode_version_reply,
     fetch_cursor_oci,
     inline_long_after_type_change,
     inline_long_for_defines,
@@ -257,6 +258,7 @@ from seerdb.common.tns_consts import (
     TTI_OCCA,
     TTI_PING,
     TTI_ROLLBACK,
+    TTI_VERSION,
 )
 from seerdb.common.types import DbZoneDatetime
 from seerdb.server import lockout, stats
@@ -719,7 +721,9 @@ def handle_login(
                 _ENCODE_FIELD_VERSION.set(field_version)
                 _SESSION_FEATURES.set(sqlplus_features(capabilities, field_version))
         else:
-            stream.send_raw(encode_dty_reply(field_version=field_version))
+            stream.send_raw(
+                encode_dty_reply(field_version=field_version, request=after_pro)
+            )
             _SESSION_FEATURES.set(session_features(field_version))
         osesskey = _expect_login_message(stream, 'OSESSKEY')
 
@@ -1591,6 +1595,7 @@ def serve_session(
                 field_version,
                 advertised,
                 watch,
+                identity,
             )
         finally:
             stats.close_session(session_id)
@@ -1607,6 +1612,7 @@ def _serve_thin_session(
     field_version: int,
     advertised: int,
     watch: BreakWatch | None = None,
+    identity: ServerIdentity = IDENTITY_11_2,
 ) -> str:
     # A logged-in thin client's calls, answered until its logoff or EOF; returns
     # the user. Every request it sends -- one call, however many packets carry it
@@ -1895,6 +1901,12 @@ def _serve_thin_session(
             _commit_at_logoff(backend)
             stream.write_packet(TNS_DATA, encode_logoff_status_thin())
             return user
+        elif body[1] == TTI_VERSION:
+            # The server's banner and release. JDBC thin 11.2 asks once after
+            # its login, and refused it closed the connection (#2854).
+            stream.write_packet(
+                TNS_DATA, encode_version_reply(identity.banner, identity.version_no)
+            )
         else:
             # A TTC function the Mirror does not implement (#832).
             _refuse_unhandled(stream, f'TTC function {body[1]}')

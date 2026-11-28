@@ -5482,11 +5482,16 @@ def test_skip_piggybacks_steps_over_pipeline_begin(field_version: int) -> None:
         _DECODE_FIELD_VERSION.reset(token)
 
 
-def test_a_success_oer_carries_no_message_from_12_1() -> None:
+def test_a_success_oer_carries_no_message() -> None:
     # A 12.1+ client reads the message only `if error_num != 0`. The empty
     # length byte written on success was never consumed -- harmless while the
     # OER ended the response, and "unknown protocol message type 0" on every
     # login once end-of-response framing made the client read on past it.
+    #
+    # Below 12.1 a real server sends none either: 10.2 and 11.2.0.2 end a
+    # success status at its batch-message count (captured). JDBC thin 11.2
+    # read the byte as the next message's code and failed its login with
+    # "Protocol violation: [0]" (#2854).
     #
     # Asserted on _oer_message rather than on the whole OER: every earlier field
     # of a success status is zero too, so the OER ends in a long zero run and a
@@ -5502,8 +5507,8 @@ def test_a_success_oer_carries_no_message_from_12_1() -> None:
         _ENCODE_FIELD_VERSION.reset(token)
     token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_11_2)
     try:
-        # Below 12.1 the captured bytes stand, empty length included.
-        assert _oer_message(0, b'') == b'\x00'
+        assert _oer_message(0, b'') == b''
+        assert _oer_message(942, b'ORA-00942: x') != b''
     finally:
         _ENCODE_FIELD_VERSION.reset(token)
 

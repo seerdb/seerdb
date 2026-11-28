@@ -56,12 +56,14 @@ from seerdb.common.tns_consts import (
     CCAP_FIELD_VERSION,
     CCAP_LOGON_O7LOGON,
     CCAP_LOGON_TYPES,
+    CCAP_UB2_DTY,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
     FIELD_VERSION_18_1_EXT_1,
     FIELD_VERSION_21_1,
     FIELD_VERSION_23_1,
+    RCAP_TZ,
     TNS_ACCEPT,
     TNS_ACCEPT_FLAG_HAS_END_OF_RESPONSE,
     TNS_DATA,
@@ -173,6 +175,11 @@ _ACCEPT_CONN_ID_LEN = 16
 # The classic sqlplus / thick-OCI PRO request leads its TTC payload with the ANO
 # container magic (0xDEADBEEF) instead of TTI_PRO (0x01); the Mirror must answer
 # that request in the matching `deadbeef` dialect (#265).
+#
+# The version a client stamps its ANO container with: sqlplus / OCI's is zero,
+# a thin client's is its own release, 11.2.0.2 for python-oracledb and 10.2 for
+# JDBC thin 11.2 (#2854).
+_OCI_ANO_VERSION = bytes(4)
 
 
 def opens_with_oci_ano(first: bytes) -> bool:
@@ -186,8 +193,14 @@ def opens_with_oci_ano(first: bytes) -> bool:
     2-byte data-flags already stripped (``read_packet`` returns ``packet[10:]``
     for a DATA packet), so the magic sits at the very start — verified against a
     live sqlplus 11.2, which is exactly where a wrong offset misfires (#265).
+
+    sqlplus stamps the container with version zero; a thin client that
+    negotiates ANO stamps its own release there, which is how the two are told
+    apart (:func:`is_ano_negotiation`). JDBC thin 11.2 opens with the container
+    too, stamped 10.2 (``0a 20 00 00``), and taken for sqlplus it was answered
+    sqlplus's type reply and hung (#2854).
     """
-    return first[:4] == ano.ANO_MAGIC_BYTES
+    return first[:4] == ano.ANO_MAGIC_BYTES and first[6:10] == _OCI_ANO_VERSION
 
 
 _SERVICE_RE = re.compile(rb'\(SERVICE_NAME\s*=\s*([^)\s]+)', re.IGNORECASE)
@@ -454,9 +467,24 @@ def build_caps_block_reply(
     )
 
 
-def build_dty_type_reply(field_version: int = FIELD_VERSION_11_2) -> bytes:
+def build_dty_type_reply(
+    field_version: int = FIELD_VERSION_11_2, request: bytes | None = None
+) -> bytes:
     """The thin DTY reply as a TTC payload: TTI_DTY then the server's
     type-conversion table.
+
+    ``request``, the client's DTY, says two more things where it can be read.
+    JDBC thin 11.2 (ojdbc6) sets both at field version 11.2, and 11.2.0.2
+    answers it so (#2854):
+
+    - its runtime capability ``RCAP_TZ``: the client sends the DB session
+      time-zone block, and the reply carries the server's ahead of the table,
+      with the timezone-file version where the client sent one, as sqlplus's
+      reply does (:func:`build_oci_dty_reply`);
+    - its compile capability ``CCAP_UB2_DTY``: the table goes in UB2 entries,
+      whatever the field version.
+
+    Without them the reply is the one the field version picks, below.
 
     The table has two encodings and the field version picks between them. Up to
     11g each entry is single bytes (``<type> <conv> <rep> 00``); from 12.1 every
@@ -471,12 +499,30 @@ def build_dty_type_reply(field_version: int = FIELD_VERSION_11_2) -> bytes:
     the same decision. It tolerated the narrow table only because it stops
     reading once it has what it needs.
     """
-    table = (
-        _datatype_table_12c()
-        if field_version >= FIELD_VERSION_12_1
-        else _SERVER_DTY_TABLE
-    )
+    wide = field_version >= FIELD_VERSION_12_1
+    head = decode_dty_request_head(request) if request else None
+    if head is not None:
+        (fields, _) = head
+        compile_caps = fields['compile_caps']
+        runtime_caps = fields.get('runtime_caps', b'')
+        if len(compile_caps) > CCAP_UB2_DTY and compile_caps[CCAP_UB2_DTY]:
+            wide = True
+        if len(runtime_caps) > RCAP_TZ and runtime_caps[RCAP_TZ]:
+            table = _datatype_table_12c() if wide else _SERVER_DTY_TABLE
+            return (
+                build_oci_dty_reply(
+                    tz_file_version=len(runtime_caps) >= _TZ_FILE_RUNTIME_CAPS
+                )
+                + table
+            )
+    table = _datatype_table_12c() if wide else _SERVER_DTY_TABLE
     return encode_dty_reply_body(table)
+
+
+# The timezone-file version follows the time-zone block in a DTY request whose
+# runtime capabilities run to 7 bytes: sqlplus 11.2's and ojdbc6's do, sqlplus
+# 10.2's 5 do not, and 11.2.0.2 answers each in kind (#1764, #2854).
+_TZ_FILE_RUNTIME_CAPS = 7
 
 
 def build_ano_null_reply() -> bytes:
@@ -534,8 +580,16 @@ def build_oci_dty_reply(*, tz_file_version: bool = True) -> bytes:
 
 def is_ano_negotiation(pro_body: bytes) -> bool:
     """Whether a post-ACCEPT packet is a modern thin client's ANO negotiation
-    (vs a TTI_PRO or the sqlplus/OCI ANO, both handled by other paths)."""
-    return pro_body[:4] == ano.ANO_MAGIC_BYTES and pro_body[6:10] == ano.VERSION_BYTES
+    (vs a TTI_PRO or the sqlplus/OCI ANO, both handled by other paths).
+
+    A thin client stamps the container with its own release, and sqlplus with
+    zero (:func:`opens_with_oci_ano`). Any release counts, not only
+    python-oracledb's 11.2.0.2: JDBC thin 11.2 stamps 10.2 (#2854)."""
+    return (
+        pro_body[:4] == ano.ANO_MAGIC_BYTES
+        and len(pro_body) >= 10
+        and pro_body[6:10] != _OCI_ANO_VERSION
+    )
 
 
 def encode_ano_null_reply(*, sdu: int = DEFAULT_SDU) -> bytes:
@@ -590,13 +644,16 @@ def encode_dty_reply(
     *,
     sdu: int = DEFAULT_SDU,
     field_version: int = FIELD_VERSION_11_2,
+    request: bytes | None = None,
 ) -> bytes:
     """Build the server's DTY (data-type negotiation) reply to a thin client —
-    §4.2: the type-conversion table, 924 bytes against an 11g capture. sqlplus /
-    thick OCI asks without a table and gets :func:`encode_oci_dty_reply`.
-    Returns the full TNS_DATA packet.
+    §4.2: the type-conversion table, 924 bytes against an 11g capture, shaped by
+    the client's ``request`` where it asks for more (:func:`build_dty_type_reply`).
+    sqlplus / thick OCI asks without a table and gets
+    :func:`encode_oci_dty_reply`. Returns the full TNS_DATA packet.
     """
-    packet, _ = encode_packet(TNS_DATA, build_dty_type_reply(field_version), sdu)
+    payload = build_dty_type_reply(field_version, request)
+    packet, _ = encode_packet(TNS_DATA, payload, sdu)
     return packet
 
 
