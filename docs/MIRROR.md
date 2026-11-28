@@ -91,7 +91,7 @@ clients are not served. What is checked, and how (measured 2026-10-31):
 | python-oracledb (thin) | its own test suite (v26.1.0), `tools/run_oracledb_suite.py` | over PostgreSQL: 2468 passed; through a passthrough: 2472 passed |
 | seerdb | seerdb's integration suite, in CI on every change | over PostgreSQL: 615 passed when presenting 23ai, 570 when presenting 12.1 |
 | sqlplus 10.2 and 23.26 | `tools/sqlplus_survey.py`, compared with sqlplus against Oracle directly | the subset sqlplus uses for real database work |
-| JDBC thin 11.2 (ojdbc6 11.2.0.3) | hand-run Java programs over PostgreSQL, compared with the same programs against 11.2.0.2 (2026-11-28) | login, DDL and DML, queries, LOB columns (CLOB, NCLOB, BLOB, empty and NULL), temporary LOBs and LOB OUT binds; only with `--encryption accepted` for now (#2858) |
+| JDBC thin 11.2 (ojdbc6 11.2.0.3) | hand-run Java programs over PostgreSQL, compared with the same programs against 11.2.0.2 (2026-11-28) | login, DDL and DML, queries, LOB columns (CLOB, NCLOB, BLOB, empty and NULL), temporary LOBs and LOB OUT binds, in the clear and under `--encryption requested` (AES-256, no checksum: it offers only MD5 and SHA1) |
 
 - **Excluded from python-oracledb's run:** some feature areas aren't served at
   all (*Not served* below), so their test files are left out. Over PostgreSQL,
