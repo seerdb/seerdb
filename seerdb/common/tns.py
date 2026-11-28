@@ -270,6 +270,7 @@ from seerdb.common.tns_consts import (
     TNS_LOB_OP_GET_LENGTH,
     TNS_LOB_OP_READ,
     TNS_LOB_OP_WRITE,
+    TNS_LOB_PREFETCH_FLAG,
     TNS_LONG_LENGTH_INDICATOR,
     TNS_MAX_SHORT_LENGTH,
     TNS_MSG_TYPE_FAST_AUTH,
@@ -422,6 +423,10 @@ class ColumnMeta:
     # being REPLACED carried, not this describe's own (#826). None everywhere
     # else, so an ordinary LOB column keeps its locator.
     inline_long_csfrm: int | None = None
+    # Set when the client's define asks for a CLOB / BLOB column's data with
+    # its locator (TNS_LOB_PREFETCH_FLAG, a non-zero length): how much, in the
+    # LOB's own units. 0 everywhere else, so the locator goes alone (#2859).
+    lob_prefetch: int = 0
     # A 23ai column's SQL domain and annotations (#1082): the domain's schema and
     # name, and the annotation map as (key, value) pairs, a name-only annotation
     # with an empty value. Empty for a column without them.
@@ -2199,6 +2204,28 @@ _LOB_CELL: wire_schema.Schema = (
         ),
     ),
 )
+# The cell for a define that asks for the data with the locator
+# (TNS_LOB_PREFETCH_FLAG, #2859), as 11.2.0.2 sends it JDBC thin 11.2: the
+# data between the chunk size and the locator. A CLOB or NCLOB has a flag
+# saying a charset follows (1 for a CLOB, which names AL16UTF16; 0 for an
+# NCLOB) and its charset form ahead of it, the data UTF-16 for both; a BLOB
+# has its bytes alone. A NULL is the plain cell's.
+_LOB_CELL_PREFETCH: wire_schema.Schema = (
+    ('n4', 'locator_length'),
+    ('n8', 'size'),
+    ('n4', 'chunk_size'),
+    (
+        'when',
+        'prefetch_text',
+        (
+            ('u8', 'has_charset'),
+            ('when', 'has_charset', (('n2', 'charset'),)),
+            ('u8', 'prefetch_csfrm'),
+        ),
+    ),
+    ('value', 'data'),
+    ('value', 'locator'),
+)
 # An object (ADT) value, a row cell's and an OUT bind's (#116, §40.4): a head
 # each dialect writes its own way, then the image's length, the TOP_LEVEL flags
 # and -- unless the value is NULL -- the image. Thin's head is the type id, an
@@ -3408,6 +3435,7 @@ _CLOSE_CURSORS_O9I = wire_schema.compile_encoder(_CLOSE_CURSORS, _O9I)
 _OBJECT_FRAME_THIN = wire_schema.compile_encoder(_OBJECT_FRAME, _THIN)
 _OBJECT_FRAME_OCI = wire_schema.compile_encoder(_OBJECT_FRAME, _OCI)
 _LOB_CELL_THIN = wire_schema.compile_encoder(_LOB_CELL, _THIN)
+_LOB_CELL_PREFETCH_THIN = wire_schema.compile_encoder(_LOB_CELL_PREFETCH, _THIN)
 _LOB_CELL_OCI = wire_schema.compile_encoder(_LOB_CELL, _OCI)
 _ROWID_CELL_THIN = wire_schema.compile_encoder(_ROWID_CELL, _THIN)
 _ROWID_CELL_OCI = wire_schema.compile_encoder(_ROWID_CELL, _OCI)
@@ -4127,7 +4155,7 @@ def inline_long_after_type_change(
 
 
 def inline_long_for_defines(
-    columns: list[ColumnMeta], defines: Sequence[tuple[int, int]]
+    columns: list[ColumnMeta], defines: Sequence[tuple[int, ...]]
 ) -> list[ColumnMeta]:
     """``columns``, with every column the client's own define asks for inline.
 
@@ -4136,14 +4164,26 @@ def inline_long_for_defines(
     describe, then re-executes with the DEFINE option and one OAC per column
     saying what it wants. Given LONG (RAW) there, a real server sends the value
     inline in the row instead of a locator, and the client issues no LOB read.
-    ``defines`` is ``ExecRequest.define_types``, the ``(tns_type, csfrm)`` of each
-    of those OACs (#826).
+    ``defines`` is ``ExecRequest.define_types``, the ``(tns_type, csfrm,
+    prefetch)`` of each of those OACs (#826).
+
+    A CLOB / BLOB define that asks for the data with the locator (a non-zero
+    ``prefetch``, as JDBC thin 11.2's does) marks its column ``lob_prefetch``:
+    its cells then carry that much of the data ahead of the locator (#2859).
     """
-    return _mark_inline_long(columns, defines)
+    out = _mark_inline_long(columns, defines)
+    for i, col in enumerate(out):
+        if i >= len(defines) or len(defines[i]) < 3 or not defines[i][2]:
+            continue
+        if col.data_type in (TNS_TYPE_CLOB, TNS_TYPE_BLOB) and (
+            col.inline_long_csfrm is None and defines[i][0] == col.data_type
+        ):
+            out[i] = replace(col, lob_prefetch=defines[i][2])
+    return out
 
 
 def _mark_inline_long(
-    columns: list[ColumnMeta], wanted: Sequence[tuple[int, int]]
+    columns: list[ColumnMeta], wanted: Sequence[tuple[int, ...]]
 ) -> list[ColumnMeta]:
     # Mark each LOB column the client is going to read as LONG (RAW), carrying the
     # charset form its bytes must use. ``wanted`` is the (type, csfrm) the client
@@ -4630,9 +4670,12 @@ def _thin_column_value(value: object, col: 'ColumnMeta') -> bytes:
         log = _LOB_EMIT_LOG.get()
         if log is not None:
             is_clob = col.data_type == TNS_TYPE_CLOB
-            locator = log.record(value, is_clob)
+            locator = log.record(value, is_clob, col.csfrm == _CSFRM_NCHAR)
             return encode_lob_locator_thin(
-                _lob_value_size(value), with_metadata=True, locator=locator
+                _lob_value_size(value),
+                with_metadata=True,
+                locator=locator,
+                prefetch=_lob_prefetch_data(col, value),
             )
     if (
         describe_wire_length(col) == 0
@@ -5168,6 +5211,13 @@ def parse_exec(
     # orientation, [11] position) is there: a scroll re-execute carries no
     # binds (#181/#485).
     al8: list[int] = [item['word'] for item in head['al8i4']]
+    # A fetch call can leave the header's row count at 0 and ask for its rows
+    # in al8i4[1]: JDBC thin 11.2 does so on the call that defines a LOB
+    # column's fetch after the describe-only execute, `0x8050` with 10 there,
+    # and 11.2.0.2 answers it with the rows. Read as 0 the Mirror sent none
+    # and ojdbc6 saw an empty result set (#2859).
+    if not fetch and options & TNS_EXEC_OPTION_FETCH and len(al8) > 1:
+        fetch = al8[1]
     scrollable = len(al8) > 9 and bool(al8[9] & TNS_EXEC_FLAGS_SCROLLABLE)
     # The request is the DML_ROWCOUNTS bit alone. Testing the composite the
     # client sends (which also carries IMPLICIT_RESULTSET) matched EVERY execute
@@ -5199,10 +5249,19 @@ def parse_exec(
         defines_rest = after
         for _ in range(define_count):
             # A 12.2+ OAC ends in an oaccolid, read so the next define aligns.
-            data_type, _maxlen, _scale, _charset, csfrm, _toid, defines_rest = (
-                decode_oac_fields(defines_rest, field_version >= FIELD_VERSION_12_2)
+            # Each define is (type, csfrm, prefetch): how much of a LOB's data
+            # the client asks for with its locator, its max characters when the
+            # cont flag carries TNS_LOB_PREFETCH_FLAG, else 0 (#2859).
+            oac = _decode_oac_walk(defines_rest, field_version >= FIELD_VERSION_12_2)
+            (data_type, cont_flags, csfrm, max_chars) = (
+                oac[0],
+                oac[5],
+                oac[9],
+                oac[10],
             )
-            define_types.append((data_type, csfrm))
+            defines_rest = oac[-1]
+            prefetch = max_chars if cont_flags & TNS_LOB_PREFETCH_FLAG else 0
+            define_types.append((data_type, csfrm, prefetch))
 
     binds: list = []
     bind_rows: list = []
@@ -22910,10 +22969,31 @@ _THIN_LOB_LOC_OFFSET_FLAG_3 = 6
 _THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET = 0x80
 
 
-def _thin_lob_locator() -> bytes:
-    raw = bytearray(b'\x00seerdb-mirror-lob-locator-0000000000\x00')
-    raw[_THIN_LOB_LOC_OFFSET_FLAG_3] |= _THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET
+# A column LOB locator's four flag bytes (offsets 4 to 7), as 11.2.0.2 sends
+# them, by the LOB's kind (#2859). JDBC thin 11.2 builds its CLOB, NCLOB or
+# BLOB from them: the ASCII they held before set 0x40 in flag byte 2, which
+# names an NCLOB, so every LOB it read was refused ("Incorrect form of use to
+# create NCLOB"). They also set ABSTRACT (0x40) in flag byte 1 and TEMP (0x01)
+# in flag byte 4, so python-oracledb took each fetched column LOB for a
+# temporary one; a real server's sets neither.
+_THIN_LOB_LOC_OFFSET_FLAG_1 = 4
+_COLUMN_LOB_LOC_FLAGS = {
+    'clob': bytes.fromhex('020c8000'),
+    'nclob': bytes.fromhex('044c0000'),
+    'blob': bytes.fromhex('010c0000'),
+}
+
+
+def _column_lob_locator(counter: bytes, kind: str) -> bytes:
+    raw = bytearray(b'\x00seerdb-mirror-lob-locator-' + counter + b'\x00')
+    raw[_THIN_LOB_LOC_OFFSET_FLAG_1 : _THIN_LOB_LOC_OFFSET_FLAG_1 + 4] = (
+        _COLUMN_LOB_LOC_FLAGS[kind]
+    )
     return bytes(raw)
+
+
+def _thin_lob_locator() -> bytes:
+    return _column_lob_locator(b'0000000000', 'clob')
 
 
 _THIN_LOB_LOCATOR = _thin_lob_locator()
@@ -22932,21 +23012,20 @@ def _thin_obj_lob_locator() -> bytes:
 _THIN_OBJ_LOB_LOCATOR = _thin_obj_lob_locator()
 
 # The counter slot of `_THIN_LOB_LOCATOR` (its trailing "0000000000"): a per-LOB
-# index printed here makes each fetched column LOB's locator unique while keeping
-# the byte layout the client accepts. Index 0 reproduces `_THIN_LOB_LOCATOR`.
-_COLUMN_LOB_LOCATOR_PREFIX = b'\x00seerdb-mirror-lob-locator-'
+# index printed there makes each fetched column LOB's locator unique while keeping
+# the byte layout the client accepts. Index 0 of a CLOB reproduces
+# `_THIN_LOB_LOCATOR` (`_column_lob_locator`).
 
 
-def mint_column_lob_locator(index: int) -> bytes:
+def mint_column_lob_locator(index: int, kind: str = 'clob') -> bytes:
     """A fetched column LOB's locator, unique per session LOB (#888).
 
     The read path is row-major and ignores the locator, so uniqueness costs the
     reader nothing; it lets :class:`LobEmitLog` remember the content the Mirror
     served under each locator, so an object bind that later carries one can be
-    resolved. Byte-for-byte `_THIN_LOB_LOCATOR` with the trailing counter set."""
-    raw = bytearray(_COLUMN_LOB_LOCATOR_PREFIX + b'%010d' % (index % 10**10) + b'\x00')
-    raw[_THIN_LOB_LOC_OFFSET_FLAG_3] |= _THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET
-    return bytes(raw)
+    resolved. `_THIN_LOB_LOCATOR`'s layout with the trailing counter set, and
+    the flag bytes of ``kind`` ('clob', 'nclob' or 'blob', #2859)."""
+    return _column_lob_locator(b'%010d' % (index % 10**10), kind)
 
 
 class LobEmitLog:
@@ -22964,8 +23043,9 @@ class LobEmitLog:
         self._next = 0
         self.contents: dict[bytes, tuple[object, bool]] = {}
 
-    def record(self, value: object, is_clob: bool) -> bytes:
-        locator = mint_column_lob_locator(self._next)
+    def record(self, value: object, is_clob: bool, national: bool = False) -> bytes:
+        kind = ('nclob' if national else 'clob') if is_clob else 'blob'
+        locator = mint_column_lob_locator(self._next, kind)
         self._next += 1
         self.contents[locator] = (value, is_clob)
         return locator
@@ -23053,8 +23133,27 @@ def encode_lob_bind_block(value: object, *, is_clob: bool) -> bytes:
     )
 
 
+def _lob_prefetch_data(col: ColumnMeta, value: object) -> tuple[int, bytes] | None:
+    # What a column whose define asked for prefetch carries ahead of the locator
+    # (#2859): the charset form (0 for a BLOB) and the first `lob_prefetch`
+    # units of the data -- a CLOB's or NCLOB's characters in UTF-16, a BLOB's
+    # bytes. None for a column that did not ask.
+    if not col.lob_prefetch:
+        return None
+    if isinstance(value, str):
+        csfrm = _CSFRM_NCHAR if col.csfrm == _CSFRM_NCHAR else 1
+        return (csfrm, value[: col.lob_prefetch].encode('utf-16-be'))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return (0, bytes(value)[: col.lob_prefetch])
+    return None
+
+
 def encode_lob_locator_thin(
-    size: int = 0, *, with_metadata: bool = False, locator: bytes = _THIN_LOB_LOCATOR
+    size: int = 0,
+    *,
+    with_metadata: bool = False,
+    locator: bytes = _THIN_LOB_LOCATOR,
+    prefetch: tuple[int, bytes] | None = None,
 ) -> bytes:
     """The RXD value for a thin LOB column (#413): a minted opaque locator the
     client echoes back over TTI_LOBOPS. The content follows in the read reply.
@@ -23084,6 +23183,24 @@ def encode_lob_locator_thin(
     which is what the stricter reader demands, and :func:`_read_lob_column`
     accepts either so seerdb's own client reads the Mirror and a real server
     alike."""
+    # ``prefetch`` is ``(csfrm, data)`` for a define that asked for the data
+    # with the locator (#2859): csfrm 1 a CLOB, whose data is then declared
+    # AL16UTF16; 2 an NCLOB, which declares no charset; 0 a BLOB.
+    if prefetch is not None:
+        (csfrm, data) = prefetch
+        return _LOB_CELL_PREFETCH_THIN(
+            {
+                'locator_length': len(locator),
+                'size': size,
+                'chunk_size': _THIN_LOB_CHUNK_SIZE,
+                'prefetch_text': csfrm != 0,
+                'has_charset': csfrm == 1,
+                'charset': AL16UTF16_CHARSET,
+                'prefetch_csfrm': csfrm,
+                'data': data,
+                'locator': locator,
+            }
+        )
     return _LOB_CELL_THIN(
         {
             'locator_length': len(locator),

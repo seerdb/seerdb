@@ -5449,6 +5449,46 @@ Consequences for seerdb:
   is a heuristic and is written down as one; it becomes unnecessary the day the
   switch above is identified.
 
+#### 14.5b.1 A define that asks for the data with the locator (#2859)
+
+JDBC thin 11.2 (ojdbc6) fetches a LOB column in two calls, as §14.5e describes:
+first the execute, which gets the describe only, then a define-and-fetch call
+(options `0x8050`). Two things in that second call differ from python-oracledb's:
+- **The row count is in `al8i4[1]`**, here 10; the header's prefetch count is 0.
+  11.2.0.2 answers with the rows, and so does the Mirror now. Read as 0, the
+  Mirror sent none, and ojdbc6 saw an empty result set.
+- **The define asks for the data with the locator.** Its cont flag carries
+  `TNS_LOB_PREFETCH_FLAG` (`0x02000000`), and its max characters is how much
+  data it wants, ojdbc6's default 4000. python-oracledb sets the flag with a
+  length of 0, and so gets the plain cell.
+
+11.2.0.2 then sends each value with its data between the chunk size and the
+locator (`_LOB_CELL_PREFETCH`), measured on a CLOB, an NCLOB, a 300-character
+CLOB, an empty CLOB, a NULL and a BLOB:
+
+```
+ub4 locator length | ub8 size | ub4 chunk size |
+  [CLOB, NCLOB: ub1 charset follows | (n2 charset) | ub1 charset form] |
+  <DALC> data | <DALC> locator
+```
+
+- **A CLOB** says a charset follows (`01`), names AL16UTF16 (`02 07 d0`, 2000)
+  and form 1. **An NCLOB** says none follows (`00`), and form 2. The data is
+  UTF-16 for both.
+- **A BLOB** has its bytes alone.
+- An empty CLOB is size 0 with an empty DALC, a long one's data is chunked, and
+  a NULL is the single `00`.
+
+**The locator's flag bytes say what the LOB is.** Offsets 4 to 7 are its four
+flag bytes: `02 0c 80 00` for a CLOB, `04 4c 00 00` for an NCLOB and
+`01 0c 00 00` for a BLOB, from 11.2.0.2. ojdbc6 builds its CLOB, NCLOB or BLOB
+from them. The Mirror's minted locators held ASCII there, whose `0x40` in flag
+byte 2 named an NCLOB, so ojdbc6 refused every LOB it read with *"Incorrect form
+of use to create NCLOB"*. The same bytes set `ABSTRACT` in flag byte 1 and
+`TEMP` in flag byte 4, so python-oracledb took each fetched column LOB for a
+temporary one. The Mirror now writes 11.2.0.2's flag bytes, by kind
+(`mint_column_lob_locator`).
+
 ### 14.5c A type change to CLOB / BLOB under a cached cursor stays **inline** (#826)
 
 A client caches a statement against the cursor id the server reported and

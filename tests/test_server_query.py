@@ -1639,7 +1639,7 @@ def test_a_define_execute_carries_one_oac_per_column() -> None:
     finally:
         _DECODE_FIELD_VERSION.reset(token)
     assert (request.sql, request.cursor, request.bind_count) == ('', 2, 0)
-    assert request.define_types == [(TNS_TYPE_LONG, 1)]
+    assert request.define_types == [(TNS_TYPE_LONG, 1, 0)]
 
 
 def test_a_define_of_a_lob_as_a_string_keeps_the_column_inline() -> None:
