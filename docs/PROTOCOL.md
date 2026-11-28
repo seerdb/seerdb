@@ -5498,6 +5498,16 @@ of use to create NCLOB"*. The same bytes set `ABSTRACT` in flag byte 1 and
 temporary one. The Mirror now writes 11.2.0.2's flag bytes, by kind
 (`mint_column_lob_locator`).
 
+**A LOB OUT bind below 12.1 is the bare block.** To JDBC thin 11.2's PL/SQL
+block with a CLOB and a BLOB registered OUT, 11.2.0.2 answers each with the
+locator's length and the locator: `ub4 length | <DALC> locator`, no size or
+chunk size, then the value's actual length (0). The Mirror sent the metadata
+block of §14.5b, and ojdbc6 read the size as the locator: *"Protocol violation:
+[11, 7, 1]"*. It now sends the bare block below 12.1 (`encode_lob_bind_block`,
+`out_bind`). A RETURNING bind keeps the metadata block, which no capture
+contradicts yet. 11.2.0.2 also marks those binds OUT (`10`) in its I/O
+vector, where the Mirror marks them IN OUT (`30`); ojdbc6 reads either.
+
 ### 14.5c A type change to CLOB / BLOB under a cached cursor stays **inline** (#826)
 
 A client caches a statement against the cursor id the server reported and
