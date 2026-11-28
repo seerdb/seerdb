@@ -8594,10 +8594,12 @@ def _read_lob_column_parts(
         )
     if isinstance(Locator, list):  # 0x00 / 0xFF DALC → empty / null
         return (None, Tail, Image, Behind)
-    if Image is None and len(Locator) > 2 and not any(Locator[2:]):
-        # An empty locator, its length and zeros, is a NULL: 9.2 answers a
-        # RETURNING of a NULL LOB so (`01 56 56 00 54` and 84 zeros, #2803). A
-        # real one carries its flags.
+    if Image is None and Locator == _O7_EMPTY_LOCATOR:
+        # 9.2's empty locator, its length and 84 zeros, is a NULL: 9.2 answers
+        # a RETURNING of a NULL LOB so (`01 56 56 00 54` and 84 zeros, #2803).
+        # Only that locator, the one measured: any locator whose bytes after
+        # its length were zeros read as NULL, a test's made-up 23ai one among
+        # them (#2855).
         return (None, Tail, None, Behind)
     return (bytes(Locator), Tail, Image, Behind)
 
