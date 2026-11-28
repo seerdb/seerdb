@@ -5299,7 +5299,10 @@ the whole `DPY-5000` / `DPY-5002` family:
    the `ub2` the reply carried (declaring `len + 2`); a **column** locator
    arrives raw in row data (declaring `len`). Try the field, then the field
    without its first two bytes, against what the session actually minted or
-   emitted.
+   emitted. A column locator bound back comes a third way: seerdb's client binds
+   a fetched LOB as it binds one to a real server, without the locator's own
+   leading `ub2`, so the emit log tries that spelling with the `ub2` put back too
+   (`LobEmitLog.key`, #2791).
 
 Why this hid for so long: **a real Oracle locator begins with its own 2-byte
 length** — `00 70` for a 114-byte one. That reads exactly like a framing prefix.
@@ -5309,6 +5312,13 @@ locators whose first two bytes are something else, such as the Mirror's own
 `00 73`. #826 recorded the mistaken reading as fact ("GET_LENGTH carries the
 locator ub2-prefixed where READ sends it bare"), and the hand-built fixture
 written to match could never falsify it.
+
+seerdb's own client does read the echo by that leading `ub2`
+(`decode_lobops_value`). A real locator satisfies both readings, but the
+Mirror's `00 73` read as 115 bytes for a 38-byte locator, so a fetched LOB's
+`size()` and `getchunksize()` came back 0 (#2791). The Mirror's column and
+object-attribute locators now open with their own length (`00 24`), as a real
+one does, and both readings hold for them too.
 
 **`WRITE` is the one exception to (1) in spirit**: both readings advance to the
 same place, because its payload follows the locator immediately, so its extent

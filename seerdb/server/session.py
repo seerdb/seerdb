@@ -3575,14 +3575,9 @@ def _emitted_lob(
     rather than trusted into the framing code."""
     if lob_emit_log is None:
         return None
-    # Try the locator as the client sent it, then without a leading 2-byte
-    # wrapper. A COLUMN locator arrives exactly as the Mirror emitted it, but a
-    # TEMP one is the Mirror's reply including the ub2 it was handed back in, so
-    # the same LOB reaches here under two spellings -- the same reason
-    # _TempLobs.resolve tries both (#826/#903).
+    # The log takes each spelling the same LOB reaches here under (LobEmitLog.key:
+    # #826/#903, #2791).
     entry = lob_emit_log.content(locator)
-    if entry is None and len(locator) > 2:
-        entry = lob_emit_log.content(locator[2:])
     if entry is None:
         return None
     value, is_clob = entry
@@ -3599,12 +3594,7 @@ def _emit_log_key(lob_emit_log: 'LobEmitLog | None', locator: bytes) -> bytes | 
     """
     if lob_emit_log is None:
         return None
-    raw = bytes(locator)
-    if lob_emit_log.content(raw) is not None:
-        return raw
-    if len(raw) > 2 and lob_emit_log.content(raw[2:]) is not None:
-        return raw[2:]
-    return None
+    return lob_emit_log.key(locator)
 
 
 def _answer_bfile(
