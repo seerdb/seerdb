@@ -570,6 +570,11 @@ CCAP_VECTOR_FEATURES = 52
 
 # Indices into the runtime capability array (TNS_RCAP_*) and the bits at them.
 RCAP_COMPAT = 0
+# A client that sets this slot to 1 sends the DB session time-zone block in its
+# DTY request and reads it back in the reply, before the type table if it sends
+# one: sqlplus does, and JDBC thin 11.2 (ojdbc6), which also sends a table; the
+# thin clients that set it to 0 send and read neither (#2854).
+RCAP_TZ = 1
 RCAP_TTC = 6
 RCAP_COMPAT_81 = 2
 RCAP_TTC_ZERO_COPY = 0x01

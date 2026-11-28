@@ -701,6 +701,17 @@ gets) and `encode_oci_dty_reply` for its data-type round (§4.2.1). A thin clien
 gets `encode_pro_reply` (238 B) and then `encode_dty_reply` (924 B). All of them
 are built so the client negotiates field version 6.
 
+**A `deadbeef` container is not always sqlplus (#2854).** JDBC thin 11.2
+(ojdbc6) opens with one too, so the magic alone took it for sqlplus: it got
+sqlplus's 16-byte type reply and waited for the rest of a table. What tells them
+apart is the container's version stamp:
+- **sqlplus / OCI** stamps zero;
+- **a thin client** stamps its own release: `0x0B200200` for python-oracledb,
+  `0x0A200000` for ojdbc6.
+
+So `opens_with_oci_ano` takes only a zero stamp, and `is_ano_negotiation` any
+other, which is then negotiated as a thin client's ANO (§33).
+
 **The 127 B `deadbeef` reply is an ANO null-negotiation response** (#564). The
 name is not incidental: `0xDEADBEEF` is the ANO / Native Services container magic
 (§33.2). sqlplus / thick OCI opens its login with an ANO negotiation, and the
@@ -1520,6 +1531,30 @@ stored `3c 3c 3c` decodes to a zero offset. `0x0E` (14) is the 11.2 default
 timezone-file (DST-rules) version. The 8 fixed framing bytes around the triplet
 are the block's captured 11.2 identity. `tests/test_handshake_generation.py`
 pins the built bytes to the live 11g capture.
+
+#### 4.2.2 A thin client that sends the time-zone block too (JDBC thin 11.2, #2854)
+
+What a DTY request carries after its capabilities, and so what the reply
+carries, depends on two capability slots, not only on the field version.
+Measured on ojdbc6 11.2.0.3 against 11.2.0.2, and on sqlplus 10.2 and 11.2:
+- **Runtime capability 1 (`RCAP_TZ`).** A client that sets it sends the 11-byte
+  time-zone block after its runtime caps, then a ub4 timezone-file version when
+  its runtime caps run to 7 bytes. The reply opens with the server's block, and
+  the version when the client sent one: §4.2.1's 16 bytes. sqlplus sets it and
+  sends no table. ojdbc6 sets it and sends its table behind the block.
+  seerdb and python-oracledb leave it at 0.
+- **Compile capability 27 (`CCAP_UB2_DTY`).** A client that sets it gets the
+  table in UB2 entries at any field version. seerdb and python-oracledb set it
+  from 12.1, which is where the docs above put the change. ojdbc6 sets it at
+  11.2.
+
+So 11.2.0.2 answers ojdbc6's DTY with §4.2.1's 16 bytes, then its table in UB2
+entries, ending in a UB2 zero (2342 bytes). The Mirror builds the same frame
+around its own table (`build_dty_type_reply`), and a request that sets neither
+slot gets the 924-byte reply as before. JDBC thin 11.2 also asks for the
+server's release once after its login, TTI_VERSION (`03 3b`): 11.2.0.2 answers
+with an RPA carrying the banner and the packed release, then a status
+(`encode_version_reply`).
 
 ### 4.3 Session Setup (TTI_FUN/TTI_SESS)
 
@@ -3780,6 +3815,12 @@ on for the marker and takes that `0x00` as the next message type — *"unknown
 protocol message type 0"* — which is how the Mirror's every login failed once it
 advertised the capability (#1059). The general lesson: end-of-response turns any
 trailing byte that used to be harmless into a desync.
+
+Below 12.1 a real server writes none either: 10.2 and 11.2.0.2 end a success
+OER at the batch-message count, to seerdb and to JDBC thin 11.2 alike. The
+Mirror kept the empty DALC there until #2854. seerdb's client stops at the OER
+and never noticed it, but ojdbc6 reads on past each status, and its login
+failed with *"Protocol violation: [0]"*.
 
 #### 6.1a ORA-01017 means the credential failed, and nothing else (#1006)
 

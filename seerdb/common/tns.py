@@ -22,7 +22,6 @@ from seerdb.common.crypto import (
     encrypt_password,
     o3logon,
     o5logon,
-    server_proof,
     server_proof_padded,
 )
 from seerdb.common.datatypes import (
@@ -4478,9 +4477,14 @@ def _oer_message(ora_code: int, message: bytes) -> bytes:
     # framing it does not stop there: it reads on for the marker, took that
     # 0x00 as the next message type, and failed every login with "unknown
     # protocol message type 0" (#1059). A real 23ai sends no such byte, or
-    # python-oracledb would trip on it too. Below 12.1 the captured bytes stand,
-    # and end-of-response cannot be negotiated there anyway.
-    if not ora_code and _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1:
+    # python-oracledb would trip on it too.
+    #
+    # Below 12.1 neither does a real server: 10.2 and 11.2.0.2 end a success
+    # status at the batch-message count, to seerdb and to JDBC thin 11.2
+    # alike. seerdb's client stops at the status and never noticed the extra
+    # byte; ojdbc6 reads on, takes it as the next message's code and fails its
+    # login with "Protocol violation: [0]" (#2854).
+    if not ora_code:
         return b''
     return _THIN.value(message)
 
@@ -7202,12 +7206,19 @@ def encode_challenge(challenge: Challenge) -> bytes:
     client's ``decode_token_rpa`` as a ``TTI_SESS`` challenge.
     """
     if challenge.derived_salt is None:
-        return encode_rpa_kv(
-            [
-                (b'AUTH_SESSKEY', _hexval(challenge.auth_sesskey)),
-                (b'AUTH_VFR_DATA', _hexval(challenge.salt)),
-            ]
-        )
+        # Below 12.1, as 10.2 and 11.2.0.2 answer seerdb and JDBC thin 11.2
+        # alike: the verifier type on AUTH_VFR_DATA, from 11.2 the database id,
+        # then a status. Without the status ojdbc6 waited for one, and the login
+        # hung (#2854); seerdb's client stops after the pairs, which hid it.
+        pairs = [
+            (b'AUTH_SESSKEY', _hexval(challenge.auth_sesskey), 0),
+            (b'AUTH_VFR_DATA', _hexval(challenge.salt), VFR_11G_SHA1),
+        ]
+        if _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_11_2:
+            pairs.append(
+                (b'AUTH_GLOBALLY_UNIQUE_DBID\x00', AUTH_GLOBALLY_UNIQUE_DBID, 0)
+            )
+        return encode_rpa_kv(pairs) + encode_status()
     # 12.1+ (#829): the client picks its key-derivation scheme from what the
     # challenge carries, so the modern shape is six pairs, not two. The extra
     # salt (AUTH_PBKDF2_CSK_SALT) plus the two iteration counts select the PBKDF2
@@ -7296,7 +7307,10 @@ def encode_result(
       :func:`encode_challenge` for why a client waits without one).
     """
     modern = _ENCODE_FIELD_VERSION.get() >= FIELD_VERSION_12_1
-    proof = server_proof_padded(session_key) if modern else server_proof(session_key)
+    # The padded proof and the closing status go below 12.1 too, as 11.2.0.2
+    # sends them to JDBC thin 11.2: without the status ojdbc6 waited for one
+    # (#2854). seerdb's client finds the marker anywhere and stops at the pairs.
+    proof = server_proof_padded(session_key)
     pairs = [
         (b'AUTH_SVR_RESPONSE', _hexval(proof)),
         (b'AUTH_VERSION_NO', str(version_no).encode('ascii')),
@@ -7336,9 +7350,7 @@ def encode_result(
     # reports it to a client that advertised the feature (#1779).
     if txn_priority is not None:
         payload += encode_sync_piggyback([(TNS_KEYWORD_NUM_TXN_PRIORITY, txn_priority)])
-    if modern:
-        payload += encode_status()
-    return payload
+    return payload + encode_status()
 
 
 def encode_sync_piggyback(pairs: list[tuple[int, str]]) -> bytes:
@@ -14561,6 +14573,37 @@ def encode_pipeline_end_status_thin() -> bytes:
     ``TTI_STA``, call status 1 and end-to-end sequence 0, as a live 23ai
     answers it (``09 01 01 00``) (#1059)."""
     return _STA_THIN({'call_status': 1, 'has_sequence': 1, 'sequence': 0})
+
+
+# The reply to a thin client's version call (TTI_VERSION, `03 3b`): the banner,
+# the release packed in a ub4, then the call's status, as 11.2.0.2 answers JDBC
+# thin 11.2, which asks once after its login (#2854). The client half reads
+# 9i's same reply (decode_fv2_version).
+_VERSION_REPLY: wire_schema.Schema = (
+    ('const', bytes([TTI_RPA])),
+    ('n2', 'banner_length'),
+    ('bytes', 'banner', 'banner_length'),
+    ('n4', 'version_no'),
+    *_STA,
+)
+_VERSION_REPLY_THIN = wire_schema.compile_encoder(_VERSION_REPLY, _THIN)
+
+
+def encode_version_reply(banner: bytes, version_no: int) -> bytes:
+    """The Mirror's answer to a thin client's version call: ``banner`` and the
+    packed release ``version_no``, then a success status carrying the session's
+    end-to-end sequence, as ``08 01 49 <banner> 04 0b 20 02 00 09 01 01 01 03``
+    from 11.2.0.2 (#2854)."""
+    return _VERSION_REPLY_THIN(
+        {
+            'banner_length': len(banner),
+            'banner': banner,
+            'version_no': version_no,
+            'call_status': 1,
+            'has_sequence': 1,
+            'sequence': _ENCODE_OER_SEQ.get(),
+        }
+    )
 
 
 def _decode_describe_oci(payload: bytes) -> list[dict]:

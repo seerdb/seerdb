@@ -35,6 +35,7 @@ from seerdb.common.tns import (
     encode_rpa_kv,
 )
 from seerdb.common.tns_consts import (
+    FIELD_VERSION_10_2,
     FIELD_VERSION_11_2,
     FIELD_VERSION_12_1,
     FIELD_VERSION_12_2,
@@ -724,13 +725,29 @@ def test_wrong_password_still_breaks_the_agreement_under_pbkdf2() -> None:
     assert derive_conn_key(challenge, client_auth_sess) != client_conn
 
 
-def test_the_11g_challenge_is_unchanged() -> None:
-    # Everything above is gated: below 12.1 the challenge is the two-pair 11g one
-    # and carries no status trailer, so the captured wire stays byte-identical.
-    challenge = make_challenge(b'pyo123', field_version=FIELD_VERSION_11_2)
-    payload = encode_challenge(challenge)
-    assert b'AUTH_PBKDF2_CSK_SALT' not in payload
-    assert payload.count(bytes([TTI_OER])) == 0
+def test_the_challenge_below_12_1_is_a_real_servers() -> None:
+    # Below 12.1 the challenge has no PBKDF2 pairs, and ends as 10.2 and
+    # 11.2.0.2 end theirs, to seerdb and to JDBC thin 11.2 alike (captured): the
+    # verifier type on AUTH_VFR_DATA, from 11.2 the database id, then a status.
+    # Without the status ojdbc6 waited for one and its login hung (#2854).
+    from seerdb.common.tns import _ENCODE_FIELD_VERSION
+
+    for field_version, pairs in ((FIELD_VERSION_10_2, 2), (FIELD_VERSION_11_2, 3)):
+        token = _ENCODE_FIELD_VERSION.set(field_version)
+        try:
+            challenge = make_challenge(b'pyo123', field_version=field_version)
+            payload = encode_challenge(challenge)
+        finally:
+            _ENCODE_FIELD_VERSION.reset(token)
+        assert b'AUTH_PBKDF2_CSK_SALT' not in payload
+        assert payload[:3] == bytes([TTI_RPA, 1, pairs])
+        assert (b'AUTH_GLOBALLY_UNIQUE_DBID' in payload) == (pairs == 3)
+        # AUTH_VFR_DATA's flag, 6949 (11g SHA-1), as 11.2.0.2 sends it.
+        assert bytes.fromhex('021b25') in payload
+        # The status: the iteration count, the empty logical rowid and batch
+        # arrays, and the batch-message count, then no message byte.
+        assert payload.endswith(bytes.fromhex('010100000000'))
+        assert payload.count(bytes([TTI_OER])) == 1
 
 
 def test_encode_result_carries_the_session_names() -> None:
