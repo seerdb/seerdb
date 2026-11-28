@@ -3978,14 +3978,22 @@ def test_temp_lob_responses_round_trip_through_the_client_decoders() -> None:
     # readers: CREATE_TEMP returns the minted locator in a bare RPA, the content-
     # free ack an RPA (skipped by its ub2 length) then a success OER (#412).
     from seerdb.common.tns import (
+        _ENCODE_FIELD_VERSION,
         decode_lobops_oer,
         encode_create_temp_response,
         encode_lobops_ack,
         mint_temp_lob_locator,
     )
+    from seerdb.common.tns_consts import FIELD_VERSION_12_1
 
     locator = mint_temp_lob_locator(3, is_blob=True)
-    create = encode_create_temp_response(locator)
+    # The 12.1 form; below 12.1 the reply is 10.2's (#2847,
+    # tests/test_mirror_pre12_temp_lob.py).
+    token = _ENCODE_FIELD_VERSION.set(FIELD_VERSION_12_1)
+    try:
+        create = encode_create_temp_response(locator)
+    finally:
+        _ENCODE_FIELD_VERSION.reset(token)
     # The client reads: 0x08, ub2 length, then the locator bytes.
     assert create[0] == 0x08  # TTI_RPA
     assert int.from_bytes(create[1:3], 'big') == len(locator)

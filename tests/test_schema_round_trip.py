@@ -55,6 +55,8 @@ ONE_WAY = {
     '_DIRECT_PATH_LOAD_STREAM',
     # The server's thin DTY reply: its type table, built before (#2773).
     '_DTY_REPLY',
+    # The Mirror's WRITE reply: the locator field echoed as sent (#2847).
+    '_LOBOPS_WRITE_ACK',
 }
 SAMPLES = 12
 
