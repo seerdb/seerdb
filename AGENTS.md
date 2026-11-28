@@ -76,8 +76,8 @@ not the whole matrix (a PR touching several rows runs the union):
 | `seerdb/server/backends/postgres.py` (the Mirror-over-PG backend) or `examples/` | `tests/test_postgres_backend.py` before pushing, then python-oracledb's suite (`tools/run_oracledb_suite.py`) against a Mirror-over-PG |
 | the rest of `seerdb/server` | python-oracledb's suite against a passthrough Mirror over 23ai, on the branch and on its `master` base, and against a Mirror-over-PG |
 | the Mirror's OCI (sqlplus) dialect: the OCI code in `seerdb/server/session.py`, `seerdb/common/oci.py` or the OCI codec in `seerdb/common/tns.py` | `tools/sqlplus_survey.py` with sqlplus 23.26, direct to 23ai and through a passthrough Mirror over it, compared on the branch and on its `master` base |
-| `seerdb/client` | the integration suite on 8i, 9i and 10g, with `SEERDB_TEST_OALL8=1` on 9i, 10g and 11g, and with `SEERDB_TEST_THIN_OALL8=1` on 9i |
-| `seerdb/common` | the integration suite on 8i, 9i and 10g, with `SEERDB_TEST_OALL8=1` on 9i, 10g and 11g, with `SEERDB_TEST_THIN_OALL8=1` on 9i, on the 26ai bed under required native encryption, and through a passthrough Mirror over 23ai; and both python-oracledb suite runs |
+| `seerdb/client` | the integration suite on 8i, 9i and 10g, with `SEERDB_TEST_OALL8=1` on 9i, 10g and 11g, and with `SEERDB_TEST_THIN_OALL8=0` (the compact form) on 9i |
+| `seerdb/common` | the integration suite on 8i, 9i and 10g, with `SEERDB_TEST_OALL8=1` on 9i, 10g and 11g, with `SEERDB_TEST_THIN_OALL8=0` (the compact form) on 9i, on the 26ai bed under required native encryption, and through a passthrough Mirror over 23ai; and both python-oracledb suite runs |
 
 Run these while the PR is a draft, and put the legs you ran and their numbers
 in the PR. CI covers the rest for those paths, and the nightly run covers every CI

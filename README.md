@@ -226,7 +226,7 @@ What works:
 - End-to-end application tracing: `connection.module` / `action` /
   `client_identifier` / `clientinfo` / `dbop` flow to the server for
   monitoring (V$SESSION etc.). 10g and later; `dbop` from 12c; on 9i,
-  `client_identifier` alone, but not with `thin_oall8=True`
+  `client_identifier` alone
 - Multiple character set support, including the national charset: bind
   full Unicode through `DB_TYPE_NVARCHAR` / `DB_TYPE_NCHAR` regardless of
   the database charset, and read NVARCHAR2 / NCHAR / NCLOB back as `str`
@@ -321,7 +321,7 @@ to every supported server — from Oracle **8i (8.1.7) through 26ai**:
 | 19c · 18c · 12c | ✅ supported | same 12c+ wire protocol as 21c |
 | 11g (11.2) | ✅ supported | primary reference tier; OCI 11.2's native form is an experimental opt-in (`oall8=True`) — see the matrix note |
 | 10g (10.2) | ✅ supported | OCI 11.2's native form is an experimental opt-in (`oall8=True`) — see the matrix note |
-| 9i (9.2) | ✅ common surface | the legacy field-version-2 (`TTI_ALL7`) dialect — see the matrix note; the native `OALL8` dialect is an experimental opt-in (`oall8=True`) |
+| 9i (9.2) | ✅ common surface | the thin `OALL8` that JDBC thin 11.2 speaks to 9.2, by default — see the matrix note; the legacy field-version-2 (`TTI_ALL7`) dialect with `thin_oall8=False`, and the native `OALL8` dialect an experimental opt-in (`oall8=True`) |
 | 8i (8.1.7) | ✅ common surface | the 9.2-era `OALL8` dialect; the oldest and most limited tier — see the matrix note. 8.1.7 is the floor (Oracle 8.0 is unsupported) |
 
 CI runs the offline suite on Python 3.10–3.14 and the integration suite against
@@ -366,7 +366,8 @@ Most of the above works across every supported server version; a few features
 are inherently version-scoped: the **23ai types** need 23ai (`VECTOR` /
 `BOOLEAN`) or 21c+ (JSON), **SODA** needs 18c+, and **array DML** needs 12.1+.
 
-**Oracle 9i** (the legacy field-version-2 / `TTI_ALL7` dialect) runs the common
+**Oracle 9i**, in every form (the default thin OALL8 below, the legacy
+field-version-2 / `TTI_ALL7` compact form, and the native one), runs the common
 surface — DB-API, scalar and national-charset binds, DATE / TIMESTAMP / INTERVAL,
 RAW, LONG / LONG RAW, LOB reads, DML, PL/SQL blocks with IN / OUT / IN OUT binds,
 transactions, and the full async API — and much of what later versions add:
@@ -386,7 +387,7 @@ refused up front), and
 bind.
 
 **Experimental: the native 9i dialect** (`connect(..., oall8=True)`, also on
-`connect_async`). Instead of the compact form, seerdb logs in and talks to 9i as
+`connect_async`). Instead of thin OALL8, seerdb logs in and talks to 9i as
 a native 9.2 OCI client does: the 64-bit `OALL8` form, on the same call sequence
 as 8i. Over the 9.2 bed it passes the integration suite like the default path
 does, with these differences:
@@ -405,11 +406,12 @@ does, with these differences:
 It stays an opt-in: the client has to choose the dialect before the server
 identifies its version (#799).
 
-**Experimental: 9i over thin OALL8** (`connect(..., thin_oall8=True)`, also on
-`connect_async`; not with `oall8=True`). seerdb talks to 9.2 as JDBC thin 11.2
-does: it sends that driver's capabilities, logs in as the compact form does, and
-then speaks the thin OALL8 that 10g and 11g take. Over the 9.2 bed it passes the
-integration suite, with these differences from the default compact form:
+**9i's default form: thin OALL8** (#2768). seerdb talks to 9.2 as JDBC thin
+11.2 does: it sends that driver's capabilities, logs in as the compact form
+does, and then speaks the thin OALL8 that 10g and 11g take. Over the 9.2 bed it
+passes more of the integration suite than either other form (678 tests, the
+compact form 660, the native 671). `connect(..., thin_oall8=False)` keeps the
+compact form, the default before. Its differences from the compact form:
 - **`connection.transaction_in_progress`** answers, from each reply's call status.
 - **It enqueues and dequeues** on a RAW or an object queue (`connection.queue()`),
   as JDBC thin 11.2 does to 9.2 (#2805).
@@ -419,7 +421,13 @@ integration suite, with these differences from the default compact form:
   and binds LOBs IN, OUT and IN OUT, LOB Vars included, in 9.2's own LOBOPS
   form, as JDBC thin 11.2 makes them there (#2803). A REF binds as on thin 10g
   (#2806).
-- **Validated on 9.2.0.4 only.** The other servers ignore the option.
+- **Scrollable cursors scroll on the server** (#2809).
+- **`client_identifier`** is set by ojdbc14's `dbms_session.set_identifier`
+  call ahead of the next statement, as on the compact form: JDBC thin 11.2
+  sends 9.2 none.
+- **It can be the default** because seerdb picks it after the server's PRO
+  reply has named 9.2, unlike the native form (#799).
+- **Validated on 9.2.0.4 only.** The other servers ignore `thin_oall8`.
 
 **Experimental: 11g's native form on a dedicated session** (the same
 `oall8=True`). A pooled 11g session always speaks OCI 11.2's native form, the

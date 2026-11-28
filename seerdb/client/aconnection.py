@@ -251,7 +251,7 @@ class AsyncOracleConnect(_ConnectionLogic):
         dsn: str | None = None,
         negotiation_cache: bool = False,
         oall8: bool = False,
-        thin_oall8: bool = False,
+        thin_oall8: bool | None = None,
         xa: bool = False,
         access_token: object = None,
         externalauth: bool = False,
@@ -332,10 +332,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         self.negotiation_cache = negotiation_cache
         # Experimental 9i OALL8 opt-in (#716, #798).
         self._oall8 = oall8
-        # 9.2 over thin OALL8 (#2768), experimental; ignored on other tiers.
+        # 9.2 over thin OALL8 (#2768): 9i's default form, unless oall8=True
+        # asks for the native one or thin_oall8=False for the compact one;
+        # ignored on other tiers.
         if thin_oall8 and oall8:
             raise ProgrammingError('thin_oall8 and oall8 are two forms: choose one')
-        self._thin_oall8 = thin_oall8
+        self._thin_oall8 = (not oall8) if thin_oall8 is None else thin_oall8
         self._o3_oall8 = False
         # A pooled 11g session speaks the native form (#2466); set at the ACCEPT.
         self._native11 = False
@@ -1661,6 +1663,12 @@ class AsyncOracleConnect(_ConnectionLogic):
         # A pre-10g dialect (9i / fv2 or 8i) runs as sans-io generators driven by
         # the async _drive; the connection is a thin orchestrator (#369). Neither
         # tier carries an autocommit bit, so commit is explicit.
+        if self._thin92:
+            # 9.2 over thin OALL8 sets a changed client identifier as the
+            # compact form does, by a call ahead of this one (#2768).
+            Call = self._fv2_client_identifier_call()
+            if Call is not None:
+                await self.execute(*Call)
         if self._dialect is not None:
             from seerdb.client.connection import _check_fv2_bind_sizes
 
