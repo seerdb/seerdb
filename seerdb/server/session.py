@@ -405,9 +405,10 @@ def _expect(stream: PacketStream, want: int, what: str) -> bytes:
 
 
 # The Mirror's algorithm preference, strongest first — intersected with what the
-# client offered. Only the AES ciphers and SHA-2 checksums are implemented.
+# client offered. Only the AES ciphers are implemented. SHA1 comes after the
+# SHA-2 checksums, for a client that offers none of them (JDBC thin 11.2, #2865).
 _SERVER_ENC_PREF = ('AES256', 'AES192', 'AES128')
-_SERVER_INT_PREF = ('SHA256', 'SHA384', 'SHA512')
+_SERVER_INT_PREF = ('SHA256', 'SHA384', 'SHA512', 'SHA1')
 
 
 def _select_algorithm(
@@ -448,13 +449,14 @@ def _negotiate_ano_server(
             raise InterfaceError('ANO: no mutually supported encryption algorithm')
         stream.send_raw(encode_ano_null_reply(sdu=stream.sdu))
         return
-    offered_integrity = ano.offered_algorithm_ids(request, ano.SERVICE_DATA_INTEGRITY)
     int_id = _select_algorithm(
-        offered_integrity, _SERVER_INT_PREF, ano.INTEGRITY_ALGO_IDS
+        ano.offered_algorithm_ids(request, ano.SERVICE_DATA_INTEGRITY),
+        _SERVER_INT_PREF,
+        ano.INTEGRITY_ALGO_IDS,
     )
-    # A client that offers no SHA-2 checksum (JDBC thin 11.2) takes only the
-    # 1024-bit group, as a real server sends it (#2858).
-    group = ano.dh_group_for(offered_integrity)
+    # A client stamping its request below 11.2.0.2 (JDBC thin 11.2) takes only
+    # the 1024-bit group, as a real server sends it (#2858, #2865).
+    group = ano.dh_group_for(request['version'])
     sdh = ano.server_dh_keypair(Group=group)
     stream.write_packet(
         TNS_DATA, ano.encode_ano_response(enc_id, int_id, sdh.public_key, group)

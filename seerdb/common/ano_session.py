@@ -19,14 +19,14 @@ server requiring AES256 + SHA256):
     sub-packet.
 
 No auth-key folding happens on the wire: the trailing per-packet "key-fold" flag
-byte is always ``0``. Only the AES ciphers and SHA-2 MACs are wired up; the
-legacy RC4/DES and MD5/SHA-1 algorithms are deferred (see the cipher/MAC
-modules).
+byte is always ``0``. The AES ciphers, the SHA-2 MACs and the legacy MD5 and
+SHA1 MACs (#2865) are wired up; the legacy RC4/DES ciphers are deferred (see
+the cipher/MAC modules).
 """
 
 from seerdb.common.ano import ENCRYPTION_ALGO_IDS, INTEGRITY_ALGO_IDS
 from seerdb.common.ano_cipher import AnoAESCipher, AnoCipherError
-from seerdb.common.ano_mac import AnoMac, AnoMacError
+from seerdb.common.ano_mac import LEGACY_ALGORITHMS, AnoLegacyMac, AnoMac, AnoMacError
 
 # Selected encryption algorithm ID -> AES key length.
 _AES_KEYSIZE = {
@@ -39,6 +39,8 @@ _INTEGRITY_NAME = {
     INTEGRITY_ALGO_IDS['SHA256']: 'SHA256',
     INTEGRITY_ALGO_IDS['SHA384']: 'SHA384',
     INTEGRITY_ALGO_IDS['SHA512']: 'SHA512',
+    INTEGRITY_ALGO_IDS['MD5']: 'MD5',
+    INTEGRITY_ALGO_IDS['SHA1']: 'SHA1',
 }
 
 _ZERO_IV = bytes(16)  # the AES-CBC cipher runs with an all-zero IV
@@ -61,18 +63,20 @@ def make_cipher(AlgoId: int, SharedSecret: bytes) -> AnoAESCipher | None:
 
 def make_mac(
     AlgoId: int, SharedSecret: bytes, ServerIv: bytes, ClientSide: bool = True
-) -> AnoMac | None:
+) -> AnoMac | AnoLegacyMac | None:
     """Build the session MAC for the negotiated data-integrity algorithm.
 
     Keys off the DH shared secret and the server-supplied DH IV (``ServerIv``).
-    Returns ``None`` when no integrity was selected (algorithm 0). Raises for a
-    non-SHA-2 algorithm (MD5/SHA-1 are not implemented).
+    Returns ``None`` when no integrity was selected (algorithm 0). MD5 and SHA1
+    run the RC4-keystream MAC, the SHA-2 checksums the AES-keystream one (#2865).
     """
     if AlgoId == 0:
         return None
     Name = _INTEGRITY_NAME.get(AlgoId)
     if Name is None:
-        raise AnoMacError(f'unsupported integrity algorithm id {AlgoId} (SHA-2 only)')
+        raise AnoMacError(f'unsupported integrity algorithm id {AlgoId}')
+    if Name in LEGACY_ALGORITHMS:
+        return AnoLegacyMac(SharedSecret, ServerIv, Name, ClientSide=ClientSide)
     return AnoMac(SharedSecret, ServerIv, Name, ClientSide=ClientSide)
 
 
@@ -115,7 +119,7 @@ class AnoChannel:
         self._enc_id = EncAlgoId
         self._mac_id = IntegrityAlgoId
         self._cipher: AnoAESCipher | None = make_cipher(EncAlgoId, SharedSecret)
-        self._mac: AnoMac | None = make_mac(
+        self._mac: AnoMac | AnoLegacyMac | None = make_mac(
             IntegrityAlgoId, SharedSecret, ServerIv, ClientSide=ClientSide
         )
 

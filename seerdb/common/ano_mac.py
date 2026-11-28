@@ -23,19 +23,28 @@ The 5-byte key prefix and the byte-5 tag position match go-ora's
 ``OracleNetworkHash2`` exactly (both the legacy RC4 hash and this SHA-2 hash use
 a 5-byte prefix; an earlier 15-byte guess here was wrong).
 
-Only the SHA-2 (AES-keystream) path is implemented; the legacy MD5 / SHA-1 path
-uses an RC4 keystream and is deferred, as with the DES/RC4 ciphers.
+The legacy MD5 and SHA1 checksums (#2865) are the same construction over an RC4
+keystream, :class:`AnoLegacyMac`. The keystream generator is RC4 keyed with five
+bytes of the secret, ``0xFF`` and the server's DH IV. Each re-derivation draws
+five bytes from it, and the per-direction keystreams are RC4 keyed with those
+five bytes and the tag 90 or 180, as above. Each packet's MAC is
+``hash(payload || the next hash-sized run of the keystream)``.
 """
 
 import hashlib
 
-from Crypto.Cipher import AES
+from Crypto.Cipher import AES, ARC4
 
 _HASHES = {
     'SHA256': hashlib.sha256,
     'SHA384': hashlib.sha384,
     'SHA512': hashlib.sha512,
 }
+_LEGACY_HASHES = {
+    'MD5': hashlib.md5,
+    'SHA1': hashlib.sha1,
+}
+LEGACY_ALGORITHMS = frozenset(_LEGACY_HASHES)
 
 _SEND_TAG = 90
 _RECV_TAG = 180
@@ -126,5 +135,63 @@ class AnoMac:
         self._recv_buf = self._recv_cipher.encrypt(self._recv_buf)
         Expected = self._hash(Payload + self._recv_buf).digest()
         if Received != Expected:
+            raise AnoMacError('data integrity check failed')
+        return Payload
+
+
+class AnoLegacyMac:
+    """Oracle native data-integrity MAC for MD5 and SHA1 (RC4 keystream, #2865).
+
+    Same interface as :class:`AnoMac`. ``Key`` is the DH shared secret and ``Iv``
+    the server's DH IV; the keystream generator is keyed with the secret's last
+    five bytes, ``0xFF`` and the IV.
+    """
+
+    _KEY_SIZE = 5
+
+    def __init__(
+        self,
+        Key: bytes,
+        Iv: bytes,
+        Algorithm: str,
+        ClientSide: bool = True,
+    ):
+        if Algorithm not in _LEGACY_HASHES:
+            raise AnoMacError(
+                f'unsupported legacy integrity algorithm {Algorithm!r} '
+                f'(supported: {", ".join(sorted(_LEGACY_HASHES))})'
+            )
+        self._hash = _LEGACY_HASHES[Algorithm]
+        self._size = self._hash().digest_size  # 16 / 20
+        (self._send_tag, self._recv_tag) = (
+            (_SEND_TAG, _RECV_TAG) if ClientSide else (_RECV_TAG, _SEND_TAG)
+        )
+        Seed = Key[-self._KEY_SIZE :] + b'\xff' + bytes(Iv)
+        self._seed_gen = ARC4.new(Seed)
+        self.rederive()
+
+    def rederive(self) -> None:
+        """Draw the next five bytes from the generator and key both
+        per-direction keystreams from them (#1345)."""
+        Base = self._seed_gen.encrypt(bytes(self._KEY_SIZE))
+        self._send_stream = ARC4.new(Base + bytes([self._send_tag]))
+        self._recv_stream = ARC4.new(Base + bytes([self._recv_tag]))
+
+    def compute(self, Payload: bytes) -> bytes:
+        Block = self._send_stream.encrypt(bytes(self._size))
+        return self._hash(Payload + Block).digest()
+
+    def sign(self, Payload: bytes) -> bytes:
+        """Return ``Payload`` with its MAC appended."""
+        return Payload + self.compute(Payload)
+
+    def validate(self, Data: bytes) -> bytes:
+        """Verify a ``payload || mac`` buffer; return the payload or raise."""
+        if len(Data) <= self._size:
+            raise AnoMacError('data shorter than its MAC')
+        Payload = Data[: -self._size]
+        Received = Data[-self._size :]
+        Block = self._recv_stream.encrypt(bytes(self._size))
+        if self._hash(Payload + Block).digest() != Received:
             raise AnoMacError('data integrity check failed')
         return Payload

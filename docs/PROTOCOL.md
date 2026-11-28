@@ -9848,14 +9848,18 @@ gen^priv mod p`, `shared = server_public^priv mod p`, both left-padded to the
 prime's byte length. `server_iv` is the constant `b"foo bar baz bat quux"` (20
 bytes).
 
-The server picks the group by the client's offered checksums (#2858, the 26ai
-bed, 2026-11-28):
-- **A client that offers a SHA-2 checksum** (seerdb, python-oracledb) gets the
-  2048-bit RFC 3526 group 14, generator 2.
-- **A client that offers only MD5 and SHA1** (JDBC thin 11.2.0.3) gets a
-  1024-bit group of Oracle's own, generator and prime each one 128-byte block,
-  neither a published group (`ano.DH_GROUP_LEGACY`). That client can't take the
-  2048-bit group: it fails reading it, with an array index error at 128.
+The server picks the group by the version the client's request is stamped with
+(#2858, #2865; the 26ai bed, 2026-11-28):
+- **A request stamped `0x0B200200`** (seerdb, python-oracledb) gets the 2048-bit
+  RFC 3526 group 14, generator 2. That holds with SHA1 alone offered, so the
+  checksums don't decide it.
+- **A request stamped `0x0A200000`** (JDBC thin 11.2.0.3) gets a 1024-bit group
+  of Oracle's own, generator and prime each one 128-byte block, neither a
+  published group (`ano.DH_GROUP_LEGACY`). That client can't take the 2048-bit
+  group: it fails reading it, with an array index error at 128.
+
+Those are the two stamps measured; the Mirror sends the 1024-bit group below
+`0x0B200200`.
 
 In both, the reply's authentication service carries the status `0xFBFF`. A
 thin client's own request carries `0xFCFF` there. seerdb's client takes either
@@ -9879,6 +9883,16 @@ itself is plaintext. Each `TNS_DATA` payload (the bytes after the 8-byte header 
   between client and server. Each packet advances the keystream one block; the
   packet MAC is `SHA256(payload ‖ keystream_block)`. Stateful — identical
   payloads get different MACs.
+- **The legacy MD5 and SHA1 MACs** (#2865) are the same construction over an
+  RC4 keystream. The generator is RC4 keyed with `shared[-5:] ‖ 0xFF ‖
+  server_iv`, the secret's *last* five bytes. Each derivation draws five bytes
+  from it, and the per-direction keystreams are RC4 keyed with those five bytes
+  and `90` (sender) or `180` (receiver). A packet's MAC is `hash(payload ‖ the
+  next 16 or 20 keystream bytes)`, and a break/reset draws the next five bytes,
+  as for SHA-2 (§33.6). Checked against 26ai with SHA1 allowed (it refuses MD5
+  even when listed): a seerdb session opens 26ai's replies, MACs and all,
+  across a reset, and 26ai accepts seerdb's. The MD5 MAC is the same code with
+  MD5, unmeasured.
 - **Cipher**: AES-CBC, key = `shared[:keysize]` (16/24/32), **IV = 16 zero
   bytes** (the DH IV is *not* used by the cipher). Oracle padding: zero-pad the
   plaintext up to the 16-byte block (no block added when already aligned), and
@@ -9921,12 +9935,13 @@ half (#448). Its behaviour follows a per-Mirror **stance**:
   both-sides-ACCEPTED outcome (Oracle only encrypts when a side asks for it), and
   it keeps every existing plaintext / sqlplus test unchanged.
 - **`requested` / `required`** — select the strongest AES the client offered
-  (AES256 ▷ AES192 ▷ AES128) plus a SHA-2 checksum, and reply with the DH
-  exchange: the server emits the group a real server sends that client (§33.2:
-  generator 2 and the RFC 3526 2048-bit MODP prime, or Oracle's 1024-bit group
-  for a client offering no SHA-2 checksum), its own public key, and the IV
-  constant. A client offering no SHA-2 checksum gets none: AES alone, which JDBC
-  thin 11.2 accepts, where a real server allowing SHA1 would agree on SHA1. It then reads the client's round-2 public
+  (AES256 ▷ AES192 ▷ AES128) plus a checksum (SHA256 ▷ SHA384 ▷ SHA512 ▷
+  SHA1), and reply with the DH exchange: the server emits the group a real
+  server sends that client (§33.2: generator 2 and the RFC 3526 2048-bit MODP
+  prime, or Oracle's 1024-bit group for a request stamped below `0x0B200200`),
+  its own public key, and the IV constant. JDBC thin 11.2, which offers only MD5
+  and SHA1, gets SHA1 (#2865). MD5 isn't in the Mirror's preference: the client
+  can run it, but no server here has shown it. It then reads the client's round-2 public
   key, derives the same shared secret, and switches the stream to encrypted
   framing before reading the (now encrypted) PRO. `required` fails the login if
   the client offered no algorithm the Mirror implements; `requested` falls back
