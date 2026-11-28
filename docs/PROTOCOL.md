@@ -4108,8 +4108,10 @@ seerdb follows each 9i form's reference client (#2810):
 - **the compact form** runs ojdbc14's call ahead of the next statement. A
   NULL clears the identifier on 9.2; ojdbc14's own clear,
   `dbms_session.clear_identifier(:1)`, is refused there;
-- **the thin OALL8 form** refuses it, as do 8i and every 8i and 9i form for
-  the other attributes.
+- **the thin OALL8 form**, 9i's default since #2768, runs ojdbc14's call as
+  the compact form does. Its reference client, JDBC thin 11.2, sends 9.2
+  nothing, and it refused the identifier while it was an opt-in. 8i and every
+  8i and 9i form refuse the other attributes.
 
 OCI 9.2's piggyback, after `11 87 <seq>`:
 - a pointer, which OCI sends whether it sets or clears;
@@ -9502,9 +9504,9 @@ none and the CSN, DSN and flags. Replayed with seerdb's values in their place,
 
 **What seerdb takes:**
 - RAW and object queues on a 10g or 11g session, thin or native (`oall8=True`,
-  and a pooled 11g one), on 9i with `oall8=True` or `thin_oall8=True`, and on
-  8i;
-- on 9i's compact form, the default, `connection.queue()` raises
+  and a pooled 11g one), on 9i in its default thin OALL8 form or with
+  `oall8=True`, and on 8i;
+- on 9i's compact form (`thin_oall8=False`), `connection.queue()` raises
   NotSupportedError, naming the other forms and the `DBMS_AQ` route.
 
 JSON payloads (no JSON type before 21c) and array enqueue and dequeue are not

@@ -790,9 +790,14 @@ _FV_KW: dict[str, Any] = {'field_version': _FIELD_VERSION} if _FIELD_VERSION els
 # every other server ignores the option.
 if os.environ.get('SEERDB_TEST_OALL8', '') not in ('', '0'):
     _FV_KW['oall8'] = True
-# Run the suite over 9.2's thin OALL8 form (#2768): ojdbc6's caps, then 10g's
-# thin path; every other server ignores the option.
-if os.environ.get('SEERDB_TEST_THIN_OALL8', '') not in ('', '0'):
+# 9.2's thin OALL8 form (#2768), ojdbc6's caps then 10g's thin path, is 9i's
+# default. SEERDB_TEST_THIN_OALL8=0 runs the suite over the compact form
+# instead (thin_oall8=False), and any other value asks for thin OALL8 by name;
+# every other server ignores the option.
+_THIN_OALL8_ENV = os.environ.get('SEERDB_TEST_THIN_OALL8', '')
+if _THIN_OALL8_ENV == '0':
+    _FV_KW['thin_oall8'] = False
+elif _THIN_OALL8_ENV:
     _FV_KW['thin_oall8'] = True
 # Run the suite over pooled sessions, as DRCP serves them (#2466): on 11g that
 # is the native form. The server's pool must be started.
@@ -9579,16 +9584,19 @@ class FetchFlowIntegration(_IntegrationBase):
 
     def test_a_pre_10_2_session_sets_what_its_server_has(self):
         # 9.2 has the client identifier alone, which the compact and the
-        # native 9i forms set as ojdbc14 and OCI 9.2 do. JDBC thin 11.2, which
-        # the thin OALL8 form follows, sends 9.2 none, and 8.1.7 has none
-        # (#2810).
+        # native 9i forms set as ojdbc14 and OCI 9.2 do (#2810). JDBC thin
+        # 11.2 sends 9.2 none; the thin OALL8 form, 9i's default, makes
+        # ojdbc14's call as the compact form does (#2768). 8.1.7 has none.
         from seerdb.client.dialect import Fv2Dialect, Fv2Oall8Dialect
 
         if not self.conn._server_below_10_2():
             self.skipTest('a pre-10.2 server')
         with self.assertRaises(seerdb.NotSupportedError):
             self.conn.module = 'M'
-        if not isinstance(self.conn._dialect, (Fv2Dialect, Fv2Oall8Dialect)):
+        sets_it = isinstance(
+            self.conn._dialect, (Fv2Dialect, Fv2Oall8Dialect)
+        ) or getattr(self.conn, '_thin92', False)
+        if not sets_it:
             with self.assertRaises(seerdb.NotSupportedError):
                 self.conn.client_identifier = 'PYOCLID'
             return

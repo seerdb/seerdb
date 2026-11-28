@@ -182,8 +182,8 @@ _LTZ_ZONES_SQL = 'SELECT DBTIMEZONE, SESSIONTIMEZONE FROM DUAL'
 # What connection.queue() says when it refuses a queue (_aq_refused).
 AQ_REFUSAL = (
     'Advanced Queuing below Oracle 12.1 takes a RAW or an object queue, and on '
-    '9i not in the default form: connect with oall8=True or thin_oall8=True, '
-    'or call DBMS_AQ from PL/SQL'
+    "9i not in the compact form (thin_oall8=False): connect in 9i's default "
+    'form or with oall8=True, or call DBMS_AQ from PL/SQL'
 )
 # A statement that may change the session's zone, after which it is read again.
 _SETS_TIME_ZONE = re.compile(r'\bALTER\s+SESSION\b.*\bTIME_ZONE\b', re.I | re.S)
@@ -668,17 +668,18 @@ class _ConnectionLogic:
         # either. 9.2 has the client identifier alone, which each 9i form sends
         # as its reference client does: OCI 9.2's piggyback on the native form,
         # ojdbc14's dbms_session call on the compact one (#2810). JDBC thin
-        # 11.2, which the thin OALL8 form follows, sends 9.2 none; 8.1.7 has
+        # 11.2, which the thin OALL8 form follows, sends 9.2 none; that form
+        # makes ojdbc14's call too, since it is 9i's default (#2768). 8.1.7 has
         # none.
         if self.field_version < FIELD_VERSION_12_1:
             if not getattr(self, '_native11', False) and self._server_below_10_2():
-                if name != 'client_identifier' or not isinstance(
-                    self._dialect, (Fv2Dialect, Fv2Oall8Dialect)
+                if name != 'client_identifier' or not (
+                    isinstance(self._dialect, (Fv2Dialect, Fv2Oall8Dialect))
+                    or self._thin92
                 ):
                     raise NotSupportedError(
                         'end-to-end tracing attributes require an Oracle 10.2+ '
-                        'server; on 9i, client_identifier alone, and not with '
-                        'thin_oall8=True'
+                        'server; on 9i, client_identifier alone'
                     )
             if name == 'dbop':
                 raise NotSupportedError('dbop requires an Oracle 12.1+ server')
@@ -686,11 +687,13 @@ class _ConnectionLogic:
         self._e2e_pending[name] = value
 
     def _fv2_client_identifier_call(self) -> tuple[str, list] | None:
-        # The call that sets a changed client identifier on a compact 9i
-        # session, run ahead of the next statement, as ojdbc14's
-        # setClientIdentifier runs it (#2810). A NULL clears it on 9.2. None
-        # when there is nothing to send.
-        if not isinstance(self._dialect, Fv2Dialect) or not self._e2e_pending:
+        # The call that sets a changed client identifier on a compact or thin
+        # OALL8 9i session, run ahead of the next statement, as ojdbc14's
+        # setClientIdentifier runs it (#2810, #2768). A NULL clears it on 9.2.
+        # None when there is nothing to send. Taking it here leaves nothing for
+        # the thin path's end-to-end piggyback, which 9.2 does not read.
+        wanted = isinstance(self._dialect, Fv2Dialect) or self._thin92
+        if not wanted or not self._e2e_pending:
             return None
         Value = self._take_end_to_end().get('client_identifier')
         return ('begin dbms_session.set_identifier(:1); end;', [Value])
@@ -918,8 +921,9 @@ class _ConnectionLogic:
         its last reply (the TXN_IN_PROGRESS bit of the call status, #2456).
         On 8i, the status's no-transaction flag says it, and on a 9i session
         with ``oall8=True`` the native form's call status does (PROTOCOL.md
-        §19.12). 9i's default compact form carries neither, so there it is
-        not available."""
+        §19.12), as thin OALL8's does in 9i's default form. 9i's compact form
+        (``thin_oall8=False``) carries neither, so there it is not
+        available."""
         if self.field_version < FIELD_VERSION_10_2 and not isinstance(
             self._dialect, (O8iDialect, Fv2Oall8Dialect)
         ):
@@ -1321,7 +1325,8 @@ class _ConnectionLogic:
         return (self.host, self.port, self.service_name or self.sid or '')
 
     # --- 9.2 over thin OALL8 (#2768) --------------------------------------
-    # With `thin_oall8=True` a 9.2 session logs in as the compact one does, then
+    # By default (unless `thin_oall8=False` or `oall8=True`, #2768) a 9.2
+    # session logs in as the compact one does, then
     # speaks 10g's thin path: ojdbc6 11.2 does so, and 9.2 answers it with the
     # call status (transaction state) and binds PL/SQL index-by tables. The
     # session runs at field version 10.2, so the client takes 10g's paths; the
