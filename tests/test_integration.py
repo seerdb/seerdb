@@ -8281,6 +8281,21 @@ class FetchedLobBindIntegration(_IntegrationBase):
         )
         self.assertEqual(self.cur.fetchall(), [(1, 5, 2), (2, 5, 2)])
 
+    def test_a_fetched_lobs_length_and_chunk_size(self):
+        # Each call's reply echoes the locator; the Mirror's opened with no length
+        # of its own, so the echo read past itself and size() came back 0 (#2791).
+        # The locator taken from the echo still binds back afterwards.
+        (Clob, Blob) = self._fetched()
+        self.assertEqual((Clob.size(), Blob.size()), (5, 2))
+        self.assertGreater(Clob.getchunksize(), 0)
+        self.assertGreater(Blob.getchunksize(), 0)
+        self.assertEqual((Clob.read(), Blob.read()), ('hello', b'\x01\x02'))
+        self.cur.execute(
+            'SELECT DBMS_LOB.GETLENGTH(:1), DBMS_LOB.GETLENGTH(:2) FROM dual',
+            [Clob, Blob],
+        )
+        self.assertEqual(self.cur.fetchone(), (5, 2))
+
     def test_a_fetched_clob_and_blob_bind_back_in_an_executemany(self):
         (Clob, Blob) = self._fetched()
         self.cur.executemany(
@@ -8571,8 +8586,7 @@ class CreateLobIntegration(_IntegrationBase):
     def test_the_chunk_size(self):
         # A value back, as a real server answers, and the session still in step
         # (#2790): the Mirror answered a temp LOB's with no value. A fetched
-        # LOB's is in python-oracledb's suite; seerdb reads one from the Mirror
-        # as 0 for another reason (#2791).
+        # LOB's is FetchedLobBindIntegration's (#2791).
         Clob = self.conn.createlob(seerdb.DB_TYPE_CLOB, 'abc')
         self.assertGreater(Clob.getchunksize(), 0)
         self.assertEqual(Clob.read(), 'abc')

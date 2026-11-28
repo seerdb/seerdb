@@ -23040,12 +23040,22 @@ _COLUMN_LOB_LOC_FLAGS = {
 }
 
 
+def _self_prefixed(raw: bytearray) -> bytes:
+    # A locator a server hands out opens with a big-endian ub2 of its length
+    # less those two bytes (prefixed_locator), and a LOB call's reply echoes it
+    # whole, so a client reads the echo back by that ub2. The Mirror's opened
+    # with 00 73 ('\x00s'): seerdb's client read 115 bytes for the echo, ran past
+    # it, and took no value for size() and getchunksize() (#2791).
+    raw[0:2] = (len(raw) - 2).to_bytes(2, 'big')
+    return bytes(raw)
+
+
 def _column_lob_locator(counter: bytes, kind: str) -> bytes:
     raw = bytearray(b'\x00seerdb-mirror-lob-locator-' + counter + b'\x00')
     raw[_THIN_LOB_LOC_OFFSET_FLAG_1 : _THIN_LOB_LOC_OFFSET_FLAG_1 + 4] = (
         _COLUMN_LOB_LOC_FLAGS[kind]
     )
-    return bytes(raw)
+    return _self_prefixed(raw)
 
 
 def _thin_lob_locator() -> bytes:
@@ -23062,7 +23072,7 @@ def _thin_obj_lob_locator() -> bytes:
     # object type's post-describe get_type_shape queries would reset) (#888).
     raw = bytearray(b'\x00seerdb-mirror-obj-lob-locator-000000\x00')
     raw[_THIN_LOB_LOC_OFFSET_FLAG_3] |= _THIN_LOB_LOC_FLAGS_VAR_LENGTH_CHARSET
-    return bytes(raw)
+    return _self_prefixed(raw)
 
 
 _THIN_OBJ_LOB_LOCATOR = _thin_obj_lob_locator()
@@ -23106,8 +23116,22 @@ class LobEmitLog:
         self.contents[locator] = (value, is_clob)
         return locator
 
+    def key(self, locator: bytes) -> bytes | None:
+        """The minted locator ``locator`` spells, or None.
+
+        A locator reaches the Mirror as it was minted (a LOB call), behind a
+        ub2 of its length (a temp LOB's reply handed back), or without its own
+        leading ub2, as a client binds a fetched LOB to a real server (#2791):
+        each spelling names the same LOB."""
+        raw = bytes(locator)
+        for spelling in (raw, raw[2:], prefixed_locator(raw)):
+            if spelling in self.contents:
+                return spelling
+        return None
+
     def content(self, locator: bytes) -> tuple[object, bool] | None:
-        return self.contents.get(bytes(locator))
+        key = self.key(locator)
+        return None if key is None else self.contents[key]
 
 
 # The session's LOB emit log, set per session so `_thin_column_value` can mint a

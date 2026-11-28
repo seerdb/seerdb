@@ -227,16 +227,23 @@ class BindTempLobs(unittest.TestCase):
         self.assertIsInstance(Out[1], BfileBind)
         self.assertEqual(Out[1].locator, Raw)
 
-    def test_a_mirror_locator_goes_whole(self):
-        # A Mirror mints a column LOB's locator without the leading ub2 length
-        # an Oracle locator has, so nothing is stripped from it: cut by two
-        # bytes, it named no LOB the Mirror had served (#2505).
-        from seerdb.common.tns import is_prefixed_locator, mint_column_lob_locator
+    def test_a_mirror_locator_binds_as_an_oracle_one(self):
+        # A Mirror mints a column LOB's locator with the leading ub2 length an
+        # Oracle locator has (#2791), so it is stripped for the bind as an
+        # Oracle one is; the Mirror takes it back in that spelling (#2505).
+        from seerdb.common.tns import (
+            LobEmitLog,
+            is_prefixed_locator,
+            mint_column_lob_locator,
+        )
 
         Minted = mint_column_lob_locator(0)
-        self.assertFalse(is_prefixed_locator(Minted))
+        self.assertTrue(is_prefixed_locator(Minted))
         (Out,) = _bind_temp_lobs([LOB(0x70, Minted)])
-        self.assertEqual(Out.locator, Minted)
+        self.assertEqual(Out.locator, Minted[2:])
+        Log = LobEmitLog()
+        Served = Log.record('abc', True)
+        self.assertEqual(Log.content(Served[2:]), ('abc', True))
 
     def test_a_dialects_session_keeps_a_fetched_lob(self):
         # 8i, 9i and a pooled 11g session bind or refuse the LOB object
