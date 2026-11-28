@@ -112,6 +112,11 @@ TNS_EXEC_OPTION_EXECUTE = 0x20
 TNS_EXEC_OPTION_PARSE = 0x01
 TNS_EXEC_OPTION_BIND = 0x08
 TNS_EXEC_OPTION_FETCH = 0x40
+# A define's cont flag asking for a LOB's data with its locator, up to the
+# define's max characters (python-oracledb's name). JDBC thin 11.2 asks so for
+# a CLOB / BLOB column, 4000 by default; python-oracledb sets it with a length
+# of 0, and so takes no data (#2859).
+TNS_LOB_PREFETCH_FLAG = 0x2000000
 TNS_FETCH_ORIENTATION_CURRENT = 0x01
 TNS_FETCH_ORIENTATION_NEXT = 0x02
 TNS_FETCH_ORIENTATION_FIRST = 0x04

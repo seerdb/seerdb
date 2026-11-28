@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+#
+# JDBC thin 11.2 (ojdbc6 11.2.0.3)'s second call for `SELECT c FROM t`, c a CLOB
+# (#2859): define and fetch (0x8050), the row count 0 in the header and 10 in
+# al8i4[1], and a CLOB define asking for prefetch (cont flag 0x02000000, 4000).
+# Captured 2026-11-28 through tools/capture_proxy.py. The TTC payload,
+# without the packet's header, as `hexdump -C` output; the offset column
+# and the |ascii| gutter are ignored by tests.replay.parse_hexdump.
+00000000  03 5e 05 02 80 50 01 02  00 00 01 01 0d 00 00 00  |.^...P..........|
+00000010  00 04 7f ff ff ff 00 00  00 00 00 00 00 01 01 01  |................|
+00000020  00 00 01 00 00 00 00 00  00 01 0a 00 00 00 00 00  |................|
+00000030  01 01 00 00 00 00 00 70  03 00 00 00 00 04 02 00  |.......p........|
+00000040  00 00 00 00 02 03 69 01  02 0f a0                 |......i....|
+0000004b
