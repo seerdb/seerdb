@@ -180,3 +180,20 @@ def test_a_sha2_offer_keeps_the_2048_bit_group() -> None:
     assert integrity[1] == (ano.SP_UB1, 5)
     assert integrity[5][1] == ano.DH_GROUP_14.prime
     assert data.endswith(b'under the agreed keys')
+
+
+def test_an_md5_offer_gets_md5() -> None:
+    # MD5 is last in the Mirror's preference: a client offering it alone gets
+    # it, and the packet after the negotiation carries an MD5 MAC (#2865).
+    for offer, expected in ((['MD5'], 1), (['MD5', 'SHA1'], 3)):
+        request = ano.encode_ano(
+            [
+                ano.supervisor_service(),
+                ano.auth_service(),
+                ano.encryption_service(['AES256']),
+                ano.data_integrity_service(offer),
+            ]
+        )
+        reply, data = _negotiate(request)
+        assert reply[ano.SERVICE_DATA_INTEGRITY][1] == (ano.SP_UB1, expected)
+        assert data.endswith(b'under the agreed keys')

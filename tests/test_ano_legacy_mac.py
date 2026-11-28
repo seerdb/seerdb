@@ -3,9 +3,10 @@
 
 """The legacy MD5 and SHA1 data-integrity checksums (#2865).
 
-The fixture is the 26ai bed's side of a session that negotiated AES-256 with
-SHA1, with the DH secret the client derived. Each reply's MAC was built by the
-server, so opening them checks the RC4-keystream MAC against Oracle's, not
+The fixtures are a real server's side of a session that negotiated AES-256 with
+a legacy checksum, with the DH secret the client derived: the 26ai bed with
+SHA1, and the 10g bed with MD5 (26ai refuses MD5). Each reply's MAC was built by
+the server, so opening them checks the RC4-keystream MAC against Oracle's, not
 against itself: in order, and across the break/reset after ORA-00942, where
 both ends re-derive.
 """
@@ -20,19 +21,24 @@ from seerdb.common import ano
 from seerdb.common.ano_mac import AnoLegacyMac, AnoMacError
 from seerdb.common.ano_session import AnoChannel, make_mac
 
-_FIXTURE = os.path.join(
-    os.path.dirname(__file__), 'captures', 'oracle26ai_sha1_session.txt'
-)
+_CAPTURES = os.path.join(os.path.dirname(__file__), 'captures')
 _AES256 = ano.ENCRYPTION_ALGO_IDS['AES256']
 _SHA1 = ano.INTEGRITY_ALGO_IDS['SHA1']
 _MD5 = ano.INTEGRITY_ALGO_IDS['MD5']
+# (fixture, checksum, a value the replies carry)
+_SESSIONS = [
+    pytest.param(
+        'oracle26ai_sha1_session.txt', _SHA1, b"'SHA1'||LEVEL", id='26ai-sha1'
+    ),
+    pytest.param('oracle10g_md5_session.txt', _MD5, b'md5 1', id='10g-md5'),
+]
 
 
-def _session() -> tuple[bytes, list[bytes | None]]:
+def _session(fixture: str) -> tuple[bytes, list[bytes | None]]:
     # The secret, and the replies in order with None where the reset fell.
     secret = b''
     replies: list[bytes | None] = []
-    with open(_FIXTURE) as f:
+    with open(os.path.join(_CAPTURES, fixture)) as f:
         for line in f:
             if line.startswith('secret '):
                 secret = bytes.fromhex(line.split()[1])
@@ -43,9 +49,9 @@ def _session() -> tuple[bytes, list[bytes | None]]:
     return secret, replies
 
 
-def _open_all(rederive: bool) -> list[bytes]:
-    secret, replies = _session()
-    channel = AnoChannel(_AES256, _SHA1, secret, ano.DH_SERVER_IV, ClientSide=True)
+def _open_all(fixture: str, algo_id: int, rederive: bool) -> list[bytes]:
+    secret, replies = _session(fixture)
+    channel = AnoChannel(_AES256, algo_id, secret, ano.DH_SERVER_IV, ClientSide=True)
     plain = []
     for reply in replies:
         if reply is None:
@@ -56,25 +62,33 @@ def _open_all(rederive: bool) -> list[bytes]:
     return plain
 
 
-def test_26ais_sha1_replies_open_with_their_macs_checked() -> None:
-    plain = _open_all(rederive=True)
-    joined = b''.join(plain)
-    assert b"'SHA1'||LEVEL" in joined
+@pytest.mark.parametrize(('fixture', 'algo_id', 'value'), _SESSIONS)
+def test_a_servers_replies_open_with_their_macs_checked(
+    fixture: str, algo_id: int, value: bytes
+) -> None:
+    joined = b''.join(_open_all(fixture, algo_id, rederive=True))
+    assert value in joined
     assert b'ORA-00942' in joined
     assert b"'AFTERTHEERROR'" in joined
 
 
-def test_the_mac_re_derives_after_a_break_reset() -> None:
+@pytest.mark.parametrize(('fixture', 'algo_id', 'value'), _SESSIONS)
+def test_the_mac_re_derives_after_a_break_reset(
+    fixture: str, algo_id: int, value: bytes
+) -> None:
     # Without the re-derivation, the first reply after the reset fails its MAC.
     with pytest.raises(AnoMacError, match='integrity check failed'):
-        _open_all(rederive=False)
+        _open_all(fixture, algo_id, rederive=False)
 
 
-def test_a_changed_reply_fails_its_mac() -> None:
-    secret, replies = _session()
+@pytest.mark.parametrize(('fixture', 'algo_id', 'value'), _SESSIONS)
+def test_a_changed_reply_fails_its_mac(
+    fixture: str, algo_id: int, value: bytes
+) -> None:
+    secret, replies = _session(fixture)
     first = replies[0]
     assert first is not None
-    channel = AnoChannel(_AES256, _SHA1, secret, ano.DH_SERVER_IV, ClientSide=True)
+    channel = AnoChannel(_AES256, algo_id, secret, ano.DH_SERVER_IV, ClientSide=True)
     forged = bytes([first[0] ^ 1]) + first[1:]
     with pytest.raises(AnoMacError):
         channel.unwrap(forged)
