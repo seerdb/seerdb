@@ -726,14 +726,14 @@ decodes (via the project's own `decode_ano`) as a container plus four services:
 |-------|-------|------|
 | container magic / length / **version** / count | `DEADBEEF` / 117 / **`0x00000000`** / 4 | the sqlplus/OCI stamp — a modern thin client's container stamps `0x0B200200` here instead |
 | supervisor (svc 4) | version `0x0B200200`, status `31` (OK), service-array `[4, 1]` | announces the supervisor + auth services |
-| auth (svc 1) | version `0x0B200200`, status `0xFBFF` | (a thin client's auth status is `0xFCFF`) |
+| auth (svc 1) | version `0x0B200200`, status `0xFBFF` | (a thin client's own request carries `0xFCFF`) |
 | encryption (svc 2) | version `0x0B200200`, selected-algo **`0`** | null cipher — plaintext |
 | data-integrity (svc 3) | version `0x0B200200`, selected-algo **`0`** | null checksum — no MAC |
 
 The container version is `0x00000000` while every *service* still echoes the
 modern `VERSION_11_2_0_2` (`0x0B200200`) — the one wrinkle that separates this reply
-from `encode_ano_response` (§33), together with the `0xFBFF` auth status and the
-null algorithm selections. `tests/test_handshake_generation.py` pins the built
+from `encode_ano_response` (§33), together with the null algorithm selections.
+Both send the `0xFBFF` auth status. `tests/test_handshake_generation.py` pins the built
 bytes to the live 11g capture.
 
 **What selects the OCI marshalling is the client's data-type request, not the
@@ -9843,10 +9843,24 @@ packet if it differs.
 - **Round 2 (C→S)** is a one-service container (data-integrity, a single `bytes`
   sub-packet) carrying the client's DH public key.
 
-DH is the classic modular exchange over the server's group (gen=2, 2048-bit
-prime): `client_public = gen^priv mod p`, `shared = server_public^priv mod p`,
-both left-padded to the prime's byte length. `server_iv` is the constant
-`b"foo bar baz bat quux"` (20 bytes).
+DH is the classic modular exchange over the server's group: `client_public =
+gen^priv mod p`, `shared = server_public^priv mod p`, both left-padded to the
+prime's byte length. `server_iv` is the constant `b"foo bar baz bat quux"` (20
+bytes).
+
+The server picks the group by the client's offered checksums (#2858, the 26ai
+bed, 2026-11-28):
+- **A client that offers a SHA-2 checksum** (seerdb, python-oracledb) gets the
+  2048-bit RFC 3526 group 14, generator 2.
+- **A client that offers only MD5 and SHA1** (JDBC thin 11.2.0.3) gets a
+  1024-bit group of Oracle's own, generator and prime each one 128-byte block,
+  neither a published group (`ano.DH_GROUP_LEGACY`). That client can't take the
+  2048-bit group: it fails reading it, with an array index error at 128.
+
+In both, the reply's authentication service carries the status `0xFBFF`. A
+thin client's own request carries `0xFCFF` there. seerdb's client takes either
+in a reply, but JDBC thin 11.2 reads `0xFCFF` as *"Authentication service
+received status failure"*.
 
 ### 33.3 The encrypted data-packet wire format
 
@@ -9908,8 +9922,11 @@ half (#448). Its behaviour follows a per-Mirror **stance**:
   it keeps every existing plaintext / sqlplus test unchanged.
 - **`requested` / `required`** — select the strongest AES the client offered
   (AES256 ▷ AES192 ▷ AES128) plus a SHA-2 checksum, and reply with the DH
-  exchange: the server emits generator 2, the RFC 3526 2048-bit MODP prime, its
-  own public key, and the IV constant. It then reads the client's round-2 public
+  exchange: the server emits the group a real server sends that client (§33.2:
+  generator 2 and the RFC 3526 2048-bit MODP prime, or Oracle's 1024-bit group
+  for a client offering no SHA-2 checksum), its own public key, and the IV
+  constant. A client offering no SHA-2 checksum gets none: AES alone, which JDBC
+  thin 11.2 accepts, where a real server allowing SHA1 would agree on SHA1. It then reads the client's round-2 public
   key, derives the same shared secret, and switches the stream to encrypted
   framing before reading the (now encrypted) PRO. `required` fails the login if
   the client offered no algorithm the Mirror implements; `requested` falls back

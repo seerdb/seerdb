@@ -236,9 +236,12 @@ def data_integrity_service(AlgoNames: list[str]) -> bytes:
 # Authentication service markers (no NTS/Kerberos selected by a thin client).
 AUTH_MARKER = 0xE0E1
 AUTH_STATUS_NONE = 0xFCFF
-# The auth-service status the server returns in the classic sqlplus / thick-OCI
-# (deadbeef) null-negotiation reply, in place of the thin AUTH_STATUS_NONE.
+# The auth-service status a server answers with when no method is selected: in
+# the classic sqlplus / thick-OCI (deadbeef) null-negotiation reply, and in the
+# reply to a thin client's offer, where the client itself sends AUTH_STATUS_NONE
+# (#2858).
 AUTH_STATUS_DEADBEEF = 0xFBFF
+AUTH_STATUS_SERVER_NONE = AUTH_STATUS_DEADBEEF
 # The status a server answers with when it selected an offered method (#2378),
 # and the Kerberos one: offered as its number and name, as sqlplus offers it.
 AUTH_STATUS_SELECTED = 0xFAFF
@@ -429,6 +432,52 @@ DH_PRIME = bytes.fromhex(
 )
 DH_GROUP_BITS = len(DH_PRIME) * 8  # 2048; both bit-length fields carry this
 DH_GENERATOR = (2).to_bytes(len(DH_PRIME), 'big')  # generator 2, prime-padded
+
+# The 1024-bit group the 26ai bed sends a client that offers no SHA-2 checksum,
+# JDBC thin 11.2 (ojdbc6) among them, which fails on the 2048-bit one (#2858).
+# Oracle's own: neither the generator nor the prime is a published group.
+DH_LEGACY_GENERATOR = bytes.fromhex(
+    '9fa2293098fd74b8d1b4cbf404dbf01c3f18e37445572a0d807fc21c54c0628d'
+    'd3ad3349d1545b03e1c3c63dfbcf7aada4de2cd56767b24ca6bab01f2244f2e5'
+    '7b43a3158b6ab16749a94103d55362fcf64d029b9a9996a55689783a808f1872'
+    '3c387b9e438f90010d3ea44aae8724fec40f0bb15e87e32757c7a25f456c1085'
+)
+DH_LEGACY_PRIME = bytes.fromhex(
+    'd6d02f85b511111bcfd2bdb90b697b83fc3c90a7e12f80503968fdcfb3b92e41'
+    'f008276127be8f87eaf90cde605feea3743c9470d03ef15f1cdcb933a79eeab9'
+    '5ed0f2e4c4ff53869c71b74376726a4c1d944922bd6151cbdbdb042a82551865'
+    'c3f6ddc5fb3b1a2ade7bc92f1e1f1ac2d16fbb4ba5b9f5310e8aa6bff873ef13'
+)
+
+
+@dataclass(frozen=True)
+class DhGroup:
+    """A Diffie-Hellman group as the server sends it: generator and prime, each
+    one prime-length block."""
+
+    generator: bytes
+    prime: bytes
+
+    @property
+    def bits(self) -> int:
+        return len(self.prime) * 8
+
+
+DH_GROUP_14 = DhGroup(DH_GENERATOR, DH_PRIME)
+DH_GROUP_LEGACY = DhGroup(DH_LEGACY_GENERATOR, DH_LEGACY_PRIME)
+_SHA2_INTEGRITY_IDS = frozenset(
+    INTEGRITY_ALGO_IDS[Name] for Name in ('SHA256', 'SHA384', 'SHA512')
+)
+
+
+def dh_group_for(OfferedIntegrity: list[int]) -> DhGroup:
+    """The group a real server sends for a client's offered checksums: the
+    2048-bit one when it offers a SHA-2 checksum, else the 1024-bit one (#2858)."""
+    if _SHA2_INTEGRITY_IDS.intersection(OfferedIntegrity):
+        return DH_GROUP_14
+    return DH_GROUP_LEGACY
+
+
 # The constant IV a real server supplies as the 8th data-integrity sub-packet;
 # it keys the data-integrity MAC (not the cipher). ASCII, 20 bytes.
 DH_SERVER_IV = b'foo bar baz bat quux'
@@ -447,30 +496,35 @@ class ServerDiffieHellman:
     private: int
     public_key: bytes  # sent to the client in the round-1 response
     session_key: bytes | None = None  # filled by :meth:`derive` at round 2
+    group: DhGroup = DH_GROUP_14
 
     def derive(self, ClientPublic: bytes) -> bytes:
         """Compute the shared secret from the client's public key (round 2)."""
-        P = int.from_bytes(DH_PRIME, 'big')
+        P = int.from_bytes(self.group.prime, 'big')
         Shared = pow(int.from_bytes(ClientPublic, 'big'), self.private, P)
-        self.session_key = Shared.to_bytes(len(DH_PRIME), 'big')
+        self.session_key = Shared.to_bytes(len(self.group.prime), 'big')
         return self.session_key
 
 
-def server_dh_keypair(Private: bytes | None = None) -> ServerDiffieHellman:
-    """Generate the server's DH keypair over the standard group.
+def server_dh_keypair(
+    Private: bytes | None = None, Group: DhGroup = DH_GROUP_14
+) -> ServerDiffieHellman:
+    """Generate the server's DH keypair over ``Group`` (:func:`dh_group_for`).
 
     ``Private`` (one prime-length block) is random when omitted; pass it only for
     deterministic tests. The shared key is derived later via
     :meth:`ServerDiffieHellman.derive` once the client's public key arrives.
     """
-    ByteLen = len(DH_PRIME)
+    ByteLen = len(Group.prime)
     if Private is None:
         Private = token_bytes(ByteLen)
     Priv = int.from_bytes(Private, 'big')
     Public = pow(
-        int.from_bytes(DH_GENERATOR, 'big'), Priv, int.from_bytes(DH_PRIME, 'big')
+        int.from_bytes(Group.generator, 'big'), Priv, int.from_bytes(Group.prime, 'big')
     )
-    return ServerDiffieHellman(private=Priv, public_key=Public.to_bytes(ByteLen, 'big'))
+    return ServerDiffieHellman(
+        private=Priv, public_key=Public.to_bytes(ByteLen, 'big'), group=Group
+    )
 
 
 def encryption_service_response(AlgoId: int) -> bytes:
@@ -480,7 +534,9 @@ def encryption_service_response(AlgoId: int) -> bytes:
     )
 
 
-def data_integrity_service_response(AlgoId: int, ServerPublic: bytes) -> bytes:
+def data_integrity_service_response(
+    AlgoId: int, ServerPublic: bytes, Group: DhGroup = DH_GROUP_14
+) -> bytes:
     """The server's data-integrity reply carrying the DH exchange (8 sub-packets):
     version, selected algorithm, the two bit-length fields, then generator, prime,
     the server public key, and the IV constant."""
@@ -489,10 +545,10 @@ def data_integrity_service_response(AlgoId: int, ServerPublic: bytes) -> bytes:
         [
             sp_version(_RESPONSE_VERSION),
             sp_ub1(AlgoId),
-            sp_ub2(DH_GROUP_BITS),
-            sp_ub2(DH_GROUP_BITS),
-            sp_bytes(DH_GENERATOR),
-            sp_bytes(DH_PRIME),
+            sp_ub2(Group.bits),
+            sp_ub2(Group.bits),
+            sp_bytes(Group.generator),
+            sp_bytes(Group.prime),
             sp_bytes(ServerPublic),
             sp_bytes(DH_SERVER_IV),
         ],
@@ -513,21 +569,29 @@ def supervisor_service_response() -> bytes:
 
 
 def auth_service_response() -> bytes:
-    """The server's authentication reply: version + the no-method status."""
+    """The server's authentication reply: version + the no-method status.
+
+    The status is 0xFBFF, as the 26ai bed answers both seerdb and JDBC thin 11.2.
+    seerdb's client also takes the 0xFCFF a client sends, but JDBC thin 11.2
+    reads that as "Authentication service received status failure" (#2858)."""
     return encode_service(
-        SERVICE_AUTH, [sp_version(_RESPONSE_VERSION), sp_status(AUTH_STATUS_NONE)]
+        SERVICE_AUTH,
+        [sp_version(_RESPONSE_VERSION), sp_status(AUTH_STATUS_SERVER_NONE)],
     )
 
 
-def encode_ano_response(EncId: int, IntId: int, ServerPublic: bytes) -> bytes:
+def encode_ano_response(
+    EncId: int, IntId: int, ServerPublic: bytes, Group: DhGroup = DH_GROUP_14
+) -> bytes:
     """Assemble the full server negotiation response advertising the selected
-    encryption + data-integrity algorithms and the DH exchange (#448)."""
+    encryption + data-integrity algorithms and the DH exchange (#448) over
+    ``Group``, the one the server keypair was made in."""
     return encode_ano(
         [
             supervisor_service_response(),
             auth_service_response(),
             encryption_service_response(EncId),
-            data_integrity_service_response(IntId, ServerPublic),
+            data_integrity_service_response(IntId, ServerPublic, Group),
         ]
     )
 

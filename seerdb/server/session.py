@@ -448,14 +448,16 @@ def _negotiate_ano_server(
             raise InterfaceError('ANO: no mutually supported encryption algorithm')
         stream.send_raw(encode_ano_null_reply(sdu=stream.sdu))
         return
+    offered_integrity = ano.offered_algorithm_ids(request, ano.SERVICE_DATA_INTEGRITY)
     int_id = _select_algorithm(
-        ano.offered_algorithm_ids(request, ano.SERVICE_DATA_INTEGRITY),
-        _SERVER_INT_PREF,
-        ano.INTEGRITY_ALGO_IDS,
+        offered_integrity, _SERVER_INT_PREF, ano.INTEGRITY_ALGO_IDS
     )
-    sdh = ano.server_dh_keypair()
+    # A client that offers no SHA-2 checksum (JDBC thin 11.2) takes only the
+    # 1024-bit group, as a real server sends it (#2858).
+    group = ano.dh_group_for(offered_integrity)
+    sdh = ano.server_dh_keypair(Group=group)
     stream.write_packet(
-        TNS_DATA, ano.encode_ano_response(enc_id, int_id, sdh.public_key)
+        TNS_DATA, ano.encode_ano_response(enc_id, int_id, sdh.public_key, group)
     )
     round2 = stream.read_packet()
     if round2 is None:
