@@ -405,10 +405,11 @@ def _expect(stream: PacketStream, want: int, what: str) -> bytes:
 
 
 # The Mirror's algorithm preference, strongest first — intersected with what the
-# client offered. Only the AES ciphers are implemented. SHA1 comes after the
-# SHA-2 checksums, for a client that offers none of them (JDBC thin 11.2, #2865).
+# client offered. Only the AES ciphers are implemented. SHA1 and then MD5 come
+# after the SHA-2 checksums, for a client that offers none of them (JDBC thin
+# 11.2 gets SHA1, #2865).
 _SERVER_ENC_PREF = ('AES256', 'AES192', 'AES128')
-_SERVER_INT_PREF = ('SHA256', 'SHA384', 'SHA512', 'SHA1')
+_SERVER_INT_PREF = ('SHA256', 'SHA384', 'SHA512', 'SHA1', 'MD5')
 
 
 def _select_algorithm(

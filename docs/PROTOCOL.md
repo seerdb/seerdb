@@ -9889,10 +9889,12 @@ itself is plaintext. Each `TNS_DATA` payload (the bytes after the 8-byte header 
   from it, and the per-direction keystreams are RC4 keyed with those five bytes
   and `90` (sender) or `180` (receiver). A packet's MAC is `hash(payload ‖ the
   next 16 or 20 keystream bytes)`, and a break/reset draws the next five bytes,
-  as for SHA-2 (§33.6). Checked against 26ai with SHA1 allowed (it refuses MD5
-  even when listed): a seerdb session opens 26ai's replies, MACs and all,
-  across a reset, and 26ai accepts seerdb's. The MD5 MAC is the same code with
-  MD5, unmeasured.
+  as for SHA-2 (§33.6). Checked against two servers, each opening the other's
+  replies, MACs and all, across a reset:
+  - SHA1 against 26ai with SHA1 allowed. 26ai refuses MD5 even when listed.
+  - MD5 against 10g requesting encryption with MD5 alone. 10g sent that client
+    a 512-bit group, so the group follows the server's release as well as the
+    client's stamp.
 - **Cipher**: AES-CBC, key = `shared[:keysize]` (16/24/32), **IV = 16 zero
   bytes** (the DH IV is *not* used by the cipher). Oracle padding: zero-pad the
   plaintext up to the 16-byte block (no block added when already aligned), and
@@ -9936,12 +9938,12 @@ half (#448). Its behaviour follows a per-Mirror **stance**:
   it keeps every existing plaintext / sqlplus test unchanged.
 - **`requested` / `required`** — select the strongest AES the client offered
   (AES256 ▷ AES192 ▷ AES128) plus a checksum (SHA256 ▷ SHA384 ▷ SHA512 ▷
-  SHA1), and reply with the DH exchange: the server emits the group a real
+  SHA1 ▷ MD5), and reply with the DH exchange: the server emits the group a real
   server sends that client (§33.2: generator 2 and the RFC 3526 2048-bit MODP
   prime, or Oracle's 1024-bit group for a request stamped below `0x0B200200`),
   its own public key, and the IV constant. JDBC thin 11.2, which offers only MD5
-  and SHA1, gets SHA1 (#2865). MD5 isn't in the Mirror's preference: the client
-  can run it, but no server here has shown it. It then reads the client's round-2 public
+  and SHA1, gets SHA1 (#2865); a client offering MD5 alone gets MD5. It then
+  reads the client's round-2 public
   key, derives the same shared secret, and switches the stream to encrypted
   framing before reading the (now encrypted) PRO. `required` fails the login if
   the client offered no algorithm the Mirror implements; `requested` falls back
