@@ -6222,7 +6222,9 @@ def _encode_out_bind_value(
         # #979). This has to sit ahead of the national-charset branch: an NCLOB
         # OUT bind is a CLOB with csfrm 2, and encoding it as UTF-16BE text
         # would hand the LOB reader a DALC.
-        return encode_lob_bind_block(value, is_clob=tns_type == TNS_TYPE_CLOB)
+        return encode_lob_bind_block(
+            value, is_clob=tns_type == TNS_TYPE_CLOB, out_bind=True
+        )
     if csfrm == _CSFRM_NCHAR and isinstance(value, str):
         # National character data travels as UTF-16BE, the same form a
         # national COLUMN uses in a row (_national_wire_value). #826.
@@ -23163,7 +23165,9 @@ def encode_prefetched_lob_value_thin(image: bytes) -> bytes:
     )
 
 
-def encode_lob_bind_block(value: object, *, is_clob: bool) -> bytes:
+def encode_lob_bind_block(
+    value: object, *, is_clob: bool, out_bind: bool = False
+) -> bytes:
     """The LOB block a BIND's value rides in, for a Mirror serving one.
 
     The block is the same one a fetched LOB column carries (§14.5b) -- a ub4
@@ -23177,13 +23181,19 @@ def encode_lob_bind_block(value: object, *, is_clob: bool) -> bytes:
     materialised -- so it MINTS one and records the content against it in the
     session's :class:`LobEmitLog`, exactly as the column path does. The read the
     client then issues is answered from that log by locator, so nothing about
-    the read path changes."""
+    the read path changes.
+
+    Below 12.1 an OUT bind's block is the bare one, the locator's length and
+    the locator, as 11.2.0.2 answers JDBC thin 11.2 (#2859); ojdbc6 read the
+    size and chunk size as the locator and failed with "Protocol violation".
+    A RETURNING bind keeps the block above there: no capture says otherwise."""
     if value is None:
         return bytes([0])
     log = _LOB_EMIT_LOG.get()
     locator = log.record(value, is_clob) if log is not None else _THIN_LOB_LOCATOR
+    bare = out_bind and _ENCODE_FIELD_VERSION.get() < FIELD_VERSION_12_1
     return encode_lob_locator_thin(
-        _lob_value_size(value), with_metadata=True, locator=locator
+        _lob_value_size(value), with_metadata=not bare, locator=locator
     )
 
 
